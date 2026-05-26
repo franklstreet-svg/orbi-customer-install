@@ -38,6 +38,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re as _re
 import threading
 import time
 from pathlib import Path
@@ -48,16 +49,25 @@ from flask import (Flask, abort, jsonify, make_response, request,
 import audit
 import auth
 import backup
+import cross_search as xs
 import llm_client
 import notifications as notify
+import pre_execute as pre_exec
 import prompts
+import users as users_mod
 import voice
+import wellbeing
 from modules import business_info as mod_business
+from modules import calendar as mod_calendar
 from modules import catalog as mod_catalog
+from modules import contacts as mod_contacts
 from modules import learning_loop as mod_learning
 from modules import memory as mod_memory
 from modules import messages as mod_messages
 from modules import notes as mod_notes
+from modules import quick_capture as mod_qc
+from modules import reminders as mod_reminders
+from modules import tasks as mod_tasks
 from modules import workspace as mod_workspace
 from tools import web_search as tool_web_search
 
@@ -148,6 +158,64 @@ def check_billing() -> None:
         log.warning(f"billing endpoint unreachable: {e}")
 
 threading.Thread(target=billing_loop, daemon=True).start()
+
+
+# ---------------------------------------------------------------------------
+# Archive sweeper — runs once on boot, then daily
+# Purges _archived/<username>/ folders past their 90-day purge_after date
+# (skipping any with hold=True). Same daemon-thread pattern as billing.
+# ---------------------------------------------------------------------------
+
+def archive_sweep_loop():
+    # Brief delay so initial startup logs aren't interleaved with our output
+    time.sleep(60)
+    while True:
+        try:
+            purged = users_mod.purge_expired_archives(DATA_DIR)
+            if purged:
+                log.info(f"archive sweep: purged {len(purged)} user(s): {purged}")
+        except Exception as e:
+            log.warning(f"archive sweep failed: {e}")
+        time.sleep(60 * 60 * 24)  # once per day
+
+threading.Thread(target=archive_sweep_loop, daemon=True).start()
+
+
+# ---------------------------------------------------------------------------
+# Reminder firing worker — checks each user's pending reminders every minute
+# and fires due ones through the notifications module.
+# ---------------------------------------------------------------------------
+
+def reminder_fire_loop():
+    time.sleep(30)
+    while True:
+        try:
+            _check_all_users_reminders()
+        except Exception as e:
+            log.warning(f"reminder fire loop error: {e}")
+        time.sleep(60)
+
+def _check_all_users_reminders():
+    for u in users_mod.list_users(DATA_DIR):
+        user_dir = users_mod.get_user_dir(DATA_DIR, u["username"])
+        if not user_dir.exists():
+            continue
+        for r in mod_reminders.due_now(user_dir):
+            try:
+                notify.send(
+                    CONFIG, DATA_DIR,
+                    event="reminder_due",
+                    title=f"Reminder for {u['username']}",
+                    body=r.get("text", ""),
+                    url="/owner",
+                )
+                mod_reminders.mark_fired(user_dir, r["id"])
+                log.info(f"fired reminder for {u['username']}: {r.get('text','')[:40]}")
+            except Exception as e:
+                log.warning(f"could not fire reminder {r.get('id')}: {e}")
+
+threading.Thread(target=reminder_fire_loop, daemon=True).start()
+
 
 # ---------------------------------------------------------------------------
 # Flask app
@@ -460,7 +528,47 @@ def public_chat():
     scope    = (CONFIG.get("scope") or {})
     system   = prompts.build_public_prompt(business, scope)
 
-    # PRIORITY 0 — LEARNED ANSWERS (never-guess pattern). If the OWNER has
+    # PRE-EXECUTE — fast local answer for common questions (greetings,
+    # time, date, hours, address, phone, catalog count). When this fires
+    # with "direct", we skip the LLM entirely — instant answer, $0 cost,
+    # zero hallucination risk. When it returns "data:..." we still call
+    # the LLM but with authoritative data injected, so the LLM only
+    # composes wording around real facts (109 tokens instead of 6,302
+    # per the my_orby measurement).
+    # MUST run AFTER the wellbeing check below so crisis messages don't
+    # get reduced to a "Hi! What can I help with?" greeting reply.
+    pre_resp, pre_kind = pre_exec.pre_execute(user_msg, DATA_DIR, business)
+    # We defer the direct-return until after wellbeing has had its say.
+
+    # WELLBEING — scan EVERY public-chat message for crisis / distress signals
+    # BEFORE we route to learned answers, catalog, or the LLM. If a signal
+    # fires, log it for the owner's dashboard AND inject the appropriate
+    # system-prompt context so Orbi handles the moment with care instead
+    # of barreling into the buy flow. (Ported from orby_5050/engine/wellbeing.py)
+    _wb_level = "ok"
+    try:
+        _wb = wellbeing.check_message(user_msg)
+        _wb_level = _wb["level"]
+        if _wb_level != "ok":
+            wellbeing.log_flag(DATA_DIR, _wb_level, _wb["signal"],
+                                user_msg, source="chat")
+            log.warning("public chat wellbeing flag fired: level=%s signal=%r",
+                        _wb_level, _wb["signal"])
+            if _wb_level == "crisis":
+                system += "\n\n" + wellbeing.get_crisis_context()
+            else:
+                system += "\n\n" + wellbeing.get_distress_context()
+    except Exception as e:
+        log.warning(f"wellbeing check failed: {e}")
+
+    # PRIORITY 0a — pre_execute DIRECT answers (only if wellbeing didn't
+    # flag the message; we want crisis messages to get the careful LLM
+    # path, not a chipper "Hi! What can I help with?" greeting reply).
+    if pre_kind == "direct" and _wb_level == "ok":
+        log.info("pre_execute direct hit: %r", pre_resp[:60])
+        return jsonify({"reply": pre_resp, "tier": "local"}), 200
+
+    # PRIORITY 0b — LEARNED ANSWERS (never-guess pattern). If the OWNER has
     # already answered this exact question for a previous visitor, return
     # that answer instantly without calling the LLM. This is what makes
     # Orbi's knowledge compound over time and never invent facts about
@@ -473,6 +581,15 @@ def public_chat():
             "tier": "learned",
             "verified": True,
         }), 200
+
+    # PRIORITY 0c — pre_execute DATA hits (e.g. catalog count, services).
+    # The LLM still composes the reply but with authoritative business
+    # data injected so it can't invent.
+    if pre_kind and pre_kind.startswith("data:"):
+        extras_pre = ("LOCAL BUSINESS DATA (AUTHORITATIVE — quote exactly, "
+                      "don't paraphrase, don't invent):\n" + pre_resp)
+        system += "\n\n" + extras_pre
+        log.info("pre_execute data hit: kind=%s len=%d", pre_kind, len(pre_resp))
 
     # Public chat gets workspace context first (so she can answer about
     # promotions, menus, FAQs the owner dropped into ~/Orbi/) — these are
@@ -720,25 +837,53 @@ def owner_dashboard_page():
 
 @app.route("/api/owner/login", methods=["POST"])
 def owner_login():
+    """Login accepts either {username, password} (multi-user) or legacy
+    {email, password} (single-owner installs pre-multi-user).
+    On first multi-user login, bootstrap the legacy CONFIG.owner into
+    users.json so subsequent logins go through the proper registry."""
     data = request.get_json(silent=True) or {}
-    email = (data.get("email") or "").strip().lower()
+    raw_id = (data.get("username") or data.get("email") or "").strip()
     password = data.get("password") or ""
-    owner = CONFIG.get("owner", {})
     ip = request.headers.get("X-Forwarded-For", request.remote_addr or "")
-    if not email or not password:
-        return jsonify({"error": "Email and password required"}), 400
-    if email != (owner.get("email") or "").lower():
-        audit.log_event(DATA_DIR, actor=email, action="owner.login.failed",
-                        ip=ip, meta={"reason": "unknown_email"})
-        return jsonify({"error": "Invalid email or password"}), 401
-    if not auth.verify_password(password, owner.get("_password_hash", "")):
-        audit.log_event(DATA_DIR, actor=email, action="owner.login.failed",
-                        ip=ip, meta={"reason": "bad_password"})
-        return jsonify({"error": "Invalid email or password"}), 401
-    token = auth.issue_session(ORBI_DIR, email)
-    resp = make_response(jsonify({"status": "ok"}))
+    if not raw_id or not password:
+        return jsonify({"error": "Username and password required"}), 400
+
+    # First-time multi-user bootstrap: legacy single-owner install with
+    # an entry in CONFIG.owner but no users.json yet.
+    legacy_owner = CONFIG.get("owner", {})
+    existing_users = users_mod.load_users(DATA_DIR)
+    if not existing_users and legacy_owner.get("email"):
+        legacy_email = legacy_owner["email"].lower()
+        if raw_id.lower() in (legacy_email, legacy_email.split("@")[0]) \
+           and auth.verify_password(password, legacy_owner.get("_password_hash", "")):
+            bootstrap_username = legacy_email.split("@")[0] or "owner"
+            try:
+                users_mod.add_user(DATA_DIR, bootstrap_username, password,
+                                   role="owner", display_name=legacy_owner.get("name", bootstrap_username))
+                log.info(f"bootstrapped owner from legacy CONFIG: {bootstrap_username}")
+                audit.log_event(DATA_DIR, actor=bootstrap_username,
+                                action="owner.bootstrap_from_config")
+            except ValueError as e:
+                log.warning(f"bootstrap failed: {e}")
+
+    # Standard multi-user verify path
+    username = raw_id.split("@")[0].lower() if "@" in raw_id else raw_id.lower()
+    user_rec = users_mod.verify_user(DATA_DIR, username, password)
+    if not user_rec:
+        audit.log_event(DATA_DIR, actor=username, action="owner.login.failed",
+                        ip=ip, meta={"reason": "bad_credentials"})
+        return jsonify({"error": "Invalid username or password"}), 401
+
+    token = auth.issue_session(ORBI_DIR, username=user_rec["username"],
+                               role=user_rec.get("role", "staff"))
+    resp = make_response(jsonify({
+        "status": "ok",
+        "username": user_rec["username"],
+        "role": user_rec["role"],
+        "display_name": user_rec.get("display_name"),
+    }))
     auth.set_session_cookie(resp, token)
-    audit.log_event(DATA_DIR, actor=email, action="owner.login.success", ip=ip)
+    audit.log_event(DATA_DIR, actor=username, action="owner.login.success", ip=ip)
     return resp
 
 @app.route("/api/owner/logout", methods=["POST"])
@@ -934,17 +1079,38 @@ def owner_audit_csv():
 
 @app.route("/api/owner/chat", methods=["POST"])
 def owner_chat():
-    auth.require_owner(ORBI_DIR)
+    """User-scoped chat. Owner mode gets full personal-assistant access;
+    staff get the same access scoped to their own per-user folder."""
+    user_rec = auth.require_user(ORBI_DIR, DATA_DIR)
+    username = user_rec["username"]
+    user_dir = users_mod.get_user_dir(DATA_DIR, username)
+    user_dir.mkdir(parents=True, exist_ok=True)
+
     data = request.get_json(silent=True) or {}
     user_msg = (data.get("message") or "").strip()
     history  = data.get("history") or []
     if not user_msg:
         return jsonify({"error": "empty message"}), 400
 
+    # ── Fast-path personal-assistant intents (no LLM needed) ──────────────
+    # READ patterns: answer directly from the user's per-user data.
+    pa_direct = _try_personal_assistant_read(user_msg, user_dir)
+    if pa_direct is not None:
+        return jsonify({"reply": pa_direct, "tier": "local", "latency_ms": 0,
+                        "source": "personal_assistant"})
+
+    # CREATE patterns: route through quick_capture which classifies and files.
+    qc_result = _try_quick_capture(user_msg, user_dir)
+    if qc_result is not None:
+        audit.log_event(DATA_DIR, actor=username, action=f"pa.capture.{qc_result['kind']}",
+                        meta={"summary": qc_result.get("summary", "")})
+        return jsonify({"reply": qc_result["summary"], "tier": "local", "latency_ms": 0,
+                        "source": "quick_capture", "captured_as": qc_result["kind"]})
+
     business = mod_business.load(DATA_DIR)
     system = prompts.build_owner_prompt(business)
 
-    # Owner mode gets memory + notes + workspace files as extra context
+    # Owner mode gets memory + notes + workspace + per-user PA as extra context
     extras = []
     notes_ctx = mod_notes.context_block(DATA_DIR)
     if notes_ctx:
@@ -952,6 +1118,13 @@ def owner_chat():
     memory_ctx = mod_memory.context_block(DATA_DIR)
     if memory_ctx:
         extras.append(memory_ctx)
+    # Per-user personal-assistant context blocks
+    for module_ctx in (mod_calendar.context_block(user_dir),
+                       mod_reminders.context_block(user_dir),
+                       mod_tasks.context_block(user_dir),
+                       mod_contacts.context_block(user_dir)):
+        if module_ctx:
+            extras.append(module_ctx)
     # Same three-way priority as public chat
     msg_lower = user_msg.lower()
     is_fresh_query = any(k in msg_lower for k in tool_web_search._FRESH_KEYWORDS)
@@ -1001,6 +1174,346 @@ def owner_chat():
         "tier": resp.tier,
         "latency_ms": resp.latency_ms,
     })
+
+
+# ---------------------------------------------------------------------------
+# Personal-assistant fast-path helpers (no LLM needed for these intents)
+# ---------------------------------------------------------------------------
+
+_PA_TODAY_RE = _re.compile(
+    r"\bwhat(?:'s|s| is)?\s+(?:on\s+)?(?:my\s+)?(?:calendar|schedule|agenda)?\s*(?:for\s+)?today\b|"
+    r"\b(?:what(?:'s|s| is) on|what do i have)\s+(?:going on\s+)?today\b|"
+    r"\bany(?:thing|meetings)\s+today\b",
+    _re.IGNORECASE,
+)
+_PA_WEEK_RE = _re.compile(
+    r"\bwhat(?:'s|s| is)?\s+(?:on\s+)?(?:my\s+)?(?:calendar|schedule|agenda)?\s*(?:for\s+)?(?:this\s+)?(?:week|next\s+week|upcoming)\b|"
+    r"\bupcoming\s+(?:events|meetings|appointments)\b",
+    _re.IGNORECASE,
+)
+_PA_TASKS_RE = _re.compile(
+    r"\b(?:show|list|what(?:'s|s| are))\s+(?:my\s+)?(?:open\s+)?(?:todo|to[\s-]?do|tasks?)(?:\s+list)?\b",
+    _re.IGNORECASE,
+)
+_PA_REMINDERS_RE = _re.compile(
+    r"\b(?:show|list|what(?:'s|s| are))\s+(?:my\s+)?(?:pending\s+)?reminders?\b|"
+    r"\bwhat\s+do\s+i\s+need\s+to\s+be\s+reminded\s+(?:about|of)\b",
+    _re.IGNORECASE,
+)
+_PA_WHO_IS_RE = _re.compile(
+    r"\bwho\s+is\s+(?P<name>[A-Z][a-zA-Z\-']+(?:\s+[A-Z][a-zA-Z\-']+){0,2})\b",
+)
+_PA_PHONE_OF_RE = _re.compile(
+    r"\b(?:what(?:'s|s| is)?|find|get|look\s*up)\s+"
+    r"(?P<name>[A-Z][a-zA-Z\-]+(?:\s+[A-Z][a-zA-Z\-]+){0,2})"
+    r"(?:'s|s')?\s+"
+    r"(?:phone|number|email|contact)\b",
+)
+
+
+def _try_personal_assistant_read(message: str, user_dir: Path) -> str | None:
+    """Detect 'what's on today / show my tasks / who is X' READ patterns
+    and answer from the user's per-user modules. Returns the answer text
+    or None to fall through."""
+    if not message:
+        return None
+
+    if _PA_TODAY_RE.search(message):
+        events = mod_calendar.today(user_dir)
+        if not events:
+            return "Nothing on your calendar for today."
+        return "Today's calendar:\n" + "\n".join(
+            f"  - {e.get('start','')[11:16]}  {e.get('title','')}" for e in events
+        )
+
+    if _PA_WEEK_RE.search(message):
+        events = mod_calendar.upcoming(user_dir, days=7)
+        if not events:
+            return "Nothing on your calendar this week."
+        return "Upcoming this week:\n" + "\n".join(
+            f"  - {e.get('start','')[:16].replace('T',' ')}  {e.get('title','')}" for e in events
+        )
+
+    if _PA_TASKS_RE.search(message):
+        items = mod_tasks.list_all(user_dir)
+        if not items:
+            return "Your task list is empty."
+        return "Open tasks:\n" + "\n".join(f"  - {t.get('text','')}" for t in items)
+
+    if _PA_REMINDERS_RE.search(message):
+        items = mod_reminders.list_all(user_dir)
+        if not items:
+            return "No pending reminders."
+        return "Pending reminders:\n" + "\n".join(
+            f"  - {r.get('due','')[:16].replace('T',' ')}  {r.get('text','')}" for r in items
+        )
+
+    m = _PA_PHONE_OF_RE.search(message)
+    if m:
+        name = m.group("name").strip()
+        hits = mod_contacts.search(user_dir, name)
+        if not hits:
+            return f"No contact found matching \"{name}\"."
+        c = hits[0]
+        bits = [f"{c.get('name','')}"]
+        if c.get("phone"): bits.append(f"phone {c['phone']}")
+        if c.get("email"): bits.append(f"email {c['email']}")
+        if c.get("company"): bits.append(f"({c['company']})")
+        return ": ".join([bits[0], ", ".join(bits[1:])]) if len(bits) > 1 else bits[0]
+
+    m = _PA_WHO_IS_RE.search(message)
+    if m:
+        name = m.group("name").strip()
+        hits = mod_contacts.search(user_dir, name)
+        if not hits:
+            return None  # let LLM handle "who is" for general-knowledge people
+        c = hits[0]
+        bits = [c.get("name", "")]
+        if c.get("company"): bits.append(f"at {c['company']}")
+        if c.get("phone"): bits.append(f"phone {c['phone']}")
+        if c.get("notes"): bits.append(f"notes: {c['notes']}")
+        return " — ".join(bits)
+
+    return None
+
+
+# Quick-capture trigger words — only fire on these explicit phrasings, so
+# normal questions don't accidentally get filed as notes.
+_QC_TRIGGER_RE = _re.compile(
+    r"^(?:remind\s+me|nudge\s+me|add\s+(?:to\s+)?(?:my\s+)?(?:todo|task|contact|person)|"
+    r"appointment|meeting|book|schedule\s+(?:a|me)|save\s+contact|todo:|task:)",
+    _re.IGNORECASE,
+)
+
+
+def _try_quick_capture(message: str, user_dir: Path) -> dict | None:
+    """If the message starts with a quick-capture trigger word, run it
+    through quick_capture.capture() and return the result dict. Otherwise None."""
+    if not message or not _QC_TRIGGER_RE.match(message.strip()):
+        return None
+    try:
+        return mod_qc.capture(user_dir, message)
+    except Exception as e:
+        log.warning(f"quick_capture failed: {e}")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Personal-assistant CRUD routes (per-user, dashboard reads/writes via these)
+# ---------------------------------------------------------------------------
+
+
+def _current_user_dir() -> Path:
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    d = users_mod.get_user_dir(DATA_DIR, user["username"])
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+@app.route("/api/owner/pa/calendar", methods=["GET", "POST"])
+def pa_calendar():
+    ud = _current_user_dir()
+    if request.method == "GET":
+        return jsonify({"events": mod_calendar.list_all(ud)})
+    data = request.get_json(silent=True) or {}
+    try:
+        event = mod_calendar.add(
+            ud,
+            title=data.get("title", ""),
+            start=data.get("start", ""),
+            end=data.get("end"),
+            all_day=bool(data.get("all_day")),
+            notes=data.get("notes", ""),
+            with_=data.get("with") or [],
+            location=data.get("location", ""),
+        )
+        return jsonify({"status": "ok", "event": event})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/owner/pa/calendar/<event_id>", methods=["DELETE", "PATCH"])
+def pa_calendar_one(event_id):
+    ud = _current_user_dir()
+    if request.method == "DELETE":
+        ok = mod_calendar.remove(ud, event_id)
+        return jsonify({"status": "ok" if ok else "not_found"}), 200 if ok else 404
+    data = request.get_json(silent=True) or {}
+    updated = mod_calendar.update(ud, event_id, **data)
+    if not updated:
+        return jsonify({"error": "not_found"}), 404
+    return jsonify({"status": "ok", "event": updated})
+
+
+@app.route("/api/owner/pa/reminders", methods=["GET", "POST"])
+def pa_reminders():
+    ud = _current_user_dir()
+    if request.method == "GET":
+        include_done = request.args.get("include_done") == "1"
+        return jsonify({"reminders": mod_reminders.list_all(ud, include_done=include_done)})
+    data = request.get_json(silent=True) or {}
+    r = mod_reminders.add(ud, text=data.get("text", ""),
+                          due=data.get("due", ""),
+                          channel=data.get("channel", "in_app"))
+    return jsonify({"status": "ok", "reminder": r})
+
+
+@app.route("/api/owner/pa/reminders/<reminder_id>/done", methods=["POST"])
+def pa_reminder_done(reminder_id):
+    ud = _current_user_dir()
+    ok = mod_reminders.mark_done(ud, reminder_id)
+    return jsonify({"status": "ok" if ok else "not_found"}), 200 if ok else 404
+
+
+@app.route("/api/owner/pa/reminders/<reminder_id>", methods=["DELETE"])
+def pa_reminder_delete(reminder_id):
+    ud = _current_user_dir()
+    # No remove in module; mark done = soft delete from active view
+    ok = mod_reminders.mark_done(ud, reminder_id)
+    return jsonify({"status": "ok" if ok else "not_found"}), 200 if ok else 404
+
+
+@app.route("/api/owner/pa/contacts", methods=["GET", "POST"])
+def pa_contacts():
+    ud = _current_user_dir()
+    if request.method == "GET":
+        q = request.args.get("q", "")
+        return jsonify({"contacts": mod_contacts.search(ud, q) if q else mod_contacts.list_all(ud)})
+    data = request.get_json(silent=True) or {}
+    c = mod_contacts.add(ud,
+                         name=data.get("name", ""),
+                         phone=data.get("phone", ""),
+                         email=data.get("email", ""),
+                         notes=data.get("notes", ""),
+                         tags=data.get("tags") or [],
+                         source=data.get("source", "manual"),
+                         company=data.get("company", ""))
+    return jsonify({"status": "ok", "contact": c})
+
+
+@app.route("/api/owner/pa/contacts/<contact_id>", methods=["DELETE", "PATCH"])
+def pa_contact_one(contact_id):
+    ud = _current_user_dir()
+    if request.method == "DELETE":
+        ok = mod_contacts.remove(ud, contact_id)
+        return jsonify({"status": "ok" if ok else "not_found"}), 200 if ok else 404
+    data = request.get_json(silent=True) or {}
+    updated = mod_contacts.update(ud, contact_id, **data)
+    if not updated:
+        return jsonify({"error": "not_found"}), 404
+    return jsonify({"status": "ok", "contact": updated})
+
+
+@app.route("/api/owner/pa/tasks", methods=["GET", "POST"])
+def pa_tasks():
+    ud = _current_user_dir()
+    if request.method == "GET":
+        include_done = request.args.get("include_done") == "1"
+        return jsonify({"tasks": mod_tasks.list_all(ud, include_done=include_done)})
+    data = request.get_json(silent=True) or {}
+    t = mod_tasks.add(ud, text=data.get("text", ""), tags=data.get("tags") or [])
+    return jsonify({"status": "ok", "task": t})
+
+
+@app.route("/api/owner/pa/tasks/<task_id>/done", methods=["POST"])
+def pa_task_done(task_id):
+    ud = _current_user_dir()
+    ok = mod_tasks.mark_done(ud, task_id)
+    return jsonify({"status": "ok" if ok else "not_found"}), 200 if ok else 404
+
+
+@app.route("/api/owner/pa/tasks/<task_id>", methods=["DELETE"])
+def pa_task_delete(task_id):
+    ud = _current_user_dir()
+    ok = mod_tasks.remove(ud, task_id)
+    return jsonify({"status": "ok" if ok else "not_found"}), 200 if ok else 404
+
+
+@app.route("/api/owner/pa/quick_capture", methods=["POST"])
+def pa_quick_capture():
+    """Single endpoint where the dashboard can stream "remember this" snippets
+    and let the classifier file them automatically."""
+    ud = _current_user_dir()
+    data = request.get_json(silent=True) or {}
+    text = (data.get("text") or "").strip()
+    if not text:
+        return jsonify({"error": "empty"}), 400
+    return jsonify(mod_qc.capture(ud, text))
+
+
+# ---------------------------------------------------------------------------
+# Multi-user management (owner-only)
+# ---------------------------------------------------------------------------
+
+
+@app.route("/api/owner/users", methods=["GET", "POST"])
+def users_route():
+    owner = auth.require_role(ORBI_DIR, DATA_DIR, "owner")
+    if request.method == "GET":
+        return jsonify({
+            "users": users_mod.list_users(DATA_DIR, include_archived=False),
+            "archived": users_mod.list_archived(DATA_DIR),
+        })
+    data = request.get_json(silent=True) or {}
+    try:
+        rec = users_mod.add_user(DATA_DIR,
+                                 username=data.get("username", ""),
+                                 password=data.get("password", ""),
+                                 role=data.get("role", "staff"),
+                                 display_name=data.get("display_name"))
+        audit.log_event(DATA_DIR, actor=owner["username"],
+                        action="users.add", resource=rec["username"])
+        return jsonify({"status": "ok", "user": rec})
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/owner/users/<username>/deactivate", methods=["POST"])
+def user_deactivate(username):
+    owner = auth.require_role(ORBI_DIR, DATA_DIR, "owner")
+    try:
+        meta = users_mod.deactivate_user(DATA_DIR, username)
+        audit.log_event(DATA_DIR, actor=owner["username"],
+                        action="users.deactivate", resource=username, meta=meta)
+        return jsonify({"status": "ok", "archive": meta})
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/owner/users/<username>/hold", methods=["POST"])
+def user_hold(username):
+    owner = auth.require_role(ORBI_DIR, DATA_DIR, "owner")
+    data = request.get_json(silent=True) or {}
+    ok = users_mod.set_purge_hold(DATA_DIR, username, bool(data.get("hold")))
+    audit.log_event(DATA_DIR, actor=owner["username"],
+                    action="users.set_hold", resource=username,
+                    meta={"hold": bool(data.get("hold"))})
+    return jsonify({"status": "ok" if ok else "not_found"}), 200 if ok else 404
+
+
+@app.route("/api/owner/users/<from_user>/transfer/<to_user>", methods=["POST"])
+def user_transfer(from_user, to_user):
+    owner = auth.require_role(ORBI_DIR, DATA_DIR, "owner")
+    data = request.get_json(silent=True) or {}
+    source = data.get("source", "")
+    ids = data.get("ids") or []
+    if not source or not ids:
+        return jsonify({"error": "source and ids required"}), 400
+    moved = users_mod.transfer_items(DATA_DIR, from_user, to_user, source, ids)
+    audit.log_event(DATA_DIR, actor=owner["username"], action="users.transfer",
+                    resource=f"{from_user}->{to_user}",
+                    meta={"source": source, "moved": moved, "ids": ids})
+    return jsonify({"status": "ok", "moved": moved})
+
+
+@app.route("/api/owner/users/purge_now", methods=["POST"])
+def users_purge_now():
+    owner = auth.require_role(ORBI_DIR, DATA_DIR, "owner")
+    purged = users_mod.purge_expired_archives(DATA_DIR)
+    audit.log_event(DATA_DIR, actor=owner["username"],
+                    action="users.purge_expired", meta={"purged": purged})
+    return jsonify({"status": "ok", "purged": purged})
+
 
 # ---------------------------------------------------------------------------
 # Internal (watchdog → us)

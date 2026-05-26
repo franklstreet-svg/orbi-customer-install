@@ -28,6 +28,7 @@ from flask import request, Response
 
 import llm_client
 import prompts
+import wellbeing
 from modules import business_info as mod_business
 from modules import catalog as mod_catalog
 from modules import learning_loop as mod_learning
@@ -149,8 +150,26 @@ def _ai_reply(config: dict, business: dict, scope: dict,
             call_state["turns"] += 1
             return learned["answer"]
 
-    # PRIORITY 1 — catalog hits, injected as authoritative system context
+    # WELLBEING — scan caller speech for crisis / distress signals BEFORE
+    # routing. People in crisis sometimes call any business they know.
+    # Log for the owner's dashboard AND inject crisis context into the
+    # system prompt so Orbi handles the moment with care.
     system = _build_voice_prompt(business, scope)
+    if data_dir:
+        try:
+            _wb = wellbeing.check_message(user_speech)
+            if _wb["level"] != "ok":
+                wellbeing.log_flag(data_dir, _wb["level"], _wb["signal"],
+                                    user_speech, source="phone")
+                log.warning(f"[call {call_sid[:8]}] wellbeing flag: level={_wb['level']}")
+                if _wb["level"] == "crisis":
+                    system += "\n\n" + wellbeing.get_crisis_context()
+                else:
+                    system += "\n\n" + wellbeing.get_distress_context()
+        except Exception as e:
+            log.warning(f"voice wellbeing check failed: {e}")
+
+    # PRIORITY 1 — catalog hits, injected as authoritative system context
     if data_dir:
         try:
             cat_matches = mod_catalog.search(data_dir, user_speech, limit=5)
