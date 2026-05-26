@@ -29,9 +29,16 @@ from flask import request, Response
 import llm_client
 import prompts
 from modules import business_info as mod_business
+from modules import catalog as mod_catalog
+from modules import learning_loop as mod_learning
 from modules import messages as mod_messages
 
 log = logging.getLogger("orbi.voice")
+
+# Set by register() at startup so the helper functions (which run inside
+# Flask request handlers without explicit data_dir args) can reach the
+# catalog + learning_loop modules.
+_DATA_DIR: Path | None = None
 
 # ---------------------------------------------------------------------------
 # In-memory call state
@@ -56,6 +63,7 @@ def _call_state(sid: str, from_phone: str | None = None) -> dict:
                 "history": deque(maxlen=20),
                 "started": time.time(),
                 "last_touch": time.time(),
+                "sid": sid,
                 "from": from_phone,
                 "turns": 0,
             }
@@ -113,13 +121,96 @@ This conversation is happening on the phone. Adapt:
 
 def _ai_reply(config: dict, business: dict, scope: dict,
               call_state: dict, user_speech: str) -> str:
+    """Phone-side brain. Mirrors /chat in orbi.py — same priority order
+    so the caller gets the SAME quality of answer as a website visitor:
+
+      Priority 0:  Learned answers (instant, never-guess)
+      Priority 1:  Catalog match (injected into LLM context as authoritative)
+      LLM:         Wraps the data in a natural conversational reply
+      Post-LLM:    If reply indicates 'I don't know' on a real question,
+                   capture into the learning loop and ask for callback.
+    """
+    # Data dir is in the closure of register() — we don't have it here;
+    # the call_state has the from_phone we use to address the asker, and
+    # the data dir is referenced via the module-level _DATA_DIR set by
+    # register() so this helper can stay synchronous.
+    data_dir = _DATA_DIR
+    caller_phone = call_state.get("from", "")
+    call_sid = call_state.get("sid", "unknown")
+
+    # PRIORITY 0 — learned answers (instant, no LLM call)
+    if data_dir:
+        learned = mod_learning.find_learned(data_dir, user_speech)
+        if learned:
+            log.info(f"[call {call_sid[:8]}] learned-answer hit "
+                     f"(asked {learned.get('asked_count', 1)}x)")
+            call_state["history"].append({"role": "user", "content": user_speech})
+            call_state["history"].append({"role": "assistant", "content": learned["answer"]})
+            call_state["turns"] += 1
+            return learned["answer"]
+
+    # PRIORITY 1 — catalog hits, injected as authoritative system context
     system = _build_voice_prompt(business, scope)
+    if data_dir:
+        try:
+            cat_matches = mod_catalog.search(data_dir, user_speech, limit=5)
+            strong = [m for m in cat_matches if m.get("score", 0) >= 10]
+            if strong:
+                lines = ["PRODUCT CATALOG MATCHES (AUTHORITATIVE — quote name, "
+                         "SKU, price, stock EXACTLY. This is a PHONE call so "
+                         "name only the TOP one or two, don't list everything):"]
+                for m in strong[:3]:
+                    bits = [m.get("name", "")]
+                    if m.get("sku"):     bits.append(f"part number {m['sku']}")
+                    if m.get("price") is not None: bits.append(f"{m['price']:.2f} dollars")
+                    if m.get("stock") is not None: bits.append(f"{m['stock']} in stock")
+                    lines.append("  - " + " — ".join(b for b in bits if b))
+                system += "\n\n" + "\n".join(lines)
+                log.info(f"[call {call_sid[:8]}] catalog hit: {len(strong)} strong matches")
+        except Exception as e:
+            log.warning(f"voice catalog lookup failed: {e}")
+
     history = list(call_state["history"])
     messages = history[-12:]  # last 6 turns
     messages.append({"role": "user", "content": user_speech})
 
     resp = llm_client.generate(config, system, messages)
     text = resp.text or "I'm sorry, I'm having trouble right now. Please call back in a moment."
+
+    # Post-LLM: learning-loop trigger when Orbi bluffs on a real question.
+    if (data_dir
+        and mod_learning.reply_indicates_unknown(text)
+        and mod_learning.is_question_form(user_speech)):
+        try:
+            asker = {"phone": caller_phone, "preferred_channel": "sms"}
+            pending = mod_learning.capture_pending(
+                data_dir, question=user_speech, asker=asker,
+                session_id=f"call:{call_sid}",
+            )
+            log.info(f"[call {call_sid[:8]}] learning-loop captured: "
+                     f"token={pending['token']}")
+            # Notify owner (best-effort)
+            try:
+                import notifications as notify
+                notify.send(
+                    config, data_dir,
+                    event="new_question",
+                    title=f"Phone caller asked a question",
+                    body=(f"{pending['token']}: {user_speech[:200]}\n\n"
+                          f"Caller: {caller_phone}"),
+                    url="/owner#learning",
+                )
+                mod_learning.mark_owner_notified(
+                    data_dir, pending["token"], channel="auto",
+                )
+            except Exception as e:
+                log.warning(f"voice owner notify failed: {e}")
+            # Override the bluff reply with a callback-promise
+            text = ("That's a great question — I'm not sure about that one, "
+                    "so I'm going to find out and call you back at this "
+                    "number. Anything else I can help with?")
+        except Exception as e:
+            log.warning(f"voice learning-loop capture failed: {e}")
 
     call_state["history"].append({"role": "user", "content": user_speech})
     call_state["history"].append({"role": "assistant", "content": text})
@@ -181,6 +272,8 @@ def _save_call_summary(data_dir: Path, call_state: dict) -> None:
 
 def register(app, CONFIG: dict, DATA_DIR: Path) -> None:
     """Call from orbi.py:  voice.register(app, CONFIG, DATA_DIR)"""
+    global _DATA_DIR
+    _DATA_DIR = DATA_DIR
 
     @app.route("/voice/incoming", methods=["POST"])
     def voice_incoming():
