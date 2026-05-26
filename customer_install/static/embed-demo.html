@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Twickell — Embed Preview</title>
+  <style>
+    body {
+      margin: 0; font-family: system-ui, sans-serif;
+      background: #f6f8fc; color: #1f2942;
+    }
+    .hero {
+      padding: 100px 24px 80px; text-align: center;
+      background: linear-gradient(135deg, #4f8cff 0%, #8b5cf6 100%);
+      color: white;
+    }
+    .hero h1 { font-size: 48px; margin: 0 0 12px; }
+    .hero p { font-size: 19px; margin: 0; opacity: 0.95; }
+    section { max-width: 800px; margin: 60px auto; padding: 0 24px; }
+    h2 { font-size: 28px; }
+    .install-box {
+      background: #0f1626; color: #eaf0ff;
+      padding: 20px 24px; border-radius: 12px;
+      font-family: ui-monospace, "Cascadia Code", "Fira Code", monospace;
+      font-size: 14px;
+      overflow-x: auto;
+      margin: 16px 0;
+    }
+    .step {
+      background: white; border-radius: 12px;
+      padding: 24px; margin: 16px 0;
+      box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+    }
+    .step-num {
+      display: inline-block; width: 32px; height: 32px;
+      background: #4f8cff; color: white;
+      border-radius: 50%; text-align: center; line-height: 32px;
+      font-weight: 700; margin-right: 12px;
+    }
+    code { background: #eaf0ff; padding: 2px 6px; border-radius: 4px; font-size: 13px; }
+  </style>
+</head>
+<body>
+
+  <header class="hero">
+    <h1>Twickell</h1>
+    <p>This is a preview of what twickell.com looks like with Orbi embedded.</p>
+    <p style="margin-top:18px;font-size:15px;opacity:0.85;">
+      ↘ See the floating chat button in the bottom-right? That's the entire integration.
+    </p>
+  </header>
+
+  <section>
+    <h2>One-line install</h2>
+    <p>Add this single line anywhere in your site's HTML (typically before <code>&lt;/body&gt;</code>):</p>
+    <div class="install-box">
+&lt;script src=&quot;http://localhost:5051/static/embed.js&quot; defer&gt;&lt;/script&gt;
+    </div>
+    <p>That's it. The chat button appears on every page of your site.</p>
+  </section>
+
+  <section>
+    <h2>What your visitors get</h2>
+
+    <div class="step">
+      <span class="step-num">1</span>
+      <strong>One tap to chat.</strong>
+      Customers click the floating button — no popups, no account creation,
+      no waiting for a human. Orbi answers instantly, 24/7.
+    </div>
+
+    <div class="step">
+      <span class="step-num">2</span>
+      <strong>Voice or text.</strong>
+      Toggle the mic to talk. Toggle the speaker for hands-free.
+      Auto-mute prevents echo when Orbi speaks.
+    </div>
+
+    <div class="step">
+      <span class="step-num">3</span>
+      <strong>Add to home screen.</strong>
+      Visitors can install Orbi as an app on their phone — no App Store needed.
+      Your business icon shows up next to their other apps.
+    </div>
+
+    <div class="step">
+      <span class="step-num">4</span>
+      <strong>You get every lead.</strong>
+      When a customer leaves their name and number, it's instantly in your
+      owner dashboard. PWA push notification on your phone.
+    </div>
+  </section>
+
+  <section style="text-align:center;padding-bottom:120px;">
+    <p style="color:#5a6b8c;font-size:14px;">
+      → Try the chat button in the bottom-right corner.
+      Ask Orbi about Twickell's hours, or tell her your name and phone number.
+    </p>
+  </section>
+
+  <!-- THE ONE LINE THAT MATTERS -->
+  <script src="/static/embed.js" defer></script>
+</body>
+</html>

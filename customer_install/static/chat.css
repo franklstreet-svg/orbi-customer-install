@@ -1,0 +1,538 @@
+/* Orbi public chat widget */
+
+:root {
+  --bg-page:    #f6f8fc;
+  --bg-panel:   #0b0f1a;
+  --bg-card:    #1a2236;
+  --bg-card-2:  #21294a;
+  --bg-input:   #0f1626;
+  --border:     #2c3957;
+  --text:       #eaf0ff;
+  --text-dim:   #b8c6e0;
+  --text-soft:  #8fa3c7;
+  --accent:     #4f8cff;
+  --accent-hov: #3a7af0;
+  --danger:     #ff5555;
+  --good:       #6fdc94;
+  --warn:       #ffc36b;
+  --bad:        #ff8b8b;
+  --shadow:     0 12px 48px rgba(0,0,0,0.25);
+}
+
+* { box-sizing: border-box; }
+html, body {
+  margin: 0; padding: 0;
+  min-height: 100vh;
+  background: var(--bg-page);
+  color: #1f2942;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-size: 16px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* When the page is the full-page chat (standalone or embed iframe),
+   the body becomes dark and the panel fills the viewport. */
+body.fullpage-chat {
+  background: var(--bg-panel);
+  color: var(--text);
+  overflow: hidden;
+  height: 100vh; height: 100dvh;
+}
+body.fullpage-chat .orbi-panel.standalone-mode,
+body.fullpage-chat .orbi-panel.embed-mode {
+  position: fixed !important;
+  inset: 0 !important;
+  width: 100vw !important;
+  height: 100vh !important;
+  height: 100dvh !important;
+  max-width: none !important;
+  max-height: 100vh !important;
+  max-height: 100dvh !important;
+  border-radius: 0 !important;
+  transform: none !important;
+  opacity: 1 !important;
+}
+
+/* --------------------------------------------------------------
+   LANDING (used only by /static/embed-demo.html)
+   -------------------------------------------------------------- */
+.landing {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 40px 20px;
+  background:
+    radial-gradient(1200px 600px at 20% 0%, rgba(79,140,255,0.08), transparent 60%),
+    radial-gradient(900px 500px at 80% 100%, rgba(139,92,246,0.08), transparent 60%);
+}
+.landing-card {
+  max-width: 540px;
+  text-align: center;
+}
+.landing-logo {
+  width: 64px; height: 64px;
+  margin: 0 auto 18px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, #4f8cff 0%, #8b5cf6 100%);
+  box-shadow: 0 8px 32px rgba(79,140,255,0.3);
+}
+.landing-card h1 {
+  margin: 0 0 8px;
+  font-size: 28px;
+  color: #0b0f1a;
+}
+.landing-card p {
+  margin: 0;
+  color: #5a6b8c;
+  font-size: 16px;
+}
+
+/* --------------------------------------------------------------
+   FLOATING LAUNCHER
+   -------------------------------------------------------------- */
+.orbi-launcher {
+  position: fixed;
+  bottom: 20px; right: 20px;
+  width: 60px; height: 60px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, #4f8cff 0%, #8b5cf6 100%);
+  color: white;
+  border: none;
+  cursor: pointer;
+  box-shadow: 0 8px 24px rgba(79,140,255,0.35);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 9998;
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+  bottom: max(20px, env(safe-area-inset-bottom));
+}
+.orbi-launcher:hover {
+  transform: scale(1.06);
+  box-shadow: 0 10px 30px rgba(79,140,255,0.45);
+}
+.orbi-launcher .launcher-icon-close { display: none; }
+.orbi-launcher.open .launcher-icon-chat { display: none; }
+.orbi-launcher.open .launcher-icon-close { display: block; }
+
+.launcher-badge {
+  position: absolute;
+  top: -2px; right: -2px;
+  background: var(--danger);
+  color: white;
+  font-size: 11px;
+  font-weight: 700;
+  min-width: 18px; height: 18px;
+  border-radius: 9px;
+  padding: 0 5px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 2px solid var(--bg-page);
+}
+
+/* --------------------------------------------------------------
+   PANEL
+   -------------------------------------------------------------- */
+.orbi-panel {
+  position: fixed;
+  bottom: 92px; right: 20px;
+  width: 380px;
+  max-width: calc(100vw - 24px);
+  height: 600px;
+  max-height: calc(100vh - 120px);
+  background: var(--bg-panel);
+  color: var(--text);
+  border-radius: 16px;
+  box-shadow: var(--shadow);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  z-index: 9999;
+  opacity: 0;
+  transform: translateY(20px) scale(0.95);
+  pointer-events: none;
+  transition: opacity 0.18s ease, transform 0.18s ease;
+}
+.orbi-panel.open {
+  opacity: 1;
+  transform: translateY(0) scale(1);
+  pointer-events: auto;
+}
+/* On mobile, the panel goes full-screen */
+@media (max-width: 480px) {
+  .orbi-panel {
+    bottom: 0; right: 0; left: 0; top: 0;
+    width: 100vw; height: 100vh; max-height: 100vh; max-width: none;
+    border-radius: 0;
+    padding-top: env(safe-area-inset-top);
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+  .orbi-launcher.open { opacity: 0; pointer-events: none; }
+}
+
+/* --------------------------------------------------------------
+   PANEL HEADER
+   -------------------------------------------------------------- */
+.orbi-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 14px;
+  background: #111728;
+  border-bottom: 1px solid #1f2942;
+  flex-shrink: 0;
+}
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+.avatar {
+  width: 34px; height: 34px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, #4f8cff 0%, #8b5cf6 100%);
+  flex-shrink: 0;
+  position: relative;
+}
+.avatar.speaking::after {
+  content: '';
+  position: absolute;
+  inset: -4px;
+  border-radius: 50%;
+  border: 2px solid var(--accent);
+  animation: ring 1.4s infinite ease-out;
+}
+@keyframes ring {
+  0%   { opacity: 1; transform: scale(0.9); }
+  100% { opacity: 0; transform: scale(1.5); }
+}
+.brand-text {
+  min-width: 0;
+}
+.business {
+  font-weight: 600;
+  font-size: 15px;
+  line-height: 1.2;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 180px;
+}
+.status {
+  font-size: 11px;
+  color: var(--good);
+  margin-top: 2px;
+}
+.status.degraded { color: var(--warn); }
+.status.offline { color: var(--bad); }
+
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.toggle-btn, .icon-btn {
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--text-dim);
+  width: 36px; height: 36px;
+  border-radius: 50%;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: inherit;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+.toggle-btn:hover, .icon-btn:hover {
+  background: var(--bg-card-2);
+  color: var(--text);
+}
+.toggle-btn[aria-pressed="true"] {
+  background: rgba(79,140,255,0.18);
+  color: var(--accent);
+  border-color: rgba(79,140,255,0.4);
+}
+/* Icon swap */
+.toggle-btn .icon-mic-off, .toggle-btn .icon-speaker-off { display: block; }
+.toggle-btn .icon-mic-on,  .toggle-btn .icon-speaker-on  { display: none; }
+.toggle-btn[aria-pressed="true"] .icon-mic-off,
+.toggle-btn[aria-pressed="true"] .icon-speaker-off { display: none; }
+.toggle-btn[aria-pressed="true"] .icon-mic-on,
+.toggle-btn[aria-pressed="true"] .icon-speaker-on  { display: block; }
+/* Special: mic shows pulsing red when actively listening */
+.toggle-btn#mic-toggle.listening {
+  background: rgba(255,85,85,0.18);
+  color: var(--danger);
+  border-color: rgba(255,85,85,0.4);
+  animation: micPulse 1.6s infinite ease-in-out;
+}
+.toggle-btn#mic-toggle.muted-while-speaking {
+  background: rgba(255,195,107,0.18);
+  color: var(--warn);
+  border-color: rgba(255,195,107,0.4);
+}
+@keyframes micPulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(255,85,85,0.4); }
+  50%      { box-shadow: 0 0 0 8px rgba(255,85,85,0); }
+}
+
+/* --------------------------------------------------------------
+   STATE BAR (shows what Orbi is doing — listening / thinking / speaking)
+   -------------------------------------------------------------- */
+.orbi-state-bar {
+  padding: 6px 16px;
+  font-size: 12px;
+  text-align: center;
+  background: rgba(79,140,255,0.08);
+  color: var(--text-soft);
+  border-bottom: 1px solid var(--border);
+}
+.orbi-state-bar.listening { background: rgba(255,85,85,0.08); color: #ffb0b0; }
+.orbi-state-bar.thinking  { background: rgba(139,92,246,0.10); color: #c4b3ff; }
+.orbi-state-bar.speaking  { background: rgba(79,140,255,0.10); color: #8eb6ff; }
+
+/* --------------------------------------------------------------
+   CHAT AREA
+   -------------------------------------------------------------- */
+.chat-area {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px 14px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.welcome {
+  margin: auto;
+  text-align: center;
+  padding: 12px;
+  max-width: 360px;
+}
+.welcome-bubble {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 18px 16px;
+  margin-bottom: 14px;
+}
+.welcome-bubble h2 {
+  margin: 0 0 6px;
+  font-size: 18px;
+}
+.welcome-bubble p {
+  margin: 0;
+  color: var(--text-dim);
+  font-size: 13px;
+}
+
+.quick-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  justify-content: center;
+}
+.quick-chip {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  padding: 7px 12px;
+  border-radius: 16px;
+  font-size: 12px;
+  cursor: pointer;
+  font-family: inherit;
+}
+.quick-chip:hover { background: var(--bg-card-2); color: var(--text); }
+
+/* MESSAGES */
+.message {
+  max-width: 82%;
+  padding: 9px 13px;
+  border-radius: 16px;
+  font-size: 14.5px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  animation: fadeIn 0.2s ease;
+}
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.message.user {
+  align-self: flex-end;
+  background: var(--accent);
+  color: white;
+  border-bottom-right-radius: 4px;
+}
+.message.assistant {
+  align-self: flex-start;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-bottom-left-radius: 4px;
+}
+.message.assistant.degraded { border-color: rgba(255,195,107,0.4); }
+.message-tier-hint {
+  font-size: 10.5px;
+  color: var(--text-soft);
+  margin-top: 4px;
+}
+
+.typing {
+  display: inline-flex;
+  gap: 4px;
+  padding: 4px 0;
+}
+.typing span {
+  width: 7px; height: 7px;
+  background: var(--text-soft);
+  border-radius: 50%;
+  animation: bounce 1.2s infinite ease-in-out;
+}
+.typing span:nth-child(2) { animation-delay: 0.15s; }
+.typing span:nth-child(3) { animation-delay: 0.30s; }
+@keyframes bounce {
+  0%, 60%, 100% { transform: translateY(0); opacity: 0.5; }
+  30% { transform: translateY(-5px); opacity: 1; }
+}
+
+/* INTERIM TRANSCRIPT bubble (preview of what mic is hearing right now) */
+.interim {
+  align-self: flex-end;
+  background: rgba(79,140,255,0.18);
+  color: var(--accent);
+  border: 1px dashed rgba(79,140,255,0.4);
+  font-style: italic;
+  opacity: 0.9;
+}
+
+/* --------------------------------------------------------------
+   COMPOSER
+   -------------------------------------------------------------- */
+.composer {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  padding: 10px 12px;
+  background: #0e1422;
+  border-top: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.composer textarea {
+  flex: 1;
+  background: var(--bg-input);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 22px;
+  padding: 10px 16px;
+  font-family: inherit;
+  font-size: 16px;  /* >= 16px prevents iOS Safari zoom on focus */
+  line-height: 1.4;
+  resize: none;
+  max-height: 120px;
+  outline: none;
+  -webkit-appearance: none;  /* prevent iOS rounded styling */
+}
+@media (min-width: 481px) { .composer textarea { font-size: 14.5px; } }
+.composer textarea:focus { border-color: var(--accent); }
+
+.send-btn {
+  background: var(--accent);
+  color: white;
+  border: none;
+  width: 40px; height: 40px;
+  border-radius: 50%;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: background 0.15s;
+}
+.send-btn:hover:not(:disabled) { background: var(--accent-hov); }
+.send-btn:disabled { background: var(--border); cursor: not-allowed; opacity: 0.6; }
+
+/* MESSAGE TIMESTAMP (visible on hover) */
+.message-time {
+  display: block;
+  font-size: 10.5px;
+  color: var(--text-soft);
+  margin-top: 4px;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+.message:hover .message-time { opacity: 0.7; }
+
+/* COPY BUTTON on assistant messages */
+.message-copy-btn {
+  position: absolute;
+  top: 6px; right: 6px;
+  width: 24px; height: 24px;
+  border: none;
+  background: transparent;
+  color: var(--text-soft);
+  cursor: pointer;
+  border-radius: 4px;
+  padding: 4px;
+  opacity: 0;
+  transition: opacity 0.15s, background 0.15s;
+}
+.message:hover .message-copy-btn { opacity: 1; }
+.message-copy-btn:hover { background: rgba(255,255,255,0.05); color: var(--text); }
+.message.assistant {
+  position: relative;
+  padding-right: 32px;
+}
+.message-copy-btn.copied {
+  color: var(--good);
+  opacity: 1;
+}
+
+/* SCROLL-TO-BOTTOM BUTTON */
+.scroll-to-bottom {
+  position: absolute;
+  right: 14px;
+  bottom: 76px;
+  width: 36px; height: 36px;
+  border-radius: 50%;
+  background: var(--accent);
+  color: white;
+  border: none;
+  cursor: pointer;
+  box-shadow: 0 4px 14px rgba(0,0,0,0.3);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 10;
+  animation: fadeIn 0.2s ease;
+}
+.scroll-to-bottom:hover { background: var(--accent-hov); }
+.scroll-badge {
+  position: absolute;
+  top: -4px; right: -4px;
+  background: var(--danger);
+  color: white;
+  font-size: 10px;
+  font-weight: 700;
+  min-width: 16px; height: 16px;
+  border-radius: 8px;
+  padding: 0 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 2px solid var(--bg-panel);
+}
+
+/* OFFLINE BANNER */
+.offline-banner {
+  background: rgba(255,90,90,0.12);
+  color: var(--bad);
+  border-bottom: 1px solid rgba(255,90,90,0.3);
+  padding: 7px 14px;
+  font-size: 12px;
+  text-align: center;
+}

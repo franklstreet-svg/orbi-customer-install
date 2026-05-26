@@ -1,0 +1,85 @@
+{
+  "_comment": "Orbi customer install configuration. Copy to config.json and fill in real values during onboarding.",
+
+  "business": {
+    "name": "REPLACE_WITH_BUSINESS_NAME",
+    "phone": "REPLACE_WITH_PHONE",
+    "email": "REPLACE_WITH_EMAIL",
+    "address": "REPLACE_WITH_ADDRESS",
+    "website": "",
+    "timezone": "America/Los_Angeles"
+  },
+
+  "owner": {
+    "name": "REPLACE_WITH_OWNER_NAME",
+    "email": "REPLACE_WITH_OWNER_EMAIL",
+    "_password_hash": "SET_BY_ONBOARDING_WIZARD"
+  },
+
+  "brain": {
+    "url": "https://orbi-brain.frank.com",
+    "api_key": "REPLACE_WITH_API_KEY_FROM_STRIPE_WEBHOOK",
+    "timeout_seconds": 15
+  },
+
+  "huggingface": {
+    "enabled": true,
+    "api_key": "REPLACE_WITH_HF_TOKEN",
+    "model": "meta-llama/Llama-3.3-70B-Instruct",
+    "timeout_seconds": 15
+  },
+
+  "local_llm": {
+    "enabled": true,
+    "model_path": "/opt/orbi/llm_local/llama-3.2-3b-instruct-q4.gguf",
+    "port": 11435,
+    "ctx_size": 2048
+  },
+
+  "billing": {
+    "check_url": "https://billing.orbi.frank.com/api/active",
+    "check_interval_seconds": 3600
+  },
+
+  "phone": {
+    "twilio_number": "",
+    "twilio_account_sid": "",
+    "twilio_auth_token": "",
+    "voice_minutes_included": 200
+  },
+
+  "server": {
+    "host": "127.0.0.1",
+    "port": 5050,
+    "tunnel_url": "https://CUSTOMER_SUBDOMAIN.orbi.frank.com"
+  },
+
+  "modules": {
+    "business_info": { "enabled": true },
+    "memory":        { "enabled": true },
+    "notes":         { "enabled": true },
+    "messages":      { "enabled": true }
+  },
+
+  "scope": {
+    "public_can_take_orders": false,
+    "public_can_book_appointments": false,
+    "public_can_request_quotes": true,
+    "public_can_request_callbacks": true,
+    "topics_to_avoid": []
+  },
+
+  "notifications": {
+    "owner_pwa_push":   true,
+    "owner_email":      false,
+    "owner_sms":        false,
+    "notify_on_new_lead":      true,
+    "notify_on_new_message":   true,
+    "notify_on_failed_billing": true
+  },
+
+  "active": false,
+  "tier": "standard",
+  "installed_at": "SET_BY_ONBOARDING_WIZARD",
+  "version": "0.1.0"
+}
