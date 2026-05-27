@@ -32,7 +32,10 @@
    change to the dashboard so phones pick up the new shell on next open.
    ========================================================================= */
 
-const ORBI_CACHE_V1 = "orbi-cache-v1";
+// Bumped from v1 → v2 after the dashboard got top-bar search, briefing banner,
+// follow-up card, voicemails tab, OCR scan button, and the integrations panel.
+// Older clients with v1 cache will purge it on activate and re-fetch.
+const ORBI_CACHE_V1 = "orbi-cache-v2";
 
 // The "app shell" — minimum files needed for the dashboard to render offline.
 const SHELL_ASSETS = [
