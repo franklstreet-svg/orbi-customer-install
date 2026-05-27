@@ -43,7 +43,7 @@ import threading
 import time
 from pathlib import Path
 
-from flask import (Flask, abort, jsonify, make_response, request,
+from flask import (Flask, Response, abort, jsonify, make_response, request,
                    send_from_directory)
 
 import audit
@@ -375,6 +375,30 @@ def health():
         "billing": BILLING_STATUS.get("active", True),
         "business_name": business.get("name") or CONFIG.get("business", {}).get("name", ""),
     })
+
+
+@app.route("/api/help/capabilities")
+def help_capabilities():
+    """Serve the Orbi capabilities markdown. The dashboard renders it
+    client-side; the chat teach-intent reads it too so a single source
+    feeds both surfaces.
+
+    Search order:
+      1. ORBI_DIR/orbi_capabilities.md  (customer override, if they edited it)
+      2. The shipped copy that sits next to this module
+    """
+    candidates = [
+        ORBI_DIR / "orbi_capabilities.md",
+        Path(__file__).parent / "orbi_capabilities.md",
+    ]
+    for p in candidates:
+        if p.exists():
+            try:
+                text = p.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            return Response(text, mimetype="text/markdown; charset=utf-8")
+    return jsonify({"error": "capabilities_doc_missing"}), 404
 
 @app.route("/api/catalog/search")
 def catalog_search():
@@ -1357,6 +1381,11 @@ def owner_chat():
 
     # Owner mode gets memory + notes + workspace + per-user PA as extra context
     extras = []
+    # "What can you do?" / "Walk me through X" — pull from the shipped
+    # capabilities doc so the answer is grounded in real features.
+    cap_ctx = _capabilities_context_block(user_msg)
+    if cap_ctx:
+        extras.append(cap_ctx)
     notes_ctx = mod_notes.context_block(DATA_DIR)
     if notes_ctx:
         extras.append(notes_ctx)
@@ -1480,6 +1509,71 @@ _PA_PHONE_OF_RE = _re.compile(
     r"(?:'s|s')?\s+"
     r"(?:phone|number|email|contact)\b",
 )
+
+
+# Phrases that mean "teach me what Orbi can do" or "walk me through how".
+# Conservative on purpose — a vague "help" alone shouldn't trigger.
+_TEACH_INTENT_PATTERNS = [
+    _re.compile(r"\bwhat\s+(can|do)\s+you\s+do\b", _re.I),
+    _re.compile(r"\bwhat\s+(are\s+your\s+)?capabilities\b", _re.I),
+    _re.compile(r"\bshow\s+me\s+how\s+(to|do)\b", _re.I),
+    _re.compile(r"\bwalk\s+me\s+through\b", _re.I),
+    _re.compile(r"\bteach\s+me\s+(how|about)\b", _re.I),
+    _re.compile(r"\bhow\s+do\s+i\s+(?!feel|look)\b", _re.I),
+    _re.compile(r"\bquick\s+tour\b", _re.I),
+]
+
+
+def _is_teach_intent(message: str) -> bool:
+    return any(p.search(message or "") for p in _TEACH_INTENT_PATTERNS)
+
+
+# Cache the markdown content so we don't re-read on every chat turn.
+_CAPABILITIES_CACHE: dict = {"text": None, "mtime": 0.0}
+
+
+def _load_capabilities_doc() -> str:
+    """Return the orbi_capabilities.md text. Re-reads on file mtime change so
+    edits to the doc (or a customer override at ORBI_DIR/orbi_capabilities.md)
+    take effect without restarting Orbi."""
+    candidates = [
+        ORBI_DIR / "orbi_capabilities.md",
+        Path(__file__).parent / "orbi_capabilities.md",
+    ]
+    for p in candidates:
+        if not p.exists():
+            continue
+        try:
+            mtime = p.stat().st_mtime
+            if _CAPABILITIES_CACHE["text"] and mtime == _CAPABILITIES_CACHE["mtime"]:
+                return _CAPABILITIES_CACHE["text"]
+            text = p.read_text(encoding="utf-8")
+            _CAPABILITIES_CACHE["text"]  = text
+            _CAPABILITIES_CACHE["mtime"] = mtime
+            return text
+        except OSError:
+            continue
+    return ""
+
+
+def _capabilities_context_block(message: str) -> str | None:
+    """When the owner is asking what Orbi can do or how to do something,
+    inject the capabilities doc into the prompt so the answer is grounded
+    in the documented features (not invented). Returns None when the user
+    isn't asking a teach-style question."""
+    if not _is_teach_intent(message):
+        return None
+    doc = _load_capabilities_doc()
+    if not doc:
+        return None
+    return (
+        "ORBI CAPABILITIES (authoritative — answer from this doc, do not invent "
+        "features). When walking the user through something, give 3-6 concrete "
+        "steps with the EXACT example phrases from the doc. If they asked a "
+        "broad question like 'what can you do', give a short overview (5-7 "
+        "headline capabilities) then ask which area they'd like to dive into.\n\n"
+        + doc
+    )
 
 
 def _try_personal_assistant_read(message: str, user_dir: Path) -> str | None:

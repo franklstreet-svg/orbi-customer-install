@@ -49,6 +49,7 @@
     <button class="tab" data-tab="business">Business</button>
     <button class="tab owner-only" data-tab="people" hidden>Staff</button>
     <button class="tab" data-tab="settings">Settings</button>
+    <button class="tab" data-tab="help" title="What can Orbi do?">Help</button>
   </nav>
 
   <main class="content">
@@ -819,6 +820,17 @@
         <button type="button" class="primary-btn" id="save-settings-btn">Save Settings</button>
         <span class="save-status" id="settings-save-status"></span>
       </div>
+    </section>
+
+    <!-- HELP TAB — what Orbi can do + how to ask -->
+    <section class="tab-panel help-panel" id="tab-help">
+      <div class="help-toolbar">
+        <input type="search" id="help-search" placeholder="Search this guide…" autocomplete="off">
+        <button class="secondary-btn" id="help-tour-btn" title="Have Orbi walk me through it">Walk me through it</button>
+      </div>
+      <article id="help-content" class="help-content">
+        <p class="help-loading">Loading your Orbi guide…</p>
+      </article>
     </section>
   </main>
 

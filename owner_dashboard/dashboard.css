@@ -1801,3 +1801,79 @@ dialog .form-actions {
   padding: 14px 22px;
   border-top: 1px solid #1f2942;
 }
+
+/* HELP TAB */
+.help-panel { padding: 18px; max-width: 880px; }
+.help-toolbar {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 16px;
+  position: sticky;
+  top: 0;
+  background: #0b0f1a;
+  padding-bottom: 8px;
+  z-index: 5;
+}
+.help-toolbar input[type="search"] {
+  flex: 1;
+  padding: 10px 14px;
+  border-radius: 8px;
+  border: 1px solid #1f2942;
+  background: #111728;
+  color: #eaf0ff;
+  font-size: 14px;
+}
+.help-content { font-size: 15px; line-height: 1.6; }
+.help-content h1 {
+  font-size: 26px;
+  margin: 4px 0 16px;
+  color: #4f8cff;
+}
+.help-content h2 {
+  font-size: 20px;
+  margin: 28px 0 10px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid #1f2942;
+  color: #cfe0ff;
+}
+.help-content h3 {
+  font-size: 17px;
+  margin: 20px 0 8px;
+  color: #b6c8ea;
+}
+.help-content p { margin: 8px 0; }
+.help-content hr { border: none; border-top: 1px solid #1f2942; margin: 24px 0; }
+.help-content code {
+  background: #111728;
+  border: 1px solid #1f2942;
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 13px;
+  font-family: ui-monospace, "SF Mono", Consolas, monospace;
+}
+.help-content ul, .help-content ol { padding-left: 22px; margin: 8px 0; }
+.help-content li { margin: 4px 0; }
+.help-content a { color: #4f8cff; }
+
+.help-content table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 12px 0 18px;
+  font-size: 14px;
+}
+.help-content th, .help-content td {
+  text-align: left;
+  padding: 8px 10px;
+  border-bottom: 1px solid #1f2942;
+  vertical-align: top;
+}
+.help-content th {
+  background: #111728;
+  color: #b6c8ea;
+  font-weight: 600;
+}
+.help-content tr:hover td { background: rgba(79, 140, 255, 0.04); }
+.help-loading, .help-error {
+  color: #8aa3c8;
+  font-style: italic;
+}

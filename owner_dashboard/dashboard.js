@@ -3301,4 +3301,141 @@
   }
   document.addEventListener('DOMContentLoaded', wireWizard);
 
+  // ------------------------------------------------------------------
+  // Help tab — renders orbi_capabilities.md
+  // ------------------------------------------------------------------
+
+  // Tiny markdown → HTML. Handles only what the capabilities doc uses:
+  // h1/h2/h3, paragraphs, bold/italic, bullet lists, pipe tables, hr.
+  // Deliberately not pulling in a markdown lib — zero new deps.
+  function mdToHtml(md) {
+    const escape = (s) => s.replace(/[&<>]/g,
+      (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+    const inline = (s) => escape(s)
+      .replace(/`([^`]+)`/g, '<code>$1</code>')
+      .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+      .replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<em>$2</em>')
+      .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+
+    const lines = md.replace(/\r\n/g, '\n').split('\n');
+    const out = [];
+    let i = 0;
+    while (i < lines.length) {
+      const line = lines[i];
+      if (/^\s*$/.test(line)) { i++; continue; }
+      if (/^---+\s*$/.test(line)) { out.push('<hr>'); i++; continue; }
+      let m;
+      if ((m = line.match(/^(#{1,6})\s+(.*)$/))) {
+        const level = m[1].length;
+        out.push(`<h${level}>${inline(m[2])}</h${level}>`);
+        i++; continue;
+      }
+      // Pipe table
+      if (line.includes('|') && i + 1 < lines.length && /^\s*\|?[-:\s|]+\|?\s*$/.test(lines[i + 1])) {
+        const header = line.split('|').map(s => s.trim()).filter(Boolean);
+        i += 2;
+        const rows = [];
+        while (i < lines.length && lines[i].includes('|')) {
+          rows.push(lines[i].split('|').map(s => s.trim()).filter((s, idx, arr) => !(idx === 0 && s === '') && !(idx === arr.length - 1 && s === '')));
+          i++;
+        }
+        out.push('<table><thead><tr>'
+          + header.map(h => `<th>${inline(h)}</th>`).join('')
+          + '</tr></thead><tbody>'
+          + rows.map(r => '<tr>' + r.map(c => `<td>${inline(c)}</td>`).join('') + '</tr>').join('')
+          + '</tbody></table>');
+        continue;
+      }
+      // Bullet list
+      if (/^\s*[-*]\s+/.test(line)) {
+        const items = [];
+        while (i < lines.length && /^\s*[-*]\s+/.test(lines[i])) {
+          items.push(lines[i].replace(/^\s*[-*]\s+/, ''));
+          i++;
+        }
+        out.push('<ul>' + items.map(it => `<li>${inline(it)}</li>`).join('') + '</ul>');
+        continue;
+      }
+      // Ordered list
+      if (/^\s*\d+\.\s+/.test(line)) {
+        const items = [];
+        while (i < lines.length && /^\s*\d+\.\s+/.test(lines[i])) {
+          items.push(lines[i].replace(/^\s*\d+\.\s+/, ''));
+          i++;
+        }
+        out.push('<ol>' + items.map(it => `<li>${inline(it)}</li>`).join('') + '</ol>');
+        continue;
+      }
+      // Paragraph (consume until blank line or block start)
+      const para = [];
+      while (i < lines.length
+             && !/^\s*$/.test(lines[i])
+             && !/^#{1,6}\s/.test(lines[i])
+             && !/^---+\s*$/.test(lines[i])
+             && !/^\s*[-*]\s+/.test(lines[i])
+             && !/^\s*\d+\.\s+/.test(lines[i])
+             && !lines[i].includes('|')) {
+        para.push(lines[i]);
+        i++;
+      }
+      if (para.length) out.push('<p>' + inline(para.join(' ')) + '</p>');
+    }
+    return out.join('\n');
+  }
+
+  let _helpLoaded = false;
+  async function loadHelpDoc() {
+    if (_helpLoaded) return;
+    const target = document.getElementById('help-content');
+    if (!target) return;
+    try {
+      const resp = await fetch('/api/help/capabilities');
+      if (!resp.ok) throw new Error('http ' + resp.status);
+      const md = await resp.text();
+      target.innerHTML = mdToHtml(md);
+      _helpLoaded = true;
+    } catch (e) {
+      target.innerHTML = '<p class="help-error">Couldn\'t load the guide. '
+        + 'Try again in a moment.</p>';
+    }
+  }
+
+  function wireHelpTab() {
+    const tab = document.querySelector('.tab[data-tab="help"]');
+    if (tab) tab.addEventListener('click', loadHelpDoc);
+
+    const search = document.getElementById('help-search');
+    if (search) {
+      search.addEventListener('input', () => {
+        const q = search.value.trim().toLowerCase();
+        const content = document.getElementById('help-content');
+        if (!content) return;
+        // Show/hide rows in tables + list items + paragraphs by match
+        content.querySelectorAll('tr, li, p, h2, h3').forEach((el) => {
+          if (!q) { el.style.display = ''; return; }
+          el.style.display = el.textContent.toLowerCase().includes(q) ? '' : 'none';
+        });
+      });
+    }
+
+    const tourBtn = document.getElementById('help-tour-btn');
+    if (tourBtn) {
+      tourBtn.addEventListener('click', () => {
+        const chatTab = document.querySelector('.tab[data-tab="chat"]');
+        if (chatTab) chatTab.click();
+        const input = document.getElementById('chat-input')
+                   || document.querySelector('#tab-chat textarea, #tab-chat input[type=text]');
+        if (input) {
+          input.value = 'Walk me through what you can do.';
+          input.focus();
+          // Submit if there's a send button
+          const send = document.getElementById('chat-send')
+                    || document.querySelector('#tab-chat button[type=submit], #tab-chat .send-btn');
+          if (send) send.click();
+        }
+      });
+    }
+  }
+  document.addEventListener('DOMContentLoaded', wireHelpTab);
+
 })();
