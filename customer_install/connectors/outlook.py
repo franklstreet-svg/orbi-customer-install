@@ -142,7 +142,9 @@ class OutlookConnector(Connector):
     label = "Outlook / Microsoft 365"
     blurb = "Read recent emails, search, draft replies (saved to Drafts, owner reviews before sending)."
     auth_kind = "oauth"
-    scopes = ["Mail.Read", "Mail.ReadWrite", "User.Read"]
+    # Mail.Send was added for safe_send.send_email() — owners who connected
+    # before this scope was added must re-connect to grant it.
+    scopes = ["Mail.Read", "Mail.ReadWrite", "Mail.Send", "User.Read"]
 
     # ── Config helpers ────────────────────────────────────────────────
 
@@ -425,6 +427,38 @@ class OutlookConnector(Connector):
 
         return {"created": True, "draft_id": draft_id, "body_set": True}
 
+    # ── Actually send a new message (NOT a reply) ─────────────────────
+    #
+    # Used by safe_send.send_email() for whitelisted categories. Calls
+    # Graph /me/sendMail which sends synchronously and returns 202 with
+    # no body — Microsoft does not expose the resulting message id from
+    # this endpoint, so we return "" for message_id. Caller is responsible
+    # for gating this against the owner's safe-send whitelist.
+
+    def send_message(self, to_email: str, subject: str, body: str) -> dict:
+        """POST /me/sendMail with a single recipient. Returns
+        {message_id: "", sent: True}. Raises RuntimeError on API failure."""
+        if not to_email or not to_email.strip():
+            raise ValueError("to_email required")
+        payload = {
+            "message": {
+                "subject":      (subject or "").strip() or "(no subject)",
+                "body":         {"contentType": "Text", "content": body or ""},
+                "toRecipients": [{"emailAddress": {"address": to_email.strip()}}],
+            },
+            "saveToSentItems": True,
+        }
+        status, resp = self._graph("POST", "/me/sendMail", json_body=payload)
+        if status not in (200, 202):
+            err = resp if isinstance(resp, dict) else {"body": resp}
+            log.warning("outlook send_message to %s failed (status=%s): %s",
+                        to_email, status, err)
+            self.update_status(last_error=f"send_message status={status}")
+            raise RuntimeError(f"outlook sendMail failed (status={status}): {err}")
+        log.info("outlook: SENT message to %s", to_email)
+        # Graph /me/sendMail returns 202 with empty body; no message id.
+        return {"message_id": "", "sent": True}
+
     # ── status (extended) ─────────────────────────────────────────────
 
     def status(self) -> dict:
@@ -498,5 +532,19 @@ class OutlookConnector(Connector):
 #       body:   {"message_id": "...", "reply_text": "..."}
 #       calls:  draft_reply(message_id, reply_text)
 #       returns:{"created": true, "draft_id": "...", "body_set": true}
+#
+#   POST /api/owner/connectors/outlook/send_message
+#       body:   {"to_email": "...", "subject": "...", "body": "..."}
+#       calls:  send_message(to_email, subject, body)
+#       returns:{"message_id": "", "sent": true}
+#       NOTE — Graph /me/sendMail returns no id, so message_id is "".
+#       Prefer routing through safe_send.send_email() so the owner's
+#       category whitelist is honoured. This raw endpoint is for the
+#       orchestrator's "Send Now" override only.
+#
+# SCOPE CHANGE (this feature):
+#   Added Mail.Send to `scopes`. Owners who connected before this change
+#   must DISCONNECT and re-CONNECT to grant the new permission. Until
+#   then send_message() will raise (or safe_send will fall back to drafts).
 #
 # ---------------------------------------------------------------------------

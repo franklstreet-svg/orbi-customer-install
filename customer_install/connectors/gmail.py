@@ -87,6 +87,11 @@ class GmailConnector(Connector):
     scopes = [
         "https://www.googleapis.com/auth/gmail.readonly",
         "https://www.googleapis.com/auth/gmail.compose",
+        # gmail.compose does NOT include send permission — that's a Google
+        # quirk. We add gmail.send so safe_send.send_email() can route
+        # whitelisted categories straight to the wire. Owners who connected
+        # before this scope was added must re-connect to grant it.
+        "https://www.googleapis.com/auth/gmail.send",
     ]
 
     # ── OAuth helpers ─────────────────────────────────────────────────────
@@ -369,6 +374,37 @@ class GmailConnector(Connector):
         log.info("gmail: drafted reply %s to message %s", draft_id, message_id)
         return {"draft_id": draft_id}
 
+    # ── Actually send a new message (NOT a reply) ─────────────────────────
+    #
+    # Used by safe_send.send_email() for whitelisted categories. The
+    # caller is responsible for gating this behind the owner's safe-send
+    # policy — this method does NOT check the whitelist itself.
+
+    def send_message(self, to_email: str, subject: str, body: str) -> dict:
+        """Send a brand-new email via users.messages.send. Returns
+        {message_id, thread_id}. Raises RuntimeError on API failure."""
+        if not to_email or not to_email.strip():
+            raise ValueError("to_email required")
+        em = EmailMessage()
+        em["To"]      = to_email.strip()
+        em["Subject"] = (subject or "").strip() or "(no subject)"
+        em.set_content(body or "")
+
+        raw = base64.urlsafe_b64encode(em.as_bytes()).decode("ascii")
+        svc = self._get_service()
+        try:
+            resp = svc.users().messages().send(
+                userId="me", body={"raw": raw},
+            ).execute()
+        except Exception as exc:    # noqa: BLE001
+            log.warning("gmail send_message to %s failed: %s", to_email, exc)
+            self.update_status(last_error=f"send_message failed: {exc}")
+            raise RuntimeError(f"gmail send failed: {exc}") from exc
+        mid = resp.get("id", "")
+        tid = resp.get("threadId", "")
+        log.info("gmail: SENT message %s to %s", mid, to_email)
+        return {"message_id": mid, "thread_id": tid}
+
     # ── Status (extends base) ─────────────────────────────────────────────
 
     def status(self) -> dict:
@@ -496,5 +532,19 @@ def _now_iso() -> str:
 #       body:    { "message_id": "...", "reply_text": "..." }
 #       calls:   conn.draft_reply(message_id, reply_text)
 #       returns: { "draft_id": "..." }
+#
+#   POST /api/owner/connectors/gmail/send_message
+#       body:    { "to_email": "...", "subject": "...", "body": "..." }
+#       calls:   conn.send_message(to_email, subject, body)
+#       returns: { "message_id": "...", "thread_id": "..." }
+#       NOTE — prefer routing through safe_send.send_email() so the
+#       owner's category whitelist is honoured. This raw endpoint is for
+#       the orchestrator's "Send Now" override only.
+#
+# SCOPE CHANGE (this feature):
+#   Added https://www.googleapis.com/auth/gmail.send to `scopes`. Owners
+#   who connected before this change must DISCONNECT and re-CONNECT to
+#   grant the new permission. Until then send_message() will raise (or
+#   safe_send will fall back to drafts).
 #
 # ---------------------------------------------------------------------------

@@ -53,12 +53,18 @@ import backup
 import briefing
 import connectors
 from connectors import base as connector_base
+import contextual_reminders
 import cross_search as xs
+import customer_thread
 import doc_convert
 import file_fetch
 import follow_up
 import gcal
+import image_gen
 import ocr as ocr_mod
+import review_responder
+import safe_send
+import scheduler as meeting_scheduler
 import universal_search
 import llm_client
 import notifications as notify
@@ -2327,6 +2333,208 @@ def messages_update_tags(msg_id):
     tags = data.get("tags") or []
     ok = mod_messages.update_tags(DATA_DIR, msg_id, tags)
     return jsonify({"status": "ok" if ok else "not_found"}), 200 if ok else 404
+
+
+# ---------------------------------------------------------------------------
+# Tier 2 — meeting scheduler
+# ---------------------------------------------------------------------------
+
+
+@app.route("/api/owner/scheduler/find_slots", methods=["POST"])
+def scheduler_find_slots():
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    user_dir = users_mod.get_user_dir(DATA_DIR, user["username"])
+    data = request.get_json(silent=True) or {}
+    return jsonify({"slots": meeting_scheduler.find_open_slots(
+        user_dir,
+        duration_minutes=int(data.get("duration_minutes", 30)),
+        days_ahead=int(data.get("days_ahead", 7)),
+    )})
+
+
+@app.route("/api/owner/scheduler/propose", methods=["POST"])
+def scheduler_propose():
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    user_dir = users_mod.get_user_dir(DATA_DIR, user["username"])
+    data = request.get_json(silent=True) or {}
+    return jsonify(meeting_scheduler.propose_meeting(
+        user_dir,
+        attendee_name=data.get("attendee_name", ""),
+        attendee_email=data.get("attendee_email", ""),
+        duration_minutes=int(data.get("duration_minutes", 30)),
+        days_ahead=int(data.get("days_ahead", 7)),
+    ))
+
+
+@app.route("/api/owner/scheduler/book", methods=["POST"])
+def scheduler_book():
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    user_dir = users_mod.get_user_dir(DATA_DIR, user["username"])
+    data = request.get_json(silent=True) or {}
+    result = meeting_scheduler.book_meeting(
+        user_dir,
+        attendee_name=data.get("attendee_name", ""),
+        attendee_email=data.get("attendee_email", ""),
+        start_iso=data.get("start_iso", ""),
+        end_iso=data.get("end_iso", ""),
+        title=data.get("title"),
+        notes=data.get("notes", ""),
+    )
+    audit.log_event(DATA_DIR, actor=user["username"], action="scheduler.book",
+                    meta={"attendee": data.get("attendee_email")})
+    return jsonify(result)
+
+
+@app.route("/api/owner/scheduler/parse_reply", methods=["POST"])
+def scheduler_parse_reply():
+    auth.require_user(ORBI_DIR, DATA_DIR)
+    data = request.get_json(silent=True) or {}
+    return jsonify(meeting_scheduler.parse_reschedule_request(data.get("text", "")) or {})
+
+
+# ---------------------------------------------------------------------------
+# Tier 2 — safe-send email (gated by category whitelist)
+# ---------------------------------------------------------------------------
+
+
+@app.route("/api/owner/safe_send/preferences", methods=["GET", "PUT"])
+def safe_send_preferences():
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    user_dir = users_mod.get_user_dir(DATA_DIR, user["username"])
+    if request.method == "GET":
+        return jsonify(safe_send.get_preferences(user_dir))
+    safe_send.set_preferences(user_dir, request.get_json(silent=True) or {})
+    return jsonify(safe_send.get_preferences(user_dir))
+
+
+@app.route("/api/owner/safe_send/send", methods=["POST"])
+def safe_send_route():
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    user_dir = users_mod.get_user_dir(DATA_DIR, user["username"])
+    data = request.get_json(silent=True) or {}
+    result = safe_send.send_email(
+        CONFIG, user_dir,
+        to_email=data.get("to_email", ""),
+        subject=data.get("subject", ""),
+        body=data.get("body", ""),
+        category=data.get("category", ""),
+    )
+    audit.log_event(DATA_DIR, actor=user["username"],
+                    action=f"safe_send.{result.get('action','unknown')}",
+                    meta={"to": data.get("to_email"), "category": data.get("category")})
+    return jsonify(result)
+
+
+# ---------------------------------------------------------------------------
+# Tier 2 — customer thread (unified timeline per contact)
+# ---------------------------------------------------------------------------
+
+
+@app.route("/api/owner/customer_thread/top", methods=["GET"])
+def customer_thread_top():
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    user_dir = users_mod.get_user_dir(DATA_DIR, user["username"])
+    limit = int(request.args.get("limit", "10"))
+    return jsonify({"contacts": customer_thread.list_top_contacts(
+        CONFIG, DATA_DIR, user_dir, limit=limit)})
+
+
+@app.route("/api/owner/customer_thread", methods=["GET"])
+def customer_thread_by_query():
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    user_dir = users_mod.get_user_dir(DATA_DIR, user["username"])
+    q = request.args.get("email") or request.args.get("name") or request.args.get("phone") or request.args.get("q") or ""
+    if not q:
+        return jsonify({"error": "missing email/name/phone/q"}), 400
+    return jsonify(customer_thread.build_thread(CONFIG, DATA_DIR, user_dir, q))
+
+
+@app.route("/api/owner/customer_thread/<contact_ref>", methods=["GET"])
+def customer_thread_by_id(contact_ref):
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    user_dir = users_mod.get_user_dir(DATA_DIR, user["username"])
+    return jsonify(customer_thread.build_thread(CONFIG, DATA_DIR, user_dir, contact_ref))
+
+
+# ---------------------------------------------------------------------------
+# Tier 2 — contextual reminders (extract promises from chat/email text)
+# ---------------------------------------------------------------------------
+
+
+@app.route("/api/owner/promises/extract", methods=["POST"])
+def promises_extract():
+    auth.require_user(ORBI_DIR, DATA_DIR)
+    data = request.get_json(silent=True) or {}
+    return jsonify({"promises": contextual_reminders.extract_promises(data.get("text", ""))})
+
+
+@app.route("/api/owner/promises/auto_create", methods=["POST"])
+def promises_auto_create():
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    user_dir = users_mod.get_user_dir(DATA_DIR, user["username"])
+    data = request.get_json(silent=True) or {}
+    created = contextual_reminders.auto_create_reminders(
+        user_dir, data.get("text", ""), data.get("source_id", ""))
+    return jsonify({"created": created, "count": len(created)})
+
+
+# ---------------------------------------------------------------------------
+# Tier 2 — review autoresponder
+# ---------------------------------------------------------------------------
+
+
+@app.route("/api/owner/reviews/new", methods=["GET"])
+def reviews_new():
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    user_dir = users_mod.get_user_dir(DATA_DIR, user["username"])
+    return jsonify(review_responder.scan_recent_reviews(CONFIG, user_dir))
+
+
+@app.route("/api/owner/reviews/<review_id>/mark_reviewed", methods=["POST"])
+def reviews_mark(review_id):
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    user_dir = users_mod.get_user_dir(DATA_DIR, user["username"])
+    ok = review_responder.mark_reviewed(user_dir, review_id)
+    return jsonify({"status": "ok" if ok else "not_found"}), 200 if ok else 404
+
+
+# ---------------------------------------------------------------------------
+# Tier 2 — image generation for social posts / flyers
+# ---------------------------------------------------------------------------
+
+
+@app.route("/api/owner/image_gen", methods=["POST"])
+def image_gen_route():
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    data = request.get_json(silent=True) or {}
+    prompt = (data.get("prompt") or "").strip()
+    kind = (data.get("kind") or "social_post").strip()
+    if not prompt:
+        return jsonify({"error": "prompt required"}), 400
+    try:
+        png_bytes = image_gen.generate(CONFIG, prompt, kind=kind)
+    except Exception as e:
+        log.warning(f"image_gen failed: {e}")
+        return jsonify({"error": str(e)}), 500
+    ws = mod_workspace.workspace_path(CONFIG)
+    saved = image_gen.save_to_workspace(png_bytes, prompt, ws)
+    try:
+        mod_workspace.scan(CONFIG, DATA_DIR)
+    except Exception:
+        pass
+    try:
+        token = file_fetch.mint_download_token(
+            DATA_DIR, str(saved), ttl_minutes=30, extra_allowed_roots=[ws])
+        download_url = f"/download/{token}"
+    except Exception:
+        download_url = None
+    audit.log_event(DATA_DIR, actor=user["username"], action="image_gen",
+                    meta={"kind": kind, "prompt": prompt[:80], "file": saved.name})
+    return jsonify({
+        "filename": saved.name,
+        "workspace_path": str(saved),
+        "download_url": download_url,
+    })
 
 
 @app.route("/api/internal/notify", methods=["POST"])
