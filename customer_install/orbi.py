@@ -898,15 +898,18 @@ def owner_logout():
 
 @app.route("/api/owner/status")
 def owner_status():
-    auth.require_owner(ORBI_DIR)
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
     business = mod_business.load(DATA_DIR)
     return jsonify({
+        "username":      user["username"],
+        "role":          user.get("role", "staff"),
+        "display_name":  user.get("display_name"),
         "business_name": business.get("name") or CONFIG.get("business", {}).get("name", ""),
-        "tier": BILLING_STATUS.get("tier"),
-        "active": BILLING_STATUS.get("active"),
-        "warning": BILLING_STATUS.get("warning"),
-        "period_end": None,  # filled from billing once endpoint returns it
-        "connection": llm_client.current_connection_state(CONFIG),
+        "tier":          BILLING_STATUS.get("tier"),
+        "active":        BILLING_STATUS.get("active"),
+        "warning":       BILLING_STATUS.get("warning"),
+        "period_end":    None,
+        "connection":    llm_client.current_connection_state(CONFIG),
     })
 
 @app.route("/api/owner/messages")

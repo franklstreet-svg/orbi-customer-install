@@ -1,0 +1,329 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Orbi Dashboard</title>
+  <link rel="manifest" href="/pwa/manifest.json">
+  <meta name="theme-color" content="#0b0f1a">
+  <link rel="icon" type="image/png" sizes="32x32" href="/pwa/icons/icon-favicon.png">
+  <link rel="apple-touch-icon" href="/pwa/icons/icon-192.png">
+  <link rel="stylesheet" href="/static/dashboard.css">
+</head>
+<body>
+  <header class="top-bar">
+    <div class="brand">
+      <div class="logo-dot"></div>
+      <span class="brand-name">Orbi</span>
+      <span class="business-name" id="business-name">—</span>
+    </div>
+    <div class="top-actions">
+      <span class="status-pill" id="status-pill">● Online</span>
+      <button class="icon-btn" id="logout-btn" title="Sign out">⏻</button>
+    </div>
+  </header>
+
+  <nav class="tabs">
+    <button class="tab active" data-tab="messages">
+      Messages <span class="badge" id="message-count">0</span>
+    </button>
+    <button class="tab" data-tab="chat">Ask Orbi</button>
+    <button class="tab" data-tab="myday">My Day</button>
+    <button class="tab" data-tab="contacts">Contacts</button>
+    <button class="tab" data-tab="business">Business</button>
+    <button class="tab owner-only" data-tab="people" hidden>People</button>
+    <button class="tab" data-tab="settings">Settings</button>
+  </nav>
+
+  <main class="content">
+    <!-- MESSAGES TAB -->
+    <section class="tab-panel active" id="tab-messages">
+      <div class="toolbar">
+        <div class="filter-group">
+          <button class="chip active" data-filter="all">All</button>
+          <button class="chip" data-filter="new">New</button>
+          <button class="chip" data-filter="leads">Leads</button>
+          <button class="chip" data-filter="voicemails">Voicemails</button>
+          <button class="chip" data-filter="orders">Orders</button>
+        </div>
+        <button class="primary-btn" id="refresh-messages">Refresh</button>
+      </div>
+      <div class="message-list" id="message-list">
+        <div class="empty-state">
+          <div class="empty-icon">&#x1F4ED;</div>
+          <div class="empty-title">No messages yet</div>
+          <div class="empty-sub">When customers reach out, you'll see them here.</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- CHAT TAB (owner's ChatGPT replacement) -->
+    <section class="tab-panel chat-panel" id="tab-chat">
+      <div class="owner-chat-shell">
+        <div class="owner-chat-messages" id="owner-chat-messages">
+          <div class="owner-chat-welcome">
+            <div class="owner-chat-logo"></div>
+            <h2>Ask me anything</h2>
+            <p>
+              I know your business and have access to all your data. I can also help with
+              writing emails, drafting social posts, brainstorming, summaries, or just
+              answering questions — like ChatGPT, but yours.
+            </p>
+            <div class="owner-chat-suggestions" id="owner-chat-suggestions">
+              <button class="quick-chip" data-text="Summarize this week's messages.">Summarize this week</button>
+              <button class="quick-chip" data-text="Draft a friendly response to a customer complaint about a long wait time.">Draft response to complaint</button>
+              <button class="quick-chip" data-text="Write a Facebook post about a Memorial Day sale.">Facebook post</button>
+              <button class="quick-chip" data-text="What leads do I have that I haven't called back?">Open leads</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="owner-chat-state-bar" id="owner-chat-state-bar" hidden></div>
+
+        <div class="owner-chat-composer">
+          <textarea id="owner-chat-input" rows="1" placeholder="Ask Orbi..." autocomplete="off"></textarea>
+          <button class="send-btn" id="owner-chat-send" aria-label="Send" disabled>
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor">
+              <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/>
+            </svg>
+          </button>
+        </div>
+      </div>
+    </section>
+
+    <!-- MY DAY TAB — calendar + tasks + reminders combined -->
+    <section class="tab-panel" id="tab-myday">
+      <div class="myday-grid">
+        <div class="myday-card">
+          <div class="myday-card-head">
+            <h2>Today</h2>
+            <span class="muted" id="myday-today-label"></span>
+          </div>
+          <div id="myday-calendar-list" class="myday-list">
+            <div class="empty-state-small">Loading calendar…</div>
+          </div>
+          <form id="myday-add-event" class="myday-add-row">
+            <input type="text" name="title" placeholder="Add event (e.g. Dentist 2pm)" required>
+            <input type="datetime-local" name="start" required>
+            <button type="submit" class="primary-btn">Add</button>
+          </form>
+        </div>
+
+        <div class="myday-card">
+          <div class="myday-card-head">
+            <h2>Tasks</h2>
+            <span class="muted" id="myday-task-count">0 open</span>
+          </div>
+          <div id="myday-task-list" class="myday-list">
+            <div class="empty-state-small">Loading tasks…</div>
+          </div>
+          <form id="myday-add-task" class="myday-add-row">
+            <input type="text" name="text" placeholder="Add a task (or say 'add to my todo: X' to Orbi)" required>
+            <button type="submit" class="primary-btn">Add</button>
+          </form>
+        </div>
+
+        <div class="myday-card">
+          <div class="myday-card-head">
+            <h2>Reminders</h2>
+            <span class="muted" id="myday-reminder-count">0 pending</span>
+          </div>
+          <div id="myday-reminder-list" class="myday-list">
+            <div class="empty-state-small">Loading reminders…</div>
+          </div>
+          <form id="myday-add-reminder" class="myday-add-row">
+            <input type="text" name="text" placeholder="Remind me to…" required>
+            <input type="datetime-local" name="due" required>
+            <button type="submit" class="primary-btn">Add</button>
+          </form>
+        </div>
+      </div>
+    </section>
+
+    <!-- CONTACTS TAB -->
+    <section class="tab-panel" id="tab-contacts">
+      <div class="toolbar">
+        <input type="text" id="contacts-search" placeholder="Search contacts…" class="search-input">
+        <button class="primary-btn" id="contacts-add-btn">+ Add Contact</button>
+      </div>
+      <div id="contacts-list" class="contacts-list">
+        <div class="empty-state-small">Loading contacts…</div>
+      </div>
+      <dialog id="contact-dialog">
+        <form method="dialog" id="contact-form">
+          <h2 id="contact-dialog-title">Add Contact</h2>
+          <label>Name <input type="text" name="name" required></label>
+          <div class="row-2">
+            <label>Phone <input type="tel" name="phone"></label>
+            <label>Email <input type="email" name="email"></label>
+          </div>
+          <label>Company <input type="text" name="company"></label>
+          <label>Notes <textarea name="notes" rows="3"></textarea></label>
+          <div class="form-actions">
+            <button type="button" class="secondary-btn" onclick="document.getElementById('contact-dialog').close()">Cancel</button>
+            <button type="submit" class="primary-btn">Save</button>
+          </div>
+        </form>
+      </dialog>
+    </section>
+
+    <!-- PEOPLE TAB (owner-only) -->
+    <section class="tab-panel" id="tab-people">
+      <div class="toolbar">
+        <h2 style="margin:0">Active users</h2>
+        <button class="primary-btn" id="people-add-btn">+ Add User</button>
+      </div>
+      <div id="people-active-list" class="people-list">
+        <div class="empty-state-small">Loading users…</div>
+      </div>
+      <h2 style="margin-top:24px">Archived users</h2>
+      <p class="muted" style="margin:4px 0 12px">Deactivated users' data is preserved for 90 days. Transfer anything you need, then it auto-purges.</p>
+      <div id="people-archived-list" class="people-list">
+        <div class="empty-state-small">No archived users.</div>
+      </div>
+      <dialog id="user-dialog">
+        <form method="dialog" id="user-form">
+          <h2>Add user</h2>
+          <label>Username (lowercase, no spaces) <input type="text" name="username" required pattern="[a-z0-9_\-]+"></label>
+          <label>Display name <input type="text" name="display_name"></label>
+          <label>Temporary password <input type="text" name="password" required minlength="6"></label>
+          <label>Role
+            <select name="role">
+              <option value="staff">Staff (own calendar/tasks/contacts; shared business data)</option>
+              <option value="owner">Owner (full access)</option>
+            </select>
+          </label>
+          <div class="form-actions">
+            <button type="button" class="secondary-btn" onclick="document.getElementById('user-dialog').close()">Cancel</button>
+            <button type="submit" class="primary-btn">Create</button>
+          </div>
+        </form>
+      </dialog>
+      <dialog id="transfer-dialog">
+        <form method="dialog" id="transfer-form">
+          <h2 id="transfer-title">Transfer items</h2>
+          <p class="muted" id="transfer-subtitle"></p>
+          <div id="transfer-summary"></div>
+          <div class="form-actions">
+            <button type="button" class="secondary-btn" onclick="document.getElementById('transfer-dialog').close()">Close</button>
+          </div>
+        </form>
+      </dialog>
+    </section>
+
+    <!-- BUSINESS INFO TAB -->
+    <section class="tab-panel" id="tab-business">
+      <form id="business-form">
+        <div class="form-section">
+          <h2>Basics</h2>
+          <label>Business Name <input type="text" name="name" required></label>
+          <label>Tagline <input type="text" name="tagline" placeholder="What you do in 5-8 words"></label>
+          <label>Description <textarea name="description" rows="3" placeholder="A paragraph about your business"></textarea></label>
+        </div>
+
+        <div class="form-section">
+          <h2>Contact</h2>
+          <div class="row-2">
+            <label>Phone <input type="tel" name="phone"></label>
+            <label>Email <input type="email" name="email"></label>
+          </div>
+          <label>Website <input type="url" name="website"></label>
+          <label>Address <input type="text" name="address" placeholder="Street, City, State ZIP"></label>
+        </div>
+
+        <div class="form-section">
+          <h2>Hours</h2>
+          <div id="hours-grid" class="hours-grid"></div>
+        </div>
+
+        <div class="form-section">
+          <h2>FAQ <button type="button" class="text-btn" id="add-faq">+ Add question</button></h2>
+          <div id="faq-list"></div>
+        </div>
+
+        <div class="form-section">
+          <h2>Services / Menu <button type="button" class="text-btn" id="add-service">+ Add item</button></h2>
+          <div id="services-list"></div>
+        </div>
+
+        <div class="form-actions">
+          <button type="submit" class="primary-btn">Save Changes</button>
+          <span class="save-status" id="save-status"></span>
+        </div>
+      </form>
+    </section>
+
+    <!-- SETTINGS TAB -->
+    <section class="tab-panel" id="tab-settings">
+      <div class="form-section">
+        <h2>Orbi's Personality</h2>
+        <label>How should Orbi sound?
+          <select name="tone" id="tone-select">
+            <option value="friendly_professional">Friendly & professional</option>
+            <option value="warm_casual">Warm & casual</option>
+            <option value="formal">Formal</option>
+            <option value="playful">Playful</option>
+          </select>
+        </label>
+        <label>Topics Orbi should NOT discuss with customers
+          <textarea name="topics_to_avoid" rows="2"
+            placeholder="One per line — e.g. internal pricing, competitor names"></textarea>
+        </label>
+      </div>
+
+      <div class="form-section">
+        <h2>What Orbi can do for customers</h2>
+        <label class="checkbox">
+          <input type="checkbox" name="public_can_take_orders"> Take orders
+        </label>
+        <label class="checkbox">
+          <input type="checkbox" name="public_can_book_appointments"> Book appointments (requires calendar integration)
+        </label>
+        <label class="checkbox">
+          <input type="checkbox" name="public_can_request_quotes" checked> Capture quote requests
+        </label>
+        <label class="checkbox">
+          <input type="checkbox" name="public_can_request_callbacks" checked> Take callback requests
+        </label>
+      </div>
+
+      <div class="form-section">
+        <h2>Notify me when</h2>
+        <label class="checkbox">
+          <input type="checkbox" name="notify_on_new_lead" checked> A new lead comes in
+        </label>
+        <label class="checkbox">
+          <input type="checkbox" name="notify_on_new_message" checked> A new message is captured
+        </label>
+        <label class="checkbox">
+          <input type="checkbox" name="notify_on_failed_billing" checked> Billing has an issue
+        </label>
+        <h3 style="margin-top:18px;font-size:14px;color:#b8c6e0;">By</h3>
+        <label class="checkbox">
+          <input type="checkbox" name="owner_pwa_push" checked> Push notification on this phone
+        </label>
+        <label class="checkbox">
+          <input type="checkbox" name="owner_email"> Email (Phase 2)
+        </label>
+        <label class="checkbox">
+          <input type="checkbox" name="owner_sms"> Text message (Phase 2)
+        </label>
+      </div>
+
+      <div class="form-section danger-zone">
+        <h2>Account</h2>
+        <p class="muted">Tier: <strong id="tier-label">—</strong></p>
+        <p class="muted">Next billing date: <span id="next-billing">—</span></p>
+        <button type="button" class="secondary-btn" id="change-password-btn">Change password</button>
+      </div>
+
+      <div class="form-actions">
+        <button type="button" class="primary-btn" id="save-settings-btn">Save Settings</button>
+        <span class="save-status" id="settings-save-status"></span>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/dashboard.js"></script>
+</body>
+</html>
