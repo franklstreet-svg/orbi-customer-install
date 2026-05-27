@@ -1678,6 +1678,308 @@
   document.addEventListener('DOMContentLoaded', wireConnectors);
 
 
+  // ==================================================================
+  // UNIVERSAL SEARCH — top-bar input, debounced, all-sources
+  // ==================================================================
+
+  let searchTimer = null;
+  function wireTopbarSearch() {
+    const input = document.getElementById('topbar-search-input');
+    const dropdown = document.getElementById('topbar-search-results');
+    if (!input || !dropdown) return;
+
+    input.addEventListener('input', () => {
+      clearTimeout(searchTimer);
+      const q = input.value.trim();
+      if (q.length < 2) { dropdown.hidden = true; return; }
+      searchTimer = setTimeout(() => runTopbarSearch(q), 250);
+    });
+    input.addEventListener('focus', () => {
+      if (input.value.trim().length >= 2 && dropdown.children.length) {
+        dropdown.hidden = false;
+      }
+    });
+    document.addEventListener('click', (e) => {
+      if (!e.target.closest('.topbar-search')) dropdown.hidden = true;
+    });
+  }
+
+  async function runTopbarSearch(query) {
+    const dropdown = document.getElementById('topbar-search-results');
+    dropdown.innerHTML = '<div class="search-loading">Searching…</div>';
+    dropdown.hidden = false;
+    try {
+      const r = await api(`/api/owner/search?q=${encodeURIComponent(query)}&limit=3`);
+      const total = r.total_hits || 0;
+      if (!total) {
+        dropdown.innerHTML = '<div class="search-empty">No matches across any source.</div>';
+        return;
+      }
+      const sections = [];
+      for (const [src, hits] of Object.entries(r.by_source || {})) {
+        if (!hits || !hits.length) continue;
+        sections.push(`
+          <div class="search-section">
+            <div class="search-section-head">${esc(hits[0].source_label || src)}</div>
+            ${hits.map(h => `
+              <a class="search-hit" ${h.link ? `href="${esc(h.link)}"` : ''}>
+                <div class="search-hit-title">${esc(h.title || '(no title)')}</div>
+                ${h.snippet ? `<div class="search-hit-snippet">${esc(h.snippet)}</div>` : ''}
+              </a>
+            `).join('')}
+          </div>
+        `);
+      }
+      const errMsg = Object.entries(r.errors || {}).filter(([k,v]) => v).map(([k,v]) => `${k}: ${v}`).join(', ');
+      dropdown.innerHTML = sections.join('')
+        + (errMsg ? `<div class="search-errors">Some sources failed: ${esc(errMsg)}</div>` : '');
+    } catch (err) {
+      dropdown.innerHTML = `<div class="search-empty">Search failed: ${esc(err.message)}</div>`;
+    }
+  }
+  document.addEventListener('DOMContentLoaded', wireTopbarSearch);
+
+
+  // ==================================================================
+  // MORNING BRIEFING — banner at top of Messages tab
+  // ==================================================================
+
+  async function loadBriefingBanner() {
+    const banner = document.getElementById('briefing-banner');
+    const summaryEl = document.getElementById('briefing-banner-summary');
+    if (!banner) return;
+    try {
+      const r = await api('/api/owner/briefing/now');
+      const summary = r.summary_text || '';
+      if (!summary || summary.length < 30) { banner.hidden = true; return; }
+      summaryEl.textContent = summary;
+      banner.hidden = false;
+    } catch (err) {
+      banner.hidden = true;
+    }
+  }
+
+  function wireBriefingBanner() {
+    document.getElementById('briefing-banner-refresh')?.addEventListener('click', loadBriefingBanner);
+    document.getElementById('briefing-banner-collapse')?.addEventListener('click', () => {
+      document.getElementById('briefing-banner').hidden = true;
+    });
+    loadBriefingBanner();
+  }
+  document.addEventListener('DOMContentLoaded', wireBriefingBanner);
+
+
+  // ==================================================================
+  // FOLLOW-UP — stale items needing attention
+  // ==================================================================
+
+  async function loadFollowUp() {
+    const card = document.getElementById('follow-up-card');
+    const list = document.getElementById('follow-up-list');
+    const count = document.getElementById('follow-up-count');
+    if (!card) return;
+    try {
+      const r = await api('/api/owner/follow_up');
+      const items = r.items || [];
+      if (!items.length) { card.hidden = true; return; }
+      card.hidden = false;
+      count.textContent = `${items.length} item${items.length === 1 ? '' : 's'}`;
+      list.innerHTML = items.map((it, idx) => `
+        <div class="follow-up-row" data-idx="${idx}">
+          <div class="follow-up-meta">
+            <span class="follow-up-source">${esc(it.source)}</span>
+            <span class="follow-up-age">${it.days_stale}d</span>
+            ${(it.tags||[]).map(t => `<span class="tag tag-${esc(t)}">${esc(t)}</span>`).join('')}
+          </div>
+          <div class="follow-up-title">${esc(it.title)}</div>
+          <div class="follow-up-from muted">from ${esc(it.from)} · suggested: ${esc(it.suggested_action)}</div>
+          <button class="secondary-btn" data-action="draft-nudge">✍ Draft a nudge</button>
+          <div class="follow-up-draft" data-draft-for="${idx}" hidden></div>
+        </div>
+      `).join('');
+      list.querySelectorAll('[data-action="draft-nudge"]').forEach((btn, i) => {
+        btn.addEventListener('click', async () => {
+          const idx = btn.closest('[data-idx]').dataset.idx;
+          const draftEl = list.querySelector(`[data-draft-for="${idx}"]`);
+          btn.disabled = true; btn.textContent = 'Drafting…';
+          try {
+            const r2 = await api('/api/owner/follow_up/draft', {
+              method: 'POST', body: JSON.stringify(items[idx])
+            });
+            draftEl.textContent = r2.text || '(no draft)';
+            draftEl.hidden = false;
+            btn.textContent = '✓ Drafted';
+          } catch (err) {
+            draftEl.textContent = 'Draft failed: ' + err.message;
+            draftEl.hidden = false;
+            btn.disabled = false; btn.textContent = '✍ Draft a nudge';
+          }
+        });
+      });
+    } catch (err) {
+      card.hidden = true;
+    }
+  }
+  document.addEventListener('DOMContentLoaded', loadFollowUp);
+
+
+  // ==================================================================
+  // VOICEMAILS — own tab
+  // ==================================================================
+
+  async function loadVoicemails() {
+    const list = document.getElementById('voicemails-list');
+    const badge = document.getElementById('voicemail-count');
+    const hint = document.getElementById('voicemails-empty-hint');
+    if (!list) return;
+    try {
+      const r = await api('/api/owner/voicemails');
+      const vms = r.voicemails || r.items || [];  // tolerate either field name
+      const unhandled = vms.filter(v => !v.handled).length;
+      if (badge) {
+        if (unhandled) { badge.textContent = unhandled; badge.hidden = false; }
+        else badge.hidden = true;
+      }
+      if (!vms.length) {
+        list.innerHTML = '';
+        if (hint) hint.hidden = false;
+        return;
+      }
+      if (hint) hint.hidden = true;
+      list.innerHTML = vms.map(v => `
+        <div class="vm-row ${v.handled ? 'handled' : 'unhandled'}" data-id="${esc(v.id)}">
+          <div class="vm-head">
+            <div>
+              <strong>${esc(v.caller_name || v.from || 'Unknown caller')}</strong>
+              ${v.callback_number ? `<span class="muted"> — ${esc(v.callback_number)}</span>` : ''}
+            </div>
+            <span class="muted">${esc((v.received_at || '').slice(0,16).replace('T',' '))}</span>
+          </div>
+          ${v.summary ? `<div class="vm-summary">${esc(v.summary)}</div>` : ''}
+          ${v.transcript ? `<details class="vm-transcript"><summary>Show transcript</summary><pre>${esc(v.transcript)}</pre></details>` : ''}
+          ${v.audio_url ? `<audio src="${esc(v.audio_url)}" controls preload="none" class="vm-audio"></audio>` : ''}
+          <div class="vm-actions">
+            ${!v.handled ? `<button class="secondary-btn" data-action="vm-handled">Mark handled</button>` : ''}
+            <button class="icon-btn-sm" data-action="vm-delete" title="Delete">×</button>
+          </div>
+        </div>
+      `).join('');
+      list.querySelectorAll('[data-action="vm-handled"]').forEach(b => {
+        b.addEventListener('click', async (e) => {
+          const id = e.target.closest('[data-id]').dataset.id;
+          await api(`/api/owner/voicemails/${id}/handled`, { method: 'POST' });
+          loadVoicemails();
+        });
+      });
+      list.querySelectorAll('[data-action="vm-delete"]').forEach(b => {
+        b.addEventListener('click', async (e) => {
+          if (!confirm('Delete this voicemail?')) return;
+          const id = e.target.closest('[data-id]').dataset.id;
+          await api(`/api/owner/voicemails/${id}`, { method: 'DELETE' });
+          loadVoicemails();
+        });
+      });
+    } catch (err) {
+      list.innerHTML = `<div class="empty-state-small">Couldn't load voicemails (${esc(err.message)})</div>`;
+    }
+  }
+
+  function wireVoicemailsTab() {
+    document.querySelectorAll('.tab').forEach(t => {
+      if (t.dataset.tab === 'voicemails') t.addEventListener('click', loadVoicemails);
+    });
+    loadVoicemails();
+  }
+  document.addEventListener('DOMContentLoaded', wireVoicemailsTab);
+
+
+  // ==================================================================
+  // RECEIPTS — OCR'd from photos in Files tab
+  // ==================================================================
+
+  async function loadReceipts() {
+    const section = document.getElementById('receipts-section');
+    const list = document.getElementById('receipts-list');
+    if (!section || !list) return;
+    try {
+      const r = await api('/api/owner/receipts');
+      const items = r.receipts || [];
+      if (!items.length) { section.hidden = true; return; }
+      section.hidden = false;
+      list.innerHTML = items.map(rc => `
+        <div class="receipt-row" data-id="${esc(rc.id)}">
+          <div class="receipt-vendor">${esc(rc.vendor || 'Unknown vendor')}</div>
+          <div class="receipt-meta">
+            ${rc.total ? `<strong>$${parseFloat(rc.total).toFixed(2)}</strong>` : ''}
+            ${rc.date ? ` · ${esc(rc.date)}` : ''}
+            ${rc.payment_method ? ` · ${esc(rc.payment_method)}` : ''}
+          </div>
+          <button class="icon-btn-sm" data-action="receipt-delete" title="Remove">×</button>
+        </div>
+      `).join('');
+      list.querySelectorAll('[data-action="receipt-delete"]').forEach(b => {
+        b.addEventListener('click', async (e) => {
+          if (!confirm('Delete this receipt?')) return;
+          const id = e.target.closest('[data-id]').dataset.id;
+          await api(`/api/owner/receipts/${id}`, { method: 'DELETE' });
+          loadReceipts();
+        });
+      });
+    } catch (err) {
+      section.hidden = true;
+    }
+  }
+
+  // When an image is uploaded, add a "Scan with OCR" hint to its row
+  // (hook into the existing file list — add an OCR button per image file)
+  const originalLoadFiles = window.loadFiles;
+  // We rebind via re-rendering; the file-row buttons get patched in here:
+  function injectOcrButtons() {
+    document.querySelectorAll('.file-row').forEach(row => {
+      const name = row.dataset.name || '';
+      const ext = (name.split('.').pop() || '').toLowerCase();
+      if (!['png','jpg','jpeg','gif'].includes(ext)) return;
+      if (row.querySelector('[data-action="ocr-scan"]')) return;
+      const btn = document.createElement('button');
+      btn.className = 'secondary-btn';
+      btn.dataset.action = 'ocr-scan';
+      btn.textContent = '🔍 Scan';
+      btn.title = 'Extract text via OCR (receipt or business card)';
+      btn.addEventListener('click', async () => {
+        btn.disabled = true; btn.textContent = 'Scanning…';
+        try {
+          const r = await api('/api/owner/ocr/process', {
+            method: 'POST', body: JSON.stringify({filename: name}),
+          });
+          if (r.error) throw new Error(r.error);
+          const kind = r.kind || 'document';
+          alert(`Found a ${kind}.\n\n${r.parsed?.vendor || r.parsed?.name || '(no key fields detected)'}\n\n${r.action || ''}`);
+          loadFiles();
+          loadReceipts();
+        } catch (err) {
+          alert('OCR failed: ' + err.message);
+        } finally {
+          btn.disabled = false; btn.textContent = '🔍 Scan';
+        }
+      });
+      const convertBtn = row.querySelector('[data-action="file-convert"]');
+      if (convertBtn) row.insertBefore(btn, convertBtn);
+      else row.appendChild(btn);
+    });
+  }
+  // Watch for files list re-renders
+  const filesListEl = document.getElementById('files-list');
+  if (filesListEl) {
+    new MutationObserver(injectOcrButtons).observe(filesListEl, {childList: true, subtree: false});
+  }
+  document.addEventListener('DOMContentLoaded', () => {
+    setTimeout(() => { loadReceipts(); injectOcrButtons(); }, 500);
+    document.querySelectorAll('.tab').forEach(t => {
+      if (t.dataset.tab === 'files') t.addEventListener('click', loadReceipts);
+    });
+  });
+
+
   // ------------------------------------------------------------------
   // Utils
   // ------------------------------------------------------------------

@@ -21,6 +21,15 @@
       <span class="brand-name">Orbi</span>
       <span class="business-name" id="business-name">—</span>
     </div>
+
+    <!-- Universal search — one box, every data source -->
+    <div class="topbar-search">
+      <input type="search" id="topbar-search-input"
+             placeholder="Search everything (contacts, calendar, files, email…)"
+             autocomplete="off">
+      <div class="topbar-search-results" id="topbar-search-results" hidden></div>
+    </div>
+
     <div class="top-actions">
       <span class="status-pill" id="status-pill">● Online</span>
       <button class="icon-btn" id="logout-btn" title="Sign out">⏻</button>
@@ -33,6 +42,7 @@
     </button>
     <button class="tab" data-tab="chat">Ask Orbi</button>
     <button class="tab" data-tab="myday">My Day</button>
+    <button class="tab" data-tab="voicemails">Voicemails <span class="badge" id="voicemail-count" hidden>0</span></button>
     <button class="tab" data-tab="contacts">Contacts</button>
     <button class="tab" data-tab="files">Files</button>
     <button class="tab" data-tab="business">Business</button>
@@ -43,6 +53,27 @@
   <main class="content">
     <!-- MESSAGES TAB -->
     <section class="tab-panel active" id="tab-messages">
+
+      <!-- Morning briefing — today's quick summary -->
+      <div class="briefing-banner" id="briefing-banner" hidden>
+        <div class="briefing-banner-icon">☀️</div>
+        <div class="briefing-banner-body">
+          <div class="briefing-banner-title" id="briefing-banner-title">Today's briefing</div>
+          <div class="briefing-banner-summary" id="briefing-banner-summary">Loading…</div>
+        </div>
+        <button class="icon-btn-sm" id="briefing-banner-refresh" title="Refresh">↻</button>
+        <button class="icon-btn-sm" id="briefing-banner-collapse" title="Hide">×</button>
+      </div>
+
+      <!-- Follow-up needed — stale items -->
+      <div class="follow-up-card" id="follow-up-card" hidden>
+        <div class="follow-up-head">
+          <h3 style="margin:0">⚡ Needs follow-up</h3>
+          <span class="muted" id="follow-up-count"></span>
+        </div>
+        <div id="follow-up-list" class="follow-up-list"></div>
+      </div>
+
       <div class="toolbar">
         <div class="filter-group">
           <button class="chip active" data-filter="all">All</button>
@@ -189,6 +220,17 @@
       </dialog>
     </section>
 
+    <!-- VOICEMAILS TAB — calls Orbi couldn't answer, transcribed -->
+    <section class="tab-panel" id="tab-voicemails">
+      <div class="toolbar">
+        <h2 style="margin:0">Voicemails</h2>
+        <span class="muted" id="voicemails-empty-hint" hidden>When a caller leaves a message, Orbi transcribes it and shows it here.</span>
+      </div>
+      <div id="voicemails-list" class="voicemails-list">
+        <div class="empty-state-small">Loading…</div>
+      </div>
+    </section>
+
     <!-- FILES TAB — drop docs/spreadsheets/pdfs for Orbi to read -->
     <section class="tab-panel" id="tab-files">
       <div class="toolbar">
@@ -214,6 +256,15 @@
 
       <div id="files-list" class="files-list">
         <div class="empty-state-small">Loading…</div>
+      </div>
+
+      <!-- Receipts (OCR'd from uploaded images) -->
+      <div id="receipts-section" style="margin-top:24px" hidden>
+        <h2 style="margin:0 0 8px">🧾 Receipts</h2>
+        <p class="muted" style="margin:0 0 12px;font-size:13px">
+          Upload a photo of a receipt and click "Scan" — Orbi extracts vendor, total, and date.
+        </p>
+        <div id="receipts-list" class="receipts-list"></div>
       </div>
 
       <dialog id="convert-dialog">
