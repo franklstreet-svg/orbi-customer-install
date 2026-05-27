@@ -3389,14 +3389,27 @@
     const target = document.getElementById('help-content');
     if (!target) return;
     try {
-      const resp = await fetch('/api/help/capabilities');
+      // redirect:'error' = treat 302 as a failure instead of silently
+      // following to "/" and rendering the landing page as raw text in
+      // the Help tab (happens when the server hasn't picked up the new
+      // /api/help/capabilities route yet).
+      const resp = await fetch('/api/help/capabilities', {redirect: 'error'});
       if (!resp.ok) throw new Error('http ' + resp.status);
+      const ctype = (resp.headers.get('Content-Type') || '').toLowerCase();
       const md = await resp.text();
+      // Guard against HTML being served when the route is missing.
+      if (md.trim().startsWith('<!doctype') || md.trim().startsWith('<html')
+          || (!ctype.includes('markdown') && !ctype.includes('text/plain'))) {
+        throw new Error('unexpected content-type: ' + ctype);
+      }
       target.innerHTML = mdToHtml(md);
       _helpLoaded = true;
     } catch (e) {
-      target.innerHTML = '<p class="help-error">Couldn\'t load the guide. '
-        + 'Try again in a moment.</p>';
+      target.innerHTML = '<p class="help-error">'
+        + 'The help guide isn\'t loaded on this Orbi yet. '
+        + 'Restart Orbi to pick up the new help content '
+        + '(or wait for your next auto-update).'
+        + '</p>';
     }
   }
 
