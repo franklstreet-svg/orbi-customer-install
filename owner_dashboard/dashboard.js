@@ -1508,6 +1508,176 @@
   document.addEventListener('DOMContentLoaded', wireConvert);
 
 
+  // ==================================================================
+  // GENERIC CONNECTORS — auto-render all registered connectors in Settings
+  // ==================================================================
+
+  const CONNECTOR_ICONS = {
+    gmail:          {emoji: '✉️',  color: '#ea4335'},
+    outlook:        {emoji: '📧',  color: '#0078d4'},
+    google_reviews: {emoji: '⭐',  color: '#4285f4'},
+    yelp:           {emoji: '★',   color: '#d32323'},
+    stripe:         {emoji: '💳',  color: '#635bff'},
+    slack:          {emoji: '💬',  color: '#4a154b'},
+    notion:         {emoji: '📝',  color: '#000000'},
+  };
+
+  async function loadConnectors() {
+    const list = document.getElementById('connectors-list');
+    if (!list) return;
+    try {
+      const r = await api('/api/owner/connectors');
+      const items = r.connectors || [];
+      if (!items.length) {
+        list.innerHTML = '<div class="empty-state-small">No additional integrations available yet.</div>';
+        return;
+      }
+      list.innerHTML = items.map(c => renderConnectorRow(c)).join('');
+      list.querySelectorAll('[data-action]').forEach(btn => {
+        btn.addEventListener('click', (e) => handleConnectorAction(e.currentTarget));
+      });
+    } catch (err) {
+      list.innerHTML = `<div class="empty-state-small">Couldn't load integrations (${esc(err.message)})</div>`;
+    }
+  }
+
+  function renderConnectorRow(c) {
+    const icon = CONNECTOR_ICONS[c.id] || {emoji: '🔌', color: '#666'};
+    const isConnected = !!c.connected;
+    const isApiKey = c.auth_kind === 'api_key';
+    const statusLine = isConnected
+      ? `Connected${c.account ? ' as <strong>'+esc(c.account)+'</strong>' : ''}`
+        + (c.last_sync ? ` · last sync ${esc(c.last_sync.slice(0,16).replace('T',' '))}` : '')
+        + (c.last_error ? ` · <span style="color:#ffb0b0">${esc(c.last_error.slice(0,60))}</span>` : '')
+      : esc(c.blurb || 'Not connected.');
+    return `
+      <div class="integration-row" data-connector-id="${esc(c.id)}">
+        <div class="integration-icon" style="background:${icon.color};color:#fff;font-size:18px;line-height:40px;text-align:center">${icon.emoji}</div>
+        <div class="integration-body">
+          <div class="integration-title">${esc(c.label || c.id)}</div>
+          <div class="integration-status">${statusLine}</div>
+        </div>
+        <div class="integration-actions">
+          ${isConnected
+            ? `<button class="secondary-btn" data-action="${isApiKey ? 'edit-key' : 'reconnect'}" data-id="${esc(c.id)}">${isApiKey ? 'Update Key' : 'Reconnect'}</button>
+               <button class="secondary-btn" data-action="disconnect" data-id="${esc(c.id)}">Disconnect</button>`
+            : `<button class="primary-btn" data-action="${isApiKey ? 'show-key-dialog' : 'oauth-connect'}" data-id="${esc(c.id)}">Connect</button>`
+          }
+        </div>
+      </div>
+    `;
+  }
+
+  async function handleConnectorAction(btn) {
+    const id = btn.dataset.id;
+    const action = btn.dataset.action;
+    if (action === 'oauth-connect' || action === 'reconnect') {
+      try {
+        const r = await api(`/api/owner/connectors/${id}/connect`, { method: 'POST' });
+        if (r.auth_url) window.location.href = r.auth_url;
+        else alert('Could not start connection: ' + JSON.stringify(r));
+      } catch (err) { alert('Connect failed: ' + err.message); }
+    } else if (action === 'show-key-dialog' || action === 'edit-key') {
+      openApiKeyDialog(id);
+    } else if (action === 'disconnect') {
+      if (!confirm('Disconnect this integration?')) return;
+      try {
+        await api(`/api/owner/connectors/${id}/disconnect`, { method: 'POST' });
+        loadConnectors();
+      } catch (err) { alert('Disconnect failed: ' + err.message); }
+    }
+  }
+
+  async function openApiKeyDialog(connectorId) {
+    // Fetch connector metadata so we can show the setup steps the connector specifies
+    let connector = null;
+    try {
+      const r = await api('/api/owner/connectors');
+      connector = (r.connectors || []).find(c => c.id === connectorId);
+    } catch {}
+    const dlg = document.getElementById('apikey-dialog');
+    document.getElementById('apikey-title').textContent =
+      `Connect ${connector?.label || connectorId}`;
+    document.getElementById('apikey-blurb').textContent = connector?.blurb || '';
+    // Setup steps are pulled from the connector class metadata via /connectors
+    // (the base.status() helper doesn't currently expose requires_owner_setup;
+    // we surface that via a separate endpoint — fall back to no steps if absent).
+    const stepsEl = document.getElementById('apikey-setup-steps');
+    stepsEl.innerHTML = connector?.requires_owner_setup?.length
+      ? '<ol style="margin:0 0 10px 16px;padding:0;color:#b8c6e0;font-size:13px">' +
+        connector.requires_owner_setup.map(s => `<li>${esc(s)}</li>`).join('') + '</ol>'
+      : '';
+    document.getElementById('apikey-input').value = '';
+    document.getElementById('apikey-status').textContent = '';
+    document.getElementById('apikey-save-btn').dataset.connectorId = connectorId;
+
+    // Show extra fields (some connectors need both api_key AND a business_id, etc.)
+    const extra = document.getElementById('apikey-extra-fields');
+    extra.innerHTML = '';
+    if (connectorId === 'yelp') {
+      extra.innerHTML = `
+        <label style="margin-top:8px;display:block">Yelp business ID
+          <input type="text" name="business_id" placeholder="the slug after /biz/ in your Yelp URL" required>
+        </label>`;
+    }
+    dlg.showModal();
+  }
+
+  function wireApiKeyDialog() {
+    const form = document.getElementById('apikey-form');
+    if (!form) return;
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const id = document.getElementById('apikey-save-btn').dataset.connectorId;
+      const fd = new FormData(form);
+      const payload = { key: (fd.get('key') || '').toString().trim() };
+      // Pull any extra fields rendered for this connector
+      document.querySelectorAll('#apikey-extra-fields input').forEach(inp => {
+        payload[inp.name] = inp.value;
+      });
+      const statusEl = document.getElementById('apikey-status');
+      const saveBtn = document.getElementById('apikey-save-btn');
+      saveBtn.disabled = true;
+      saveBtn.textContent = 'Saving…';
+      statusEl.innerHTML = '<span style="color:#4f8cff">Verifying key…</span>';
+      try {
+        const r = await api(`/api/owner/connectors/${id}/save_key`, {
+          method: 'POST',
+          body: JSON.stringify(payload),
+        });
+        statusEl.innerHTML = `<span style="color:#6fdc94">✓ Saved</span>`;
+        setTimeout(() => {
+          document.getElementById('apikey-dialog').close();
+          loadConnectors();
+          saveBtn.disabled = false;
+          saveBtn.textContent = 'Save';
+        }, 800);
+      } catch (err) {
+        statusEl.innerHTML = `<span style="color:#ffb0b0">${esc(err.message)}</span>`;
+        saveBtn.disabled = false;
+        saveBtn.textContent = 'Try again';
+      }
+    });
+  }
+
+  function wireConnectors() {
+    wireApiKeyDialog();
+    // Auto-load on Settings tab click
+    document.querySelectorAll('.tab').forEach(t => {
+      if (t.dataset.tab === 'settings') {
+        t.addEventListener('click', loadConnectors);
+      }
+    });
+    loadConnectors();
+    if (window.location.hash === '#integrations') {
+      const tab = document.querySelector('.tab[data-tab="settings"]');
+      if (tab) tab.click();
+    }
+  }
+
+  document.addEventListener('DOMContentLoaded', wireConnectors);
+
+
   // ------------------------------------------------------------------
   // Utils
   // ------------------------------------------------------------------

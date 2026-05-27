@@ -55,9 +55,27 @@
   },
 
   "gcal_oauth": {
-    "_comment": "Google Cloud OAuth Desktop-app credentials. Owner gets these from console.cloud.google.com → APIs & Services → Credentials. Each install can have its own, or ship Frank's shared Desktop-app credentials.",
+    "_comment": "Google Cloud OAuth Desktop-app credentials. Owner gets these from console.cloud.google.com → APIs & Services → Credentials. Used by Gmail, Calendar, and Google Reviews connectors.",
     "client_id":     "REPLACE_WITH_GOOGLE_CLIENT_ID",
     "client_secret": "REPLACE_WITH_GOOGLE_CLIENT_SECRET"
+  },
+
+  "outlook_oauth": {
+    "_comment": "Microsoft 365 OAuth — register an App at portal.azure.com → Azure AD → App registrations. Add a Client Secret under Certificates & secrets. Paste the Application (client) ID and the secret VALUE here.",
+    "client_id":     "REPLACE_WITH_MS_CLIENT_ID",
+    "client_secret": "REPLACE_WITH_MS_CLIENT_SECRET"
+  },
+
+  "slack_oauth": {
+    "_comment": "Slack OAuth — register at api.slack.com/apps. Instant approval, no review process.",
+    "client_id":     "REPLACE_WITH_SLACK_CLIENT_ID",
+    "client_secret": "REPLACE_WITH_SLACK_CLIENT_SECRET"
+  },
+
+  "notion_oauth": {
+    "_comment": "Notion OAuth — register at notion.so/my-integrations as a Public integration. Instant approval.",
+    "client_id":     "REPLACE_WITH_NOTION_CLIENT_ID",
+    "client_secret": "REPLACE_WITH_NOTION_CLIENT_SECRET"
   },
 
   "modules": {

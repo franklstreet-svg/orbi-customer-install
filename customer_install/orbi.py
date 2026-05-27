@@ -49,6 +49,8 @@ from flask import (Flask, abort, jsonify, make_response, request,
 import audit
 import auth
 import backup
+import connectors
+from connectors import base as connector_base
 import cross_search as xs
 import doc_convert
 import file_fetch
@@ -125,6 +127,14 @@ def save_config(cfg: dict) -> None:
     tmp.replace(CONFIG_FILE)
 
 CONFIG: dict = load_config()
+
+# Import all connector modules so each one's @register decorator fires.
+# Done after CONFIG is loaded so connector imports can read config if they need to.
+try:
+    connectors.base.import_all()
+except Exception as _e:
+    # A single bad connector shouldn't take down the whole app
+    logging.getLogger("orbi").warning(f"some connectors failed to import: {_e}")
 
 # ---------------------------------------------------------------------------
 # Billing check (background thread, polls Frank's central billing service)
@@ -1873,6 +1883,144 @@ def gcal_status():
     user = auth.require_user(ORBI_DIR, DATA_DIR)
     user_dir = users_mod.get_user_dir(DATA_DIR, user["username"])
     return jsonify(gcal.get_status(user_dir))
+
+
+# ---------------------------------------------------------------------------
+# Generic connector dispatch — every registered Connector subclass plugs in
+# automatically. Lets us add a new integration just by dropping a file in
+# connectors/ — no orbi.py change needed for the common ops.
+# ---------------------------------------------------------------------------
+
+
+def _connector_instance(connector_id: str):
+    """Resolve connector_id to a live instance scoped to the logged-in user."""
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    user_dir = users_mod.get_user_dir(DATA_DIR, user["username"])
+    user_dir.mkdir(parents=True, exist_ok=True)
+    inst = connector_base.get_instance(connector_id, CONFIG, user_dir)
+    if inst is None:
+        abort(404, description=f"connector {connector_id!r} not found")
+    return user, inst
+
+
+def _connector_redirect_uri(connector_id: str) -> str:
+    port = (CONFIG.get("server") or {}).get("port") or 5050
+    return f"http://localhost:{port}/api/owner/connectors/{connector_id}/callback"
+
+
+@app.route("/api/owner/connectors", methods=["GET"])
+def connectors_list():
+    """Return all registered connectors + the logged-in user's status on each."""
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    user_dir = users_mod.get_user_dir(DATA_DIR, user["username"])
+    out = []
+    for cls in connector_base.list_connectors():
+        try:
+            inst = cls(CONFIG, user_dir)
+            out.append(inst.status())
+        except Exception as e:
+            log.warning(f"connector {cls.id} status failed: {e}")
+            out.append({"id": cls.id, "label": cls.label, "connected": False,
+                        "error": str(e)})
+    return jsonify({"connectors": out})
+
+
+@app.route("/api/owner/connectors/<connector_id>/connect", methods=["POST"])
+def connector_connect(connector_id):
+    user, inst = _connector_instance(connector_id)
+    if inst.auth_kind != "oauth":
+        return jsonify({"error": "not_oauth", "auth_kind": inst.auth_kind}), 400
+    try:
+        url = inst.start_oauth(_connector_redirect_uri(connector_id))
+        return jsonify({"auth_url": url})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/owner/connectors/<connector_id>/callback", methods=["GET"])
+def connector_callback(connector_id):
+    user, inst = _connector_instance(connector_id)
+    code = request.args.get("code", "")
+    if not code:
+        return "Missing authorization code", 400
+    try:
+        result = inst.complete_oauth(code, _connector_redirect_uri(connector_id))
+        audit.log_event(DATA_DIR, actor=user["username"],
+                        action=f"connector.connected.{connector_id}",
+                        meta={k: v for k, v in result.items() if "token" not in k})
+        from flask import redirect
+        return redirect("/owner#integrations")
+    except Exception as e:
+        log.warning(f"connector {connector_id} callback failed: {e}")
+        return f"Connect failed: {e}", 500
+
+
+@app.route("/api/owner/connectors/<connector_id>/disconnect", methods=["POST"])
+def connector_disconnect(connector_id):
+    user, inst = _connector_instance(connector_id)
+    inst.disconnect()
+    audit.log_event(DATA_DIR, actor=user["username"],
+                    action=f"connector.disconnected.{connector_id}")
+    return jsonify({"ok": True})
+
+
+@app.route("/api/owner/connectors/<connector_id>/status", methods=["GET"])
+def connector_status(connector_id):
+    user, inst = _connector_instance(connector_id)
+    return jsonify(inst.status())
+
+
+@app.route("/api/owner/connectors/<connector_id>/save_key", methods=["POST"])
+def connector_save_key(connector_id):
+    """For API-key connectors (Stripe, Yelp): owner pastes their key here."""
+    user, inst = _connector_instance(connector_id)
+    if inst.auth_kind != "api_key":
+        return jsonify({"error": "not_api_key", "auth_kind": inst.auth_kind}), 400
+    data = request.get_json(silent=True) or {}
+    key = data.get("key", "")
+    meta = {k: v for k, v in data.items() if k != "key"}
+    try:
+        result = inst.save_api_key(key, meta=meta)
+        audit.log_event(DATA_DIR, actor=user["username"],
+                        action=f"connector.key_saved.{connector_id}",
+                        meta={k: v for k, v in result.items() if "key" not in k})
+        return jsonify(result)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/owner/connectors/<connector_id>/<action>", methods=["GET", "POST"])
+def connector_action(connector_id, action):
+    """Generic action dispatch — any method on the Connector class that doesn't
+    start with _ can be called via this route. Method args come from the JSON
+    body (POST) or query string (GET). For example:
+
+      GET /api/owner/connectors/gmail/list_recent?limit=20
+        → calls inst.list_recent(limit=20)
+      POST /api/owner/connectors/gmail/draft_reply with {message_id, reply_text}
+        → calls inst.draft_reply(message_id="...", reply_text="...")
+    """
+    # Block the routes we already have explicit handlers for
+    if action in ("connect", "callback", "disconnect", "status", "save_key"):
+        abort(404)
+    user, inst = _connector_instance(connector_id)
+    method = getattr(inst, action, None)
+    if method is None or not callable(method) or action.startswith("_"):
+        return jsonify({"error": "unknown_action", "action": action}), 404
+    if request.method == "GET":
+        kwargs = {k: (int(v) if v.isdigit() else v)
+                  for k, v in request.args.items()}
+    else:
+        kwargs = request.get_json(silent=True) or {}
+    try:
+        result = method(**kwargs)
+        return jsonify({"result": result})
+    except TypeError as e:
+        return jsonify({"error": f"bad_args: {e}"}), 400
+    except Exception as e:
+        log.warning(f"connector {connector_id}.{action} failed: {e}")
+        inst.update_status(last_error=str(e)[:200])
+        return jsonify({"error": str(e)}), 500
 
 
 # Background gcal sync — runs every 5 min per active user

@@ -396,10 +396,11 @@
         </label>
       </div>
 
-      <div class="form-section">
+      <div class="form-section" id="integrations-section">
         <h2>Integrations</h2>
-        <p class="muted" style="margin:4px 0 14px">Connect Orbi to your other accounts so events flow both ways.</p>
+        <p class="muted" style="margin:4px 0 14px">Connect Orbi to your other accounts so she can read and act on them.</p>
 
+        <!-- Google Calendar (special — kept inline because it predates the generic connector framework) -->
         <div class="integration-row" id="gcal-row">
           <div class="integration-icon" aria-hidden="true">
             <svg viewBox="0 0 32 32" width="28" height="28">
@@ -418,6 +419,33 @@
             <button type="button" class="secondary-btn" id="gcal-disconnect-btn" hidden>Disconnect</button>
           </div>
         </div>
+
+        <!-- Generic connector list rendered by dashboard.js -->
+        <div id="connectors-list" style="margin-top:8px">
+          <div class="empty-state-small">Loading integrations…</div>
+        </div>
+
+        <dialog id="apikey-dialog">
+          <form method="dialog" id="apikey-form">
+            <h2 id="apikey-title">Save API key</h2>
+            <p class="muted" id="apikey-blurb" style="margin:2px 0 12px"></p>
+            <div id="apikey-setup-steps" class="apikey-setup-steps"></div>
+
+            <label>API key
+              <input type="text" id="apikey-input" name="key" required autocomplete="off"
+                     placeholder="paste here">
+            </label>
+
+            <div id="apikey-extra-fields"></div>
+
+            <div id="apikey-status" style="margin-top:10px;font-size:13px"></div>
+
+            <div class="form-actions">
+              <button type="button" class="secondary-btn" onclick="document.getElementById('apikey-dialog').close()">Cancel</button>
+              <button type="submit" class="primary-btn" id="apikey-save-btn">Save</button>
+            </div>
+          </form>
+        </dialog>
       </div>
 
       <div class="form-section danger-zone">
