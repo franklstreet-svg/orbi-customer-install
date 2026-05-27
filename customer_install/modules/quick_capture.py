@@ -120,13 +120,14 @@ def capture(user_dir: Path, text: str) -> dict:
             due_iso = _parse_when(when_phrase) or _default_tomorrow_9am()
             item = mod_reminders.add(user_dir, body, due_iso)
             return {"kind": "reminder", "item": item,
-                    "summary": f"Reminder set: \"{item['text']}\" for {due_iso[:16].replace('T',' ')}"}
+                    "summary": f"Reminder set: \"{item['text']}\" for {_iso_to_local_display(due_iso)}"}
     m = _REMIND_SIMPLE_RE.match(text)
     if m:
         body = m.group(1).strip()
-        item = mod_reminders.add(user_dir, body, _default_tomorrow_9am())
+        due_iso = _default_tomorrow_9am()
+        item = mod_reminders.add(user_dir, body, due_iso)
         return {"kind": "reminder", "item": item,
-                "summary": f"Reminder set: \"{item['text']}\" for tomorrow 9am"}
+                "summary": f"Reminder set: \"{item['text']}\" for {_iso_to_local_display(due_iso)}"}
 
     # Try APPOINTMENT
     m = _APPT_RE.match(text)
@@ -136,7 +137,7 @@ def capture(user_dir: Path, text: str) -> dict:
         start_iso = _parse_when(when_phrase) or _default_tomorrow_9am()
         item = mod_calendar.add(user_dir, title, start_iso)
         return {"kind": "calendar", "item": item,
-                "summary": f"Added to your calendar: \"{item['title']}\" at {start_iso[:16].replace('T',' ')}"}
+                "summary": f"Added to your calendar: \"{item['title']}\" at {_iso_to_local_display(start_iso)}"}
 
     # Try CONTACT
     m = _CONTACT_RE.match(text)
@@ -238,24 +239,35 @@ def _parse_clock(token: str, default_pm_if_low: bool = True) -> tuple[int, int] 
     return hour, minute
 
 
+def _local_at(days_offset: int, hour: int, minute: int = 0) -> str:
+    """Build a UTC ISO timestamp from a LOCAL hour:minute. Critical for
+    natural-language reminders: 'tomorrow at 9' means 9am where the user
+    lives, not 9am UTC. Uses Python's OS-local timezone."""
+    now_local = datetime.now().astimezone()
+    target_local = (now_local + timedelta(days=days_offset)).replace(
+        hour=hour, minute=minute, second=0, microsecond=0)
+    return target_local.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def _parse_when(phrase: str) -> str | None:
     """Lightweight natural-language → ISO. Returns None when nothing matches
-    so the caller can pick a default."""
+    so the caller can pick a default. All clock times are interpreted in
+    LOCAL time; storage is UTC."""
     if not phrase:
         return None
     phrase = phrase.strip().lower().rstrip(".!?")
     now = datetime.now(timezone.utc)
 
     if phrase in ("tomorrow", "tomorrow morning"):
-        return (now + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return _local_at(1, 9)
     if phrase == "tonight":
-        return now.replace(hour=20, minute=0, second=0, microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return _local_at(0, 20)
     if phrase in ("today", "later today"):
         return (now + timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
     if phrase == "next week":
-        return (now + timedelta(days=7)).replace(hour=9, minute=0, second=0, microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return _local_at(7, 9)
 
-    # "in N minutes/hours/days/weeks"
+    # "in N minutes/hours/days/weeks" — offset from now (no TZ involved)
     m_in = re.match(r"^(?:in\s+)?(\d+)\s*(min|minute|hour|hr|day|week)s?$", phrase)
     if m_in:
         n = int(m_in.group(1))
@@ -270,11 +282,15 @@ def _parse_when(phrase: str) -> str | None:
     base = phrase.replace("on ", "").replace("next ", "").strip()
     if base in weekdays:
         target = weekdays[base]
-        days_ahead = (target - now.weekday()) % 7 or 7
-        return (now + timedelta(days=days_ahead)).replace(hour=9, minute=0, second=0, microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+        now_local = datetime.now().astimezone()
+        days_ahead = (target - now_local.weekday()) % 7 or 7
+        return _local_at(days_ahead, 9)
 
     # Time-of-day phrases — "5:45", "1:00 p.m.", "4:45 today", "1pm tomorrow",
-    # "tomorrow at 1:00 p.m.", "today at 4:45".
+    # "tomorrow at 1:00 p.m.", "today at 4:45". Crucially these are parsed in
+    # LOCAL time (the user said "1pm" meaning 1pm where they live), then
+    # converted to UTC for storage. Without this the reminder lands 7-8 hours
+    # off in the wrong direction.
     day_offset = None  # None = decide from time-of-day (past → tomorrow, future → today)
     time_part = phrase
     # Strip leading/trailing day-words
@@ -295,21 +311,61 @@ def _parse_when(phrase: str) -> str | None:
     clock = _parse_clock(time_part)
     if clock is not None:
         hour, minute = clock
+        now_local = datetime.now().astimezone()
         if day_offset is None:
-            # Default to today if the target time is still in the future,
-            # else tomorrow. Matches how a human reads "remind me at 5:45".
-            target_today = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-            day_offset = 0 if target_today > now + timedelta(minutes=2) else 1
-        target = (now + timedelta(days=day_offset)).replace(
+            target_today_local = now_local.replace(
+                hour=hour, minute=minute, second=0, microsecond=0)
+            day_offset = 0 if target_today_local > now_local + timedelta(minutes=2) else 1
+        target_local = (now_local + timedelta(days=day_offset)).replace(
             hour=hour, minute=minute, second=0, microsecond=0)
-        return target.strftime("%Y-%m-%dT%H:%M:%SZ")
+        target_utc = target_local.astimezone(timezone.utc)
+        return target_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     return None
 
 
 def _default_tomorrow_9am() -> str:
-    now = datetime.now(timezone.utc)
-    return (now + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+    """9 AM the user's local time, tomorrow. Stored as UTC."""
+    return _local_at(1, 9)
+
+
+def _iso_to_local_display(due_iso: str) -> str:
+    """Convert a UTC ISO timestamp ('2026-05-27T22:40:00Z') into a local-time
+    display string ('2026-05-27 3:40 PM'). Storage stays UTC; only the text
+    shown to the user is in local time.
+
+    Uses the OS local timezone (Python's astimezone() with no arg picks up
+    /etc/timezone). If parsing fails for any reason, falls back to the raw
+    ISO so the reminder is never silently dropped from the summary.
+    """
+    if not due_iso:
+        return ""
+    try:
+        s = due_iso.replace("Z", "+00:00")
+        dt_utc = datetime.fromisoformat(s)
+        if dt_utc.tzinfo is None:
+            dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+        dt_local = dt_utc.astimezone()  # OS-local tz
+        now_local = datetime.now().astimezone()
+        # Same day?  show just "3:40 PM today"
+        # Tomorrow?  show "3:40 PM tomorrow"
+        # Else        "Fri May 30 at 3:40 PM"
+        same_day = dt_local.date() == now_local.date()
+        tomorrow = dt_local.date() == (now_local + timedelta(days=1)).date()
+        time_str = dt_local.strftime("%-I:%M %p") if hasattr(dt_local, "strftime") else ""
+        # %-I works on Linux/Mac; fall back if needed
+        try:
+            time_str = dt_local.strftime("%-I:%M %p")
+        except (ValueError, OSError):
+            time_str = dt_local.strftime("%I:%M %p").lstrip("0")
+        if same_day:
+            return f"{time_str} today"
+        if tomorrow:
+            return f"{time_str} tomorrow"
+        return dt_local.strftime("%a %b %d") + " at " + time_str
+    except (ValueError, TypeError) as e:
+        log.warning(f"_iso_to_local_display failed for {due_iso!r}: {e}")
+        return due_iso[:16].replace("T", " ")
 
 
 def _extract_phone(s: str) -> str:
