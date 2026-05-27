@@ -48,13 +48,18 @@ from flask import (Flask, abort, jsonify, make_response, request,
 
 import audit
 import auth
+import auto_categorize
 import backup
+import briefing
 import connectors
 from connectors import base as connector_base
 import cross_search as xs
 import doc_convert
 import file_fetch
+import follow_up
 import gcal
+import ocr as ocr_mod
+import universal_search
 import llm_client
 import notifications as notify
 import pre_execute as pre_exec
@@ -2137,6 +2142,192 @@ threading.Thread(target=file_temp_sweep_loop, daemon=True).start()
 # ---------------------------------------------------------------------------
 # Internal (watchdog → us)
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Morning briefing — personalized digest delivered via push every morning
+# ---------------------------------------------------------------------------
+
+
+@app.route("/api/owner/briefing/now", methods=["GET"])
+def briefing_now():
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    try:
+        return jsonify(briefing.build_briefing(CONFIG, DATA_DIR, user["username"]))
+    except Exception as e:
+        log.warning(f"briefing build failed: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/owner/briefing/send_now", methods=["POST"])
+def briefing_send_now():
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    result = briefing.send_morning_brief(CONFIG, DATA_DIR, user["username"])
+    audit.log_event(DATA_DIR, actor=user["username"], action="briefing.send_now")
+    return jsonify(result)
+
+
+@app.route("/api/owner/briefing/preferences", methods=["GET", "PUT"])
+def briefing_preferences():
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    user_dir = users_mod.get_user_dir(DATA_DIR, user["username"])
+    if request.method == "GET":
+        return jsonify(briefing.get_preferences(user_dir))
+    data = request.get_json(silent=True) or {}
+    briefing.set_preferences(user_dir, data)
+    return jsonify(briefing.get_preferences(user_dir))
+
+
+def briefing_scheduler_loop():
+    """Once per minute, check each active user's preferences. If their
+    configured hour has passed today AND they haven't been brief'd today,
+    send the briefing. Keeps the sweep cheap by short-circuiting fast."""
+    time.sleep(45)
+    while True:
+        try:
+            now_hour = datetime.now(timezone.utc).hour
+            for u in users_mod.list_users(DATA_DIR):
+                username = u["username"]
+                user_dir = users_mod.get_user_dir(DATA_DIR, username)
+                if not user_dir.exists():
+                    continue
+                try:
+                    prefs = briefing.get_preferences(user_dir)
+                    if not prefs.get("enabled", True):
+                        continue
+                    if now_hour < int(prefs.get("hour", 7)):
+                        continue
+                    if not briefing.should_send_today(user_dir):
+                        continue
+                    briefing.send_morning_brief(CONFIG, DATA_DIR, username)
+                    log.info(f"morning brief sent: {username}")
+                except Exception as e:
+                    log.warning(f"briefing schedule error for {username}: {e}")
+        except Exception as e:
+            log.warning(f"briefing loop error: {e}")
+        time.sleep(60)
+
+
+# Lazy import for the datetime stuff this scheduler uses
+from datetime import datetime, timezone  # noqa: E402  (already imported elsewhere but explicit here)
+threading.Thread(target=briefing_scheduler_loop, daemon=True).start()
+
+
+# ---------------------------------------------------------------------------
+# Universal search — one query, every data source
+# ---------------------------------------------------------------------------
+
+
+@app.route("/api/owner/search", methods=["GET"])
+def universal_search_route():
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    user_dir = users_mod.get_user_dir(DATA_DIR, user["username"])
+    q = (request.args.get("q") or "").strip()
+    if not q:
+        return jsonify({"query": "", "total_hits": 0, "by_source": {}})
+    limit = int(request.args.get("limit", "5"))
+    return jsonify(universal_search.search(CONFIG, DATA_DIR, user_dir, q,
+                                            limit_per_source=limit))
+
+
+# ---------------------------------------------------------------------------
+# Follow-up tracker — surface unresponded items
+# ---------------------------------------------------------------------------
+
+
+@app.route("/api/owner/follow_up", methods=["GET"])
+def follow_up_list():
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    user_dir = users_mod.get_user_dir(DATA_DIR, user["username"])
+    min_days = int(request.args.get("min_days", "2"))
+    limit = int(request.args.get("limit", "20"))
+    items = follow_up.find_stale_items(CONFIG, DATA_DIR, user_dir,
+                                        min_days=min_days, limit=limit)
+    return jsonify({"items": items, "count": len(items)})
+
+
+@app.route("/api/owner/follow_up/draft", methods=["POST"])
+def follow_up_draft():
+    auth.require_user(ORBI_DIR, DATA_DIR)
+    item = request.get_json(silent=True) or {}
+    return jsonify({"text": follow_up.draft_nudge(CONFIG, item)})
+
+
+# ---------------------------------------------------------------------------
+# OCR — receipts + business cards from photos
+# ---------------------------------------------------------------------------
+
+
+@app.route("/api/owner/ocr/process", methods=["POST"])
+def ocr_process():
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    user_dir = users_mod.get_user_dir(DATA_DIR, user["username"])
+    data = request.get_json(silent=True) or {}
+    filename = data.get("filename", "")
+    if not filename:
+        return jsonify({"error": "filename required"}), 400
+    # Resolve the workspace path safely (filename must be inside the workspace)
+    import re as _re
+    safe = os.path.basename(filename.replace("\\", "/"))
+    safe = _re.sub(r"[^\w\s.\-()]+", "", safe).strip(" .")
+    if not safe:
+        return jsonify({"error": "invalid filename"}), 400
+    ws = mod_workspace.workspace_path(CONFIG)
+    image_path = ws / safe
+    if not image_path.exists():
+        return jsonify({"error": "file_not_found"}), 404
+    try:
+        result = ocr_mod.process_image(CONFIG, image_path, user_dir)
+        audit.log_event(DATA_DIR, actor=user["username"],
+                        action=f"ocr.{result.get('kind','unknown')}",
+                        resource=safe)
+        return jsonify(result)
+    except Exception as e:
+        log.warning(f"OCR process failed: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/owner/receipts", methods=["GET"])
+def receipts_list():
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    user_dir = users_mod.get_user_dir(DATA_DIR, user["username"])
+    return jsonify({"receipts": ocr_mod.list_receipts(user_dir, limit=200)})
+
+
+@app.route("/api/owner/receipts/<receipt_id>", methods=["GET", "DELETE"])
+def receipts_one(receipt_id):
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    user_dir = users_mod.get_user_dir(DATA_DIR, user["username"])
+    if request.method == "GET":
+        rec = ocr_mod.get_receipt(user_dir, receipt_id)
+        if not rec:
+            return jsonify({"error": "not_found"}), 404
+        return jsonify(rec)
+    ok = ocr_mod.delete_receipt(user_dir, receipt_id)
+    return jsonify({"status": "ok" if ok else "not_found"}), 200 if ok else 404
+
+
+# ---------------------------------------------------------------------------
+# Messages — bulk re-tagging and manual tag override
+# ---------------------------------------------------------------------------
+
+
+@app.route("/api/owner/messages/retag_all", methods=["POST"])
+def messages_retag_all():
+    user = auth.require_role(ORBI_DIR, DATA_DIR, "owner")
+    n = mod_messages.retag_all(DATA_DIR, CONFIG)
+    audit.log_event(DATA_DIR, actor=user["username"], action="messages.retag_all",
+                    meta={"count": n})
+    return jsonify({"retagged": n})
+
+
+@app.route("/api/owner/messages/<msg_id>/tags", methods=["PUT"])
+def messages_update_tags(msg_id):
+    auth.require_user(ORBI_DIR, DATA_DIR)
+    data = request.get_json(silent=True) or {}
+    tags = data.get("tags") or []
+    ok = mod_messages.update_tags(DATA_DIR, msg_id, tags)
+    return jsonify({"status": "ok" if ok else "not_found"}), 200 if ok else 404
+
 
 @app.route("/api/internal/notify", methods=["POST"])
 def internal_notify():

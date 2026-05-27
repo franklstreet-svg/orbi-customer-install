@@ -44,7 +44,8 @@ def list_all(data_dir: Path, limit: int = 200) -> list[dict]:
 
 def capture(data_dir: Path, *, msg_type: str, from_name: str | None,
             from_phone: str | None, from_email: str | None,
-            body: str, source: str = "chat", meta: dict | None = None) -> dict:
+            body: str, source: str = "chat", meta: dict | None = None,
+            config: dict | None = None) -> dict:
     if msg_type not in VALID_TYPES:
         msg_type = "message"
     msg = {
@@ -59,11 +60,59 @@ def capture(data_dir: Path, *, msg_type: str, from_name: str | None,
         "read": False,
         "meta": meta or {},
     }
+    # Auto-categorize on capture. Lazy import so messages.py stays
+    # usable from setup scripts that don't have an LLM configured.
+    try:
+        import auto_categorize
+        msg["tags"] = auto_categorize.categorize(
+            config or {}, msg["body"],
+            hints={"from_name": msg["from_name"],
+                   "from_email": msg["from_email"],
+                   "from_phone": msg["from_phone"],
+                   "type": msg["type"]},
+        )
+    except Exception:
+        msg["tags"] = ["other"]
     with _LOCK:
         data = _load_raw(data_dir)
         data.setdefault("messages", []).append(msg)
         _save_raw(data_dir, data)
     return msg
+
+
+def retag_all(data_dir: Path, config: dict) -> int:
+    """Re-run categorization across the whole message list. Owner-triggered
+    from the dashboard (e.g. after tweaking the classifier prompt). Returns
+    the number of messages updated."""
+    import auto_categorize
+    with _LOCK:
+        data = _load_raw(data_dir)
+        msgs = data.get("messages", [])
+        for m in msgs:
+            try:
+                m["tags"] = auto_categorize.categorize(
+                    config, m.get("body", ""),
+                    hints={"from_name": m.get("from_name"),
+                           "from_email": m.get("from_email"),
+                           "from_phone": m.get("from_phone"),
+                           "type": m.get("type")},
+                )
+            except Exception:
+                m["tags"] = m.get("tags") or ["other"]
+        _save_raw(data_dir, data)
+        return len(msgs)
+
+
+def update_tags(data_dir: Path, message_id: str, tags: list[str]) -> bool:
+    """Manual tag override from the dashboard."""
+    with _LOCK:
+        data = _load_raw(data_dir)
+        for m in data.get("messages", []):
+            if m.get("id") == message_id:
+                m["tags"] = list(tags)
+                _save_raw(data_dir, data)
+                return True
+    return False
 
 def mark_read(data_dir: Path, message_id: str) -> bool:
     with _LOCK:
