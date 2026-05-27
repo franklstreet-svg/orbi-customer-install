@@ -6,7 +6,7 @@
 # Assumes /home/frank/orbi_web (or wherever the source lives) is reachable.
 #
 # Usage:
-#   sudo ./install.sh [--source /path/to/orbi_web]
+#   sudo ./install.sh [--source /path/to/orbi_web] [--token <install_token>]
 #
 # What it does:
 #   1. Installs system deps (python3, pip, cloudflared, ffmpeg, sqlite3, tar)
@@ -14,11 +14,18 @@
 #   3. Copies files into /opt/orbi/
 #   4. Installs Python deps
 #   5. Initializes data/ from templates
-#   6. Prompts for owner email + password and writes them into config.json
-#   7. Prompts for brain URL, API key, HuggingFace token
-#   8. Installs systemd units for orbi + watchdog
-#   9. Starts everything
-#  10. Prints the health-check URL
+#   6. If --token is given, verifies it against billing.orbi.frank.com
+#      and pre-populates the api_key + owner_email automatically
+#   7. Prompts for owner email + password and writes them into config.json
+#   8. Prompts for brain URL, API key, HuggingFace token (skipped if token used)
+#   9. Installs systemd units for orbi + watchdog
+#  10. Starts everything
+#  11. Prints the health-check URL
+#
+# The --token flag is the bridge from this bash installer to the newer
+# Stripe-checkout flow. It lets Frank (or a customer) run this script with
+# the token they received in their Stripe receipt email — no manual brain
+# URL/API-key pasting.
 #
 # Exit codes:
 #   0  success
@@ -31,6 +38,8 @@ set -euo pipefail
 SOURCE="/home/frank/orbi_web"
 INSTALL_DIR="/opt/orbi"
 ORBI_USER="orbi"
+INSTALL_TOKEN=""
+BILLING_URL="${ORBI_BILLING_URL:-https://billing.orbi.frank.com}"
 
 # ---------------------------------------------------------------------------
 # Argument parsing
@@ -38,8 +47,9 @@ ORBI_USER="orbi"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --source) SOURCE="$2"; shift 2 ;;
+    --token)  INSTALL_TOKEN="$2"; shift 2 ;;
     --help|-h)
-      sed -n '1,30p' "$0"
+      sed -n '1,40p' "$0"
       exit 0 ;;
     *) echo "Unknown argument: $1"; exit 2 ;;
   esac
@@ -145,6 +155,36 @@ pip3 install --quiet --break-system-packages -r "$INSTALL_DIR/requirements.txt" 
 ok "python deps installed"
 
 # ---------------------------------------------------------------------------
+# 5a. Optional: verify install token from Stripe webhook
+# ---------------------------------------------------------------------------
+TOKEN_API_KEY=""
+TOKEN_OWNER_EMAIL=""
+TOKEN_TIER=""
+if [[ -n "$INSTALL_TOKEN" ]]; then
+  step "Verifying install token with $BILLING_URL"
+  # Token should look like inst_<32 hex>. Reject obvious garbage early.
+  if [[ ! "$INSTALL_TOKEN" =~ ^[A-Za-z0-9_]{16,80}$ ]]; then
+    fail "install token has invalid shape (expected inst_<hex32>)"
+  fi
+  TOKEN_RESP=$(curl -sS -m 15 -w "\n%{http_code}" \
+    "${BILLING_URL%/}/api/verify/${INSTALL_TOKEN}") || \
+    fail "could not reach billing service at $BILLING_URL"
+  TOKEN_BODY=$(echo "$TOKEN_RESP" | sed '$d')
+  TOKEN_CODE=$(echo "$TOKEN_RESP" | tail -n1)
+  if [[ "$TOKEN_CODE" != "200" ]]; then
+    fail "billing rejected token (HTTP $TOKEN_CODE) — already used or invalid"
+  fi
+  # Parse with python so we don't need jq on a barebones box
+  TOKEN_API_KEY=$(echo "$TOKEN_BODY" | python3 -c "import sys,json; print(json.load(sys.stdin).get('api_key',''))")
+  TOKEN_OWNER_EMAIL=$(echo "$TOKEN_BODY" | python3 -c "import sys,json; print(json.load(sys.stdin).get('owner_email',''))")
+  TOKEN_TIER=$(echo "$TOKEN_BODY" | python3 -c "import sys,json; print(json.load(sys.stdin).get('tier',''))")
+  if [[ -z "$TOKEN_API_KEY" || -z "$TOKEN_OWNER_EMAIL" ]]; then
+    fail "billing response missing api_key/owner_email"
+  fi
+  ok "token verified — owner=$TOKEN_OWNER_EMAIL tier=$TOKEN_TIER"
+fi
+
+# ---------------------------------------------------------------------------
 # 5 + 6 + 7. Onboarding prompts (owner credentials + brain + HF)
 # ---------------------------------------------------------------------------
 if [[ ! -t 0 ]]; then
@@ -154,14 +194,24 @@ if [[ ! -t 0 ]]; then
 else
   step "Onboarding — fill in owner credentials and brain settings"
   read -r -p "  Business name: " BIZ_NAME
-  read -r -p "  Owner email: "    OWNER_EMAIL
+  if [[ -n "$TOKEN_OWNER_EMAIL" ]]; then
+    OWNER_EMAIL="$TOKEN_OWNER_EMAIL"
+    echo "  Owner email (from install token): $OWNER_EMAIL"
+  else
+    read -r -p "  Owner email: " OWNER_EMAIL
+  fi
   while true; do
     read -r -s -p "  Owner password (8+ chars): " OWNER_PW; echo
     [[ ${#OWNER_PW} -ge 8 ]] && break
     echo "  Password must be at least 8 characters."
   done
   read -r -p "  Brain URL (e.g. https://orbi-brain.frank.com) [skip]: " BRAIN_URL
-  read -r -p "  Brain API key (from Stripe webhook) [skip]: " BRAIN_KEY
+  if [[ -n "$TOKEN_API_KEY" ]]; then
+    BRAIN_KEY="$TOKEN_API_KEY"
+    echo "  Brain API key (from install token): ${BRAIN_KEY:0:14}…"
+  else
+    read -r -p "  Brain API key (from Stripe webhook) [skip]: " BRAIN_KEY
+  fi
   read -r -p "  HuggingFace token (hf_...) [skip]: " HF_TOKEN
   read -r -p "  Twilio phone number (e.g. +14155551234) [skip]: " TWILIO_NUM
   read -r -p "  Tunnel URL for this customer (e.g. https://joes.orbi.frank.com) [skip]: " TUNNEL_URL
