@@ -54,6 +54,12 @@
     "tunnel_url": "https://CUSTOMER_SUBDOMAIN.orbi.frank.com"
   },
 
+  "gcal_oauth": {
+    "_comment": "Google Cloud OAuth Desktop-app credentials. Owner gets these from console.cloud.google.com → APIs & Services → Credentials. Each install can have its own, or ship Frank's shared Desktop-app credentials.",
+    "client_id":     "REPLACE_WITH_GOOGLE_CLIENT_ID",
+    "client_secret": "REPLACE_WITH_GOOGLE_CLIENT_SECRET"
+  },
+
   "modules": {
     "business_info": { "enabled": true },
     "memory":        { "enabled": true },
