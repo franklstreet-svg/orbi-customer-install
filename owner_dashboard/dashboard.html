@@ -658,6 +658,15 @@
     <!-- SETTINGS TAB -->
     <section class="tab-panel" id="tab-settings">
       <div class="form-section">
+        <h2>🪄 First-time setup</h2>
+        <p class="muted" style="margin:4px 0 10px;font-size:13px">
+          Walk through the wizard to teach Orbi about your business, connect your phone, email, and the rest.
+          Takes about 10 minutes. You can re-run it any time.
+        </p>
+        <button type="button" class="primary-btn" id="open-onboarding-btn">Start the setup wizard</button>
+      </div>
+
+      <div class="form-section">
         <h2>Orbi's Personality</h2>
         <label>How should Orbi sound?
           <select name="tone" id="tone-select">
@@ -812,6 +821,27 @@
       </div>
     </section>
   </main>
+
+  <!-- ONBOARDING WIZARD — multi-step setup for new business owners -->
+  <dialog id="onboarding-wizard" class="onboarding-wizard">
+    <div class="wiz-header">
+      <div class="wiz-progress">
+        <span class="wiz-step-num" id="wiz-step-num">1</span>
+        <span class="wiz-step-of">of 7</span>
+      </div>
+      <h2 id="wiz-title">Welcome</h2>
+      <button class="icon-btn" id="wiz-close-btn" title="Close wizard">×</button>
+    </div>
+    <div class="wiz-body" id="wiz-body">
+      <!-- screens injected by JS -->
+    </div>
+    <div class="wiz-footer">
+      <button class="secondary-btn" id="wiz-back-btn" hidden>← Back</button>
+      <div style="flex:1"></div>
+      <button class="secondary-btn" id="wiz-skip-btn" hidden>Skip for now</button>
+      <button class="primary-btn" id="wiz-next-btn">Get started</button>
+    </div>
+  </dialog>
 
   <script src="/static/dashboard.js"></script>
   <script src="/pwa/register-sw.js" defer></script>

@@ -1745,3 +1745,59 @@ dialog .form-actions {
 }
 
 #email-detail-dialog { max-width: 720px; width: 90vw; }
+
+/* ========================================================== */
+/* Onboarding wizard                                          */
+/* ========================================================== */
+
+.onboarding-wizard {
+  max-width: 640px;
+  width: 92vw;
+  padding: 0;
+  background: #111728;
+  color: #eaf0ff;
+  border: 1px solid #2c3957;
+  border-radius: 16px;
+}
+.onboarding-wizard::backdrop { background: rgba(0,0,0,0.7); }
+
+.wiz-header {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 18px 22px;
+  border-bottom: 1px solid #1f2942;
+  background: linear-gradient(135deg, rgba(79,140,255,0.08), rgba(139,92,246,0.08));
+}
+.wiz-header h2 {
+  margin: 0;
+  font-size: 20px;
+  flex: 1;
+}
+.wiz-progress {
+  background: linear-gradient(135deg, #4f8cff, #8b5cf6);
+  color: white;
+  padding: 4px 12px;
+  border-radius: 12px;
+  font-size: 12px;
+  font-weight: 600;
+}
+.wiz-step-num { font-size: 14px; }
+.wiz-step-of { opacity: 0.8; font-weight: 400; margin-left: 4px; }
+
+.wiz-body {
+  padding: 22px;
+  min-height: 220px;
+  max-height: 64vh;
+  overflow-y: auto;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.wiz-footer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 14px 22px;
+  border-top: 1px solid #1f2942;
+}

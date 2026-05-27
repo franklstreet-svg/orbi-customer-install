@@ -2957,4 +2957,348 @@
 
   document.addEventListener('DOMContentLoaded', wireScheduleMeeting);
 
+
+  // ==================================================================
+  // ONBOARDING WIZARD — 7-screen setup walkthrough for new owners
+  // ==================================================================
+
+  let _wizState = {
+    step: 0,
+    website: "",
+    draft: null,
+    gapAnswers: {},
+    currentGap: 0,
+    gapQuestions: [],
+  };
+
+  // Each screen: {title, render() → HTML, onNext() async → void or string error,
+  //               nextLabel?, showBack?, showSkip?}
+  function wizardScreens() {
+    return [
+      // 0. Welcome
+      {
+        title: "Welcome to Orbi",
+        nextLabel: "Get started",
+        showSkip: false,
+        showBack: false,
+        render: () => `
+          <div style="text-align:center;padding:20px 0">
+            <div style="font-size:48px;margin-bottom:12px">👋</div>
+            <h3 style="margin-top:0">Let's get you set up — it takes about 10 minutes.</h3>
+            <p class="muted" style="font-size:14px;line-height:1.6;max-width:480px;margin:14px auto">
+              I'll walk you through 7 quick steps:
+            </p>
+            <ol style="text-align:left;color:#b8c6e0;font-size:13px;max-width:380px;margin:0 auto;line-height:1.8">
+              <li>Connect your website (I'll learn your business)</li>
+              <li>Fill in anything I missed</li>
+              <li>Connect your email (Gmail or Outlook)</li>
+              <li>Set up your phone receptionist (Twilio)</li>
+              <li>Pick your tunnel URL (so customers can reach you)</li>
+              <li>Add your staff (optional)</li>
+              <li>Done — you're live</li>
+            </ol>
+          </div>`,
+        onNext: async () => {}
+      },
+
+      // 1. Website
+      {
+        title: "What's your business website?",
+        nextLabel: "Scan my website",
+        render: () => `
+          <p class="muted" style="font-size:13px">I'll read your homepage, About, Contact, and Services pages to pull your business name, address, phone, email, hours, and what you sell.</p>
+          <label style="display:block;margin-top:10px">Website URL
+            <input type="url" id="wiz-website" placeholder="https://yourbusiness.com" required
+              style="width:100%;background:#0b0f1a;border:1px solid #2c3957;color:#eaf0ff;border-radius:8px;padding:10px 14px;font-size:15px;margin-top:4px"
+              value="${esc(_wizState.website)}">
+          </label>
+          <div id="wiz-scan-status" style="margin-top:14px;font-size:13px"></div>
+        `,
+        onNext: async () => {
+          const url = document.getElementById('wiz-website').value.trim();
+          if (!url) return "Please enter your website URL.";
+          _wizState.website = url;
+          const status = document.getElementById('wiz-scan-status');
+          status.innerHTML = '<span style="color:#4f8cff">Scanning your website…</span>';
+          try {
+            const r = await api('/api/owner/onboarding/discover', {
+              method: 'POST', body: JSON.stringify({url}),
+            });
+            if (r.error) throw new Error(r.error);
+            _wizState.draft = r.draft;
+            _wizState.gapQuestions = r.gap_questions || [];
+            _wizState.currentGap = 0;
+          } catch (err) {
+            return `Couldn't scan that site: ${err.message}. You can still continue and fill in everything manually.`;
+          }
+        }
+      },
+
+      // 2. Confirm + fill gaps
+      {
+        title: "Here's what I found",
+        nextLabel: _wizState.gapQuestions.length ? "Fill in the gaps" : "Looks good — continue",
+        render: () => {
+          const d = _wizState.draft || {};
+          const sources = d._sources || {};
+          const conf = d._confidence || {};
+          const row = (label, value, key) => {
+            const c = conf[key] || (value ? "high" : "missing");
+            const dot = c === "high" ? '🟢' : (c === "medium" ? '🟡' : '⚪');
+            const src = sources[key] ? `<span class="muted" style="font-size:11px">  (from ${esc(sources[key].slice(0,40))})</span>` : '';
+            return `<div style="margin-bottom:6px">${dot} <strong>${esc(label)}:</strong> ${esc(value || '(not found)')}${src}</div>`;
+          };
+          const addr = d.address || {};
+          const addrStr = [addr.street, addr.city, addr.state, addr.zip].filter(Boolean).join(', ');
+          const contact = d.contact || {};
+          const svc = (d.services || []).map(s => `<li>${esc(s.name||'')}${s.price ? ' — '+esc(s.price) : ''}</li>`).join('');
+          return `
+            <p class="muted" style="font-size:13px">I scanned ${esc(_wizState.website)} and pulled these. Anything wrong? Click "Fix something" — otherwise continue and I'll ask about the missing pieces.</p>
+            <div style="background:#0b0f1a;border:1px solid #1f2942;border-radius:10px;padding:14px;margin-top:12px;font-size:14px;color:#eaf0ff">
+              ${row('Business name', d.name, 'name')}
+              ${row('Tagline', d.tagline || d.description, 'tagline')}
+              ${row('Address', addrStr, 'address')}
+              ${row('Phone', contact.phone, 'phone')}
+              ${row('Email', contact.email, 'email')}
+              ${row('Hours', d.hours && Object.keys(d.hours).length ? Object.keys(d.hours).length+' day(s) of hours found' : '', 'hours')}
+              <div style="margin-top:8px">🟢 <strong>Services found:</strong> ${(d.services||[]).length}</div>
+              ${svc ? `<ul style="margin:4px 0 0 16px;color:#b8c6e0;font-size:13px">${svc}</ul>` : ''}
+            </div>
+            <p class="muted" style="font-size:12px;margin-top:10px">🟢 = found · 🟡 = partial · ⚪ = missing — I'll ask about the missing ones next.</p>
+          `;
+        },
+        onNext: async () => {
+          // Move to next screen (gap-filling or skip ahead if no gaps)
+        }
+      },
+
+      // 3. Gap-filling questions (renders ONE at a time, multi-pass)
+      {
+        title: "Just a few quick questions",
+        nextLabel: "Save my answer",
+        showSkip: true,
+        render: () => {
+          const qs = _wizState.gapQuestions || [];
+          if (!qs.length || _wizState.currentGap >= qs.length) {
+            return `<p class="muted">All set — I have everything I need from this step. Click Continue.</p>`;
+          }
+          const q = qs[_wizState.currentGap];
+          return `
+            <p class="muted" style="font-size:12px">Question ${_wizState.currentGap+1} of ${qs.length}</p>
+            <h3 style="margin:8px 0 14px">${esc(q.question)}</h3>
+            ${
+              q.type === 'textarea'
+              ? `<textarea id="wiz-answer" rows="4" style="width:100%;background:#0b0f1a;border:1px solid #2c3957;color:#eaf0ff;border-radius:8px;padding:10px 14px;font-size:14px"></textarea>`
+              : `<input type="${esc(q.type)}" id="wiz-answer" style="width:100%;background:#0b0f1a;border:1px solid #2c3957;color:#eaf0ff;border-radius:8px;padding:10px 14px;font-size:15px">`
+            }
+            <div id="wiz-answer-status" style="margin-top:10px;font-size:13px"></div>
+          `;
+        },
+        onNext: async () => {
+          const qs = _wizState.gapQuestions || [];
+          if (!qs.length || _wizState.currentGap >= qs.length) return;
+          const q = qs[_wizState.currentGap];
+          const ans = document.getElementById('wiz-answer')?.value.trim();
+          if (!ans) return; // Skip empty
+          try {
+            const r = await api('/api/owner/onboarding/answer', {
+              method: 'POST', body: JSON.stringify({field: q.field, answer: ans}),
+            });
+            // Merge the patch into the draft
+            _wizState.draft = deepMerge(_wizState.draft || {}, r.patch || {});
+          } catch (err) {
+            return `Couldn't save: ${err.message}`;
+          }
+          _wizState.currentGap++;
+          // If still have more gap questions, stay on this step
+          if (_wizState.currentGap < qs.length) {
+            // Re-render same screen with next question
+            renderWizStep();
+            return "STAY";
+          }
+        }
+      },
+
+      // 4. Save business profile
+      {
+        title: "Saving your business profile…",
+        nextLabel: "Continue to email setup",
+        render: () => `
+          <p style="font-size:14px">I'm saving everything to your local business profile. From now on I can answer any customer question about your business using the real facts you just gave me.</p>
+          <div id="wiz-save-status" style="margin-top:12px;font-size:13px;color:#4f8cff">Saving…</div>
+        `,
+        onNext: async () => {},
+        onShow: async () => {
+          const status = document.getElementById('wiz-save-status');
+          try {
+            await api('/api/owner/onboarding/apply', {
+              method: 'POST',
+              body: JSON.stringify({draft: _wizState.draft, overwrite: true}),
+            });
+            status.innerHTML = '<span style="color:#6fdc94">✓ Saved. Your business profile is loaded.</span>';
+          } catch (err) {
+            status.innerHTML = `<span style="color:#ffb0b0">Save failed: ${esc(err.message)}</span>`;
+          }
+        }
+      },
+
+      // 5. Email connection
+      {
+        title: "Connect your email",
+        nextLabel: "Continue",
+        showSkip: true,
+        render: () => `
+          <p style="font-size:14px">Connecting your email lets me read incoming customer emails, draft replies in your voice, and surface urgent ones.</p>
+          <p class="muted" style="font-size:13px;margin-top:8px">You can connect Gmail or Outlook from Settings → Integrations whenever you're ready. The wizard isn't blocking — skip this if you'll do it later.</p>
+          <div style="margin-top:14px;display:flex;gap:8px">
+            <button type="button" class="secondary-btn" onclick="document.querySelector('.tab[data-tab=settings]').click(); document.getElementById('onboarding-wizard').close()">Open Integrations now</button>
+          </div>
+        `,
+        onNext: async () => {}
+      },
+
+      // 6. Phone (Twilio)
+      {
+        title: "Phone receptionist",
+        nextLabel: "Continue",
+        showSkip: true,
+        render: () => `
+          <p style="font-size:14px">Orbi can answer calls 24/7 if you give her a phone number. This uses Twilio — you'll need a Twilio account (~$1/mo per number + a few cents per call).</p>
+          <p class="muted" style="font-size:13px;margin-top:8px">You can configure this from Settings → Phone whenever you're ready. Skip for now if you don't have Twilio set up.</p>
+        `,
+        onNext: async () => {}
+      },
+
+      // 7. Done
+      {
+        title: "You're set up 🎉",
+        nextLabel: "Finish",
+        showBack: false,
+        showSkip: false,
+        render: () => `
+          <div style="text-align:center;padding:14px 0">
+            <div style="font-size:48px;margin-bottom:12px">🎉</div>
+            <h3 style="margin-top:0">Orbi knows your business.</h3>
+            <p style="font-size:14px;max-width:480px;margin:14px auto;color:#b8c6e0">
+              Click any tab to start. Try Ask Orbi → type "tell me about my business" — she should now know everything you just taught her.
+            </p>
+            <p class="muted" style="font-size:13px;margin-top:14px">
+              You can re-run this wizard any time from Settings → First-time setup.
+            </p>
+          </div>
+        `,
+        onNext: async () => {
+          document.getElementById('onboarding-wizard').close();
+        }
+      },
+    ];
+  }
+
+  function deepMerge(a, b) {
+    const out = {...a};
+    for (const k of Object.keys(b)) {
+      if (b[k] && typeof b[k] === 'object' && !Array.isArray(b[k])) {
+        out[k] = deepMerge(out[k] || {}, b[k]);
+      } else if (b[k] !== undefined && b[k] !== null && b[k] !== "") {
+        out[k] = b[k];
+      }
+    }
+    return out;
+  }
+
+  async function renderWizStep() {
+    const screens = wizardScreens();
+    const i = _wizState.step;
+    const s = screens[i];
+    if (!s) return;
+    document.getElementById('wiz-step-num').textContent = (i+1);
+    document.getElementById('wiz-title').textContent = s.title;
+    document.getElementById('wiz-body').innerHTML = s.render();
+    const nextBtn = document.getElementById('wiz-next-btn');
+    nextBtn.textContent = s.nextLabel || "Next →";
+    nextBtn.disabled = false;
+    document.getElementById('wiz-back-btn').hidden = (s.showBack === false) || i === 0;
+    document.getElementById('wiz-skip-btn').hidden = !s.showSkip;
+    if (s.onShow) {
+      try { await s.onShow(); } catch (e) { console.warn(e); }
+    }
+  }
+
+  function wireWizard() {
+    const open = document.getElementById('open-onboarding-btn');
+    const dlg  = document.getElementById('onboarding-wizard');
+    const next = document.getElementById('wiz-next-btn');
+    const back = document.getElementById('wiz-back-btn');
+    const skip = document.getElementById('wiz-skip-btn');
+    const close = document.getElementById('wiz-close-btn');
+    if (!dlg) return;
+
+    open?.addEventListener('click', () => {
+      _wizState = {step: 0, website: "", draft: null, gapAnswers: {},
+                   currentGap: 0, gapQuestions: []};
+      renderWizStep();
+      dlg.showModal();
+    });
+
+    close?.addEventListener('click', () => dlg.close());
+
+    next.addEventListener('click', async () => {
+      next.disabled = true;
+      const screens = wizardScreens();
+      const s = screens[_wizState.step];
+      const errOrStay = await s.onNext?.();
+      if (errOrStay === "STAY") {
+        next.disabled = false;
+        return;
+      }
+      if (typeof errOrStay === 'string' && errOrStay) {
+        // Show error inline
+        const body = document.getElementById('wiz-body');
+        body.insertAdjacentHTML('beforeend',
+          `<div style="color:#ffb0b0;margin-top:10px;font-size:13px">${esc(errOrStay)}</div>`);
+        next.disabled = false;
+        return;
+      }
+      _wizState.step++;
+      if (_wizState.step >= screens.length) {
+        dlg.close();
+        return;
+      }
+      renderWizStep();
+    });
+
+    back.addEventListener('click', () => {
+      if (_wizState.step > 0) {
+        _wizState.step--;
+        renderWizStep();
+      }
+    });
+
+    skip.addEventListener('click', () => {
+      _wizState.step++;
+      const screens = wizardScreens();
+      if (_wizState.step >= screens.length) {
+        dlg.close();
+        return;
+      }
+      renderWizStep();
+    });
+
+    // Auto-open if business_info looks empty on first load
+    setTimeout(async () => {
+      try {
+        const biz = await api('/api/owner/business_info');
+        const looksEmpty = !biz.name || biz.name === "REPLACE_WITH_BUSINESS_NAME";
+        if (looksEmpty && !sessionStorage.getItem('orbi-wiz-shown')) {
+          sessionStorage.setItem('orbi-wiz-shown', '1');
+          _wizState = {step: 0, website: "", draft: null, gapAnswers: {},
+                       currentGap: 0, gapQuestions: []};
+          renderWizStep();
+          dlg.showModal();
+        }
+      } catch {}
+    }, 1500);
+  }
+  document.addEventListener('DOMContentLoaded', wireWizard);
+
 })();
