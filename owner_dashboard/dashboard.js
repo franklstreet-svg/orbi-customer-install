@@ -1325,6 +1325,7 @@
                 ${f.mtime ? new Date(f.mtime*1000).toLocaleDateString() : ''}
               </div>
             </div>
+            <button class="secondary-btn" data-action="file-convert" title="Clean &amp; convert to another format">✨ Convert</button>
             <button class="icon-btn-sm" data-action="file-delete" title="Remove">×</button>
           </div>
         `).join('')}
@@ -1337,6 +1338,12 @@
             await api('/api/owner/workspace/' + encodeURIComponent(name), { method: 'DELETE' });
             loadFiles();
           } catch (err) { alert('Delete failed: ' + err.message); }
+        });
+      });
+      list.querySelectorAll('[data-action="file-convert"]').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+          const name = e.target.closest('[data-name]').dataset.name;
+          openConvertDialog(name);
         });
       });
     } catch (err) {
@@ -1424,6 +1431,81 @@
   }
 
   document.addEventListener('DOMContentLoaded', wireFiles);
+
+
+  // ==================================================================
+  // Clean & Convert — LLM-cleaned version of a file, in target format
+  // ==================================================================
+
+  let convertSourceName = null;
+
+  function openConvertDialog(name) {
+    convertSourceName = name;
+    const dlg = document.getElementById('convert-dialog');
+    document.getElementById('convert-title').textContent = `Clean & convert: ${name}`;
+    document.getElementById('convert-status').innerHTML = '';
+    document.getElementById('convert-go').disabled = false;
+    document.getElementById('convert-go').textContent = 'Clean & Convert';
+
+    // Pre-select PDF for prose-y files, xlsx for tabular files
+    const ext = (name.split('.').pop() || '').toLowerCase();
+    const target = document.getElementById('convert-target');
+    if (['csv','xlsx','xls'].includes(ext)) {
+      target.value = 'xlsx';
+    } else {
+      target.value = 'pdf';
+    }
+    dlg.showModal();
+  }
+
+  function wireConvert() {
+    const form = document.getElementById('convert-form');
+    if (!form) return;
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      if (!convertSourceName) return;
+      const fd = new FormData(form);
+      const payload = {
+        target: fd.get('target'),
+        hint:   (fd.get('hint') || '').toString().trim(),
+        clean:  fd.get('clean') === 'on',
+      };
+      const statusEl = document.getElementById('convert-status');
+      const goBtn = document.getElementById('convert-go');
+      goBtn.disabled = true;
+      goBtn.textContent = 'Working… (5-30s for LLM cleanup)';
+      statusEl.innerHTML = '<span style="color:#4f8cff">Cleaning and converting…</span>';
+      try {
+        const res = await fetch(
+          '/api/owner/workspace/' + encodeURIComponent(convertSourceName) + '/convert',
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+            credentials: 'same-origin',
+          }
+        );
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          throw new Error(err.error || `HTTP ${res.status}`);
+        }
+        const data = await res.json();
+        statusEl.innerHTML = `<span style="color:#6fdc94">✓ Saved as <strong>${esc(data.output_name)}</strong></span>`
+          + (data.download_url
+            ? ` · <a href="${esc(data.download_url)}" download style="color:#4f8cff">Download</a>`
+            : '');
+        goBtn.textContent = 'Done — convert another?';
+        goBtn.disabled = false;
+        loadFiles();
+      } catch (err) {
+        statusEl.innerHTML = `<span style="color:#ffb0b0">✗ ${esc(err.message)}</span>`;
+        goBtn.disabled = false;
+        goBtn.textContent = 'Try again';
+      }
+    });
+  }
+
+  document.addEventListener('DOMContentLoaded', wireConvert);
 
 
   // ------------------------------------------------------------------

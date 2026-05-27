@@ -326,12 +326,16 @@ def _prune_tokens(tokens: dict) -> dict:
     return kept
 
 
-def mint_download_token(data_dir: Path, path: str, ttl_minutes: int = DEFAULT_TTL_MIN) -> str:
+def mint_download_token(data_dir: Path, path: str, ttl_minutes: int = DEFAULT_TTL_MIN,
+                        extra_allowed_roots: list[Path] | None = None) -> str:
     """Create a single-use, time-limited token bound to `path`.
 
     Validates that `path` is inside an allowed root (or under the tmp
     downloads dir, which is implicitly allowed because we just wrote it
-    there ourselves). Raises ValueError otherwise.
+    there ourselves). Callers like the doc-convert pipeline pass their own
+    `extra_allowed_roots` (e.g. the workspace folder) so files Orbi just
+    created on the owner's behalf can be downloaded without forcing the
+    owner to widen their global file-fetch scope. Raises ValueError otherwise.
 
     Returns the hex token string. Caller hands that to the user as
     /download/<token>.
@@ -341,7 +345,8 @@ def mint_download_token(data_dir: Path, path: str, ttl_minutes: int = DEFAULT_TT
         raise ValueError(f"path does not exist: {path}")
 
     tmp_root = (Path(data_dir) / TMP_DIR).resolve(strict=False)
-    allowed = get_allowed_roots(data_dir) + [tmp_root]
+    extra = [Path(p).expanduser().resolve(strict=False) for p in (extra_allowed_roots or [])]
+    allowed = get_allowed_roots(data_dir) + [tmp_root] + extra
     if not _path_is_safe(target, allowed):
         log.warning(f"mint refused — outside scope: {target}")
         raise ValueError("path is outside the configured allowed scope")
@@ -360,6 +365,10 @@ def mint_download_token(data_dir: Path, path: str, ttl_minutes: int = DEFAULT_TT
         "expires_at": expires.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "used":       False,
         "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        # Roots that were trusted at MINT time. Redeem re-checks scope using
+        # these so a workspace-minted token still works even though workspace
+        # isn't in the visitor-facing allowed_paths config.
+        "extra_allowed_roots": [str(p) for p in extra],
     }
 
     with _TOKEN_LOCK:
@@ -404,9 +413,13 @@ def redeem_token(data_dir: Path, token: str) -> dict | None:
             log.warning(f"redeem: file vanished: {target}")
             return None
 
-        # Re-check scope at redeem time — config may have changed
+        # Re-check scope at redeem time — config may have changed. Honor any
+        # extra roots that were trusted at MINT time (e.g. the workspace
+        # folder for files Orbi created on the owner's behalf).
         tmp_root = (Path(data_dir) / TMP_DIR).resolve(strict=False)
-        allowed = get_allowed_roots(data_dir) + [tmp_root]
+        extra = [Path(p).expanduser().resolve(strict=False)
+                 for p in (rec.get("extra_allowed_roots") or [])]
+        allowed = get_allowed_roots(data_dir) + [tmp_root] + extra
         if not _path_is_safe(target, allowed):
             log.warning(f"redeem: file no longer in scope: {target}")
             return None

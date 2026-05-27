@@ -215,6 +215,41 @@
       <div id="files-list" class="files-list">
         <div class="empty-state-small">Loading…</div>
       </div>
+
+      <dialog id="convert-dialog">
+        <form method="dialog" id="convert-form">
+          <h2 id="convert-title">Clean &amp; convert</h2>
+          <p class="muted" id="convert-subtitle" style="margin:2px 0 14px">Choose a target format and Orbi will clean up the file then save it back to your workspace.</p>
+
+          <label>Target format
+            <select name="target" id="convert-target">
+              <option value="pdf">PDF</option>
+              <option value="docx">Word document (.docx)</option>
+              <option value="txt">Plain text (.txt)</option>
+              <option value="md">Markdown (.md)</option>
+              <option value="xlsx">Excel spreadsheet (.xlsx) — best for tables</option>
+              <option value="csv">CSV — best for tables</option>
+            </select>
+          </label>
+
+          <label>Any instructions? (optional)
+            <textarea name="hint" rows="2"
+              placeholder="e.g. 'keep it under one page', 'use bullet points', 'fix the headings'"></textarea>
+          </label>
+
+          <label class="checkbox" style="display:flex;align-items:center;gap:8px;margin-top:8px">
+            <input type="checkbox" name="clean" id="convert-clean" checked>
+            <span>Clean up the text with AI (fix typos, normalize formatting). Uncheck for raw conversion only.</span>
+          </label>
+
+          <div id="convert-status" style="margin-top:12px;font-size:13px"></div>
+
+          <div class="form-actions">
+            <button type="button" class="secondary-btn" onclick="document.getElementById('convert-dialog').close()">Cancel</button>
+            <button type="submit" class="primary-btn" id="convert-go">Clean &amp; Convert</button>
+          </div>
+        </form>
+      </dialog>
     </section>
 
     <!-- PEOPLE TAB (owner-only) -->

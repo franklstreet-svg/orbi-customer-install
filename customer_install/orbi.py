@@ -50,6 +50,7 @@ import audit
 import auth
 import backup
 import cross_search as xs
+import doc_convert
 import file_fetch
 import gcal
 import llm_client
@@ -1105,6 +1106,68 @@ def owner_workspace_upload():
         "rejected": rejected,
         "indexed": scan_result.get("added", 0) + scan_result.get("updated", 0),
     })
+
+
+@app.route("/api/owner/workspace/<path:filename>/convert", methods=["POST"])
+def owner_workspace_convert(filename):
+    """Clean a file with the LLM and write it back in a different format.
+    Saves the result alongside the source in the workspace folder so it shows
+    up in the Files tab and can be downloaded via /api/owner/files/request."""
+    owner_session = auth.require_owner(ORBI_DIR)
+    import re as _re
+    safe = os.path.basename(filename.replace("\\", "/"))
+    safe = _re.sub(r"[^\w\s.\-()]+", "", safe).strip(" .")
+    if not safe:
+        return jsonify({"error": "invalid_name"}), 400
+
+    data = request.get_json(silent=True) or {}
+    target = (data.get("target") or "").lower().strip()
+    if target not in doc_convert.SUPPORTED_TARGETS:
+        return jsonify({"error": "invalid_target",
+                        "valid": list(doc_convert.SUPPORTED_TARGETS)}), 400
+    hint = (data.get("hint") or "").strip()
+    clean = bool(data.get("clean", True))
+
+    ws = mod_workspace.workspace_path(CONFIG)
+    src = ws / safe
+    if not src.exists():
+        return jsonify({"error": "source_not_found"}), 404
+
+    try:
+        result = doc_convert.convert(CONFIG, src, target, out_dir=ws,
+                                     hint=hint, clean=clean)
+    except (ValueError, FileNotFoundError) as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        log.warning(f"convert failed: {e}")
+        return jsonify({"error": f"convert_failed: {e}"}), 500
+
+    # Re-index workspace so the new file shows up in the Files tab
+    try:
+        mod_workspace.scan(CONFIG, DATA_DIR)
+    except Exception as e:
+        log.warning(f"post-convert scan failed: {e}")
+
+    # Mint a one-time download token. The workspace folder is implicitly safe
+    # for these tokens since Orbi just wrote the file there itself — we pass
+    # it as an extra allowed root so the owner doesn't have to widen their
+    # global file-fetch scope just to download their own cleaned-up doc.
+    try:
+        token = file_fetch.mint_download_token(
+            DATA_DIR, result["output_path"], ttl_minutes=30,
+            extra_allowed_roots=[ws],
+        )
+        result["download_url"] = f"/download/{token}"
+    except Exception as e:
+        log.warning(f"could not mint download token: {e}")
+        result["download_url"] = None
+
+    audit.log_event(DATA_DIR, actor=owner_session.get("username", "?"),
+                    action="workspace.convert",
+                    resource=safe,
+                    meta={"target": target, "output": result["output_name"],
+                          "clean": clean})
+    return jsonify({"status": "ok", **result})
 
 
 @app.route("/api/owner/workspace/<path:filename>", methods=["DELETE"])
