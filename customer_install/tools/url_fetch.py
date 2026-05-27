@@ -20,7 +20,12 @@ from html.parser import HTMLParser
 
 log = logging.getLogger("orbi.url_fetch")
 
-USER_AGENT = "Orbi/0.1 (+https://twickell.com)"
+# Some sites refuse bot-shaped UAs but accept generic browser strings.
+# Big-name sites with Cloudflare/Akamai bot detection (Ferguson, Home Depot,
+# etc.) will reject regardless — the chat handler falls back to web search
+# in that case (see url_fetch_or_search below).
+USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36")
 MAX_BYTES = 1_500_000      # 1.5 MB cap on download
 MAX_TEXT_CHARS = 12_000    # 12k chars of extracted text max
 
@@ -79,10 +84,24 @@ def fetch(url: str, timeout: int = 10, follow_about: bool = True,
         result["error"] = "no_url"
         return result
     try:
+        # Full browser-shaped headers — beats simple bot-detection on a lot of sites.
+        # Won't help against Cloudflare WAF or proper JS challenges, but those are
+        # an order of magnitude rarer than basic UA filtering.
         req = urllib.request.Request(url, headers={
             "User-Agent": USER_AGENT,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "identity",  # ask for uncompressed — we don't decompress
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+            "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="127", "Google Chrome";v="127"',
+            "Sec-Ch-Ua-Mobile": "?0",
+            "Sec-Ch-Ua-Platform": '"Windows"',
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+            "Upgrade-Insecure-Requests": "1",
         })
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             result["status"] = resp.status
@@ -150,6 +169,82 @@ def fetch(url: str, timeout: int = 10, follow_about: bool = True,
                 return sub
 
     return result
+
+
+def fetch_or_search(url: str, timeout: int = 10) -> dict:
+    """Try in order: direct fetch → Wayback Machine snapshot → web-search
+    snippets. Returns same shape as fetch() plus a `source` field of
+    'direct' | 'wayback' | 'search' | 'direct_failed' so the caller
+    knows where the info came from."""
+    r = fetch(url, timeout=timeout)
+    if r.get("ok") and r.get("text") and len(r["text"]) > 200:
+        r["source"] = "direct"
+        return r
+
+    # Tier 2 — Wayback Machine snapshot. Always-accepting bot, has cached
+    # versions of nearly every public site. Slightly stale (last snapshot
+    # might be days/weeks old) but content is real, no blocking, no JS.
+    wb = _fetch_wayback(url, timeout=timeout)
+    if wb and wb.get("ok") and wb.get("text") and len(wb["text"]) > 200:
+        wb["url"] = url  # keep the URL the owner asked about
+        wb["source"] = "wayback"
+        wb["note"] = f"(Snapshot via web.archive.org — live site blocked or unreachable)"
+        return wb
+
+    # Tier 3 — DuckDuckGo snippets about the domain
+    try:
+        from . import web_search
+    except ImportError:
+        return r
+
+    try:
+        parsed = urllib.parse.urlparse(url)
+        domain = parsed.netloc.replace("www.", "").lower()
+        hits = web_search.search(f"{domain} company about", limit=5)
+        if hits:
+            text_chunks = [f"# {domain}",
+                           f"(Note: I couldn't fetch {url} directly — it blocked the request "
+                           f"and no archive was available. Info below is from web-search snippets.)\n"]
+            for h in hits:
+                title = h.get("title", "")
+                snippet = h.get("snippet", "")
+                if title or snippet:
+                    text_chunks.append(f"## {title}\n{snippet}\n")
+            return {
+                "url": url, "ok": True, "status": r.get("status", 0),
+                "title": domain, "official_name": "",
+                "tagline": "", "copyright": "",
+                "text": "\n".join(text_chunks)[:MAX_TEXT_CHARS],
+                "byte_count": 0, "error": "",
+                "source": "search",
+                "original_error": r.get("error", ""),
+            }
+    except Exception as e:
+        log.warning(f"search fallback failed: {e}")
+
+    r["source"] = "direct_failed"
+    return r
+
+
+def _fetch_wayback(url: str, timeout: int = 10) -> dict | None:
+    """Look up the most recent Wayback Machine snapshot of `url` and fetch it.
+    Returns a fetch()-shaped dict on success, None on failure."""
+    try:
+        avail_url = "https://archive.org/wayback/available?url=" + urllib.parse.quote(url)
+        req = urllib.request.Request(avail_url, headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            import json as _json
+            data = _json.loads(resp.read().decode("utf-8", errors="replace"))
+        snap = (data.get("archived_snapshots") or {}).get("closest") or {}
+        snap_url = snap.get("url")
+        if not snap_url:
+            return None
+        log.info(f"wayback: using snapshot from {snap.get('timestamp', '?')}: {snap_url}")
+        # Fetch the snapshot — Wayback never blocks
+        return fetch(snap_url, timeout=timeout, follow_about=False, _no_retry=True)
+    except Exception as e:
+        log.debug(f"wayback lookup failed for {url}: {e}")
+        return None
 
 
 def _build_url_alternates(url: str) -> list[str]:

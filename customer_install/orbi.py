@@ -729,7 +729,7 @@ def public_chat():
     try:
         urls_in_msg = tool_url_fetch.extract_urls(user_msg)[:3]
         if urls_in_msg:
-            fetched = [tool_url_fetch.fetch(u) for u in urls_in_msg]
+            fetched = [tool_url_fetch.fetch_or_search(u) for u in urls_in_msg]
             url_ctx = tool_url_fetch.context_block(fetched)
             if url_ctx:
                 extras.append(url_ctx)
@@ -1397,7 +1397,7 @@ def owner_chat():
     try:
         urls_in_msg = tool_url_fetch.extract_urls(user_msg)[:3]
         if urls_in_msg:
-            fetched = [tool_url_fetch.fetch(u) for u in urls_in_msg]
+            fetched = [tool_url_fetch.fetch_or_search(u) for u in urls_in_msg]
             url_ctx = tool_url_fetch.context_block(fetched)
             if url_ctx:
                 extras.append(url_ctx)
