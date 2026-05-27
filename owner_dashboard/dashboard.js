@@ -583,9 +583,12 @@
       const reply = data.reply || "I couldn't reach any AI tier just now.";
       addOwnerBubble('assistant', reply, { tier: data.tier });
       ownerChatHistory.push({ role: 'assistant', content: reply });
+      if (window.__orbiSpeakReply) window.__orbiSpeakReply(reply);
     } catch (e) {
       thinking.remove();
-      addOwnerBubble('assistant', "I'm offline right now. Try again in a moment.", { tier: 'none' });
+      const fallback = "I'm offline right now. Try again in a moment.";
+      addOwnerBubble('assistant', fallback, { tier: 'none' });
+      if (window.__orbiSpeakReply) window.__orbiSpeakReply(fallback);
     } finally {
       state.hidden = true;
       ownerChatSending = false;
@@ -596,13 +599,16 @@
   function addOwnerBubble(role, text, opts = {}) {
     const msgs = document.getElementById('owner-chat-messages');
     const div = document.createElement('div');
-    div.className = 'owner-chat-bubble ' + role +
-      (opts.tier && opts.tier !== 'brain' && opts.tier !== 'none' ? ' degraded' : '');
+    // 'huggingface' and 'local' are NORMAL tiers for the customer install —
+    // only flag truly degraded states (no LLM reachable at all, or fast-path
+    // fallbacks that the user might want to know about).
+    const isOffline = opts.tier === 'none';
+    div.className = 'owner-chat-bubble ' + role + (isOffline ? ' degraded' : '');
     div.textContent = text;
-    if (opts.tier && opts.tier !== 'brain' && opts.tier !== 'none') {
+    if (isOffline) {
       const hint = document.createElement('div');
       hint.className = 'owner-chat-tier-hint';
-      hint.textContent = opts.tier === 'huggingface' ? '— backup mode —' : '— offline mode —';
+      hint.textContent = '— offline mode —';
       div.appendChild(hint);
     }
     msgs.appendChild(div);
@@ -985,6 +991,440 @@
       });
     });
   });
+
+  // ==================================================================
+  // VOICE MODE — one button toggles mic + speaker together
+  // Tap on  → Orbi listens to you AND reads her replies aloud
+  // Tap off → text-only
+  // The stop button (square) appears while she's speaking — tap to interrupt
+  // ==================================================================
+
+  let voiceOn = false;
+  let recognition = null;
+  let isListening = false;
+  let isSpeaking = false;
+  let wantsListening = false;
+  let restartTimer = null;
+  let currentAudio = null;
+  let currentAudioUrl = null;
+  const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+
+  function setupOwnerVoice() {
+    const btn = document.getElementById('owner-voice-toggle');
+    const stopBtn = document.getElementById('owner-stop-speaking');
+    if (!btn) return;
+
+    if (!Recognition) {
+      btn.disabled = true;
+      btn.title = 'Voice not supported in this browser';
+      btn.style.opacity = 0.4;
+      return;
+    }
+
+    btn.addEventListener('click', () => setVoiceMode(!voiceOn));
+    stopBtn.addEventListener('click', stopSpeaking);
+
+    recognition = new Recognition();
+    recognition.lang = 'en-US';
+    recognition.continuous = true;
+    recognition.interimResults = false;
+
+    recognition.onstart = () => {
+      isListening = true;
+      btn.classList.add('listening');
+      setVoiceState('Listening — speak any time...', 'listening');
+    };
+    recognition.onend = () => {
+      isListening = false;
+      btn.classList.remove('listening');
+      // Chrome stops mic after silence — auto-restart if user still wants it on
+      if (wantsListening && !isSpeaking) {
+        clearTimeout(restartTimer);
+        restartTimer = setTimeout(() => {
+          if (wantsListening && !isSpeaking) safeStartMic();
+        }, 300);
+      } else {
+        setVoiceState(null);
+      }
+    };
+    recognition.onerror = (e) => {
+      if (e.error === 'aborted' || e.error === 'no-speech') return;
+      if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
+        setVoiceMode(false);
+        alert('Microphone permission denied. Allow microphone access for this site to use voice.');
+      }
+    };
+    recognition.onresult = (event) => {
+      let finalText = '';
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        if (event.results[i].isFinal) finalText += event.results[i][0].transcript;
+      }
+      if (finalText.trim()) {
+        // Drop it into the input and fire send like the user typed it
+        const input = document.getElementById('owner-chat-input');
+        if (input) {
+          input.value = finalText.trim();
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+          document.getElementById('owner-chat-send')?.click();
+        }
+      }
+    };
+  }
+
+  function setVoiceMode(on) {
+    voiceOn = on;
+    const btn = document.getElementById('owner-voice-toggle');
+    btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+    btn.title = 'Voice mode (' + (on ? 'on — tap to turn off' : 'off — tap to turn on') + ')';
+    if (on) {
+      wantsListening = true;
+      safeStartMic();
+    } else {
+      wantsListening = false;
+      stopSpeaking();
+      try { recognition && recognition.stop(); } catch {}
+      setVoiceState(null);
+    }
+  }
+
+  function safeStartMic() {
+    if (!recognition || isListening || isSpeaking) return;
+    try { recognition.start(); } catch {}
+  }
+
+  // Uses server-side /tts endpoint (edge_tts, en-US-AvaNeural by default
+  // — same voice as orbi_test on twickell.com). Falls back to browser
+  // synthesis only if the server endpoint fails.
+  async function speakReply(text) {
+    if (!voiceOn || !text) return;
+    stopSpeaking();
+    isSpeaking = true;
+    // Mute the mic while Orbi talks so we don't echo-loop her own voice
+    try { recognition && recognition.stop(); } catch {}
+    document.getElementById('owner-stop-speaking').hidden = false;
+    setVoiceState('Orbi is speaking...', 'speaking');
+
+    const cleanText = stripForSpeech(text);
+
+    const finish = () => {
+      isSpeaking = false;
+      if (currentAudioUrl) {
+        URL.revokeObjectURL(currentAudioUrl);
+        currentAudioUrl = null;
+      }
+      currentAudio = null;
+      document.getElementById('owner-stop-speaking').hidden = true;
+      setVoiceState(null);
+      if (wantsListening) safeStartMic();
+    };
+
+    try {
+      // Use GET so the browser does PROGRESSIVE playback — audio starts within
+      // ~300ms as the first MP3 frames arrive, instead of waiting for the whole
+      // file (which was the 2-3 sec gap Frank saw).
+      const url = '/tts?text=' + encodeURIComponent(cleanText);
+      currentAudio = new Audio(url);
+      currentAudio.preload = 'auto';
+      currentAudio.onended = finish;
+      currentAudio.onerror = finish;
+      await currentAudio.play();
+    } catch (err) {
+      console.warn('[Orbi] server TTS failed, falling back to browser voice:', err);
+      // Last-resort fallback so something speaks
+      if (window.speechSynthesis) {
+        const u = new SpeechSynthesisUtterance(cleanText);
+        u.onend = finish;
+        u.onerror = finish;
+        window.speechSynthesis.speak(u);
+      } else {
+        finish();
+      }
+    }
+  }
+
+  function stopSpeaking() {
+    if (currentAudio) {
+      try { currentAudio.pause(); currentAudio.src = ''; } catch {}
+    }
+    if (window.speechSynthesis) {
+      try { window.speechSynthesis.cancel(); } catch {}
+    }
+    if (currentAudioUrl) {
+      URL.revokeObjectURL(currentAudioUrl);
+      currentAudioUrl = null;
+    }
+    currentAudio = null;
+    isSpeaking = false;
+    const stopBtn = document.getElementById('owner-stop-speaking');
+    if (stopBtn) stopBtn.hidden = true;
+  }
+
+  // Strip markdown/links/code-fences before sending text to TTS so we don't
+  // hear "asterisk asterisk" or read URLs character-by-character.
+  function stripForSpeech(text) {
+    return String(text || '')
+      .replace(/```[\s\S]*?```/g, ' code block ')
+      .replace(/`([^`]+)`/g, '$1')
+      .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')   // markdown link → just the label
+      // Strip LLM stage directions like "(pause)", "(whispers)", "(softly)",
+      // "(excited)", "(sigh)" — TTS reads these literally otherwise.
+      .replace(/\(\s*(pause|pauses|paused|breath|breathe|sigh|sighs|laugh|laughs|whisper|whispers|softly|loudly|slowly|quickly|excited|gentle|gently|smile|smiles|warm|warmly)\s*\)/gi, '')
+      // Strip square-bracket source citations like "[Tahoe Tourism Board]" that
+      // the LLM sometimes invents — they sound weird out loud.
+      .replace(/\[[^\]]+\]/g, '')
+      .replace(/[*_#>~]/g, '')
+      .replace(/https?:\/\/\S+/g, 'a link')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  function setVoiceState(text, cls) {
+    const bar = document.getElementById('owner-voice-state');
+    if (!bar) return;
+    if (!text) { bar.hidden = true; bar.textContent = ''; bar.className = 'owner-voice-state'; return; }
+    bar.hidden = false;
+    bar.textContent = text;
+    bar.className = 'owner-voice-state ' + (cls || '');
+  }
+
+  // Expose for the chat-send code path (which is inside the original IIFE)
+  window.__orbiSpeakReply = speakReply;
+
+  document.addEventListener('DOMContentLoaded', setupOwnerVoice);
+
+
+  // ==================================================================
+  // GOOGLE CALENDAR — Settings tab integration row
+  // ==================================================================
+
+  async function loadGcalStatus() {
+    const statusEl   = document.getElementById('gcal-status');
+    const connectBtn = document.getElementById('gcal-connect-btn');
+    const disconBtn  = document.getElementById('gcal-disconnect-btn');
+    const syncBtn    = document.getElementById('gcal-sync-btn');
+    if (!statusEl) return;
+    try {
+      const s = await api('/api/owner/gcal/status');
+      if (s.connected) {
+        statusEl.innerHTML = `Connected as <strong>${esc(s.email || '')}</strong>`
+          + (s.last_sync ? ` · last sync ${esc(s.last_sync.slice(0,16).replace('T',' '))}` : '')
+          + (s.last_error ? ` · <span style="color:#ffb0b0">${esc(s.last_error.slice(0,60))}</span>` : '')
+          + (s.events_count ? ` · ${s.events_count} events (${s.gcal_events||0} from Google)` : '');
+        connectBtn.hidden = true;
+        disconBtn.hidden  = false;
+        syncBtn.hidden    = false;
+      } else {
+        statusEl.textContent = 'Not connected. Click Connect to link your Google Calendar — '
+          + 'events flow both ways.';
+        connectBtn.hidden = false;
+        disconBtn.hidden  = true;
+        syncBtn.hidden    = true;
+      }
+    } catch (err) {
+      statusEl.innerHTML = `<span style="color:#ffb0b0">Could not check status (${esc(err.message)})</span>`;
+    }
+  }
+
+  function wireGcal() {
+    const connectBtn = document.getElementById('gcal-connect-btn');
+    const disconBtn  = document.getElementById('gcal-disconnect-btn');
+    const syncBtn    = document.getElementById('gcal-sync-btn');
+    const statusEl   = document.getElementById('gcal-status');
+    if (!connectBtn) return;
+
+    connectBtn.addEventListener('click', async () => {
+      try {
+        const r = await api('/api/owner/gcal/connect', { method: 'POST' });
+        if (r.auth_url) {
+          // Open Google's consent page. After approval, Google redirects back
+          // to /api/owner/gcal/callback which then sends user to /owner#gcal.
+          window.location.href = r.auth_url;
+        } else {
+          alert('Could not start connection: ' + (r.error || 'unknown'));
+        }
+      } catch (err) {
+        alert('Connect failed: ' + err.message);
+      }
+    });
+
+    disconBtn.addEventListener('click', async () => {
+      if (!confirm('Disconnect Google Calendar? Events already pulled stay in Orbi; new changes stop syncing.')) return;
+      try {
+        await api('/api/owner/gcal/disconnect', { method: 'POST' });
+        loadGcalStatus();
+      } catch (err) {
+        alert('Disconnect failed: ' + err.message);
+      }
+    });
+
+    syncBtn.addEventListener('click', async () => {
+      const label = syncBtn.textContent;
+      syncBtn.disabled = true;
+      syncBtn.textContent = 'Syncing…';
+      try {
+        const r = await api('/api/owner/gcal/sync_now', { method: 'POST' });
+        statusEl.innerHTML = `Synced: pulled ${r.pulled||0} new, pushed ${r.pushed||0}`;
+        setTimeout(loadGcalStatus, 1200);
+      } catch (err) {
+        statusEl.innerHTML = `<span style="color:#ffb0b0">Sync failed: ${esc(err.message)}</span>`;
+      } finally {
+        syncBtn.disabled = false;
+        syncBtn.textContent = label;
+      }
+    });
+
+    // Auto-load whenever Settings tab is opened
+    document.querySelectorAll('.tab').forEach(t => {
+      if (t.dataset.tab === 'settings') {
+        t.addEventListener('click', loadGcalStatus);
+      }
+    });
+    // Also load now, and if URL hash is #gcal (post-OAuth-callback redirect)
+    loadGcalStatus();
+    if (window.location.hash === '#gcal') {
+      // Pop them to the settings tab so they see the result
+      const settingsTab = document.querySelector('.tab[data-tab="settings"]');
+      if (settingsTab) settingsTab.click();
+    }
+  }
+
+  document.addEventListener('DOMContentLoaded', wireGcal);
+
+
+  // ==================================================================
+  // FILES tab — upload + drag/drop + list + delete
+  // ==================================================================
+
+  function fmtBytes(n) {
+    if (n < 1024) return n + ' B';
+    if (n < 1024*1024) return (n/1024).toFixed(1) + ' KB';
+    return (n/(1024*1024)).toFixed(1) + ' MB';
+  }
+
+  async function loadFiles() {
+    const list = document.getElementById('files-list');
+    if (!list) return;
+    try {
+      const r = await api('/api/owner/workspace');
+      const files = r.files || [];
+      if (!files.length) {
+        list.innerHTML = `<div class="empty-state-small">No files uploaded yet. Drop something above to get started.</div>
+          <p class="muted" style="margin-top:8px;font-size:12px">Folder on your computer: <code>${esc(r.path||'')}</code></p>`;
+        return;
+      }
+      list.innerHTML = `
+        <p class="muted" style="margin:0 0 10px;font-size:12px">${files.length} file(s) · Folder: <code>${esc(r.path||'')}</code></p>
+        ${files.map(f => `
+          <div class="file-row" data-name="${esc(f.name||'')}">
+            <div class="file-icon">${esc(fileEmoji(f.name||''))}</div>
+            <div class="file-body">
+              <div class="file-name">${esc(f.name||'(unnamed)')}</div>
+              <div class="file-meta">
+                ${esc(fmtBytes(f.size||0))} ·
+                ${f.indexed_chars ? (f.indexed_chars + ' chars indexed') : 'not indexed'} ·
+                ${f.mtime ? new Date(f.mtime*1000).toLocaleDateString() : ''}
+              </div>
+            </div>
+            <button class="icon-btn-sm" data-action="file-delete" title="Remove">×</button>
+          </div>
+        `).join('')}
+      `;
+      list.querySelectorAll('[data-action="file-delete"]').forEach(btn => {
+        btn.addEventListener('click', async (e) => {
+          const name = e.target.closest('[data-name]').dataset.name;
+          if (!confirm(`Remove "${name}" from your workspace? Orbi will forget about it.`)) return;
+          try {
+            await api('/api/owner/workspace/' + encodeURIComponent(name), { method: 'DELETE' });
+            loadFiles();
+          } catch (err) { alert('Delete failed: ' + err.message); }
+        });
+      });
+    } catch (err) {
+      list.innerHTML = `<div class="empty-state-small">Couldn't load files (${esc(err.message)})</div>`;
+    }
+  }
+
+  function fileEmoji(name) {
+    const ext = (name.split('.').pop() || '').toLowerCase();
+    return ({
+      pdf:'📄', docx:'📝', doc:'📝', txt:'📃', md:'📋',
+      csv:'📊', xlsx:'📊', xls:'📊',
+      html:'🌐', htm:'🌐', json:'⚙', log:'📜',
+      png:'🖼', jpg:'🖼', jpeg:'🖼', gif:'🖼',
+    })[ext] || '📁';
+  }
+
+  async function uploadFiles(fileList) {
+    const status = document.getElementById('files-upload-status');
+    if (!fileList || !fileList.length) return;
+    const fd = new FormData();
+    for (const f of fileList) fd.append('files', f);
+    status.hidden = false;
+    status.className = 'files-upload-status uploading';
+    status.textContent = `Uploading ${fileList.length} file(s)…`;
+    try {
+      const res = await fetch('/api/owner/workspace/upload', {
+        method: 'POST',
+        body: fd,
+        credentials: 'same-origin',
+      });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const data = await res.json();
+      const okN = (data.saved || []).length;
+      const badN = (data.rejected || []).length;
+      let msg = `✓ Uploaded ${okN}`;
+      if (data.indexed) msg += `, ${data.indexed} indexed for search`;
+      if (badN) {
+        const reasons = data.rejected.map(r => `${r.name} (${r.reason})`).join('; ');
+        msg += ` · ${badN} rejected: ${reasons}`;
+        status.className = 'files-upload-status partial';
+      } else {
+        status.className = 'files-upload-status ok';
+      }
+      status.textContent = msg;
+      loadFiles();
+      setTimeout(() => { status.hidden = true; }, 6000);
+    } catch (err) {
+      status.className = 'files-upload-status err';
+      status.textContent = 'Upload failed: ' + err.message;
+    }
+  }
+
+  function wireFiles() {
+    const dz = document.getElementById('files-dropzone');
+    const input = document.getElementById('files-input');
+    const pickBtn = document.getElementById('files-pick-btn');
+    if (!dz || !input) return;
+
+    pickBtn?.addEventListener('click', () => input.click());
+    dz.addEventListener('click', () => input.click());
+    input.addEventListener('change', () => {
+      uploadFiles(input.files);
+      input.value = ''; // allow re-pick of same file
+    });
+
+    ['dragenter','dragover'].forEach(ev => {
+      dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.add('drag-over'); });
+    });
+    ['dragleave','drop'].forEach(ev => {
+      dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.remove('drag-over'); });
+    });
+    dz.addEventListener('drop', (e) => {
+      e.preventDefault();
+      const files = e.dataTransfer?.files;
+      if (files && files.length) uploadFiles(files);
+    });
+
+    // Auto-load on tab click
+    document.querySelectorAll('.tab').forEach(t => {
+      if (t.dataset.tab === 'files') {
+        t.addEventListener('click', loadFiles);
+      }
+    });
+  }
+
+  document.addEventListener('DOMContentLoaded', wireFiles);
+
 
   // ------------------------------------------------------------------
   // Utils

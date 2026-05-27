@@ -44,6 +44,11 @@ try:
     HAS_DOCX = True
 except ImportError:
     HAS_DOCX = False
+try:
+    import openpyxl
+    HAS_XLSX = True
+except ImportError:
+    HAS_XLSX = False
 
 
 # ---------------------------------------------------------------------------
@@ -85,8 +90,16 @@ def _save_index(data_dir: Path, index: dict) -> None:
 def _extract_text(path: Path) -> str:
     suffix = path.suffix.lower()
     try:
-        if suffix in (".txt", ".md", ".csv", ".log", ".json"):
-            return path.read_text(encoding="utf-8", errors="ignore")[:MAX_FILE_CHARS]
+        if suffix in (".txt", ".md", ".csv", ".log", ".json", ".html", ".htm"):
+            t = path.read_text(encoding="utf-8", errors="ignore")[:MAX_FILE_CHARS]
+            # Cheap HTML tag stripping so indexing isn't drowned in markup
+            if suffix in (".html", ".htm"):
+                import re as _re
+                t = _re.sub(r"<script[\s\S]*?</script>", " ", t, flags=_re.IGNORECASE)
+                t = _re.sub(r"<style[\s\S]*?</style>", " ", t, flags=_re.IGNORECASE)
+                t = _re.sub(r"<[^>]+>", " ", t)
+                t = _re.sub(r"\s+", " ", t).strip()
+            return t
         if suffix == ".pdf" and HAS_PDF:
             text = []
             with path.open("rb") as f:
@@ -102,6 +115,20 @@ def _extract_text(path: Path) -> str:
         if suffix == ".docx" and HAS_DOCX:
             d = docx.Document(str(path))
             return "\n".join(p.text for p in d.paragraphs)[:MAX_FILE_CHARS]
+        if suffix == ".xlsx" and HAS_XLSX:
+            wb = openpyxl.load_workbook(str(path), data_only=True, read_only=True)
+            chunks = []
+            for sheet in wb.worksheets:
+                chunks.append(f"## Sheet: {sheet.title}")
+                for row in sheet.iter_rows(values_only=True):
+                    row_text = " | ".join(str(c) if c is not None else "" for c in row)
+                    if row_text.strip(" |"):
+                        chunks.append(row_text)
+                    if sum(len(c) for c in chunks) > MAX_FILE_CHARS:
+                        break
+                if sum(len(c) for c in chunks) > MAX_FILE_CHARS:
+                    break
+            return "\n".join(chunks)[:MAX_FILE_CHARS]
     except Exception as e:
         log.warning(f"could not extract text from {path.name}: {e}")
     return ""
@@ -225,15 +252,26 @@ def list_files(config: dict, data_dir: Path) -> list[dict]:
         index = _load_index(data_dir)
     items = []
     for key, e in index.get("files", {}).items():
+        chunks = e.get("chunks", []) or []
+        size = e.get("size", 0)
+        # Chunks may be stored as strings (current) or dicts (legacy)
+        indexed_chars = sum(
+            len(c) if isinstance(c, str) else len(c.get("text", "") if isinstance(c, dict) else "")
+            for c in chunks
+        )
         items.append({
-            "path": key,
-            "filename": e.get("filename", key),
-            "size_kb": e.get("size", 0) // 1024,
-            "ext": e.get("ext", ""),
-            "chunks": len(e.get("chunks", [])),
-            "modified": e.get("mtime"),
+            "path":          key,
+            "filename":      e.get("filename", key),  # legacy
+            "name":          e.get("filename", key),  # dashboard expects 'name'
+            "size":          size,
+            "size_kb":       size // 1024,
+            "ext":           e.get("ext", ""),
+            "chunks":        len(chunks),
+            "indexed_chars": indexed_chars,
+            "modified":      e.get("mtime"),
+            "mtime":         e.get("mtime"),
         })
-    items.sort(key=lambda i: i.get("modified", 0), reverse=True)
+    items.sort(key=lambda i: i.get("modified", 0) or 0, reverse=True)
     return items
 
 # Synonyms — when a query uses these words, also search for the corresponding

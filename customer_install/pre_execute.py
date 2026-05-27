@@ -70,10 +70,35 @@ def pre_execute(message: str, data_dir: Path,
         return (f"Today is {datetime.now().strftime('%A')}.", "direct")
 
     # ── BUSINESS INFO direct answers (only if owner has filled in the field) ──
-    biz_addr = (business.get("address") or "").strip()
-    biz_phone = (business.get("phone") or "").strip()
-    biz_email = (business.get("email") or "").strip()
-    biz_website = (business.get("website") or "").strip()
+    # business_info has nested shapes — address is a dict, contact is a dict.
+    # Flatten safely so a missing/partial dict doesn't crash.
+    def _flat_addr(b):
+        a = b.get("address")
+        if isinstance(a, str):
+            return a.strip()
+        if isinstance(a, dict):
+            parts = [a.get("street", ""), a.get("city", ""),
+                     a.get("state", ""), a.get("zip", "")]
+            return ", ".join(p.strip() for p in parts if p and p.strip())
+        return ""
+    def _flat_str(b, *keys):
+        """Look up keys.0 directly OR nested under 'contact'.{key}."""
+        for k in keys:
+            v = b.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        contact = b.get("contact") or {}
+        if isinstance(contact, dict):
+            for k in keys:
+                v = contact.get(k)
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
+        return ""
+
+    biz_addr    = _flat_addr(business)
+    biz_phone   = _flat_str(business, "phone")
+    biz_email   = _flat_str(business, "email")
+    biz_website = _flat_str(business, "website")
 
     if biz_addr and _ADDRESS_RE.search(msg_l):
         return (f"We're at {biz_addr}.", "direct")

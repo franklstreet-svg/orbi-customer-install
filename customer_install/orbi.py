@@ -56,6 +56,7 @@ import llm_client
 import notifications as notify
 import pre_execute as pre_exec
 import prompts
+import rate_limit
 import users as users_mod
 import voice
 import wellbeing
@@ -257,45 +258,63 @@ def favicon():
 
 _DEFAULT_VOICE = (CONFIG.get("voice", {}) or {}).get("name", "en-US-AvaNeural")
 
-@app.route("/tts", methods=["POST"])
+@app.route("/tts", methods=["GET", "POST"])
 def tts():
     """Generate MP3 audio for text using Edge TTS neural voices.
-    Same engine as your personal Orby on twickell.com — sounds natural."""
-    data = request.get_json(silent=True) or {}
-    text = (data.get("text") or "").strip()
-    voice = data.get("voice") or _DEFAULT_VOICE
-    rate  = data.get("rate", "+0%")
+    Same engine as twickell.com. Streams chunks as edge_tts produces them
+    so the browser can start playing within ~300ms instead of waiting 1-2s
+    for the full file. GET form lets <audio src="/tts?text=..."> work directly."""
+    if request.method == "GET":
+        text  = (request.args.get("text") or "").strip()
+        voice = request.args.get("voice") or _DEFAULT_VOICE
+        rate  = request.args.get("rate", "+0%")
+    else:
+        data  = request.get_json(silent=True) or {}
+        text  = (data.get("text") or "").strip()
+        voice = data.get("voice") or _DEFAULT_VOICE
+        rate  = data.get("rate", "+0%")
     if not text:
         return jsonify({"error": "empty_text"}), 400
-    # Cap length to keep things fast
     if len(text) > 1500:
         text = text[:1500]
 
-    import asyncio
-    import io as _io
     try:
         import edge_tts
     except ImportError:
         return jsonify({"error": "edge_tts_not_installed"}), 503
 
-    async def synthesize():
-        communicate = edge_tts.Communicate(text, voice, rate=rate)
-        buf = _io.BytesIO()
-        async for chunk in communicate.stream():
-            if chunk["type"] == "audio":
-                buf.write(chunk["data"])
-        return buf.getvalue()
-
-    try:
-        audio = asyncio.run(synthesize())
-    except Exception as e:
-        log.warning(f"tts failed: {e}")
-        return jsonify({"error": f"tts_failed: {e}"}), 500
-
+    import asyncio
     from flask import Response
-    return Response(audio, mimetype="audio/mpeg",
-                    headers={"Cache-Control": "no-cache",
-                             "Content-Length": str(len(audio))})
+
+    # Bridge async edge_tts.stream() to a sync generator Flask can yield.
+    def stream_chunks():
+        loop = asyncio.new_event_loop()
+        try:
+            communicate = edge_tts.Communicate(text, voice, rate=rate)
+            it = communicate.stream().__aiter__()
+            while True:
+                try:
+                    chunk = loop.run_until_complete(it.__anext__())
+                except StopAsyncIteration:
+                    break
+                if chunk.get("type") == "audio":
+                    data = chunk.get("data")
+                    if data:
+                        yield data
+        except Exception as e:
+            log.warning(f"tts stream failed: {e}")
+        finally:
+            try: loop.close()
+            except Exception: pass
+
+    return Response(
+        stream_chunks(),
+        mimetype="audio/mpeg",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",  # disable proxy buffering
+        },
+    )
 
 @app.route("/api/voices", methods=["GET"])
 def list_voices():
@@ -682,6 +701,18 @@ def public_chat():
     messages = [m for m in history if m.get("role") in ("user", "assistant")][-10:]
     messages.append({"role": "user", "content": user_msg})
 
+    # Visitor rate limit — protect the LLM budget from runaway loops or
+    # malicious traffic. Identity = client IP for unauthenticated chat.
+    _visitor_ip = request.headers.get("X-Forwarded-For", request.remote_addr or "anon")
+    _rl_ok, _rl_used, _rl_cap = rate_limit.check_and_increment(_visitor_ip, role="visitor")
+    if not _rl_ok:
+        log.warning(f"public chat rate-limited: {_visitor_ip} {_rl_used}/{_rl_cap}")
+        return jsonify({
+            "reply": ("I've been quite busy today. Please try again in a little while, "
+                      "or leave your name and number and someone will reach out."),
+            "tier": "rate_limited", "latency_ms": 0,
+        })
+
     resp = llm_client.generate(CONFIG, system, messages)
 
     # LEARNING-LOOP TRIGGER — if Orbi's reply reads like "I don't know"
@@ -1003,6 +1034,100 @@ def owner_workspace_scan():
     auth.require_owner(ORBI_DIR)
     return jsonify(mod_workspace.scan(CONFIG, DATA_DIR))
 
+
+_ALLOWED_UPLOAD_EXTS = {
+    ".txt", ".md", ".csv", ".log", ".json", ".html", ".htm",
+    ".pdf", ".docx", ".xlsx",
+    ".png", ".jpg", ".jpeg", ".gif",
+}
+_MAX_UPLOAD_BYTES = 25 * 1024 * 1024  # 25 MB per file
+
+
+@app.route("/api/owner/workspace/upload", methods=["POST"])
+def owner_workspace_upload():
+    """Save uploaded files into the workspace folder and re-index. The owner's
+    files NEVER leave the local computer — they sit in workspace_path() on disk
+    and only get summarized into the index. Filenames are sanitized so a
+    malicious upload can't write outside the workspace folder."""
+    owner_session = auth.require_owner(ORBI_DIR)
+    files = request.files.getlist("files")
+    if not files:
+        return jsonify({"error": "no_files"}), 400
+
+    import re as _re
+    ws = mod_workspace.workspace_path(CONFIG)
+    ws.mkdir(parents=True, exist_ok=True)
+
+    saved = []
+    rejected = []
+    for f in files:
+        original = (f.filename or "").strip()
+        if not original:
+            continue
+        # Sanitize: keep basename only, strip any path components
+        base = os.path.basename(original.replace("\\", "/"))
+        # Strip leading dots and weird chars
+        safe = _re.sub(r"[^\w\s.\-()]+", "", base).strip(" .")
+        if not safe or safe.startswith("."):
+            rejected.append({"name": original, "reason": "invalid_filename"})
+            continue
+        suffix = Path(safe).suffix.lower()
+        if suffix not in _ALLOWED_UPLOAD_EXTS:
+            rejected.append({"name": original, "reason": f"unsupported_type ({suffix or 'no extension'})"})
+            continue
+        dest = ws / safe
+        # If a file with this name exists, append timestamp to avoid clobbering
+        if dest.exists():
+            stem, ext = dest.stem, dest.suffix
+            dest = ws / f"{stem}__{int(time.time())}{ext}"
+        try:
+            f.save(str(dest))
+            size = dest.stat().st_size
+            if size > _MAX_UPLOAD_BYTES:
+                dest.unlink(missing_ok=True)
+                rejected.append({"name": original, "reason": f"too_large ({size} bytes, max {_MAX_UPLOAD_BYTES})"})
+                continue
+            saved.append({"name": dest.name, "size": size})
+            log.info(f"workspace upload by {owner_session.get('username','?')}: "
+                     f"{dest.name} ({size} bytes)")
+        except Exception as e:
+            rejected.append({"name": original, "reason": f"save_failed: {e}"})
+
+    scan_result = mod_workspace.scan(CONFIG, DATA_DIR) if saved else {}
+    audit.log_event(DATA_DIR,
+                    actor=owner_session.get("username", "?"),
+                    action="workspace.upload",
+                    meta={"saved": [s["name"] for s in saved],
+                          "rejected": [r["name"] for r in rejected]})
+    return jsonify({
+        "status": "ok",
+        "saved": saved,
+        "rejected": rejected,
+        "indexed": scan_result.get("added", 0) + scan_result.get("updated", 0),
+    })
+
+
+@app.route("/api/owner/workspace/<path:filename>", methods=["DELETE"])
+def owner_workspace_delete(filename):
+    owner_session = auth.require_owner(ORBI_DIR)
+    import re as _re
+    # Sanitize same way as upload — no path traversal
+    safe = os.path.basename(filename.replace("\\", "/"))
+    safe = _re.sub(r"[^\w\s.\-()]+", "", safe).strip(" .")
+    if not safe:
+        return jsonify({"error": "invalid_name"}), 400
+    target = mod_workspace.workspace_path(CONFIG) / safe
+    if not target.exists():
+        return jsonify({"error": "not_found"}), 404
+    try:
+        target.unlink()
+        mod_workspace.scan(CONFIG, DATA_DIR)
+        audit.log_event(DATA_DIR, actor=owner_session.get("username","?"),
+                        action="workspace.delete", resource=safe)
+        return jsonify({"status": "ok"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/api/owner/change_password", methods=["POST"])
 def owner_change_password():
     owner_session = auth.require_owner(ORBI_DIR)
@@ -1169,6 +1294,19 @@ def owner_chat():
 
     messages = [m for m in history if m.get("role") in ("user", "assistant")][-20:]
     messages.append({"role": "user", "content": user_msg})
+
+    # Owner/staff rate limit — per-user daily cap protects the HF budget.
+    _rl_ok, _rl_used, _rl_cap = rate_limit.check_and_increment(
+        username, role=user_rec.get("role", "staff"))
+    if not _rl_ok:
+        log.warning(f"owner chat rate-limited: {username} {_rl_used}/{_rl_cap}")
+        return jsonify({
+            "reply": (f"Daily AI-chat limit reached ({_rl_used}/{_rl_cap}). "
+                      f"This protects your LLM budget from accidental loops. "
+                      f"Resets at midnight UTC. Fast-path commands "
+                      f"(tasks, calendar, contacts) still work."),
+            "tier": "rate_limited", "latency_ms": 0,
+        })
 
     resp = llm_client.generate(CONFIG, system, messages)
 

@@ -39,7 +39,7 @@
       display: block; font-size: 13px;
       color: #b8c6e0; margin-bottom: 6px;
     }
-    input[type="email"], input[type="password"] {
+    input[type="email"], input[type="text"], input[type="password"] {
       width: 100%; padding: 12px 14px;
       background: #0f1626; color: #eaf0ff;
       border: 1px solid #2c3957;
@@ -80,8 +80,10 @@
     <div id="error" class="error"></div>
 
     <form id="login-form">
-      <label for="email">Email</label>
-      <input type="email" id="email" name="email" required autocomplete="email">
+      <label for="username">Username or Email</label>
+      <input type="text" id="username" name="username" required autocomplete="username"
+             autocapitalize="off" autocorrect="off" spellcheck="false"
+             placeholder="frank, or your email">
 
       <label for="password">Password</label>
       <input type="password" id="password" name="password" required autocomplete="current-password">
@@ -104,18 +106,22 @@
       submitBtn.textContent = 'Signing in...';
 
       try {
+        // Backend accepts either {username} or {email} — send both so legacy
+        // single-owner installs and new multi-user installs both work.
+        const identifier = document.getElementById('username').value.trim();
         const res = await fetch('/api/owner/login', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            email: document.getElementById('email').value,
+            username: identifier,
+            email: identifier,
             password: document.getElementById('password').value
           })
         });
 
         if (!res.ok) {
           const data = await res.json().catch(() => ({}));
-          throw new Error(data.error || 'Invalid email or password');
+          throw new Error(data.error || 'Invalid username or password');
         }
 
         window.location.href = '/owner';

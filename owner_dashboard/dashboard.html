@@ -34,8 +34,9 @@
     <button class="tab" data-tab="chat">Ask Orbi</button>
     <button class="tab" data-tab="myday">My Day</button>
     <button class="tab" data-tab="contacts">Contacts</button>
+    <button class="tab" data-tab="files">Files</button>
     <button class="tab" data-tab="business">Business</button>
-    <button class="tab owner-only" data-tab="people" hidden>People</button>
+    <button class="tab owner-only" data-tab="people" hidden>Staff</button>
     <button class="tab" data-tab="settings">Settings</button>
   </nav>
 
@@ -85,13 +86,30 @@
         <div class="owner-chat-state-bar" id="owner-chat-state-bar" hidden></div>
 
         <div class="owner-chat-composer">
-          <textarea id="owner-chat-input" rows="1" placeholder="Ask Orbi..." autocomplete="off"></textarea>
+          <button class="voice-btn" id="owner-voice-toggle" aria-pressed="false"
+                  title="Voice mode (off) — tap to turn on, tap again to turn off">
+            <svg class="voice-icon-off" viewBox="0 0 24 24" width="28" height="28" fill="currentColor">
+              <path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2z"/>
+            </svg>
+            <svg class="voice-icon-on" viewBox="0 0 24 24" width="28" height="28" fill="currentColor">
+              <path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2z"/>
+              <circle cx="20" cy="6" r="3" fill="#ff5050"/>
+            </svg>
+            <span class="voice-label">Voice</span>
+          </button>
+          <textarea id="owner-chat-input" rows="1" placeholder="Ask Orbi (or tap Voice to talk)" autocomplete="off"></textarea>
+          <button class="stop-btn" id="owner-stop-speaking" aria-label="Stop speaking" title="Stop Orbi" hidden>
+            <svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor">
+              <rect x="6" y="6" width="12" height="12" rx="2"/>
+            </svg>
+          </button>
           <button class="send-btn" id="owner-chat-send" aria-label="Send" disabled>
             <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor">
               <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/>
             </svg>
           </button>
         </div>
+        <div class="owner-voice-state" id="owner-voice-state" hidden></div>
       </div>
     </section>
 
@@ -171,23 +189,52 @@
       </dialog>
     </section>
 
+    <!-- FILES TAB — drop docs/spreadsheets/pdfs for Orbi to read -->
+    <section class="tab-panel" id="tab-files">
+      <div class="toolbar">
+        <h2 style="margin:0">Workspace files</h2>
+        <button class="primary-btn" id="files-pick-btn">+ Upload</button>
+      </div>
+      <p class="muted" style="margin:4px 0 14px">
+        Drop spreadsheets, PDFs, letters, or notes here. Orbi reads the contents and
+        can answer questions about them in the Ask Orbi tab.
+        Supported: .txt, .md, .csv, .pdf, .docx, .xlsx, .html, .json, .log, images.
+      </p>
+
+      <div id="files-dropzone" class="files-dropzone">
+        <div class="files-dropzone-icon">⬇</div>
+        <div class="files-dropzone-title">Drag files here</div>
+        <div class="files-dropzone-sub">or click <strong>Upload</strong> to pick from your computer</div>
+        <input type="file" id="files-input" multiple
+               accept=".txt,.md,.csv,.log,.json,.html,.htm,.pdf,.docx,.xlsx,.png,.jpg,.jpeg,.gif"
+               style="display:none">
+      </div>
+
+      <div id="files-upload-status" class="files-upload-status" hidden></div>
+
+      <div id="files-list" class="files-list">
+        <div class="empty-state-small">Loading…</div>
+      </div>
+    </section>
+
     <!-- PEOPLE TAB (owner-only) -->
     <section class="tab-panel" id="tab-people">
       <div class="toolbar">
-        <h2 style="margin:0">Active users</h2>
-        <button class="primary-btn" id="people-add-btn">+ Add User</button>
+        <h2 style="margin:0">Active staff</h2>
+        <button class="primary-btn" id="people-add-btn">+ Add Staff Member</button>
       </div>
+      <p class="muted" style="margin:4px 0 12px">People who work for your business and need their own Orbi login (with their own private calendar, tasks, and contacts). Different from the Contacts tab, which is for customers and vendors.</p>
       <div id="people-active-list" class="people-list">
-        <div class="empty-state-small">Loading users…</div>
+        <div class="empty-state-small">Loading staff…</div>
       </div>
-      <h2 style="margin-top:24px">Archived users</h2>
-      <p class="muted" style="margin:4px 0 12px">Deactivated users' data is preserved for 90 days. Transfer anything you need, then it auto-purges.</p>
+      <h2 style="margin-top:24px">Archived staff</h2>
+      <p class="muted" style="margin:4px 0 12px">When someone leaves, their data is preserved for 90 days. Transfer anything you need (customer contacts, notes) before it auto-purges.</p>
       <div id="people-archived-list" class="people-list">
-        <div class="empty-state-small">No archived users.</div>
+        <div class="empty-state-small">No archived staff.</div>
       </div>
       <dialog id="user-dialog">
         <form method="dialog" id="user-form">
-          <h2>Add user</h2>
+          <h2>Add staff member</h2>
           <label>Username (lowercase, no spaces) <input type="text" name="username" required pattern="[a-z0-9_\-]+"></label>
           <label>Display name <input type="text" name="display_name"></label>
           <label>Temporary password <input type="text" name="password" required minlength="6"></label>
@@ -312,6 +359,30 @@
         <label class="checkbox">
           <input type="checkbox" name="owner_sms"> Text message (Phase 2)
         </label>
+      </div>
+
+      <div class="form-section">
+        <h2>Integrations</h2>
+        <p class="muted" style="margin:4px 0 14px">Connect Orbi to your other accounts so events flow both ways.</p>
+
+        <div class="integration-row" id="gcal-row">
+          <div class="integration-icon" aria-hidden="true">
+            <svg viewBox="0 0 32 32" width="28" height="28">
+              <rect x="3" y="6" width="26" height="22" rx="3" fill="#fff" stroke="#dadce0" stroke-width="1"/>
+              <rect x="3" y="6" width="26" height="6" rx="3" fill="#4285f4"/>
+              <text x="16" y="22" text-anchor="middle" font-size="11" font-weight="700" fill="#4285f4" font-family="Arial">31</text>
+            </svg>
+          </div>
+          <div class="integration-body">
+            <div class="integration-title">Google Calendar</div>
+            <div class="integration-status" id="gcal-status">Checking connection…</div>
+          </div>
+          <div class="integration-actions">
+            <button type="button" class="secondary-btn" id="gcal-sync-btn" hidden>Sync Now</button>
+            <button type="button" class="primary-btn" id="gcal-connect-btn">Connect</button>
+            <button type="button" class="secondary-btn" id="gcal-disconnect-btn" hidden>Disconnect</button>
+          </div>
+        </div>
       </div>
 
       <div class="form-section danger-zone">
