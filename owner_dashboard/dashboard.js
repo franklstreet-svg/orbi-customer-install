@@ -1748,6 +1748,128 @@
 
 
   // ==================================================================
+  // Settings → Public booking widget
+  // ==================================================================
+
+  async function loadBookingSettings() {
+    const enabled = document.getElementById('booking-enabled');
+    const urlRow  = document.getElementById('booking-url-row');
+    const urlIn   = document.getElementById('booking-url');
+    const dur     = document.getElementById('booking-duration');
+    const days    = document.getElementById('booking-days-ahead');
+    if (!enabled) return;
+    try {
+      const cfg = await api('/api/owner/booking/config');
+      enabled.checked = !!cfg.enabled;
+      dur.value  = cfg.duration_minutes || 30;
+      days.value = cfg.days_ahead || 14;
+      if (currentUsername) {
+        const origin = window.location.origin;
+        urlIn.value = `${origin}/book?u=${encodeURIComponent(currentUsername)}`;
+      }
+      urlRow.hidden = !cfg.enabled;
+    } catch (err) {
+      console.warn('booking config load failed', err);
+    }
+  }
+
+  function wireBookingSettings() {
+    const enabledEl = document.getElementById('booking-enabled');
+    const urlRow    = document.getElementById('booking-url-row');
+    const saveBtn   = document.getElementById('booking-save-btn');
+    const copyBtn   = document.getElementById('booking-copy-btn');
+    const statusEl  = document.getElementById('booking-save-status');
+    if (!enabledEl) return;
+
+    enabledEl.addEventListener('change', () => { urlRow.hidden = !enabledEl.checked; });
+    copyBtn?.addEventListener('click', async () => {
+      const urlIn = document.getElementById('booking-url');
+      try {
+        await navigator.clipboard.writeText(urlIn.value);
+        copyBtn.textContent = '✓ Copied';
+        setTimeout(() => { copyBtn.textContent = 'Copy'; }, 1500);
+      } catch { urlIn.select(); }
+    });
+    saveBtn?.addEventListener('click', async () => {
+      const payload = {
+        enabled: enabledEl.checked,
+        duration_minutes: parseInt(document.getElementById('booking-duration').value, 10) || 30,
+        days_ahead: parseInt(document.getElementById('booking-days-ahead').value, 10) || 14,
+      };
+      try {
+        await api('/api/owner/booking/config', {
+          method: 'PUT', body: JSON.stringify(payload),
+        });
+        statusEl.textContent = '✓ Saved';
+        statusEl.style.color = '#6fdc94';
+        setTimeout(() => { statusEl.textContent = ''; }, 2000);
+        loadBookingSettings();
+      } catch (err) {
+        statusEl.textContent = 'Save failed: ' + err.message;
+        statusEl.style.color = '#ffb0b0';
+      }
+    });
+    document.querySelectorAll('.tab').forEach(t => {
+      if (t.dataset.tab === 'settings') t.addEventListener('click', loadBookingSettings);
+    });
+    setTimeout(loadBookingSettings, 800);
+  }
+  document.addEventListener('DOMContentLoaded', wireBookingSettings);
+
+
+  // ==================================================================
+  // Settings → Style learner (refresh corpus + show status)
+  // ==================================================================
+
+  async function loadStyleStatus() {
+    const el = document.getElementById('style-status');
+    if (!el) return;
+    try {
+      const s = await api('/api/owner/style/status');
+      const count = s.count || 0;
+      const last  = s.last_indexed || s.last_refresh || '';
+      if (!count) {
+        el.innerHTML = 'No style corpus yet. Click below to read your sent emails and learn your voice. ' +
+                       '(Connect Gmail or Outlook in Integrations first.)';
+      } else {
+        el.innerHTML = `Corpus: <strong>${count}</strong> messages indexed` +
+                       (last ? ` · last refresh ${esc(last.slice(0,16).replace('T',' '))}` : '');
+      }
+    } catch (err) {
+      el.textContent = 'Style status unavailable.';
+    }
+  }
+
+  function wireStyleLearner() {
+    const btn = document.getElementById('style-refresh-btn');
+    const statusEl = document.getElementById('style-refresh-status');
+    if (!btn) return;
+    btn.addEventListener('click', async () => {
+      btn.disabled = true;
+      btn.textContent = 'Reading your sent mail…';
+      statusEl.textContent = '';
+      try {
+        const r = await api('/api/owner/style/refresh', { method: 'POST' });
+        statusEl.textContent = `✓ Indexed ${r.indexed || 0} messages`;
+        statusEl.style.color = '#6fdc94';
+        loadStyleStatus();
+      } catch (err) {
+        statusEl.textContent = 'Refresh failed: ' + err.message;
+        statusEl.style.color = '#ffb0b0';
+      } finally {
+        btn.disabled = false;
+        btn.textContent = '🎓 Refresh from my sent mail';
+      }
+    });
+    document.querySelectorAll('.tab').forEach(t => {
+      if (t.dataset.tab === 'settings') t.addEventListener('click', loadStyleStatus);
+    });
+    setTimeout(loadStyleStatus, 1000);
+  }
+  document.addEventListener('DOMContentLoaded', wireStyleLearner);
+
+
+  // ==================================================================
   // MORNING BRIEFING — banner at top of Messages tab
   // ==================================================================
 

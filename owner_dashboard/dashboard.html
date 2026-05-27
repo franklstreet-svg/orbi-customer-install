@@ -499,6 +499,41 @@
         </dialog>
       </div>
 
+      <!-- Public booking widget -->
+      <div class="form-section">
+        <h2>Public booking widget</h2>
+        <p class="muted" style="margin:4px 0 12px;font-size:13px">
+          Share this link with customers — they can pick a time from your calendar and book it themselves.
+          When they book, you get a notification and a calendar event.
+        </p>
+        <label class="checkbox" style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+          <input type="checkbox" id="booking-enabled">
+          <span>Allow public bookings</span>
+        </label>
+        <div id="booking-url-row" style="display:flex;align-items:center;gap:8px" hidden>
+          <input type="text" id="booking-url" readonly style="flex:1;background:#0b0f1a;border:1px solid #2c3957;color:#eaf0ff;border-radius:8px;padding:8px 12px;font-size:13px;font-family:monospace">
+          <button class="secondary-btn" id="booking-copy-btn">Copy</button>
+        </div>
+        <div class="row-2" style="margin-top:12px">
+          <label>Meeting length (minutes) <input type="number" id="booking-duration" min="15" max="180" step="15" value="30"></label>
+          <label>Days ahead to show <input type="number" id="booking-days-ahead" min="1" max="60" value="14"></label>
+        </div>
+        <button type="button" class="secondary-btn" id="booking-save-btn" style="margin-top:10px">Save booking settings</button>
+        <span class="save-status" id="booking-save-status"></span>
+      </div>
+
+      <!-- Style learner — train Orbi on your writing -->
+      <div class="form-section">
+        <h2>Train Orbi to write in your voice</h2>
+        <p class="muted" style="margin:4px 0 12px;font-size:13px">
+          Orbi reads your past sent emails (Gmail or Outlook must be connected) and learns your writing style.
+          When she drafts replies for you, she'll sound like you — same vocabulary, same warmth, same sign-offs.
+        </p>
+        <div id="style-status" class="muted" style="font-size:13px;margin-bottom:10px">Checking corpus…</div>
+        <button type="button" class="primary-btn" id="style-refresh-btn">🎓 Refresh from my sent mail</button>
+        <span class="save-status" id="style-refresh-status"></span>
+      </div>
+
       <div class="form-section danger-zone">
         <h2>Account</h2>
         <p class="muted">Tier: <strong id="tier-label">—</strong></p>
