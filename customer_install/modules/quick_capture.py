@@ -124,6 +124,26 @@ def capture(user_dir: Path, text: str) -> dict:
     m = _REMIND_SIMPLE_RE.match(text)
     if m:
         body = m.group(1).strip()
+        # Catch incomplete requests like "remind me to call Jeffrey at" —
+        # the user pressed send before typing the time. We only treat "at"
+        # and "on" as dangling because "in"/"to"/"by" are also natural at
+        # the end of verb phrases ("check in", "talk to", "drive by").
+        # Also bail when the body is empty or is only a stub preposition
+        # ("remind me to" gets parsed as body='to').
+        if (not body
+                or re.fullmatch(r"(to|at|on|in|by|for)", body, re.IGNORECASE)
+                or re.search(r"\b(at|on)\s*$", body, re.IGNORECASE)):
+            cleaned = re.sub(r"\b(at|on)\s*$", "", body, flags=re.IGNORECASE).strip()
+            if cleaned:
+                ask = f"Sure — what time should I remind you to {cleaned}?"
+            else:
+                ask = "What should I remind you about, and when?"
+            return {
+                "kind":    "reminder_needs_time",
+                "item":    None,
+                "summary": ask + (" (try 'at 4:45 today', 'tomorrow at 9 AM',"
+                                  " or 'in 30 minutes')"),
+            }
         due_iso = _default_tomorrow_9am()
         item = mod_reminders.add(user_dir, body, due_iso)
         return {"kind": "reminder", "item": item,
