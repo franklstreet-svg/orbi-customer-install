@@ -1503,6 +1503,14 @@ _PA_REMINDERS_RE = _re.compile(
 _PA_WHO_IS_RE = _re.compile(
     r"\bwho\s+is\s+(?P<name>[A-Z][a-zA-Z\-']+(?:\s+[A-Z][a-zA-Z\-']+){0,2})\b",
 )
+_PA_STAFF_RE = _re.compile(
+    # "who's on/in my staff", "show me my staff", "list my staff",
+    # "who works for me", "who are my employees", etc.
+    r"\b(?:who(?:'s|s| is| are)\s+(?:(?:on|in)\s+)?(?:my\s+)?(?:staff|employees|team)\b"
+    r"|(?:show|list|tell\s+me\s+about)\s+(?:me\s+)?(?:my\s+)?(?:staff|employees|team)\b"
+    r"|who\s+works\s+(?:for\s+me|here)\b)",
+    _re.IGNORECASE,
+)
 _PA_PHONE_OF_RE = _re.compile(
     r"\b(?:what(?:'s|s| is)?|find|get|look\s*up)\s+"
     r"(?P<name>[A-Z][a-zA-Z\-]+(?:\s+[A-Z][a-zA-Z\-]+){0,2})"
@@ -1612,6 +1620,23 @@ def _try_personal_assistant_read(message: str, user_dir: Path) -> str | None:
         return "Pending reminders:\n" + "\n".join(
             f"  - {r.get('due','')[:16].replace('T',' ')}  {r.get('text','')}" for r in items
         )
+
+    if _PA_STAFF_RE.search(message):
+        active = users_mod.list_users(DATA_DIR, include_archived=False)
+        archived = users_mod.list_archived(DATA_DIR)
+        if not active:
+            base = "You have no active staff right now — just you."
+            if archived:
+                names = ", ".join(u.get("display_name") or u.get("username", "")
+                                  for u in archived)
+                base += f" Archived: {names}."
+            return base
+        lines = []
+        for u in active:
+            name = u.get("display_name") or u.get("username", "")
+            role = u.get("role", "staff")
+            lines.append(f"  - {name} ({role})")
+        return f"Your active staff ({len(active)}):\n" + "\n".join(lines)
 
     m = _PA_PHONE_OF_RE.search(message)
     if m:
