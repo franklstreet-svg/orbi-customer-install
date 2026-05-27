@@ -1780,13 +1780,36 @@ def _try_office_gen(message: str, username: str) -> dict | None:
     return None
 
 
+_POLITE_PREFIX_RE = _re.compile(
+    r"^\s*(?:hey\s+orbi[,\s]+|orbi[,\s]+|"
+    r"(?:can|could|would|will)\s+you\s+(?:please\s+)?|"
+    r"please\s+|"
+    r"i\s+(?:want|need)\s+(?:you\s+)?to\s+|"
+    r"i'?d\s+like\s+(?:you\s+)?to\s+|"
+    r"no[,\s]+(?:i\s+(?:want|need|meant)\s+(?:you\s+)?to\s+|actually\s+)?|"
+    r"actually[,\s]+|wait[,\s]+)+",
+    _re.IGNORECASE,
+)
+
+
+def _strip_polite_prefix(message: str) -> str:
+    """Remove leading conversational openers so 'can you remind me to X'
+    matches the same fast-path as 'remind me to X'. Critical: without this
+    the request falls through to the LLM which then hallucinates that it
+    saved the reminder when it didn't."""
+    return _POLITE_PREFIX_RE.sub("", message or "", count=1).strip()
+
+
 def _try_quick_capture(message: str, user_dir: Path) -> dict | None:
     """If the message starts with a quick-capture trigger word, run it
     through quick_capture.capture() and return the result dict. Otherwise None."""
-    if not message or not _QC_TRIGGER_RE.match(message.strip()):
+    if not message:
+        return None
+    stripped = _strip_polite_prefix(message)
+    if not _QC_TRIGGER_RE.match(stripped):
         return None
     try:
-        return mod_qc.capture(user_dir, message)
+        return mod_qc.capture(user_dir, stripped)
     except Exception as e:
         log.warning(f"quick_capture failed: {e}")
         return None

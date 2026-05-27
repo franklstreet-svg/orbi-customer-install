@@ -48,6 +48,13 @@ _REMIND_RE = re.compile(
     r"(?:on\s+|at\s+|by\s+|in\s+)(?P<when>.+)$",
     re.IGNORECASE,
 )
+# Reversed order: "remind me at 5:45 to call Bill"
+_REMIND_AT_FIRST_RE = re.compile(
+    r"^(?:remind|nudge|ping)\s+me\s+"
+    r"(?:on\s+|at\s+|by\s+|in\s+|tomorrow\s+at\s+|today\s+at\s+)?(?P<when>.+?)\s+"
+    r"(?:to\s+)(?P<body>.+)$",
+    re.IGNORECASE,
+)
 _REMIND_END_TIME_RE = re.compile(
     r"^(?:remind|nudge|ping)\s+me\s+(?:to\s+)?(?P<body>.+?)\s+(?P<when>" + _TIME_WORDS + r")\s*$",
     re.IGNORECASE,
@@ -96,12 +103,20 @@ def capture(user_dir: Path, text: str) -> dict:
                 "summary": f"Added to your tasks: \"{item['text']}\""}
 
     # Try REMINDER — try the strict patterns first so we don't truncate.
-    # Order: explicit preposition > known time at end > simple fallback.
-    for pattern in (_REMIND_RE, _REMIND_END_TIME_RE):
+    # Order: time-first ("remind me at 5:45 to call") > explicit preposition
+    # > known time at end > simple fallback.
+    for pattern in (_REMIND_AT_FIRST_RE, _REMIND_RE, _REMIND_END_TIME_RE):
         m = pattern.match(text)
         if m:
             body = m.group("body").strip()
             when_phrase = m.group("when").strip()
+            # Body sometimes absorbs the day word: "call John tomorrow" + "1:00 p.m."
+            # Move trailing day-word from body into the front of when_phrase.
+            for day_word in ("tomorrow", "today", "tonight"):
+                if body.lower().endswith(" " + day_word):
+                    body = body[: -(len(day_word) + 1)].strip()
+                    when_phrase = day_word + " at " + when_phrase
+                    break
             due_iso = _parse_when(when_phrase) or _default_tomorrow_9am()
             item = mod_reminders.add(user_dir, body, due_iso)
             return {"kind": "reminder", "item": item,
@@ -194,9 +209,38 @@ def _save_quick_note(user_dir: Path, text: str) -> dict:
     return note
 
 
+_TIME_RE = re.compile(
+    r"^\s*(\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?|am|pm)?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _parse_clock(token: str, default_pm_if_low: bool = True) -> tuple[int, int] | None:
+    """Parse '5:45', '1:00 p.m.', '4:45 pm', '13:30', '5' into (hour, minute) 24h.
+    If no am/pm given and the hour is 1-7, assume PM (matches owner intent —
+    nobody says 'remind me at 5' meaning 5am). 8-12 with no suffix → AM."""
+    m = _TIME_RE.match(token or "")
+    if not m:
+        return None
+    hour = int(m.group(1))
+    minute = int(m.group(2) or 0)
+    suffix = (m.group(3) or "").lower().replace(".", "")
+    if hour > 23 or minute > 59:
+        return None
+    if suffix in ("am",):
+        if hour == 12: hour = 0
+    elif suffix in ("pm",):
+        if hour < 12: hour += 12
+    elif suffix == "" and hour < 12:
+        # No suffix — assume PM for hours 1-7 (typical business-day reminders).
+        if 1 <= hour <= 7 and default_pm_if_low:
+            hour += 12
+    return hour, minute
+
+
 def _parse_when(phrase: str) -> str | None:
-    """Lightweight natural-language → ISO. Handles a handful of common patterns,
-    bigger phrases fall through to None and the caller picks a default."""
+    """Lightweight natural-language → ISO. Returns None when nothing matches
+    so the caller can pick a default."""
     if not phrase:
         return None
     phrase = phrase.strip().lower().rstrip(".!?")
@@ -211,6 +255,16 @@ def _parse_when(phrase: str) -> str | None:
     if phrase == "next week":
         return (now + timedelta(days=7)).replace(hour=9, minute=0, second=0, microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
 
+    # "in N minutes/hours/days/weeks"
+    m_in = re.match(r"^(?:in\s+)?(\d+)\s*(min|minute|hour|hr|day|week)s?$", phrase)
+    if m_in:
+        n = int(m_in.group(1))
+        unit = m_in.group(2)
+        delta = {"min": timedelta(minutes=n), "minute": timedelta(minutes=n),
+                 "hour": timedelta(hours=n), "hr": timedelta(hours=n),
+                 "day": timedelta(days=n), "week": timedelta(weeks=n)}[unit]
+        return (now + delta).strftime("%Y-%m-%dT%H:%M:%SZ")
+
     weekdays = {"monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
                 "friday": 4, "saturday": 5, "sunday": 6}
     base = phrase.replace("on ", "").replace("next ", "").strip()
@@ -218,6 +272,37 @@ def _parse_when(phrase: str) -> str | None:
         target = weekdays[base]
         days_ahead = (target - now.weekday()) % 7 or 7
         return (now + timedelta(days=days_ahead)).replace(hour=9, minute=0, second=0, microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # Time-of-day phrases — "5:45", "1:00 p.m.", "4:45 today", "1pm tomorrow",
+    # "tomorrow at 1:00 p.m.", "today at 4:45".
+    day_offset = None  # None = decide from time-of-day (past → tomorrow, future → today)
+    time_part = phrase
+    # Strip leading/trailing day-words
+    for word, off in (("today ", 0), ("tomorrow ", 1), ("tonight ", 0)):
+        if time_part.startswith(word):
+            day_offset = off
+            time_part = time_part[len(word):].strip()
+            break
+    for word, off in ((" today", 0), (" tomorrow", 1), (" tonight", 0)):
+        if time_part.endswith(word):
+            day_offset = off
+            time_part = time_part[:-len(word)].strip()
+            break
+    # Allow "at 5:45" / "at 1:00 p.m."
+    if time_part.startswith("at "):
+        time_part = time_part[3:].strip()
+
+    clock = _parse_clock(time_part)
+    if clock is not None:
+        hour, minute = clock
+        if day_offset is None:
+            # Default to today if the target time is still in the future,
+            # else tomorrow. Matches how a human reads "remind me at 5:45".
+            target_today = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            day_offset = 0 if target_today > now + timedelta(minutes=2) else 1
+        target = (now + timedelta(days=day_offset)).replace(
+            hour=hour, minute=minute, second=0, microsecond=0)
+        return target.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     return None
 
