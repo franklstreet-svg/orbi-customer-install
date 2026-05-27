@@ -196,11 +196,11 @@ def verify_token(token: str) -> dict | None:
 # ---------------------------------------------------------------------------
 
 def setup_directories(install_dir: Path) -> None:
-    """Create /opt/orbi/{data,snapshots,llm_local,tunnel} (or platform-equiv).
+    """Create /opt/orbi/{data,snapshots,llm_local,tunnel,bin} (or platform-equiv).
     Idempotent — won't clobber existing data."""
     install_dir = Path(install_dir)
     install_dir.mkdir(parents=True, exist_ok=True)
-    for sub in ("data", "snapshots", "llm_local", "tunnel"):
+    for sub in ("data", "snapshots", "llm_local", "tunnel", "bin"):
         (install_dir / sub).mkdir(parents=True, exist_ok=True)
     # Lock down data dir on POSIX
     if not _SYS.startswith("win"):
@@ -208,7 +208,44 @@ def setup_directories(install_dir: Path) -> None:
             os.chmod(install_dir / "data", 0o700)
         except OSError as e:
             log.warning("chmod 700 on data/ failed: %s", e)
+    # Move any bundled binaries (ffmpeg, cloudflared) from the PyInstaller
+    # temp dir into install_dir/bin/ so they survive the installer exiting.
+    extract_bundled_binaries(install_dir / "bin")
     log.info("install dirs ready under %s", install_dir)
+
+
+def extract_bundled_binaries(bin_dir: Path) -> list[Path]:
+    """When run from a PyInstaller bundle, sys._MEIPASS/bin/ holds the
+    ffmpeg + cloudflared binaries we shipped at build time. Copy them
+    into the persistent install_dir/bin/ so the running Orbi process
+    can find them after the installer exits.
+
+    Returns the list of binaries successfully installed (so the caller
+    can write their paths into config.json)."""
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    out: list[Path] = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if not meipass:
+        log.info("not running from PyInstaller bundle — skipping binary extraction")
+        return out
+    src = Path(meipass) / "bin"
+    if not src.exists() or not src.is_dir():
+        log.info("no bin/ subdirectory in bundle — no bundled binaries to install")
+        return out
+    for f in src.iterdir():
+        if not f.is_file():
+            continue
+        dst = bin_dir / f.name
+        try:
+            import shutil
+            shutil.copy2(f, dst)
+            if not _SYS.startswith("win"):
+                dst.chmod(0o755)
+            out.append(dst)
+            log.info("installed bundled binary: %s", dst)
+        except OSError as e:
+            log.warning("could not install %s: %s", f.name, e)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -387,6 +424,8 @@ Type=simple
 User=orbi
 WorkingDirectory={install_dir}
 Environment=PYTHONUNBUFFERED=1
+Environment=ORBI_DIR={install_dir}
+Environment=PATH={install_dir}/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart={python} {install_dir}/orbi.py
 Restart=always
 RestartSec=5
@@ -449,6 +488,15 @@ _MAC_PLIST = """\
     </array>
     <key>WorkingDirectory</key>
     <string>{install_dir}</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>ORBI_DIR</key>
+        <string>{install_dir}</string>
+        <key>PATH</key>
+        <string>{install_dir}/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+    </dict>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>

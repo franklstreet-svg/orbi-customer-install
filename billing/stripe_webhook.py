@@ -343,27 +343,82 @@ def handle_checkout_completed(event: dict) -> None:
 
 def _send_install_email(email: str | None, install_token: str,
                         tier: str | None) -> None:
-    """Phase-1 stub: log what we WOULD send. Phase 2 wires this to Resend."""
+    """Send the install email via Resend's HTTPS API. Falls back to log-only
+    if RESEND_API_KEY is missing — so the system is never broken by a missing
+    secret, but Frank knows immediately what happened.
+
+    Why Resend: simple HTTPS POST, generous free tier (3k emails/month),
+    no SMTP config to wrangle, no DNS until you scale past 100/day."""
     if not email:
         print(f"[email] no address for token {install_token[:14]}... — skipping send")
         return
+
     download_url = f"{DOWNLOAD_BASE_URL.rstrip('/')}/download/{tier or 'standard'}"
-    msg = (
-        f"To: {email}\n"
-        f"Subject: Your Orbi install token\n"
-        f"\n"
-        f"Welcome to Orbi! Two things to do:\n"
-        f"\n"
-        f"1) Download the installer for your OS:\n"
-        f"   {download_url}\n"
-        f"\n"
-        f"2) When the installer asks for your install token, paste:\n"
-        f"   {install_token}\n"
-        f"\n"
-        f"The token is single-use. Don't share it.\n"
+    subject = "Your Orbi is ready — install token inside"
+    text = (
+        f"Welcome to Orbi!\n\n"
+        f"Two things to do:\n\n"
+        f"1) Download the installer for your operating system:\n"
+        f"   {download_url}\n\n"
+        f"2) When the installer asks for your install token, paste:\n\n"
+        f"   {install_token}\n\n"
+        f"The token is single-use. Don't share it — anyone with this token "
+        f"could install Orbi as you.\n\n"
+        f"Need help? Reply to this email.\n\n"
+        f"— Frank @ My Orbi AI Solutions"
     )
-    # In Phase 1 this goes to journald; Frank can read it and forward manually.
-    print(f"[email-stub] would send to {email}:\n{msg}")
+    html = (
+        f'<div style="font-family:system-ui,-apple-system,sans-serif;font-size:15px;line-height:1.6;color:#1a2236">'
+        f'<h2 style="color:#4f8cff;margin-bottom:6px">Welcome to Orbi 🎉</h2>'
+        f'<p>Two quick steps to get you live:</p>'
+        f'<p><strong>1.</strong> Download the installer for your operating system:<br>'
+        f'<a href="{download_url}" style="display:inline-block;margin-top:6px;background:linear-gradient(135deg,#4f8cff,#8b5cf6);color:#fff;text-decoration:none;padding:10px 18px;border-radius:8px;font-weight:600">Download Orbi installer</a></p>'
+        f'<p><strong>2.</strong> When the installer asks for your install token, paste this:</p>'
+        f'<pre style="background:#0b0f1a;color:#eaf0ff;padding:14px;border-radius:8px;font-size:14px;'
+        f'word-break:break-all">{install_token}</pre>'
+        f'<p style="color:#666;font-size:13px">The token is single-use — anyone with it could install '
+        f'Orbi as you, so keep it private.</p>'
+        f'<p style="color:#666;font-size:13px;margin-top:20px">Need help? Just reply to this email.</p>'
+        f'<p style="color:#888;font-size:12px;margin-top:24px">— Frank @ My Orbi AI Solutions</p>'
+        f'</div>'
+    )
+
+    api_key = os.environ.get("RESEND_API_KEY", "").strip()
+    if not api_key:
+        print(f"[email] RESEND_API_KEY not set — would send to {email}:")
+        print(text)
+        return
+
+    from_addr = os.environ.get("ORBI_FROM_EMAIL",
+                                "Orbi <welcome@orbiaisolutions.com>")
+    payload = {
+        "from":    from_addr,
+        "to":      [email],
+        "subject": subject,
+        "text":    text,
+        "html":    html,
+        "tags":    [{"name": "kind", "value": "install_token"},
+                    {"name": "tier", "value": tier or "standard"}],
+    }
+    try:
+        import json as _json
+        import urllib.request
+        req = urllib.request.Request(
+            "https://api.resend.com/emails",
+            data=_json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type":  "application/json",
+                "User-Agent":    "Orbi-Billing/0.1",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+            print(f"[email] Resend OK for {email}: {body[:200]}")
+    except Exception as e:
+        print(f"[email] Resend FAILED for {email}: {e}")
+        print(f"[email] falling back to log so the token isn't lost:\n{text}")
 
 def handle_subscription_updated(event: dict) -> None:
     """Subscription renewed, downgraded, upgraded, or canceled."""

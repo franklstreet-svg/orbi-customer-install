@@ -99,8 +99,11 @@ def _clean() -> None:
             log.info("removed %s", d)
 
 
-def _pyinstaller_cmd(out_subdir: Path, name: str = "orbi-installer") -> list:
-    """Common PyInstaller args used for all three targets."""
+def _pyinstaller_cmd(out_subdir: Path, name: str = "orbi-installer",
+                     bundled_bins: list[Path] | None = None) -> list:
+    """Common PyInstaller args used for all three targets.
+    `bundled_bins` is a list of already-downloaded binaries (ffmpeg,
+    cloudflared) to ship inside the installer for the target platform."""
     cmd = [
         sys.executable, "-m", "PyInstaller",
         "--onefile",
@@ -122,8 +125,130 @@ def _pyinstaller_cmd(out_subdir: Path, name: str = "orbi-installer") -> list:
             f"{CUSTOMER_INSTALL / 'users.py'}{sep}."]
     cmd += ["--add-data",
             f"{CUSTOMER_INSTALL / 'auth.py'}{sep}."]
+    # Ship the helper binaries (ffmpeg + cloudflared) so the customer gets
+    # a self-contained install with no internet needed at install time.
+    for binpath in bundled_bins or []:
+        if binpath and binpath.exists():
+            cmd += ["--add-binary", f"{binpath}{sep}bin"]
     cmd.append(str(RUNTIME_ENTRY))
     return cmd
+
+
+# ---------------------------------------------------------------------------
+# Bundle helper binaries — ffmpeg + cloudflared, per platform
+# ---------------------------------------------------------------------------
+
+BIN_CACHE = HERE / "_bin_cache"
+
+# Static binary sources we trust:
+#   ffmpeg     — johnvansickle (Linux), evermeet.cx (Mac), gyan.dev (Windows)
+#   cloudflared — Cloudflare's own GitHub releases (every platform)
+_BINARY_SOURCES = {
+    "linux": {
+        "ffmpeg":      "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz",
+        "cloudflared": "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64",
+    },
+    "darwin": {
+        "ffmpeg":      "https://evermeet.cx/ffmpeg/getrelease/zip",
+        "cloudflared": "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-amd64.tgz",
+    },
+    "windows": {
+        "ffmpeg":      "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip",
+        "cloudflared": "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe",
+    },
+}
+
+
+def _download(url: str, dest: Path) -> Path:
+    """Download a URL to dest with a friendly progress log. Idempotent —
+    if dest already exists, no re-download."""
+    if dest.exists() and dest.stat().st_size > 1024:
+        log.info("cached: %s (%.1f MB)", dest.name, dest.stat().st_size / 1_000_000)
+        return dest
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    log.info("downloading %s → %s", url, dest)
+    import urllib.request
+    req = urllib.request.Request(url, headers={"User-Agent": "Orbi-Build/0.1"})
+    with urllib.request.urlopen(req, timeout=120) as resp, dest.open("wb") as fp:
+        shutil.copyfileobj(resp, fp)
+    log.info("got %s (%.1f MB)", dest.name, dest.stat().st_size / 1_000_000)
+    return dest
+
+
+def _extract_binary(archive: Path, target_name: str, out_dir: Path) -> Path | None:
+    """Pull a single named executable out of a downloaded archive
+    (tar.xz / zip / tgz). Returns the extracted path or None."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    name_lower = target_name.lower()
+    extracted: Path | None = None
+    suffix = archive.suffix.lower()
+    if suffix in (".xz", ".tar", ".gz", ".tgz"):
+        import tarfile
+        with tarfile.open(archive) as tar:
+            for member in tar.getmembers():
+                base = Path(member.name).name.lower()
+                if base == name_lower or base == name_lower + ".exe":
+                    tar.extract(member, out_dir)
+                    extracted = out_dir / member.name
+                    break
+    elif suffix == ".zip":
+        import zipfile
+        with zipfile.ZipFile(archive) as z:
+            for member in z.namelist():
+                base = Path(member).name.lower()
+                if base == name_lower + ".exe" or base == name_lower:
+                    z.extract(member, out_dir)
+                    extracted = out_dir / member
+                    break
+    elif archive.is_file():
+        # Already a bare executable — copy + rename so the bundled file
+        # has the canonical name.
+        out_name = target_name + (".exe" if archive.name.endswith(".exe") else "")
+        dst = out_dir / out_name
+        shutil.copy2(archive, dst)
+        extracted = dst
+    if extracted and extracted.exists():
+        try:
+            extracted.chmod(0o755)
+        except OSError:
+            pass
+        # Normalize the filename to plain "ffmpeg" / "cloudflared" (+ .exe on Windows)
+        norm = target_name + (".exe" if extracted.suffix.lower() == ".exe" else "")
+        normalized = out_dir / norm
+        if extracted != normalized:
+            shutil.move(str(extracted), str(normalized))
+            extracted = normalized
+    return extracted
+
+
+def fetch_platform_binaries(target: str) -> list[Path]:
+    """Download ffmpeg + cloudflared for `target` (linux/darwin/windows)
+    and return the list of paths PyInstaller should --add-binary in."""
+    if target not in _BINARY_SOURCES:
+        log.warning("no binary sources defined for %s — skipping bundling", target)
+        return []
+    target_cache = BIN_CACHE / target
+    target_cache.mkdir(parents=True, exist_ok=True)
+    out: list[Path] = []
+    for tool, url in _BINARY_SOURCES[target].items():
+        try:
+            # Download to a deterministic filename based on the URL extension
+            from urllib.parse import urlparse
+            url_path = urlparse(url).path
+            ext = Path(url_path).suffix or ".bin"
+            archive = target_cache / f"_dl_{tool}{ext}"
+            _download(url, archive)
+            binpath = _extract_binary(archive, tool, target_cache)
+            if binpath:
+                out.append(binpath)
+                log.info("✓ bundling %s for %s: %s", tool, target, binpath.name)
+            else:
+                log.warning("could not extract %s from %s", tool, archive)
+        except Exception as e:
+            log.warning("failed to fetch %s for %s: %s — installer will work, "
+                        "but the customer's machine needs %s installed manually",
+                        tool, target, e, tool)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -135,7 +260,8 @@ def build_windows() -> Path:
     out = DIST_DIR / "windows"
     out.mkdir(parents=True, exist_ok=True)
     _ensure_pyinstaller()
-    cmd = _pyinstaller_cmd(out, name="orbi-installer")
+    bins = fetch_platform_binaries("windows")
+    cmd = _pyinstaller_cmd(out, name="orbi-installer", bundled_bins=bins)
     _run(cmd)
     exe = out / "orbi-installer.exe"
     if not exe.exists():
@@ -158,7 +284,8 @@ def build_mac() -> Path:
     out.mkdir(parents=True, exist_ok=True)
     _ensure_pyinstaller()
     # Stage 1: PyInstaller binary
-    _run(_pyinstaller_cmd(out, name="orbi-installer"))
+    bins = fetch_platform_binaries("darwin")
+    _run(_pyinstaller_cmd(out, name="orbi-installer", bundled_bins=bins))
     binary = out / "orbi-installer"
     if not binary.exists():
         raise RuntimeError("PyInstaller did not produce orbi-installer")
@@ -213,7 +340,8 @@ def build_linux() -> Path:
     out = DIST_DIR / "linux"
     out.mkdir(parents=True, exist_ok=True)
     _ensure_pyinstaller()
-    _run(_pyinstaller_cmd(out, name="orbi-installer"))
+    bins = fetch_platform_binaries("linux")
+    _run(_pyinstaller_cmd(out, name="orbi-installer", bundled_bins=bins))
     binary = out / "orbi-installer"
     if not binary.exists():
         raise RuntimeError("PyInstaller did not produce orbi-installer")

@@ -33,6 +33,33 @@ From then on, the install pings /api/active/<api_key> hourly
 - The token is minted inside `handle_checkout_completed()` and stored in `installs.json` (single JSON file, atomic writes, threading.Lock).
 - Tokens are `inst_` + 32 hex chars (37 chars total).
 
+## Sending the install email (Resend)
+
+When `RESEND_API_KEY` is set in the environment, the install email goes out via Resend's HTTPS API:
+
+```bash
+export RESEND_API_KEY="re_..."          # from resend.com/api-keys
+export ORBI_FROM_EMAIL="Orbi <welcome@orbiaisolutions.com>"
+```
+
+If `RESEND_API_KEY` is unset, the email is logged to stdout/journald instead — so a missing secret never silently drops the install token. Frank can read the journal, copy the token, and forward by hand.
+
+### Why Resend (the engineering call):
+
+- **Free tier covers 3,000 emails/month** — enough for the first hundred customers
+- **Single HTTPS POST**, no SMTP server / DNS dance for the first 100/day
+- **Built-in retries + bounce handling** so we don't have to
+- **HTML + plain-text** delivered in one call
+- Alternatives considered: AWS SES (cheaper at scale but requires DNS + sandbox-exit), Postmark (great deliverability but $15/mo minimum), SendGrid (older API). Resend wins on developer experience and time-to-shipping.
+
+### To set up Resend (one-time, ~5 min):
+
+1. Sign up at resend.com (free)
+2. Add your sending domain (`orbiaisolutions.com`) — copy the 3 DNS records they show you into Cloudflare under that zone
+3. Wait ~5 minutes for DNS to propagate, click "Verify" on Resend
+4. Generate an API key, set `RESEND_API_KEY` in `/etc/orbi-brain/stripe.env`
+5. Restart the systemd unit — `sudo systemctl restart stripe-webhook`
+
 ## Install on the brain machine
 
 ```bash
