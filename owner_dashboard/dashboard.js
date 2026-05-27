@@ -768,18 +768,40 @@
   // CONTACTS tab
   // ==================================================================
 
+  // Module-scoped state for contact selection (used by mail-merge)
+  const selectedContactIds = new Set();
+  let lastLoadedContacts = [];
+
+  function updateMergeButton() {
+    const btn = document.getElementById('contacts-merge-btn');
+    if (!btn) return;
+    const n = selectedContactIds.size;
+    btn.textContent = `📨 Mail merge (${n})`;
+    btn.disabled = n === 0;
+  }
+
   async function loadContacts(query = '') {
     const list = document.getElementById('contacts-list');
     try {
       const { contacts } = await api(`/api/owner/pa/contacts${query ? '?q=' + encodeURIComponent(query) : ''}`);
+      lastLoadedContacts = contacts || [];
+      // Prune selections that no longer exist in the visible list
+      const visibleIds = new Set(lastLoadedContacts.map(c => String(c.id)));
+      for (const id of [...selectedContactIds]) {
+        if (!visibleIds.has(String(id))) selectedContactIds.delete(id);
+      }
       if (!contacts.length) {
         list.innerHTML = `<div class="empty-state-small">${query ? 'No matches' : 'No contacts yet'}</div>`;
+        updateMergeButton();
         return;
       }
-      list.innerHTML = contacts.map(c => `
+      list.innerHTML = contacts.map(c => {
+        const checked = selectedContactIds.has(String(c.id)) ? 'checked' : '';
+        return `
         <div class="contact-card" data-id="${esc(c.id)}">
+          <input type="checkbox" class="contact-select" data-id="${esc(c.id)}" ${checked} title="Select for mail merge">
           <div class="contact-main">
-            <div class="contact-name">${esc(c.name)}${c.company ? ` <span class="muted">— ${esc(c.company)}</span>` : ''}</div>
+            <div class="contact-name" data-action="contact-open" data-id="${esc(c.id)}" title="View thread">${esc(c.name)}${c.company ? ` <span class="muted">— ${esc(c.company)}</span>` : ''}</div>
             <div class="contact-meta">
               ${c.phone ? `<span>${esc(c.phone)}</span>` : ''}
               ${c.email ? `<span>${esc(c.email)}</span>` : ''}
@@ -788,16 +810,44 @@
             ${c.notes ? `<div class="contact-notes">${esc(c.notes)}</div>` : ''}
           </div>
           <button class="icon-btn-sm" data-action="contact-delete" title="Remove">×</button>
-        </div>
-      `).join('');
+        </div>`;
+      }).join('');
+
       list.querySelectorAll('[data-action="contact-delete"]').forEach(btn => {
         btn.addEventListener('click', async (e) => {
           const id = e.target.closest('[data-id]').dataset.id;
           if (!confirm('Remove this contact?')) return;
           await api(`/api/owner/pa/contacts/${id}`, { method: 'DELETE' });
+          selectedContactIds.delete(String(id));
           loadContacts(document.getElementById('contacts-search').value);
         });
       });
+
+      list.querySelectorAll('[data-action="contact-open"]').forEach(el => {
+        el.addEventListener('click', (e) => {
+          const id = e.currentTarget.dataset.id;
+          openThreadDialog(id);
+        });
+      });
+
+      list.querySelectorAll('.contact-select').forEach(cb => {
+        cb.addEventListener('click', (e) => e.stopPropagation());
+        cb.addEventListener('change', (e) => {
+          const id = String(e.target.dataset.id);
+          if (e.target.checked) selectedContactIds.add(id);
+          else selectedContactIds.delete(id);
+          updateMergeButton();
+          // Sync "select all"
+          const sa = document.getElementById('contacts-select-all');
+          if (sa) {
+            const all = list.querySelectorAll('.contact-select');
+            const checkedEls = list.querySelectorAll('.contact-select:checked');
+            sa.checked = all.length > 0 && all.length === checkedEls.length;
+          }
+        });
+      });
+
+      updateMergeButton();
     } catch (err) {
       list.innerHTML = `<div class="empty-state-small">Couldn't load contacts</div>`;
     }
@@ -827,6 +877,26 @@
       document.getElementById('contact-dialog').close();
       loadContacts(document.getElementById('contacts-search').value);
     });
+
+    // Select-all toggles every visible checkbox
+    document.getElementById('contacts-select-all')?.addEventListener('change', (e) => {
+      const checked = e.target.checked;
+      document.querySelectorAll('#contacts-list .contact-select').forEach(cb => {
+        cb.checked = checked;
+        const id = String(cb.dataset.id);
+        if (checked) selectedContactIds.add(id);
+        else selectedContactIds.delete(id);
+      });
+      updateMergeButton();
+    });
+
+    // Open merge dialog
+    document.getElementById('contacts-merge-btn')?.addEventListener('click', () => {
+      if (selectedContactIds.size === 0) return;
+      openMergeDialog();
+    });
+
+    wireMailMerge();
   }
 
   // ==================================================================
@@ -2117,4 +2187,774 @@
       .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
       .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   }
+
+
+  // ==================================================================
+  // FILES TAB — content generation tools (chart, pptx, image, translate)
+  // ==================================================================
+
+  function showToolResult(el, html, kind) {
+    if (!el) return;
+    el.hidden = false;
+    el.className = 'tool-result' + (kind ? ' tool-result-' + kind : '');
+    el.innerHTML = html;
+  }
+
+  function busyButton(btn, label) {
+    btn.disabled = true;
+    btn.dataset.originalLabel = btn.dataset.originalLabel || btn.textContent;
+    btn.textContent = label;
+  }
+
+  function resetButton(btn, label) {
+    btn.disabled = false;
+    btn.textContent = label || btn.dataset.originalLabel || btn.textContent;
+  }
+
+  function wireToolButtons() {
+    const chartBtn = document.getElementById('tool-chart-btn');
+    const pptxBtn  = document.getElementById('tool-pptx-btn');
+    const imageBtn = document.getElementById('tool-image-btn');
+    const transBtn = document.getElementById('tool-translate-btn');
+    if (!chartBtn) return; // not on this page
+
+    chartBtn.addEventListener('click', () => openToolDialog('chart-dialog', 'chart-result', 'chart-request'));
+    pptxBtn .addEventListener('click', () => openToolDialog('pptx-dialog',  'pptx-result',  'pptx-topic'));
+    imageBtn.addEventListener('click', () => openToolDialog('image-dialog', 'image-result', 'image-prompt'));
+    transBtn.addEventListener('click', () => {
+      openToolDialog('translate-dialog', 'translate-result', 'translate-source');
+      const rt = document.getElementById('translate-result-text');
+      if (rt) rt.value = '';
+    });
+
+    wireChartForm();
+    wirePptxForm();
+    wireImageForm();
+    wireTranslateForm();
+  }
+
+  function openToolDialog(dlgId, resultId, focusId) {
+    const dlg = document.getElementById(dlgId);
+    const result = document.getElementById(resultId);
+    if (result) { result.hidden = true; result.innerHTML = ''; }
+    if (dlg) dlg.showModal();
+    const f = focusId && document.getElementById(focusId);
+    if (f) setTimeout(() => f.focus(), 50);
+  }
+
+  function wireChartForm() {
+    const form = document.getElementById('chart-form');
+    if (!form) return;
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const btn = document.getElementById('chart-go');
+      const result = document.getElementById('chart-result');
+      const request = (document.getElementById('chart-request').value || '').trim();
+      if (!request) return;
+      busyButton(btn, 'Working…');
+      showToolResult(result, '<span style="color:#4f8cff">Generating chart…</span>');
+      try {
+        const data = await api('/api/owner/chart/from_request', {
+          method: 'POST',
+          body: JSON.stringify({ request }),
+        });
+        const url = data.download_url || '';
+        const name = data.filename || 'chart.png';
+        showToolResult(result,
+          `<div style="color:#6fdc94">✓ Chart ready</div>`
+          + (url ? `<img class="tool-preview-img" src="${esc(url)}" alt="chart preview">` : '')
+          + (url ? `<a href="${esc(url)}" download="${esc(name)}" class="tool-download-link">⬇ Download ${esc(name)}</a>` : '')
+        , 'ok');
+        resetButton(btn, 'Generate another');
+        loadFiles && loadFiles();
+      } catch (err) {
+        showToolResult(result, `<span style="color:#ffb0b0">✗ ${esc(err.message)}</span>`, 'err');
+        resetButton(btn, 'Try again');
+      }
+    });
+  }
+
+  function wirePptxForm() {
+    const form = document.getElementById('pptx-form');
+    if (!form) return;
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const btn = document.getElementById('pptx-go');
+      const result = document.getElementById('pptx-result');
+      const topic = (document.getElementById('pptx-topic').value || '').trim();
+      const slide_count = parseInt(document.getElementById('pptx-slides').value, 10) || 7;
+      const theme = document.getElementById('pptx-theme').value || 'modern';
+      if (!topic) return;
+      busyButton(btn, 'Working… (10-30s)');
+      showToolResult(result, '<span style="color:#4f8cff">Writing outline and building slides…</span>');
+      try {
+        const data = await api('/api/owner/pptx/build', {
+          method: 'POST',
+          body: JSON.stringify({ topic, slide_count, theme }),
+        });
+        const url = data.download_url || '';
+        const name = data.filename || 'deck.pptx';
+        const outline = Array.isArray(data.outline) ? data.outline : [];
+        const outlineHtml = outline.length
+          ? `<ol class="tool-outline">${outline.map(s => `<li>${esc(s)}</li>`).join('')}</ol>`
+          : '';
+        showToolResult(result,
+          `<div style="color:#6fdc94">✓ ${data.slide_count || slide_count} slides built</div>`
+          + outlineHtml
+          + (url ? `<a href="${esc(url)}" download="${esc(name)}" class="tool-download-link">⬇ Download ${esc(name)}</a>` : '')
+        , 'ok');
+        resetButton(btn, 'Build another');
+        loadFiles && loadFiles();
+      } catch (err) {
+        showToolResult(result, `<span style="color:#ffb0b0">✗ ${esc(err.message)}</span>`, 'err');
+        resetButton(btn, 'Try again');
+      }
+    });
+  }
+
+  function wireImageForm() {
+    const form = document.getElementById('image-form');
+    if (!form) return;
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const btn = document.getElementById('image-go');
+      const result = document.getElementById('image-result');
+      const prompt = (document.getElementById('image-prompt').value || '').trim();
+      const kind = document.getElementById('image-kind').value || 'social_post';
+      if (!prompt) return;
+      busyButton(btn, 'Working… (can be slow)');
+      showToolResult(result, '<span style="color:#4f8cff">Generating image…</span>');
+      try {
+        const data = await api('/api/owner/image_gen', {
+          method: 'POST',
+          body: JSON.stringify({ prompt, kind }),
+        });
+        const url = data.download_url || '';
+        const name = data.filename || 'image.png';
+        showToolResult(result,
+          `<div style="color:#6fdc94">✓ Image ready</div>`
+          + (url ? `<img class="tool-preview-img" src="${esc(url)}" alt="generated image">` : '')
+          + (url ? `<a href="${esc(url)}" download="${esc(name)}" class="tool-download-link">⬇ Download ${esc(name)}</a>` : '')
+        , 'ok');
+        resetButton(btn, 'Generate another');
+        loadFiles && loadFiles();
+      } catch (err) {
+        showToolResult(result, `<span style="color:#ffb0b0">✗ ${esc(err.message)}</span>`, 'err');
+        resetButton(btn, 'Try again');
+      }
+    });
+  }
+
+  function wireTranslateForm() {
+    const form = document.getElementById('translate-form');
+    if (!form) return;
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const btn = document.getElementById('translate-go');
+      const result = document.getElementById('translate-result');
+      const out = document.getElementById('translate-result-text');
+      const text = (document.getElementById('translate-source').value || '').trim();
+      const target_lang = document.getElementById('translate-target').value || 'es';
+      if (!text) return;
+      busyButton(btn, 'Translating…');
+      if (out) out.value = '';
+      showToolResult(result, '<span style="color:#4f8cff">Translating…</span>');
+      try {
+        const data = await api('/api/owner/translate', {
+          method: 'POST',
+          body: JSON.stringify({ text, target_lang }),
+        });
+        const translated = data.translated || '';
+        if (out) out.value = translated;
+        showToolResult(result,
+          `<div style="color:#6fdc94">✓ Translated to ${esc(target_lang)}</div>`
+        , 'ok');
+        resetButton(btn, 'Translate again');
+      } catch (err) {
+        showToolResult(result, `<span style="color:#ffb0b0">✗ ${esc(err.message)}</span>`, 'err');
+        resetButton(btn, 'Try again');
+      }
+    });
+  }
+
+  document.addEventListener('DOMContentLoaded', wireToolButtons);
+
+  // ==================================================================
+  // CUSTOMER THREAD dialog + MAIL MERGE dialog
+  // ==================================================================
+
+  // Relative-time formatter.
+  // Accepts ISO 8601 strings, JS Date objects, or unix timestamps (sec or ms).
+  // Returns "just now", "5 min ago", "2 hours ago", "yesterday", "3 days ago",
+  // "last week", "2 weeks ago", or a compact date for items > ~45 days.
+  function relTime(input) {
+    if (input == null || input === '') return '';
+    let ts;
+    if (input instanceof Date) ts = input.getTime();
+    else if (typeof input === 'number') ts = input < 1e12 ? input * 1000 : input;
+    else {
+      const parsed = Date.parse(input);
+      if (isNaN(parsed)) return String(input);
+      ts = parsed;
+    }
+    const now = Date.now();
+    const diff = now - ts;            // ms, +ve = past
+    const abs = Math.abs(diff);
+    const sec = 1000, min = 60*sec, hour = 60*min, day = 24*hour, week = 7*day;
+    const future = diff < 0;
+
+    if (abs < 45*sec) return future ? 'in a moment' : 'just now';
+    if (abs < 90*sec) return future ? 'in 1 min' : '1 min ago';
+    if (abs < 45*min) {
+      const m = Math.round(abs/min);
+      return future ? `in ${m} min` : `${m} min ago`;
+    }
+    if (abs < 90*min) return future ? 'in 1 hour' : '1 hour ago';
+    if (abs < 22*hour) {
+      const h = Math.round(abs/hour);
+      return future ? `in ${h} hours` : `${h} hours ago`;
+    }
+    if (abs < 36*hour) return future ? 'tomorrow' : 'yesterday';
+    if (abs < 7*day) {
+      const d = Math.round(abs/day);
+      return future ? `in ${d} days` : `${d} days ago`;
+    }
+    if (abs < 2*week) return future ? 'next week' : 'last week';
+    if (abs < 45*day) {
+      const w = Math.round(abs/week);
+      return future ? `in ${w} weeks` : `${w} weeks ago`;
+    }
+    // Older: compact date; add year only if not current year.
+    const d = new Date(ts);
+    const sameYear = d.getFullYear() === new Date().getFullYear();
+    return d.toLocaleDateString(undefined, sameYear
+      ? { month: 'short', day: 'numeric' }
+      : { month: 'short', day: 'numeric', year: 'numeric' });
+  }
+
+  const THREAD_ICONS = {
+    call:     '📞',
+    voicemail:'📞',
+    email:    '✉',
+    chat:     '💬',
+    sms:      '💬',
+    message:  '💬',
+    calendar: '📅',
+    event:    '📅',
+    booking:  '📅',
+    payment:  '💳',
+    order:    '💳',
+    invoice:  '💳',
+    note:     '📝',
+    task:     '📝',
+  };
+
+  function threadIconFor(kind) {
+    const k = String(kind || '').toLowerCase();
+    return THREAD_ICONS[k] || '•';
+  }
+
+  async function openThreadDialog(contactId) {
+    const dlg = document.getElementById('thread-dialog');
+    const nameEl = document.getElementById('thread-name');
+    const sumEl  = document.getElementById('thread-summary');
+    const evEl   = document.getElementById('thread-events');
+    if (!dlg) return;
+    nameEl.textContent = '—';
+    sumEl.textContent  = 'Loading…';
+    evEl.innerHTML     = '<div class="empty-state-small">Loading timeline…</div>';
+    if (typeof dlg.showModal === 'function') dlg.showModal();
+    else dlg.setAttribute('open', '');
+
+    try {
+      const data = await api(`/api/owner/customer_thread/${encodeURIComponent(contactId)}`);
+      const contact = data.contact || {};
+      const events  = Array.isArray(data.events) ? data.events : [];
+      nameEl.textContent = contact.name || contact.email || contact.phone || 'Contact';
+      const subBits = [];
+      if (contact.company) subBits.push(esc(contact.company));
+      if (contact.email)   subBits.push(esc(contact.email));
+      if (contact.phone)   subBits.push(esc(contact.phone));
+      sumEl.innerHTML = data.summary
+        ? esc(data.summary)
+        : (subBits.length ? subBits.join(' • ') : `${events.length} events`);
+
+      if (!events.length) {
+        evEl.innerHTML = '<div class="empty-state-small">No history yet for this contact.</div>';
+        return;
+      }
+      evEl.innerHTML = events.map(ev => {
+        const kind = String(ev.kind || ev.type || 'note').toLowerCase();
+        const icon = threadIconFor(kind);
+        const when = ev.when || ev.timestamp || ev.created_at || ev.date || ev.ts;
+        const title = ev.title || ev.subject || ev.summary || ev.headline ||
+                      (kind ? kind.charAt(0).toUpperCase() + kind.slice(1) : 'Event');
+        const snippet = ev.snippet || ev.body || ev.text || ev.preview || '';
+        const source  = ev.source || ev.channel || '';
+        return `
+        <div class="thread-event" data-kind="${esc(kind)}">
+          <div class="icon" aria-hidden="true">${icon}</div>
+          <div class="body">
+            <div class="thread-event-title">${esc(title)}</div>
+            <div class="thread-event-meta">
+              <span class="when" title="${esc(when || '')}">${esc(relTime(when))}</span>
+              ${source ? `<span class="tag">${esc(source)}</span>` : ''}
+            </div>
+            ${snippet ? `<div class="thread-event-snippet">${esc(snippet)}</div>` : ''}
+          </div>
+        </div>`;
+      }).join('');
+    } catch (err) {
+      evEl.innerHTML = `<div class="empty-state-small">Couldn't load thread (${esc(err.message)})</div>`;
+    }
+  }
+
+  function openMergeDialog() {
+    const dlg = document.getElementById('merge-dialog');
+    if (!dlg) return;
+    const n = selectedContactIds.size;
+    const countEl = document.getElementById('merge-selected-count');
+    if (countEl) countEl.textContent = `${n} contact${n === 1 ? '' : 's'} selected`;
+    const prev = document.getElementById('merge-preview');
+    const res  = document.getElementById('merge-result');
+    if (prev) { prev.hidden = true; prev.innerHTML = ''; }
+    if (res)  { res.hidden  = true; res.innerHTML  = ''; }
+    // Default sender name from owner profile (best-effort).
+    const senderInput = document.getElementById('merge-sender');
+    if (senderInput && !senderInput.value) {
+      const guess = (businessInfo && (businessInfo.owner_name || businessInfo.name)) ||
+                    document.getElementById('business-name')?.textContent || '';
+      if (guess && guess !== '—') senderInput.value = guess;
+    }
+    if (typeof dlg.showModal === 'function') dlg.showModal();
+    else dlg.setAttribute('open', '');
+  }
+
+  function wireMailMerge() {
+    const previewBtn = document.getElementById('merge-preview-btn');
+    const runBtn     = document.getElementById('merge-run-btn');
+    const tplEl      = document.getElementById('merge-template');
+    const tgtEl      = document.getElementById('merge-target');
+    const senderEl   = document.getElementById('merge-sender');
+    const personEl   = document.getElementById('merge-personalize');
+    const prevEl     = document.getElementById('merge-preview');
+    const resEl      = document.getElementById('merge-result');
+
+    if (!previewBtn || !runBtn) return; // dialog not present
+
+    function gatherExtras() {
+      return {
+        sender_name: senderEl?.value?.trim() || '',
+        today: new Date().toLocaleDateString(),
+      };
+    }
+
+    previewBtn.addEventListener('click', async () => {
+      if (!tplEl.value.trim()) {
+        prevEl.hidden = false;
+        prevEl.innerHTML = '<div class="muted">Type a template first.</div>';
+        return;
+      }
+      const ids = [...selectedContactIds];
+      if (!ids.length) {
+        prevEl.hidden = false;
+        prevEl.innerHTML = '<div class="muted">No contacts selected.</div>';
+        return;
+      }
+      prevEl.hidden = false;
+      prevEl.innerHTML = '<div class="muted">Rendering…</div>';
+      previewBtn.disabled = true;
+      try {
+        const r = await api('/api/owner/mail_merge/preview', {
+          method: 'POST',
+          body: JSON.stringify({
+            template: tplEl.value,
+            contact_id: ids[0],
+            extras: gatherExtras(),
+          }),
+        });
+        const rendered = r.rendered || '';
+        prevEl.innerHTML =
+          `<div class="merge-preview-label muted">Preview (first selected contact):</div>
+           <pre class="merge-preview-body">${esc(rendered)}</pre>`;
+      } catch (err) {
+        prevEl.innerHTML = `<div class="muted">Preview failed: ${esc(err.message)}</div>`;
+      } finally {
+        previewBtn.disabled = false;
+      }
+    });
+
+    runBtn.addEventListener('click', async () => {
+      if (!tplEl.value.trim()) {
+        resEl.hidden = false;
+        resEl.innerHTML = '<div class="muted">Type a template first.</div>';
+        return;
+      }
+      const ids = [...selectedContactIds];
+      if (!ids.length) {
+        resEl.hidden = false;
+        resEl.innerHTML = '<div class="muted">No contacts selected.</div>';
+        return;
+      }
+      resEl.hidden = false;
+      resEl.innerHTML = `<div class="muted">Generating ${ids.length} letter${ids.length === 1 ? '' : 's'}…</div>`;
+      runBtn.disabled = true; previewBtn.disabled = true;
+      try {
+        const r = await api('/api/owner/mail_merge/run', {
+          method: 'POST',
+          body: JSON.stringify({
+            template: tplEl.value,
+            contact_ids: ids,
+            target_format: tgtEl?.value || 'pdf',
+            extras: gatherExtras(),
+            llm_personalize: !!personEl?.checked,
+          }),
+        });
+        const merged = r.merged ?? ids.length;
+        const dl = r.download_url || '';
+        resEl.innerHTML = `
+          <div class="merge-success">✓ ${esc(merged)} letter${merged === 1 ? '' : 's'} generated.</div>
+          ${dl ? `<a class="merge-download" href="${esc(dl)}" target="_blank" rel="noopener">⬇ Download zip</a>` : ''}
+          ${r.zip_path && !dl ? `<div class="muted">Saved to: <code>${esc(r.zip_path)}</code></div>` : ''}
+        `;
+      } catch (err) {
+        resEl.innerHTML = `<div class="muted">Merge failed: ${esc(err.message)}</div>`;
+      } finally {
+        runBtn.disabled = false; previewBtn.disabled = false;
+      }
+    });
+  }
+
+
+  // ==================================================================
+  // EMAIL TAB — unified Gmail + Outlook inbox
+  // ==================================================================
+
+  let _emailState = { messages: [], filter: "all", currentMessageId: null };
+  const EMAIL_FILTERS = [
+    { id: "all",        label: "All",        emoji: "📥" },
+    { id: "unread",     label: "Unread",     emoji: "🔵" },
+    { id: "flagged",    label: "Flagged",    emoji: "🚩" },
+    { id: "urgent",     label: "Urgent",     emoji: "🔥" },
+    { id: "lead",       label: "Leads",      emoji: "💼" },
+    { id: "complaint",  label: "Complaints", emoji: "⚠️" },
+    { id: "question",   label: "Questions",  emoji: "❓" },
+  ];
+
+  function renderEmailFilterRow() {
+    const row = document.getElementById('email-filter-row');
+    if (!row) return;
+    row.innerHTML = EMAIL_FILTERS.map(f => `
+      <button class="chip ${_emailState.filter === f.id ? 'active' : ''}" data-email-filter="${esc(f.id)}">
+        ${esc(f.emoji)} ${esc(f.label)} <span class="chip-count" data-count-for="${esc(f.id)}"></span>
+      </button>`).join('');
+    row.querySelectorAll('[data-email-filter]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        _emailState.filter = btn.dataset.emailFilter;
+        renderEmailFilterRow(); renderEmailList();
+      });
+    });
+    const counts = {};
+    for (const m of _emailState.messages) {
+      counts.all = (counts.all || 0) + 1;
+      if (m.unread) counts.unread = (counts.unread || 0) + 1;
+      if (m.flagged) counts.flagged = (counts.flagged || 0) + 1;
+      for (const t of m.tags || []) counts[t] = (counts[t] || 0) + 1;
+    }
+    row.querySelectorAll('[data-count-for]').forEach(s => {
+      const n = counts[s.dataset.countFor] || 0; s.textContent = n ? n : '';
+    });
+  }
+
+  function filterEmails() {
+    const f = _emailState.filter;
+    if (f === "all") return _emailState.messages;
+    if (f === "unread") return _emailState.messages.filter(m => m.unread);
+    if (f === "flagged") return _emailState.messages.filter(m => m.flagged);
+    return _emailState.messages.filter(m => (m.tags || []).includes(f));
+  }
+
+  function renderEmailList() {
+    const list = document.getElementById('email-list');
+    if (!list) return;
+    const filtered = filterEmails();
+    if (!filtered.length) {
+      list.innerHTML = `<div class="empty-state-small">No ${_emailState.filter === 'all' ? '' : _emailState.filter + ' '}emails.</div>`;
+      return;
+    }
+    list.innerHTML = filtered.map(m => `
+      <div class="email-row ${m.unread ? 'unread' : ''} ${m.flagged ? 'flagged' : ''}" data-id="${esc(m.id)}">
+        <div class="email-row-icons">
+          <span class="email-provider email-provider-${esc(m.provider)}">${esc(m.provider === 'gmail' ? '✉' : '📧')}</span>
+          ${m.flagged ? `<span class="email-flag" title="${esc(m.flag_reason||'flagged')}">🚩</span>` : ''}
+        </div>
+        <div class="email-row-body">
+          <div class="email-row-head">
+            <span class="email-from">${esc(m.from || '(unknown)')}</span>
+            <span class="email-date muted">${esc((m.date || '').slice(0,16).replace('T',' '))}</span>
+          </div>
+          <div class="email-subject">${esc(m.subject || '(no subject)')}</div>
+          <div class="email-snippet">${esc(m.snippet || '')}</div>
+          <div class="email-tags">${(m.tags || []).map(t => `<span class="tag tag-${esc(t)}">${esc(t)}</span>`).join('')}</div>
+        </div>
+        <div class="email-row-actions">
+          <button class="icon-btn-sm" data-action="email-flag" title="${m.flagged ? 'Unflag' : 'Flag'}">${m.flagged ? '🚩' : '⚐'}</button>
+          <button class="icon-btn-sm" data-action="email-archive" title="Archive">📁</button>
+        </div>
+      </div>`).join('');
+    list.querySelectorAll('.email-row .email-row-body').forEach(body => {
+      body.addEventListener('click', () => openEmailDetail(body.parentElement.dataset.id));
+    });
+    list.querySelectorAll('[data-action="email-flag"]').forEach(btn => {
+      btn.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        const id = btn.closest('[data-id]').dataset.id;
+        const m = _emailState.messages.find(x => x.id === id);
+        if (!m) return;
+        try {
+          await api(`/api/owner/email/${encodeURIComponent(id)}/flag`, {
+            method: 'POST', body: JSON.stringify({flagged: !m.flagged}),
+          });
+          m.flagged = !m.flagged;
+          renderEmailList(); renderEmailFilterRow();
+        } catch (err) { alert(err.message); }
+      });
+    });
+    list.querySelectorAll('[data-action="email-archive"]').forEach(btn => {
+      btn.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        if (!confirm('Archive this email?')) return;
+        const id = btn.closest('[data-id]').dataset.id;
+        try {
+          await api(`/api/owner/email/${encodeURIComponent(id)}/archive`, { method: 'POST' });
+          _emailState.messages = _emailState.messages.filter(x => x.id !== id);
+          renderEmailList(); renderEmailFilterRow();
+        } catch (err) { alert(err.message); }
+      });
+    });
+  }
+
+  async function loadEmails(force = false, query = "") {
+    const list = document.getElementById('email-list');
+    if (!list) return;
+    if (!_emailState.messages.length) list.innerHTML = '<div class="empty-state-small">Loading…</div>';
+    try {
+      const q = query ? '&q=' + encodeURIComponent(query) : '';
+      const r = await api(`/api/owner/email/inbox?source=all&limit=50${q}${force ? '&refresh=1' : ''}`);
+      _emailState.messages = r.messages || [];
+      const badge = document.getElementById('email-count');
+      const unread = _emailState.messages.filter(m => m.unread).length;
+      if (badge) {
+        if (unread) { badge.textContent = unread; badge.hidden = false; }
+        else badge.hidden = true;
+      }
+      renderEmailFilterRow(); renderEmailList();
+    } catch (err) {
+      list.innerHTML = `<div class="empty-state-small">Couldn't load email (${esc(err.message)}). Connect Gmail or Outlook in Settings → Integrations.</div>`;
+    }
+  }
+
+  async function openEmailDetail(messageId) {
+    _emailState.currentMessageId = messageId;
+    const m = _emailState.messages.find(x => x.id === messageId);
+    if (!m) return;
+    const dlg = document.getElementById('email-detail-dialog');
+    document.getElementById('email-detail-body').innerHTML = `
+      <div style="display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:8px">
+        <h2 style="margin:0;font-size:18px">${esc(m.subject || '(no subject)')}</h2>
+        <span class="muted">${esc(m.provider)} · ${esc((m.date || '').slice(0,16).replace('T',' '))}</span>
+      </div>
+      <div class="muted" style="margin-bottom:8px">from <strong>${esc(m.from || '(unknown)')}</strong></div>
+      <div style="background:#0b0f1a;border:1px solid #1f2942;border-radius:8px;padding:12px;margin-bottom:14px;max-height:340px;overflow:auto">
+        <div id="email-detail-fullbody" style="white-space:pre-wrap">Loading body…</div>
+      </div>`;
+    document.getElementById('email-reply-text').value = '';
+    document.getElementById('email-detail-status').textContent = '';
+    dlg.showModal();
+    if (m.unread) {
+      api(`/api/owner/email/${encodeURIComponent(messageId)}/mark_read`, { method: 'POST' })
+        .then(() => { m.unread = false; renderEmailList(); renderEmailFilterRow(); }).catch(() => {});
+    }
+    try {
+      const full = await api(`/api/owner/email/${encodeURIComponent(messageId)}`);
+      document.getElementById('email-detail-fullbody').textContent =
+        full.body || full.body_text || full.snippet || '(no body)';
+    } catch { document.getElementById('email-detail-fullbody').textContent = 'Could not load full body.'; }
+  }
+
+  function wireEmailDialog() {
+    document.getElementById('email-save-draft')?.addEventListener('click', async () => {
+      const id = _emailState.currentMessageId;
+      const text = document.getElementById('email-reply-text').value.trim();
+      const status = document.getElementById('email-detail-status');
+      if (!text) { status.textContent = 'Type a reply first.'; return; }
+      status.textContent = 'Saving draft…';
+      try {
+        const r = await api(`/api/owner/email/${encodeURIComponent(id)}/reply`, {
+          method: 'POST', body: JSON.stringify({reply_text: text}),
+        });
+        if (r.error) throw new Error(r.error);
+        status.innerHTML = '<span style="color:#6fdc94">✓ Saved to Drafts. Open Gmail/Outlook to review and send.</span>';
+      } catch (err) { status.innerHTML = `<span style="color:#ffb0b0">${esc(err.message)}</span>`; }
+    });
+    document.getElementById('email-suggest-reply')?.addEventListener('click', async () => {
+      const id = _emailState.currentMessageId;
+      const m = _emailState.messages.find(x => x.id === id);
+      if (!m) return;
+      const status = document.getElementById('email-detail-status');
+      status.textContent = 'Drafting in your voice…';
+      try {
+        const r = await api('/api/owner/style/draft', {
+          method: 'POST',
+          body: JSON.stringify({
+            draft_context: `Incoming email from ${m.from}: "${m.subject}"\n${m.snippet || ''}`,
+            what_to_say:   `Write a short, friendly reply.`,
+          }),
+        });
+        document.getElementById('email-reply-text').value = r.draft || '';
+        status.innerHTML = '<span style="color:#6fdc94">Drafted — edit and click Save to Drafts.</span>';
+      } catch (err) { status.innerHTML = `<span style="color:#ffb0b0">Could not draft: ${esc(err.message)}</span>`; }
+    });
+  }
+
+  function wireEmailSettings() {
+    const open = document.getElementById('email-settings-btn');
+    const save = document.getElementById('email-settings-save');
+    const dlg = document.getElementById('email-settings-dialog');
+    open?.addEventListener('click', async () => {
+      try {
+        const s = await api('/api/owner/email/settings');
+        document.getElementById('email-flag-keywords').value = (s.flag_keywords || []).join(', ');
+        document.getElementById('email-fetch-limit').value = s.fetch_limit || 50;
+      } catch {}
+      dlg.showModal();
+    });
+    save?.addEventListener('click', async () => {
+      const status = document.getElementById('email-settings-status');
+      try {
+        const kw = document.getElementById('email-flag-keywords').value
+                     .split(',').map(s => s.trim()).filter(Boolean);
+        const limit = parseInt(document.getElementById('email-fetch-limit').value, 10) || 50;
+        await api('/api/owner/email/settings', {
+          method: 'PUT', body: JSON.stringify({flag_keywords: kw, fetch_limit: limit}),
+        });
+        status.innerHTML = '<span style="color:#6fdc94">✓ Saved. Refreshing inbox…</span>';
+        loadEmails(true);
+        setTimeout(() => dlg.close(), 800);
+      } catch (err) { status.innerHTML = `<span style="color:#ffb0b0">${esc(err.message)}</span>`; }
+    });
+  }
+
+  function wireEmailTab() {
+    document.querySelectorAll('.tab').forEach(t => {
+      if (t.dataset.tab === 'email') t.addEventListener('click', () => loadEmails(false));
+    });
+    document.getElementById('email-refresh-btn')?.addEventListener('click', () => loadEmails(true));
+    let st;
+    document.getElementById('email-search')?.addEventListener('input', (e) => {
+      clearTimeout(st);
+      st = setTimeout(() => loadEmails(false, e.target.value.trim()), 250);
+    });
+    wireEmailDialog();
+    wireEmailSettings();
+  }
+  document.addEventListener('DOMContentLoaded', wireEmailTab);
+
+
+  // ==================================================================
+  // MY DAY — Schedule a meeting button
+  // ==================================================================
+
+  let _scheduleState = { attendee_name: "", attendee_email: "", duration_minutes: 30 };
+
+  function wireScheduleMeeting() {
+    const open = document.getElementById('myday-schedule-meeting-btn');
+    const dlg  = document.getElementById('schedule-meeting-dialog');
+    const find = document.getElementById('schedule-find-slots-btn');
+    if (!open || !dlg || !find) return;
+
+    open.addEventListener('click', () => {
+      document.getElementById('schedule-meeting-form').reset();
+      document.getElementById('schedule-slots-list').innerHTML = '';
+      document.getElementById('schedule-status').textContent = '';
+      find.textContent = 'Find open times';
+      dlg.showModal();
+    });
+
+    find.addEventListener('click', async () => {
+      const form = document.getElementById('schedule-meeting-form');
+      const fd = new FormData(form);
+      _scheduleState.attendee_name = fd.get('attendee_name') || '';
+      _scheduleState.attendee_email = fd.get('attendee_email') || '';
+      _scheduleState.duration_minutes = parseInt(fd.get('duration_minutes'), 10) || 30;
+      const days = parseInt(fd.get('days_ahead'), 10) || 7;
+      const slotsList = document.getElementById('schedule-slots-list');
+      const status = document.getElementById('schedule-status');
+      if (!_scheduleState.attendee_name || !_scheduleState.attendee_email) {
+        status.textContent = 'Need both name and email.';
+        return;
+      }
+      find.disabled = true;
+      slotsList.innerHTML = '<div class="muted">Looking for open times…</div>';
+      status.textContent = '';
+      try {
+        const r = await api('/api/owner/scheduler/find_slots', {
+          method: 'POST',
+          body: JSON.stringify({
+            duration_minutes: _scheduleState.duration_minutes,
+            days_ahead: days,
+          }),
+        });
+        const slots = (r.slots || []).slice(0, 6);
+        if (!slots.length) {
+          slotsList.innerHTML = '<div class="muted">No open slots found in that window. Try a longer window.</div>';
+        } else {
+          slotsList.innerHTML = `
+            <div style="font-weight:600;font-size:14px;margin-bottom:6px">Pick a time to send to ${esc(_scheduleState.attendee_name)}:</div>
+            <div style="display:flex;flex-direction:column;gap:6px">
+              ${slots.map(s => `
+                <button type="button" class="secondary-btn schedule-slot" data-start="${esc(s.start_iso)}" data-end="${esc(s.end_iso)}" style="text-align:left">
+                  ${esc(s.day_label || '')} · ${esc(s.time_label || '')}
+                </button>
+              `).join('')}
+            </div>`;
+          slotsList.querySelectorAll('.schedule-slot').forEach(btn => {
+            btn.addEventListener('click', () => bookSlot(btn.dataset.start, btn.dataset.end));
+          });
+        }
+      } catch (err) {
+        slotsList.innerHTML = `<div class="muted" style="color:#ffb0b0">${esc(err.message)}</div>`;
+      } finally {
+        find.disabled = false;
+        find.textContent = 'Find again';
+      }
+    });
+  }
+
+  async function bookSlot(startIso, endIso) {
+    const status = document.getElementById('schedule-status');
+    status.innerHTML = 'Booking…';
+    try {
+      const r = await api('/api/owner/scheduler/book', {
+        method: 'POST',
+        body: JSON.stringify({
+          attendee_name:  _scheduleState.attendee_name,
+          attendee_email: _scheduleState.attendee_email,
+          start_iso: startIso,
+          end_iso:   endIso,
+          title: `Meeting with ${_scheduleState.attendee_name}`,
+        }),
+      });
+      const when = (startIso || '').slice(0,16).replace('T',' ');
+      status.innerHTML = `<span style="color:#6fdc94">✓ Booked ${esc(when)}. Calendar event created${r.calendar_synced ? ' + synced to Google Calendar' : ''}.</span>`;
+      // Refresh the calendar card
+      if (typeof loadMyCalendar === 'function') loadMyCalendar();
+      setTimeout(() => document.getElementById('schedule-meeting-dialog').close(), 1500);
+    } catch (err) {
+      status.innerHTML = `<span style="color:#ffb0b0">Could not book: ${esc(err.message)}</span>`;
+    }
+  }
+
+  document.addEventListener('DOMContentLoaded', wireScheduleMeeting);
+
 })();

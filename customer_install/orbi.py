@@ -68,6 +68,7 @@ import scheduler as meeting_scheduler
 import birthdays
 import booking
 import chart_gen
+import email_inbox
 import mail_merge
 import pptx_gen
 import style_learner
@@ -2365,6 +2366,81 @@ def messages_update_tags(msg_id):
     tags = data.get("tags") or []
     ok = mod_messages.update_tags(DATA_DIR, msg_id, tags)
     return jsonify({"status": "ok" if ok else "not_found"}), 200 if ok else 404
+
+
+# ---------------------------------------------------------------------------
+# Email inbox — unified Gmail + Outlook view with categories + flagging
+# ---------------------------------------------------------------------------
+
+
+@app.route("/api/owner/email/inbox", methods=["GET"])
+def email_inbox_route():
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    user_dir = users_mod.get_user_dir(DATA_DIR, user["username"])
+    return jsonify(email_inbox.fetch_inbox(
+        CONFIG, user_dir,
+        source=request.args.get("source", "all"),
+        limit=int(request.args.get("limit", "50")),
+        query=request.args.get("q", ""),
+        force_refresh=request.args.get("refresh") == "1",
+    ))
+
+
+@app.route("/api/owner/email/<message_id>", methods=["GET"])
+def email_message_get(message_id):
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    user_dir = users_mod.get_user_dir(DATA_DIR, user["username"])
+    return jsonify(email_inbox.get_message(CONFIG, user_dir, message_id))
+
+
+@app.route("/api/owner/email/<message_id>/reply", methods=["POST"])
+def email_reply(message_id):
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    user_dir = users_mod.get_user_dir(DATA_DIR, user["username"])
+    data = request.get_json(silent=True) or {}
+    text = data.get("reply_text", "")
+    result = email_inbox.draft_reply(CONFIG, user_dir, message_id, text)
+    audit.log_event(DATA_DIR, actor=user["username"], action="email.draft_reply",
+                    resource=message_id, meta={"chars": len(text)})
+    return jsonify(result)
+
+
+@app.route("/api/owner/email/<message_id>/mark_read", methods=["POST"])
+def email_mark_read(message_id):
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    user_dir = users_mod.get_user_dir(DATA_DIR, user["username"])
+    return jsonify(email_inbox.mark_read(CONFIG, user_dir, message_id))
+
+
+@app.route("/api/owner/email/<message_id>/archive", methods=["POST"])
+def email_archive(message_id):
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    user_dir = users_mod.get_user_dir(DATA_DIR, user["username"])
+    audit.log_event(DATA_DIR, actor=user["username"], action="email.archive",
+                    resource=message_id)
+    return jsonify(email_inbox.archive_message(CONFIG, user_dir, message_id))
+
+
+@app.route("/api/owner/email/<message_id>/flag", methods=["POST"])
+def email_flag(message_id):
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    user_dir = users_mod.get_user_dir(DATA_DIR, user["username"])
+    data = request.get_json(silent=True) or {}
+    return jsonify(email_inbox.flag_message(
+        CONFIG, user_dir, message_id, flagged=bool(data.get("flagged", True))))
+
+
+@app.route("/api/owner/email/settings", methods=["GET", "PUT"])
+def email_settings():
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    user_dir = users_mod.get_user_dir(DATA_DIR, user["username"])
+    if request.method == "GET":
+        return jsonify(email_inbox.load_settings(user_dir))
+    data = request.get_json(silent=True) or {}
+    current = email_inbox.load_settings(user_dir)
+    current.update(data)
+    email_inbox.save_settings(user_dir, current)
+    return jsonify(current)
 
 
 # ---------------------------------------------------------------------------

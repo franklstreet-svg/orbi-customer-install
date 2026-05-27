@@ -43,6 +43,7 @@
     <button class="tab" data-tab="chat">Ask Orbi</button>
     <button class="tab" data-tab="myday">My Day</button>
     <button class="tab" data-tab="voicemails">Voicemails <span class="badge" id="voicemail-count" hidden>0</span></button>
+    <button class="tab" data-tab="email">Email <span class="badge" id="email-count" hidden>0</span></button>
     <button class="tab" data-tab="contacts">Contacts</button>
     <button class="tab" data-tab="files">Files</button>
     <button class="tab" data-tab="business">Business</button>
@@ -160,7 +161,41 @@
             <input type="datetime-local" name="start" required>
             <button type="submit" class="primary-btn">Add</button>
           </form>
+          <button type="button" class="secondary-btn" id="myday-schedule-meeting-btn" style="margin-top:6px;width:100%">📅 Schedule a meeting with someone</button>
         </div>
+
+        <!-- Schedule meeting dialog -->
+        <dialog id="schedule-meeting-dialog">
+          <form method="dialog" id="schedule-meeting-form">
+            <h2>Schedule a meeting</h2>
+            <p class="muted" style="margin:4px 0 12px;font-size:13px">
+              Pick the attendee + duration. Orbi finds 3 open times in your calendar.
+              You choose one — she emails them a confirmation and adds it to your calendar (and Google Calendar if connected).
+            </p>
+            <label>Attendee name <input type="text" name="attendee_name" required></label>
+            <label>Attendee email <input type="email" name="attendee_email" required></label>
+            <div class="row-2">
+              <label>Duration (minutes)
+                <select name="duration_minutes">
+                  <option value="15">15</option>
+                  <option value="30" selected>30</option>
+                  <option value="45">45</option>
+                  <option value="60">60</option>
+                  <option value="90">90</option>
+                </select>
+              </label>
+              <label>Within the next (days)
+                <input type="number" name="days_ahead" value="7" min="1" max="30">
+              </label>
+            </div>
+            <div id="schedule-slots-list" style="margin-top:12px"></div>
+            <div id="schedule-status" style="margin-top:8px;font-size:13px"></div>
+            <div class="form-actions">
+              <button type="button" class="secondary-btn" onclick="document.getElementById('schedule-meeting-dialog').close()">Cancel</button>
+              <button type="button" class="primary-btn" id="schedule-find-slots-btn">Find open times</button>
+            </div>
+          </form>
+        </dialog>
 
         <div class="myday-card">
           <div class="myday-card-head">
@@ -197,6 +232,10 @@
     <section class="tab-panel" id="tab-contacts">
       <div class="toolbar">
         <input type="text" id="contacts-search" placeholder="Search contacts…" class="search-input">
+        <label class="muted" style="display:flex;align-items:center;gap:4px">
+          <input type="checkbox" id="contacts-select-all"> Select all
+        </label>
+        <button class="secondary-btn" id="contacts-merge-btn" disabled>📨 Mail merge (0)</button>
         <button class="primary-btn" id="contacts-add-btn">+ Add Contact</button>
       </div>
       <div id="contacts-list" class="contacts-list">
@@ -218,6 +257,72 @@
           </div>
         </form>
       </dialog>
+
+      <!-- Customer thread dialog (click contact name to open) -->
+      <dialog id="thread-dialog" class="thread-dialog">
+        <div class="thread-head">
+          <div>
+            <h2 id="thread-name" style="margin:0">—</h2>
+            <div id="thread-summary" class="muted" style="margin-top:4px">Loading…</div>
+          </div>
+          <button type="button" class="icon-btn-sm" id="thread-close-btn"
+                  onclick="document.getElementById('thread-dialog').close()" title="Close">×</button>
+        </div>
+        <div id="thread-events" class="thread-events">
+          <div class="empty-state-small">Loading timeline…</div>
+        </div>
+      </dialog>
+
+      <!-- Mail-merge dialog -->
+      <dialog id="merge-dialog" class="merge-dialog">
+        <form method="dialog" id="merge-form">
+          <h2 style="margin:0 0 6px">📨 Mail merge</h2>
+          <div id="merge-selected-count" class="muted" style="margin-bottom:10px">0 contacts selected</div>
+
+          <label>Template
+            <textarea name="template" id="merge-template" rows="8"
+              placeholder="Hi {{first_name}},&#10;&#10;Quick note from {{sender_name}} at {{company}}…&#10;&#10;You can reach me at {{email}}."></textarea>
+          </label>
+          <p class="muted" style="margin:2px 0 8px;font-size:12px">
+            Allowed substitutions: <code>{{first_name}}</code>, <code>{{last_name}}</code>,
+            <code>{{name}}</code>, <code>{{company}}</code>, <code>{{email}}</code>,
+            <code>{{phone}}</code>, <code>{{sender_name}}</code>, <code>{{today}}</code>.
+          </p>
+
+          <div class="row-2">
+            <label>Target format
+              <select name="target_format" id="merge-target">
+                <option value="pdf">PDF (default)</option>
+                <option value="docx">Word document (.docx)</option>
+                <option value="txt">Plain text (.txt)</option>
+              </select>
+            </label>
+            <label>Sender name
+              <input type="text" name="sender_name" id="merge-sender" placeholder="Your name">
+            </label>
+          </div>
+
+          <label class="checkbox" style="display:flex;align-items:center;gap:8px;margin-top:8px">
+            <input type="checkbox" name="llm_personalize" id="merge-personalize">
+            <span>Personalize with AI</span>
+          </label>
+          <p class="muted" style="margin:2px 0 8px;font-size:12px">
+            Polishes wording for each recipient but doesn't change facts. Slower (a few seconds per contact).
+          </p>
+
+          <div class="merge-preview-row">
+            <button type="button" class="secondary-btn" id="merge-preview-btn">Preview (1st contact)</button>
+            <button type="button" class="primary-btn" id="merge-run-btn">Run merge</button>
+          </div>
+
+          <div id="merge-preview" class="merge-preview" hidden></div>
+          <div id="merge-result" class="merge-result" hidden></div>
+
+          <div class="form-actions">
+            <button type="button" class="secondary-btn" onclick="document.getElementById('merge-dialog').close()">Close</button>
+          </div>
+        </form>
+      </dialog>
     </section>
 
     <!-- VOICEMAILS TAB — calls Orbi couldn't answer, transcribed -->
@@ -231,6 +336,57 @@
       </div>
     </section>
 
+    <!-- EMAIL TAB — unified Gmail + Outlook inbox with auto-categorization -->
+    <section class="tab-panel" id="tab-email">
+      <div class="toolbar">
+        <input type="text" id="email-search" placeholder="Search emails…" class="search-input">
+        <button class="secondary-btn" id="email-refresh-btn" title="Pull new mail">↻</button>
+        <button class="secondary-btn" id="email-settings-btn" title="Flag-keyword settings">⚙ Settings</button>
+      </div>
+      <div class="email-filter-row" id="email-filter-row"></div>
+      <div id="email-list" class="email-list">
+        <div class="empty-state-small">Connect Gmail or Outlook in Settings → Integrations to see your inbox here.</div>
+      </div>
+
+      <!-- Detail / reply modal -->
+      <dialog id="email-detail-dialog">
+        <div id="email-detail-body"></div>
+        <form method="dialog" style="margin:0">
+          <h3 style="margin:14px 0 6px">Draft a reply (saves to Drafts — won't send)</h3>
+          <textarea id="email-reply-text" rows="6" style="width:100%;background:#0b0f1a;border:1px solid #2c3957;color:#eaf0ff;border-radius:8px;padding:10px;font-family:inherit;font-size:14px"></textarea>
+          <div class="form-actions">
+            <button type="button" class="secondary-btn" onclick="document.getElementById('email-detail-dialog').close()">Close</button>
+            <button type="button" class="secondary-btn" id="email-suggest-reply">✨ Suggest a reply</button>
+            <button type="button" class="primary-btn" id="email-save-draft">Save to Drafts</button>
+          </div>
+          <div id="email-detail-status" style="margin-top:8px;font-size:13px"></div>
+        </form>
+      </dialog>
+
+      <!-- Settings modal: flag keywords, folder scope -->
+      <dialog id="email-settings-dialog">
+        <form method="dialog">
+          <h2>Email settings</h2>
+          <p class="muted" style="margin:4px 0 12px;font-size:13px">
+            Keywords here will FLAG any incoming email containing them — Orbi shows flagged messages with a red dot so they stand out.
+          </p>
+          <label>Flag keywords (comma-separated)
+            <textarea id="email-flag-keywords" rows="2"
+              placeholder="urgent, lawsuit, invoice, refund, deadline"
+              style="width:100%;background:#0b0f1a;border:1px solid #2c3957;color:#eaf0ff;border-radius:8px;padding:10px;font-size:14px"></textarea>
+          </label>
+          <label>How many messages to load
+            <input type="number" id="email-fetch-limit" min="10" max="200" step="10" value="50">
+          </label>
+          <div class="form-actions">
+            <button type="button" class="secondary-btn" onclick="document.getElementById('email-settings-dialog').close()">Cancel</button>
+            <button type="button" class="primary-btn" id="email-settings-save">Save</button>
+          </div>
+          <div id="email-settings-status" style="margin-top:8px;font-size:13px"></div>
+        </form>
+      </dialog>
+    </section>
+
     <!-- FILES TAB — drop docs/spreadsheets/pdfs for Orbi to read -->
     <section class="tab-panel" id="tab-files">
       <div class="toolbar">
@@ -242,6 +398,13 @@
         can answer questions about them in the Ask Orbi tab.
         Supported: .txt, .md, .csv, .pdf, .docx, .xlsx, .html, .json, .log, images.
       </p>
+
+      <div class="files-tools-row">
+        <button class="secondary-btn tool-btn tool-btn-chart" id="tool-chart-btn">📊 Make a chart</button>
+        <button class="secondary-btn tool-btn tool-btn-pptx" id="tool-pptx-btn">📽️ Build slide deck</button>
+        <button class="secondary-btn tool-btn tool-btn-image" id="tool-image-btn">🎨 Generate image</button>
+        <button class="secondary-btn tool-btn tool-btn-translate" id="tool-translate-btn">🌐 Translate</button>
+      </div>
 
       <div id="files-dropzone" class="files-dropzone">
         <div class="files-dropzone-icon">⬇</div>
@@ -298,6 +461,108 @@
           <div class="form-actions">
             <button type="button" class="secondary-btn" onclick="document.getElementById('convert-dialog').close()">Cancel</button>
             <button type="submit" class="primary-btn" id="convert-go">Clean &amp; Convert</button>
+          </div>
+        </form>
+      </dialog>
+
+      <!-- Tool: Make a chart -->
+      <dialog id="chart-dialog">
+        <form method="dialog" id="chart-form">
+          <h2>📊 Make a chart</h2>
+          <p class="muted" style="margin:2px 0 12px">Describe the data in plain English — Orbi picks a chart type and renders a PNG you can download.</p>
+          <label>Describe the chart
+            <textarea name="request" id="chart-request" rows="4" required
+              placeholder="e.g. monthly revenue: Jan 1000, Feb 1500, Mar 2200, Apr 2800 — bar chart"></textarea>
+          </label>
+          <div class="tool-result" id="chart-result" hidden></div>
+          <div class="form-actions">
+            <button type="button" class="secondary-btn" onclick="document.getElementById('chart-dialog').close()">Cancel</button>
+            <button type="submit" class="primary-btn" id="chart-go">Generate</button>
+          </div>
+        </form>
+      </dialog>
+
+      <!-- Tool: Build a slide deck -->
+      <dialog id="pptx-dialog">
+        <form method="dialog" id="pptx-form">
+          <h2>📽️ Build slide deck</h2>
+          <p class="muted" style="margin:2px 0 12px">Orbi writes an outline and builds a .pptx file you can open in PowerPoint or Keynote.</p>
+          <label>Topic
+            <input type="text" name="topic" id="pptx-topic" required
+              placeholder="e.g. Q2 marketing plan for our deli">
+          </label>
+          <label>Number of slides
+            <input type="number" name="slide_count" id="pptx-slides" value="7" min="3" max="20">
+          </label>
+          <label>Theme
+            <select name="theme" id="pptx-theme">
+              <option value="modern">Modern (dark)</option>
+              <option value="light">Light</option>
+              <option value="bold">Bold</option>
+            </select>
+          </label>
+          <div class="tool-result" id="pptx-result" hidden></div>
+          <div class="form-actions">
+            <button type="button" class="secondary-btn" onclick="document.getElementById('pptx-dialog').close()">Cancel</button>
+            <button type="submit" class="primary-btn" id="pptx-go">Build deck</button>
+          </div>
+        </form>
+      </dialog>
+
+      <!-- Tool: Generate image -->
+      <dialog id="image-dialog">
+        <form method="dialog" id="image-form">
+          <h2>🎨 Generate image</h2>
+          <p class="muted" style="margin:2px 0 12px">Describe what you want — Orbi generates an image sized for the use case you pick.</p>
+          <label>Describe what you want
+            <textarea name="prompt" id="image-prompt" rows="3" required
+              placeholder="e.g. cozy deli storefront at sunset, warm lighting, photographic"></textarea>
+          </label>
+          <label>Size
+            <select name="kind" id="image-kind">
+              <option value="social_post">Social post (square)</option>
+              <option value="flyer">Flyer (portrait)</option>
+              <option value="banner">Banner (wide)</option>
+            </select>
+          </label>
+          <div class="tool-result" id="image-result" hidden></div>
+          <div class="form-actions">
+            <button type="button" class="secondary-btn" onclick="document.getElementById('image-dialog').close()">Cancel</button>
+            <button type="submit" class="primary-btn" id="image-go">Generate</button>
+          </div>
+        </form>
+      </dialog>
+
+      <!-- Tool: Translate -->
+      <dialog id="translate-dialog">
+        <form method="dialog" id="translate-form">
+          <h2>🌐 Translate</h2>
+          <p class="muted" style="margin:2px 0 12px">Paste text, pick a target language, and Orbi translates it.</p>
+          <label>Source text
+            <textarea name="text" id="translate-source" rows="4" required
+              placeholder="Paste the text you want translated"></textarea>
+          </label>
+          <label>Target language
+            <select name="target_lang" id="translate-target">
+              <option value="en">English</option>
+              <option value="es" selected>Spanish</option>
+              <option value="fr">French</option>
+              <option value="de">German</option>
+              <option value="it">Italian</option>
+              <option value="pt">Portuguese</option>
+              <option value="zh">Chinese</option>
+              <option value="ja">Japanese</option>
+              <option value="ko">Korean</option>
+            </select>
+          </label>
+          <label>Translated text
+            <textarea id="translate-result-text" rows="4" readonly
+              placeholder="Translation will appear here"></textarea>
+          </label>
+          <div class="tool-result" id="translate-result" hidden></div>
+          <div class="form-actions">
+            <button type="button" class="secondary-btn" onclick="document.getElementById('translate-dialog').close()">Cancel</button>
+            <button type="submit" class="primary-btn" id="translate-go">Translate</button>
           </div>
         </form>
       </dialog>

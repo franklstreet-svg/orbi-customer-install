@@ -1302,3 +1302,446 @@ dialog .form-actions {
   font-size: 13px;
   color: #8fa3c7;
 }
+
+
+/* ============================================================ */
+/* Files tab — content-generation tool buttons + dialogs        */
+/* ============================================================ */
+
+.files-tools-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 12px 0;
+}
+
+.tool-btn {
+  position: relative;
+  padding-left: 16px;
+  font-weight: 600;
+  background: #161d33;
+  border-color: #2c3957;
+  transition: background 0.15s, transform 0.05s;
+}
+.tool-btn:hover {
+  background: #1d2649;
+  transform: translateY(-1px);
+}
+.tool-btn::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 6px;
+  bottom: 6px;
+  width: 3px;
+  border-radius: 2px;
+  background: #4f8cff;
+}
+.tool-btn-chart::before     { background: #4f8cff; }   /* blue */
+.tool-btn-pptx::before      { background: #f0a040; }   /* amber */
+.tool-btn-image::before     { background: #c873ff; }   /* purple */
+.tool-btn-translate::before { background: #6fdc94; }   /* green */
+
+/* Result panel inside a tool dialog */
+.tool-result {
+  margin-top: 12px;
+  padding: 10px 12px;
+  background: #0b0f1a;
+  border: 1px solid #2c3957;
+  border-radius: 8px;
+  color: #eaf0ff;
+  font-size: 13px;
+  line-height: 1.5;
+  max-height: 360px;
+  overflow-y: auto;
+}
+.tool-result-ok  { border-color: #2c5a3a; }
+.tool-result-err { border-color: #6a2c2c; }
+
+.tool-preview-img {
+  display: block;
+  max-width: 100%;
+  border-radius: 8px;
+  margin: 10px 0;
+  border: 1px solid #2c3957;
+}
+
+.tool-download-link {
+  display: inline-block;
+  margin-top: 6px;
+  color: #4f8cff;
+  font-weight: 600;
+  text-decoration: none;
+}
+.tool-download-link:hover { text-decoration: underline; }
+
+.tool-outline {
+  margin: 8px 0 10px 18px;
+  padding: 0;
+  color: #cad5ec;
+  font-size: 13px;
+}
+.tool-outline li { margin: 2px 0; }
+
+/* The tool dialogs are slightly wider than convert-dialog to fit previews */
+#chart-dialog,
+#pptx-dialog,
+#image-dialog,
+#translate-dialog {
+  min-width: 380px;
+  max-width: 560px;
+  width: 90vw;
+}
+
+/* ============================================================ */
+/* Contacts tab — selection + clickable name                    */
+/* ============================================================ */
+
+.contact-card .contact-select {
+  margin-top: 3px;
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+
+.contact-card .contact-name {
+  cursor: pointer;
+  display: inline-block;
+}
+.contact-card .contact-name:hover {
+  color: #6ea2ff;
+  text-decoration: underline;
+}
+
+#contacts-merge-btn[disabled],
+.contacts-merge-btn[disabled] {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+/* ============================================================ */
+/* Customer thread dialog — wide, scrollable timeline           */
+/* ============================================================ */
+
+.thread-dialog {
+  min-width: 480px;
+  max-width: 720px;
+  width: 92vw;
+  max-height: 80vh;
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+}
+
+.thread-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  border-bottom: 1px solid #1f2942;
+  padding-bottom: 12px;
+  margin-bottom: 12px;
+}
+
+.thread-events {
+  overflow-y: auto;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding-right: 4px;
+}
+
+.thread-event {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  background: #0f1626;
+  border: 1px solid #1f2942;
+  border-left: 3px solid #2c3957;
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+
+.thread-event .icon {
+  flex: 0 0 auto;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: #1a2236;
+  border: 1px solid #2c3957;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 16px;
+  line-height: 1;
+}
+
+.thread-event .body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.thread-event-title {
+  font-weight: 600;
+  font-size: 14px;
+  color: #eaf0ff;
+}
+
+.thread-event-meta {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  font-size: 12px;
+  color: #8fa3c7;
+  flex-wrap: wrap;
+}
+
+.thread-event-snippet {
+  font-size: 13px;
+  color: #b8c6e0;
+  margin-top: 3px;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  overflow-wrap: anywhere;
+}
+
+/* Kind-specific accent colors on the left border + icon background */
+.thread-event[data-kind="payment"],
+.thread-event[data-kind="order"],
+.thread-event[data-kind="invoice"] {
+  border-left-color: #6fdc94;
+}
+.thread-event[data-kind="payment"] .icon,
+.thread-event[data-kind="order"] .icon,
+.thread-event[data-kind="invoice"] .icon {
+  background: rgba(111, 220, 148, 0.12);
+  border-color: rgba(111, 220, 148, 0.4);
+}
+
+.thread-event[data-kind="email"] {
+  border-left-color: #4f8cff;
+}
+.thread-event[data-kind="email"] .icon {
+  background: rgba(79, 140, 255, 0.14);
+  border-color: rgba(79, 140, 255, 0.4);
+}
+
+.thread-event[data-kind="call"],
+.thread-event[data-kind="voicemail"] {
+  border-left-color: #b48cff;
+}
+.thread-event[data-kind="call"] .icon,
+.thread-event[data-kind="voicemail"] .icon {
+  background: rgba(180, 140, 255, 0.14);
+  border-color: rgba(180, 140, 255, 0.4);
+}
+
+.thread-event[data-kind="chat"] .icon,
+.thread-event[data-kind="sms"] .icon,
+.thread-event[data-kind="message"] .icon {
+  background: rgba(255, 200, 80, 0.12);
+  border-color: rgba(255, 200, 80, 0.35);
+}
+
+.thread-event[data-kind="calendar"] .icon,
+.thread-event[data-kind="event"] .icon,
+.thread-event[data-kind="booking"] .icon {
+  background: rgba(80, 200, 255, 0.12);
+  border-color: rgba(80, 200, 255, 0.4);
+}
+
+/* ============================================================ */
+/* Mail-merge dialog                                            */
+/* ============================================================ */
+
+.merge-dialog {
+  min-width: 480px;
+  max-width: 640px;
+  width: 92vw;
+  max-height: 85vh;
+  overflow-y: auto;
+}
+
+.merge-dialog code {
+  background: #0b0f1a;
+  border: 1px solid #1f2942;
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-size: 11px;
+  color: #cad5ec;
+}
+
+.merge-preview-row {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+  flex-wrap: wrap;
+}
+
+.merge-preview {
+  margin-top: 12px;
+  background: #0b0f1a;
+  border: 1px solid #1f2942;
+  border-radius: 8px;
+  padding: 10px 12px;
+  max-height: 240px;
+  overflow-y: auto;
+}
+.merge-preview-label { margin-bottom: 6px; }
+.merge-preview-body {
+  margin: 0;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  font-family: inherit;
+  font-size: 13px;
+  color: #eaf0ff;
+}
+
+.merge-result {
+  margin-top: 12px;
+  background: #0b0f1a;
+  border: 1px solid #1f2942;
+  border-radius: 8px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.merge-success {
+  color: #6fdc94;
+  font-weight: 600;
+}
+.merge-download {
+  color: #4f8cff;
+  font-weight: 600;
+  text-decoration: none;
+}
+.merge-download:hover { text-decoration: underline; }
+
+/* ========================================================== */
+/* Email tab — unified Gmail + Outlook inbox                  */
+/* ========================================================== */
+
+.email-filter-row {
+  display: flex;
+  gap: 6px;
+  margin: 10px 0 12px;
+  flex-wrap: wrap;
+}
+
+.email-filter-row .chip {
+  background: #111728;
+  border: 1px solid #1f2942;
+  color: #b8c6e0;
+  padding: 6px 12px;
+  border-radius: 16px;
+  font-size: 13px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.email-filter-row .chip.active {
+  background: linear-gradient(135deg, #4f8cff, #8b5cf6);
+  color: white;
+  border-color: #8b5cf6;
+}
+.chip-count {
+  font-size: 11px;
+  background: rgba(255,255,255,0.15);
+  padding: 1px 7px;
+  border-radius: 10px;
+  min-width: 18px;
+  text-align: center;
+}
+
+.email-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.email-row {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 12px;
+  padding: 12px 14px;
+  background: #111728;
+  border: 1px solid #1f2942;
+  border-radius: 8px;
+  align-items: flex-start;
+  transition: background 0.12s;
+}
+.email-row:hover { background: #161e35; }
+.email-row.unread { border-left: 3px solid #4f8cff; }
+.email-row.flagged { border-left: 3px solid #ff5050; }
+
+.email-row-icons {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  font-size: 16px;
+}
+.email-provider {
+  width: 28px; height: 28px;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 6px;
+  font-size: 14px;
+}
+.email-provider-gmail   { background: rgba(234,67,53,0.18); color: #ea4335; }
+.email-provider-outlook { background: rgba(0,120,212,0.18); color: #0078d4; }
+.email-flag { font-size: 14px; }
+
+.email-row-body { min-width: 0; cursor: pointer; }
+.email-row-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 2px;
+}
+.email-from {
+  font-weight: 600;
+  color: #eaf0ff;
+  font-size: 13px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 280px;
+}
+.email-date { font-size: 11px; white-space: nowrap; }
+.email-subject {
+  font-size: 14px;
+  color: #eaf0ff;
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.email-snippet {
+  font-size: 12px;
+  color: #8fa3c7;
+  margin-top: 2px;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.email-tags {
+  display: flex;
+  gap: 4px;
+  margin-top: 6px;
+  flex-wrap: wrap;
+}
+
+.email-row-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+#email-detail-dialog { max-width: 720px; width: 90vw; }
