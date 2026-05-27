@@ -50,7 +50,8 @@ def extract_urls(text: str) -> list[str]:
     return out
 
 
-def fetch(url: str, timeout: int = 10, follow_about: bool = True) -> dict:
+def fetch(url: str, timeout: int = 10, follow_about: bool = True,
+          _no_retry: bool = False) -> dict:
     """Fetch a URL and return its readable text. Always returns a dict —
     on error, populates the 'error' field instead of raising.
 
@@ -132,7 +133,47 @@ def fetch(url: str, timeout: int = 10, follow_about: bool = True) -> dict:
         result["error"] = f"network_error: {e.reason}"
     except Exception as e:
         result["error"] = f"fetch_failed: {e}"
+
+    # Retry with alternate URL forms — many small business sites have a
+    # broken www.* cert OR a flaky https→http redirect. Try the obvious
+    # alternates before giving up.
+    if not result["ok"] and not _no_retry:
+        alternates = _build_url_alternates(url)
+        for alt in alternates:
+            log.info(f"url_fetch retrying with alternate: {alt}")
+            sub = fetch(alt, timeout=timeout, follow_about=False, _no_retry=True)
+            if sub.get("ok"):
+                # Merge: keep the original URL the owner pasted but use the
+                # successful fetch's content
+                sub["url"] = url
+                sub["resolved_url"] = alt
+                return sub
+
     return result
+
+
+def _build_url_alternates(url: str) -> list[str]:
+    """Return reasonable fallback variants of a URL — strip/add 'www.',
+    swap https/http. Skips duplicates of the input. Used after the
+    primary fetch fails."""
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except ValueError:
+        return []
+    host = parsed.netloc.lower()
+    schemes = ["https", "http"]
+    hosts = [host]
+    if host.startswith("www."):
+        hosts.append(host[4:])
+    else:
+        hosts.append("www." + host)
+    out = []
+    for scheme in schemes:
+        for h in hosts:
+            alt = parsed._replace(scheme=scheme, netloc=h).geturl()
+            if alt != url and alt not in out:
+                out.append(alt)
+    return out
 
 
 def context_block(urls_text: list[dict]) -> str:
@@ -152,7 +193,12 @@ def context_block(urls_text: list[dict]) -> str:
              "in the 'About' section or footer). Quote real facts; never invent."]
     for r in urls_text:
         if not r.get("ok"):
-            parts.append(f"\n--- {r.get('url')} ---\n(could not load: {r.get('error', 'unknown')})")
+            parts.append(f"\n--- {r.get('url')} ---\n"
+                         f"FETCH_FAILED: this URL could not be loaded ({r.get('error', 'unknown')}). "
+                         f"Tell the owner you couldn't reach this specific site — DO NOT pretend you "
+                         f"have its content, DO NOT say you cannot browse the web in general, and DO "
+                         f"NOT make up details about the company. Suggest checking the URL or trying "
+                         f"again later.")
             continue
         url = r.get("url", "")
         parts.append(f"\n--- {url} ---")
