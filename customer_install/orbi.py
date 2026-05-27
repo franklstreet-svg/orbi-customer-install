@@ -67,6 +67,9 @@ import safe_send
 import scheduler as meeting_scheduler
 import birthdays
 import booking
+import chart_gen
+import mail_merge
+import pptx_gen
 import style_learner
 import translation
 import universal_search
@@ -2362,6 +2365,183 @@ def messages_update_tags(msg_id):
     tags = data.get("tags") or []
     ok = mod_messages.update_tags(DATA_DIR, msg_id, tags)
     return jsonify({"status": "ok" if ok else "not_found"}), 200 if ok else 404
+
+
+# ---------------------------------------------------------------------------
+# Office gaps — charts/graphs, PowerPoint, mail merge
+# ---------------------------------------------------------------------------
+
+
+def _save_and_token(file_bytes: bytes, filename: str, mime_hint: str = "") -> dict:
+    """Save bytes into the workspace, scan, mint a download token, return
+    {filename, workspace_path, download_url}."""
+    ws = mod_workspace.workspace_path(CONFIG)
+    ws.mkdir(parents=True, exist_ok=True)
+    target = ws / filename
+    target.write_bytes(file_bytes)
+    try:
+        mod_workspace.scan(CONFIG, DATA_DIR)
+    except Exception:
+        pass
+    try:
+        token = file_fetch.mint_download_token(
+            DATA_DIR, str(target), ttl_minutes=30, extra_allowed_roots=[ws])
+        url = f"/download/{token}"
+    except Exception:
+        url = None
+    return {"filename": filename, "workspace_path": str(target), "download_url": url}
+
+
+@app.route("/api/owner/chart/from_data", methods=["POST"])
+def chart_from_data():
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    data = request.get_json(silent=True) or {}
+    try:
+        png = chart_gen.generate_chart(
+            CONFIG,
+            title=data.get("title", "Chart"),
+            kind=data.get("kind", "bar"),
+            data=data.get("data") or {},
+            style=data.get("style", "modern"),
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+    fname = f"chart_{int(time.time())}.png"
+    saved = _save_and_token(png, fname)
+    audit.log_event(DATA_DIR, actor=user["username"], action="chart.from_data",
+                    meta={"kind": data.get("kind"), "title": data.get("title")})
+    return jsonify(saved)
+
+
+@app.route("/api/owner/chart/from_request", methods=["POST"])
+def chart_from_request():
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    data = request.get_json(silent=True) or {}
+    req_text = data.get("request", "")
+    parsed = chart_gen.parse_chart_request(CONFIG, req_text)
+    try:
+        png = chart_gen.generate_chart(
+            CONFIG,
+            title=parsed.get("title", "Chart"),
+            kind=parsed.get("kind", "bar"),
+            data=parsed.get("data") or {},
+        )
+    except Exception as e:
+        return jsonify({"error": str(e), "parsed": parsed}), 400
+    fname = f"chart_{int(time.time())}.png"
+    saved = _save_and_token(png, fname)
+    saved["parsed"] = parsed
+    audit.log_event(DATA_DIR, actor=user["username"], action="chart.from_request",
+                    meta={"request": req_text[:120]})
+    return jsonify(saved)
+
+
+@app.route("/api/owner/pptx/outline", methods=["POST"])
+def pptx_outline_route():
+    auth.require_user(ORBI_DIR, DATA_DIR)
+    data = request.get_json(silent=True) or {}
+    return jsonify(pptx_gen.build_outline(
+        CONFIG,
+        topic=data.get("topic", ""),
+        target_slide_count=int(data.get("slide_count", 7)),
+    ))
+
+
+@app.route("/api/owner/pptx/build", methods=["POST"])
+def pptx_build_route():
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    data = request.get_json(silent=True) or {}
+    try:
+        biz = mod_business.load(DATA_DIR)
+        result = pptx_gen.build_deck(
+            CONFIG,
+            topic=data.get("topic", ""),
+            target_slide_count=int(data.get("slide_count", 7)),
+            theme=data.get("theme", "modern"),
+            business_info=biz,
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    slug = re.sub(r"\W+", "_", (data.get("topic") or "deck")[:40]).strip("_")
+    fname = f"deck_{slug}_{int(time.time())}.pptx"
+    saved = _save_and_token(result["pptx_bytes"], fname)
+    saved["outline"] = result.get("outline")
+    saved["slide_count"] = result.get("slide_count")
+    audit.log_event(DATA_DIR, actor=user["username"], action="pptx.build",
+                    meta={"topic": data.get("topic"), "slides": result.get("slide_count")})
+    return jsonify(saved)
+
+
+# Need re module accessible here
+import re  # noqa: E402
+
+
+@app.route("/api/owner/pptx/from_outline", methods=["POST"])
+def pptx_from_outline_route():
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    data = request.get_json(silent=True) or {}
+    outline = data.get("outline") or {}
+    try:
+        biz = mod_business.load(DATA_DIR)
+        pptx_bytes = pptx_gen.render_deck(outline, theme=data.get("theme", "modern"),
+                                           business_info=biz)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    title = outline.get("title", "deck")
+    slug = re.sub(r"\W+", "_", title[:40]).strip("_") or "deck"
+    fname = f"deck_{slug}_{int(time.time())}.pptx"
+    saved = _save_and_token(pptx_bytes, fname)
+    audit.log_event(DATA_DIR, actor=user["username"], action="pptx.from_outline")
+    return jsonify(saved)
+
+
+@app.route("/api/owner/mail_merge/preview", methods=["POST"])
+def mail_merge_preview():
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    user_dir = users_mod.get_user_dir(DATA_DIR, user["username"])
+    data = request.get_json(silent=True) or {}
+    template = data.get("template", "")
+    contact_id = data.get("contact_id", "")
+    extras = data.get("extras") or {}
+    contacts_list = mod_contacts.list_all(user_dir)
+    contact = next((c for c in contacts_list if c.get("id") == contact_id), None)
+    if not contact:
+        return jsonify({"error": "contact_not_found"}), 404
+    return jsonify({"rendered": mail_merge.merge_one(template, contact, extras=extras)})
+
+
+@app.route("/api/owner/mail_merge/run", methods=["POST"])
+def mail_merge_run():
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    user_dir = users_mod.get_user_dir(DATA_DIR, user["username"])
+    data = request.get_json(silent=True) or {}
+    try:
+        result = mail_merge.merge_all(
+            CONFIG, user_dir,
+            template_text=data.get("template", ""),
+            contact_ids=data.get("contact_ids") or [],
+            target_format=data.get("target_format", "pdf"),
+            extras=data.get("extras") or {},
+            llm_personalize=bool(data.get("llm_personalize")),
+        )
+        # Mint a download token for the zip if it exists
+        if result.get("zip_path"):
+            try:
+                ws = mod_workspace.workspace_path(CONFIG)
+                token = file_fetch.mint_download_token(
+                    DATA_DIR, result["zip_path"], ttl_minutes=60,
+                    extra_allowed_roots=[ws])
+                result["download_url"] = f"/download/{token}"
+            except Exception as e:
+                log.warning(f"mail_merge token mint failed: {e}")
+                result["download_url"] = None
+        audit.log_event(DATA_DIR, actor=user["username"], action="mail_merge.run",
+                        meta={"count": len(result.get("merged", [])),
+                              "format": data.get("target_format", "pdf")})
+        return jsonify(result)
+    except Exception as e:
+        log.warning(f"mail_merge run failed: {e}")
+        return jsonify({"error": str(e)}), 500
 
 
 # ---------------------------------------------------------------------------

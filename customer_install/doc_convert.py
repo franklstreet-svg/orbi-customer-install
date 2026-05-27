@@ -220,42 +220,236 @@ def _pdf_escape(s: str) -> str:
              .replace(">", "&gt;"))
 
 
-def write_docx(text: str, out_path: Path, title: str = "Orbi cleaned document") -> Path:
-    """Write the cleaned text as a real Word file. Markdown headings (# / ## / ###)
-    become Word heading styles."""
+def write_docx(text: str, out_path: Path, title: str = "Orbi cleaned document",
+               *, header_text: str = "", footer_text: str = "",
+               page_numbers: bool = False, business_name: str = "") -> Path:
+    """Write the cleaned text as a real Word file.
+
+    Markdown features supported:
+      # / ## / ### / ####          → Word heading styles
+      | a | b | c |                 → real Word tables (consecutive pipe lines)
+      | - | - | - |                 → table-header separator (skipped)
+      blank line                    → paragraph break
+      ---                           → horizontal-rule paragraph
+
+    Optional document furniture:
+      header_text / footer_text     → page header / footer band
+      page_numbers                  → adds "Page X of Y" in the footer
+      business_name                 → defaults the header if set + header_text empty
+    """
     import docx
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+
     d = docx.Document()
-    # First page header
     d.core_properties.title = title
-    for line in text.splitlines():
-        line = line.rstrip()
+
+    # Header + footer band on the default section
+    if header_text or business_name:
+        section = d.sections[0]
+        hdr = section.header.paragraphs[0]
+        hdr.text = header_text or business_name
+    if footer_text or page_numbers:
+        section = d.sections[0]
+        ftr = section.footer.paragraphs[0]
+        if footer_text:
+            ftr.text = footer_text
+        if page_numbers:
+            # Add a "Page X of Y" field. Word field-code XML trick.
+            run = ftr.add_run("  Page ")
+            _add_field_code(run, "PAGE")
+            ftr.add_run(" of ")
+            run2 = ftr.add_run()
+            _add_field_code(run2, "NUMPAGES")
+
+    # Walk the text. Detect runs of pipe-table lines and emit a real table.
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i].rstrip()
+        # Markdown table block?
+        if _is_pipe_table_row(line):
+            block = [line]
+            j = i + 1
+            while j < len(lines) and _is_pipe_table_row(lines[j].rstrip()):
+                block.append(lines[j].rstrip())
+                j += 1
+            _emit_docx_table(d, block)
+            i = j
+            continue
+        # Plain content
         if not line:
             d.add_paragraph("")
-            continue
-        if line.startswith("### "):
+        elif line.startswith("#### "):
+            d.add_heading(line[5:], level=4)
+        elif line.startswith("### "):
             d.add_heading(line[4:], level=3)
         elif line.startswith("## "):
             d.add_heading(line[3:], level=2)
         elif line.startswith("# "):
             d.add_heading(line[2:], level=1)
+        elif line.startswith("---") and set(line) <= {"-", " "}:
+            p = d.add_paragraph()
+            p.add_run("_" * 60)
+        elif line.startswith("- ") or line.startswith("* "):
+            d.add_paragraph(line[2:], style="List Bullet")
         else:
             d.add_paragraph(line)
+        i += 1
+
     d.save(str(out_path))
     return out_path
 
 
+def _is_pipe_table_row(line: str) -> bool:
+    s = line.strip()
+    return s.startswith("|") and s.count("|") >= 2 and s.endswith("|")
+
+
+def _emit_docx_table(doc, block: list[str]) -> None:
+    """Convert a markdown pipe-table block into a real Word table."""
+    rows = []
+    for ln in block:
+        cells = [c.strip() for c in ln.strip().strip("|").split("|")]
+        # Skip pure-separator rows (|---|---|)
+        if cells and all(set(c) <= set("-: ") for c in cells):
+            continue
+        rows.append(cells)
+    if not rows:
+        return
+    n_cols = max(len(r) for r in rows)
+    table = doc.add_table(rows=len(rows), cols=n_cols)
+    table.style = "Light Grid Accent 1"
+    for r_idx, row in enumerate(rows):
+        for c_idx, cell_text in enumerate(row):
+            if c_idx < n_cols:
+                table.cell(r_idx, c_idx).text = cell_text
+
+
+def _add_field_code(run, code: str) -> None:
+    """Insert a Word field code (e.g. PAGE, NUMPAGES) into a docx run."""
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+    fld_char_begin = OxmlElement("w:fldChar")
+    fld_char_begin.set(qn("w:fldCharType"), "begin")
+    instr_text = OxmlElement("w:instrText")
+    instr_text.set(qn("xml:space"), "preserve")
+    instr_text.text = code
+    fld_char_end = OxmlElement("w:fldChar")
+    fld_char_end.set(qn("w:fldCharType"), "end")
+    run._r.append(fld_char_begin)
+    run._r.append(instr_text)
+    run._r.append(fld_char_end)
+
+
 def write_xlsx(text: str, out_path: Path, title: str = "Orbi cleaned data") -> Path:
-    """Take tab-separated or comma-separated cleaned data and write XLSX."""
+    """Take cleaned table data and write XLSX with formulas, multi-sheet
+    support, and basic styling.
+
+    Multi-sheet syntax — the LLM (or owner) can mark sheet breaks in the
+    incoming text with a line like:
+        ## Sheet: Q1 Sales
+        Header1\tHeader2\tHeader3
+        ...rows...
+        ## Sheet: Q2 Sales
+        ...rows...
+
+    Formula syntax — any cell value starting with '=' is written as a
+    formula, not literal text. e.g. =SUM(B2:B10), =AVERAGE(C:C), etc.
+
+    Styling: header row is bold + light gray fill, columns autosized.
+    """
     import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
+
     wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Sheet1"
-    rows = _parse_table(text)
-    for row in rows:
-        ws.append(row)
+    # Remove the default blank sheet — we'll add our own
+    default = wb.active
+    wb.remove(default)
+
+    sheets = _split_sheets(text)
+    if not sheets:
+        sheets = [("Sheet1", [])]
+
+    header_font = Font(bold=True, color="FFFFFF")
+    header_fill = PatternFill(start_color="4F8CFF", end_color="4F8CFF",
+                              fill_type="solid")
+    header_align = Alignment(horizontal="left", vertical="center")
+
+    for sheet_name, rows in sheets:
+        ws = wb.create_sheet(title=(sheet_name or "Sheet")[:31])  # 31 = Excel max
+        if not rows:
+            continue
+        # Append rows. If a cell starts with "=" treat as formula.
+        for r_idx, row in enumerate(rows, start=1):
+            for c_idx, raw in enumerate(row, start=1):
+                cell = ws.cell(row=r_idx, column=c_idx)
+                val = (raw or "").strip()
+                if val.startswith("="):
+                    # Real formula
+                    cell.value = val
+                else:
+                    # Try to coerce numeric strings to numbers so Excel
+                    # treats them right (sums, charts, etc.)
+                    cell.value = _coerce_cell(val)
+        # Style the header row
+        for c_idx in range(1, len(rows[0]) + 1):
+            cell = ws.cell(row=1, column=c_idx)
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = header_align
+        # Autosize columns (best-effort — actual width is approximate)
+        for c_idx in range(1, len(rows[0]) + 1):
+            max_len = 8
+            for r in rows[:50]:  # sample first 50 rows for sizing
+                if c_idx <= len(r):
+                    max_len = max(max_len, min(40, len(str(r[c_idx - 1]))))
+            ws.column_dimensions[get_column_letter(c_idx)].width = max_len + 2
+        # Freeze header row
+        ws.freeze_panes = "A2"
+
     wb.properties.title = title
     wb.save(str(out_path))
     return out_path
+
+
+def _coerce_cell(val: str):
+    """Convert numeric-looking strings into actual numbers so Excel treats
+    them as numbers (and they sum correctly, chart correctly, etc.)."""
+    if not val:
+        return val
+    # Strip $ and , for currency-style values
+    stripped = val.replace("$", "").replace(",", "").strip()
+    try:
+        if "." in stripped:
+            return float(stripped)
+        return int(stripped)
+    except ValueError:
+        return val
+
+
+def _split_sheets(text: str) -> list[tuple[str, list[list[str]]]]:
+    """Detect ## Sheet: <name> markers and split into multiple sheets.
+    If no markers, returns a single-sheet list."""
+    lines = text.splitlines()
+    sheets: list[tuple[str, list[str]]] = []
+    current_name = "Sheet1"
+    current_lines: list[str] = []
+    for ln in lines:
+        m_match = ln.strip()
+        if m_match.lower().startswith("## sheet:") or m_match.lower().startswith("# sheet:"):
+            # Flush current
+            if current_lines:
+                sheets.append((current_name, current_lines))
+            current_name = m_match.split(":", 1)[1].strip() or f"Sheet{len(sheets)+1}"
+            current_lines = []
+            continue
+        current_lines.append(ln)
+    if current_lines:
+        sheets.append((current_name, current_lines))
+    # Parse each sheet's lines into rows via existing _parse_table
+    return [(name, _parse_table("\n".join(block))) for name, block in sheets]
 
 
 def write_csv(text: str, out_path: Path) -> Path:
