@@ -37,10 +37,10 @@
   </header>
 
   <nav class="tabs">
-    <button class="tab active" data-tab="messages">
+    <button class="tab" data-tab="messages">
       Messages <span class="badge" id="message-count">0</span>
     </button>
-    <button class="tab" data-tab="chat">Ask Orbi</button>
+    <button class="tab active" data-tab="chat">Ask Orbi</button>
     <button class="tab" data-tab="myday">My Day</button>
     <button class="tab" data-tab="voicemails">Voicemails <span class="badge" id="voicemail-count" hidden>0</span></button>
     <button class="tab" data-tab="email">Email <span class="badge" id="email-count" hidden>0</span></button>
@@ -54,7 +54,7 @@
 
   <main class="content">
     <!-- MESSAGES TAB -->
-    <section class="tab-panel active" id="tab-messages">
+    <section class="tab-panel" id="tab-messages">
 
       <!-- Morning briefing — today's quick summary -->
       <div class="briefing-banner" id="briefing-banner" hidden>
@@ -96,7 +96,7 @@
     </section>
 
     <!-- CHAT TAB (owner's ChatGPT replacement) -->
-    <section class="tab-panel chat-panel" id="tab-chat">
+    <section class="tab-panel chat-panel active" id="tab-chat">
       <div class="owner-chat-shell">
         <div class="owner-chat-messages" id="owner-chat-messages">
           <div class="owner-chat-welcome">
