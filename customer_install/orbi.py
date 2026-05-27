@@ -70,6 +70,7 @@ import booking
 import chart_gen
 import email_inbox
 import mail_merge
+import onboarding
 import pptx_gen
 import style_learner
 import translation
@@ -1338,6 +1339,11 @@ def owner_chat():
     if ff is not None:
         return jsonify(ff)
 
+    # OFFICE GENERATION — chart / deck / image fast-paths
+    office_result = _try_office_gen(user_msg, username)
+    if office_result is not None:
+        return jsonify(office_result)
+
     # CREATE patterns: route through quick_capture which classifies and files.
     qc_result = _try_quick_capture(user_msg, user_dir)
     if qc_result is not None:
@@ -1549,6 +1555,110 @@ _QC_TRIGGER_RE = _re.compile(
     r"appointment|meeting|book|schedule\s+(?:a|me)|save\s+contact|todo:|task:)",
     _re.IGNORECASE,
 )
+
+
+_CHART_TRIGGER_RE = _re.compile(
+    r"^(?:make|build|create|generate|draw)\s+(?:me\s+)?(?:a\s+)?"
+    r"(?:bar|line|pie|scatter)?\s*(?:chart|graph|plot|visualization)\b",
+    _re.IGNORECASE,
+)
+_DECK_TRIGGER_RE = _re.compile(
+    r"^(?:make|build|create|generate)\s+(?:me\s+)?(?:a\s+)?"
+    r"(?:\d+[-\s]?slide\s+)?(?:pitch\s+)?(?:slide\s+)?(?:deck|presentation|powerpoint|pptx)\b",
+    _re.IGNORECASE,
+)
+_IMAGE_TRIGGER_RE = _re.compile(
+    r"^(?:make|build|create|generate|design|draw)\s+(?:me\s+)?(?:a\s+)?"
+    r"(?:social|facebook|instagram|flyer|banner|poster|image|graphic|picture|post)\b",
+    _re.IGNORECASE,
+)
+
+
+def _try_office_gen(message: str, username: str) -> dict | None:
+    """Detect chart / deck / image generation intents and fire the
+    corresponding generator. Returns a chat-shaped reply or None to
+    fall through to the LLM."""
+    msg = (message or "").strip()
+    if not msg:
+        return None
+
+    try:
+        if _CHART_TRIGGER_RE.match(msg):
+            parsed = chart_gen.parse_chart_request(CONFIG, msg)
+            png = chart_gen.generate_chart(
+                CONFIG,
+                title=parsed.get("title", "Chart"),
+                kind=parsed.get("kind", "bar"),
+                data=parsed.get("data") or {},
+            )
+            fname = f"chart_{int(time.time())}.png"
+            saved = _save_and_token(png, fname)
+            audit.log_event(DATA_DIR, actor=username, action="chart.via_chat",
+                            meta={"req": msg[:120]})
+            return {"reply": (f"Made a {parsed.get('kind','bar')} chart titled "
+                              f"\"{parsed.get('title','Chart')}\". "
+                              f"[Download it]({saved['download_url']}) — "
+                              f"it's also saved to your Files tab."),
+                    "tier": "local", "latency_ms": 0,
+                    "source": "chart_gen", "download_url": saved.get("download_url")}
+
+        if _DECK_TRIGGER_RE.match(msg):
+            # Extract topic — everything after "deck about/on/for" or after the word "deck"
+            topic_match = _re.search(
+                r"(?:about|on|for|titled)\s+(.+)$", msg, _re.IGNORECASE)
+            topic = (topic_match.group(1).strip() if topic_match
+                     else _re.sub(r"^.{0,80}?(deck|presentation|powerpoint|pptx)\b\s*", "",
+                                  msg, flags=_re.IGNORECASE).strip())
+            if not topic:
+                topic = "my business"
+            slide_count = 7
+            sc_m = _re.search(r"(\d+)[\s-]?slide", msg, _re.IGNORECASE)
+            if sc_m:
+                try: slide_count = max(3, min(20, int(sc_m.group(1))))
+                except ValueError: pass
+            biz = mod_business.load(DATA_DIR)
+            result = pptx_gen.build_deck(CONFIG, topic=topic,
+                                         target_slide_count=slide_count,
+                                         theme="modern", business_info=biz)
+            slug = _re.sub(r"\W+", "_", topic[:40]).strip("_") or "deck"
+            fname = f"deck_{slug}_{int(time.time())}.pptx"
+            saved = _save_and_token(result["pptx_bytes"], fname)
+            audit.log_event(DATA_DIR, actor=username, action="pptx.via_chat",
+                            meta={"topic": topic})
+            return {"reply": (f"Built a {result.get('slide_count', slide_count)}-slide "
+                              f"deck on \"{topic}\". "
+                              f"[Download .pptx]({saved['download_url']}) — "
+                              f"also in your Files tab."),
+                    "tier": "local", "latency_ms": 0,
+                    "source": "pptx_gen", "download_url": saved.get("download_url")}
+
+        if _IMAGE_TRIGGER_RE.match(msg):
+            # Strip the leading verb to get the visual prompt
+            prompt = _re.sub(
+                r"^(?:make|build|create|generate|design|draw)\s+(?:me\s+)?(?:a\s+)?",
+                "", msg, flags=_re.IGNORECASE).strip()
+            png = image_gen.generate(CONFIG, prompt, kind="social_post")
+            ws = mod_workspace.workspace_path(CONFIG)
+            saved_path = image_gen.save_to_workspace(png, prompt, ws)
+            try:
+                token = file_fetch.mint_download_token(
+                    DATA_DIR, str(saved_path), ttl_minutes=30,
+                    extra_allowed_roots=[ws])
+                url = f"/download/{token}"
+            except Exception:
+                url = None
+            audit.log_event(DATA_DIR, actor=username, action="image.via_chat",
+                            meta={"prompt": prompt[:120]})
+            return {"reply": (f"Generated an image for \"{prompt}\". "
+                              + (f"[Download it]({url})" if url else "Saved to Files.")
+                              + " — saved to your Files tab."),
+                    "tier": "local", "latency_ms": 0,
+                    "source": "image_gen", "download_url": url}
+    except Exception as e:
+        log.warning(f"office_gen fast-path failed: {e}")
+        return None
+
+    return None
 
 
 def _try_quick_capture(message: str, user_dir: Path) -> dict | None:
@@ -2366,6 +2476,62 @@ def messages_update_tags(msg_id):
     tags = data.get("tags") or []
     ok = mod_messages.update_tags(DATA_DIR, msg_id, tags)
     return jsonify({"status": "ok" if ok else "not_found"}), 200 if ok else 404
+
+
+# ---------------------------------------------------------------------------
+# Onboarding wizard — discover business from website + ask gap questions
+# ---------------------------------------------------------------------------
+
+
+@app.route("/api/owner/onboarding/discover", methods=["POST"])
+def onboarding_discover():
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    data = request.get_json(silent=True) or {}
+    url = (data.get("url") or "").strip()
+    if not url:
+        return jsonify({"error": "url required"}), 400
+    try:
+        draft = onboarding.discover_from_url(url)
+        questions = onboarding.gap_questions(draft)
+        audit.log_event(DATA_DIR, actor=user["username"],
+                        action="onboarding.discover", meta={"url": url})
+        return jsonify({"draft": draft, "gap_questions": questions})
+    except Exception as e:
+        log.warning(f"onboarding discover failed: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/owner/onboarding/answer", methods=["POST"])
+def onboarding_answer():
+    """Owner answered one of the gap questions. Convert the answer to
+    the structured shape and return it (caller merges into the draft)."""
+    auth.require_user(ORBI_DIR, DATA_DIR)
+    data = request.get_json(silent=True) or {}
+    field = data.get("field", "")
+    answer = data.get("answer", "")
+    return jsonify({"patch": onboarding.parse_answer(field, answer)})
+
+
+@app.route("/api/owner/onboarding/apply", methods=["POST"])
+def onboarding_apply():
+    """Owner clicked 'Save' on the wizard. Merge the draft into
+    business_info.json — overwrite=True means owner answers win over
+    any existing values."""
+    user = auth.require_role(ORBI_DIR, DATA_DIR, "owner")
+    data = request.get_json(silent=True) or {}
+    draft = data.get("draft") or {}
+    overwrite = bool(data.get("overwrite", True))
+    saved = onboarding.apply_to_business(DATA_DIR, draft, overwrite=overwrite)
+    audit.log_event(DATA_DIR, actor=user["username"], action="onboarding.apply",
+                    meta={"name": saved.get("name", "")})
+    return jsonify({"status": "ok", "business": saved})
+
+
+@app.route("/api/owner/onboarding/explain", methods=["GET"])
+def onboarding_explain():
+    """Returns the canned 'here's how I learn about your business' text
+    so chat can pull it verbatim or the dashboard can show it."""
+    return jsonify({"text": onboarding.explain_flow()})
 
 
 # ---------------------------------------------------------------------------
