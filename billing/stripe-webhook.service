@@ -1,0 +1,28 @@
+[Unit]
+Description=Orbi Stripe Webhook Handler
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/orbi-brain/stripe.env
+ExecStart=/usr/bin/python3 /opt/orbi-brain/stripe_webhook.py
+Restart=on-failure
+RestartSec=10
+User=orbi-brain
+Group=orbi-brain
+WorkingDirectory=/opt/orbi-brain
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=orbi-stripe
+Environment=PYTHONUNBUFFERED=1
+
+MemoryMax=256M
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+ReadWritePaths=/opt/orbi-brain
+
+[Install]
+WantedBy=multi-user.target

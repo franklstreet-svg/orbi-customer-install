@@ -61,6 +61,13 @@ log = logging.getLogger("orbi.installer")
 BILLING_BASE_URL = os.environ.get(
     "ORBI_BILLING_URL", "https://billing.orbi.frank.com"
 )
+# Brain proxy URL — separate env var so Frank can move the LLM brain to a
+# different host (a self-owned 70B box, an alternate Cloudflare tunnel)
+# without disturbing the billing host. Defaults to the same hostname
+# because today both run on the same machine.
+BRAIN_BASE_URL = os.environ.get(
+    "ORBI_BRAIN_URL", BILLING_BASE_URL
+)
 VERIFY_TIMEOUT_SECONDS = 15
 HEALTH_TIMEOUT_SECONDS = 30
 HEALTH_PORT = 5050
@@ -289,6 +296,8 @@ def write_config(install_dir: Path, billing_data: dict,
     cfg["owner"].pop("_password_hash", None)
 
     cfg.setdefault("brain", {})["api_key"] = api_key
+    cfg["brain"]["url"] = BRAIN_BASE_URL.rstrip("/")
+    cfg["brain"].setdefault("timeout_seconds", 30)
     cfg.setdefault("billing", {})["check_url"] = (
         f"{BILLING_BASE_URL.rstrip('/')}/api/active"
     )

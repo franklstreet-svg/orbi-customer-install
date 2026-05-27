@@ -105,21 +105,42 @@ Once the service is running and exposed via cloudflared (e.g. `billing.orbi.fran
 4. Copy the signing secret into `/etc/orbi-brain/stripe.env` as `STRIPE_WEBHOOK_SECRET`
 5. Restart the service: `sudo systemctl restart stripe-webhook`
 
-## Create the three products in Stripe
+## Create the eight products in Stripe
 
-In Stripe Dashboard > Products, create three recurring products:
+In Stripe Dashboard > Products, create eight recurring products — four tiers × two billing cycles. No setup fee (dropped 2026-05-27 — the onboarding wizard handles it).
 
-| Name | Price | Interval | Notes |
-|------|-------|----------|-------|
-| Orbi Chat Only | $79.00 | monthly | Set up fee handled separately as one-time |
-| Orbi Standard | $149.00 | monthly | |
-| Orbi Local-Only Premium | $179.00 | monthly | |
+| Tier | Monthly | Annual (15% off) | Notes |
+|------|---------|------------------|-------|
+| Small Business    | $99/mo  | $999/yr   | 500 chats/mo, 1 user, no phone |
+| Medium Business   | $149/mo | $1,499/yr | 2,000 chats + 200 calls, 5 users |
+| Large Business    | $249/mo | $2,499/yr | 10,000 chats + 1,000 calls, 15 users, 70B brain |
+| Enterprise        | $399/mo | $3,999/yr | unlimited, custom integrations |
 
-Copy each Price ID (starts with `price_`) into `/etc/orbi-brain/stripe.env`.
+Copy each Price ID (starts with `price_`) into the matching `STRIPE_PRICE_*` slot in `/etc/orbi-brain/stripe.env`.
 
-## Setup fees
+## Brain proxy
 
-Setup fees ($199 / $349 / $799) are one-time payments. Add them as one-time products and include them in the Checkout session as additional line items. They don't trigger subscription events — Frank tracks them in his own books.
+Customers' local Orbis call **`POST /v1/chat/completions`** on this server using their api_key as a Bearer token. The proxy:
+
+1. Looks up the api_key → tier + active flag
+2. Returns 402 if the subscription is inactive (cancelled / refunded / unpaid)
+3. Returns 429 if they've hit their monthly chat cap
+4. Otherwise forwards to HuggingFace Inference using **Frank's** HF token, picking the model from `TIER_TO_MODEL` (8B for Small/Medium, 70B for Large/Enterprise)
+5. Records the usage and returns the OpenAI-shaped response
+
+This closes the refund loophole: software is free, the brain (LLM access) is what customers actually pay for.
+
+### Brain config in stripe.env:
+
+```
+HF_TOKEN=hf_...                    # huggingface.co/settings/tokens (Read + Inference)
+HF_API_BASE=https://api-inference.huggingface.co/models   # only override to swap providers
+BRAIN_TIMEOUT_S=60
+```
+
+### Usage endpoint
+
+The customer dashboard can show usage by hitting `GET /api/brain/usage/<api_key>` — returns `{tier, period, used: {chats, calls, tokens_in, tokens_out}, cap: {...}}`.
 
 ## Frank-only admin endpoints
 

@@ -56,12 +56,43 @@ DOWNLOAD_BASE_URL     = os.environ.get(
     "ORBI_DOWNLOAD_BASE_URL", "https://downloads.orbi.frank.com"
 )
 
-# Map Stripe price IDs → human-readable tier names
-# (set these to your real price IDs once you create the products in Stripe)
+# Map Stripe price IDs → (tier_name, billing_cycle). Tiers are
+# small / medium / large / enterprise (set 2026-05-27). billing_cycle is
+# 'monthly' or 'annual'. The customer pays whatever Stripe charges; we
+# look up the tier from this map when the webhook fires.
+#
+# Frank creates these Prices in the Stripe dashboard then sets the env
+# vars in /etc/orbi-brain/stripe.env. If an env var is missing we still
+# boot (placeholder string won't match anything) — the webhook will just
+# log "unknown price_id" until the env is corrected.
 PRICE_TO_TIER = {
-    os.environ.get("STRIPE_PRICE_CHAT",    "price_chat_placeholder"):    "chat_only",
-    os.environ.get("STRIPE_PRICE_STD",     "price_std_placeholder"):     "standard",
-    os.environ.get("STRIPE_PRICE_LOCAL",   "price_local_placeholder"):   "local_only_premium",
+    os.environ.get("STRIPE_PRICE_SMALL_MO",  "price_small_mo_placeholder"):  ("small",      "monthly"),
+    os.environ.get("STRIPE_PRICE_SMALL_YR",  "price_small_yr_placeholder"):  ("small",      "annual"),
+    os.environ.get("STRIPE_PRICE_MEDIUM_MO", "price_medium_mo_placeholder"): ("medium",     "monthly"),
+    os.environ.get("STRIPE_PRICE_MEDIUM_YR", "price_medium_yr_placeholder"): ("medium",     "annual"),
+    os.environ.get("STRIPE_PRICE_LARGE_MO",  "price_large_mo_placeholder"):  ("large",      "monthly"),
+    os.environ.get("STRIPE_PRICE_LARGE_YR",  "price_large_yr_placeholder"):  ("large",      "annual"),
+    os.environ.get("STRIPE_PRICE_ENT_MO",    "price_ent_mo_placeholder"):    ("enterprise", "monthly"),
+    os.environ.get("STRIPE_PRICE_ENT_YR",    "price_ent_yr_placeholder"):    ("enterprise", "annual"),
+}
+
+# Tier → LLM model name. The brain proxy uses this to decide which
+# model to call. Large + Enterprise get the bigger 70B brain.
+TIER_TO_MODEL = {
+    "small":      "meta-llama/Llama-3.1-8B-Instruct",
+    "medium":     "meta-llama/Llama-3.1-8B-Instruct",
+    "large":      "meta-llama/Llama-3.3-70B-Instruct",
+    "enterprise": "meta-llama/Llama-3.3-70B-Instruct",
+}
+
+# Tier → monthly usage caps. The brain proxy enforces these soft caps —
+# when a customer goes over, they get a polite "upgrade to continue"
+# response instead of being silently cut off.
+TIER_CAPS = {
+    "small":      {"chats_per_mo":    500, "calls_per_mo":     0, "staff": 1},
+    "medium":     {"chats_per_mo":  2_000, "calls_per_mo":   200, "staff": 5},
+    "large":      {"chats_per_mo": 10_000, "calls_per_mo": 1_000, "staff": 15},
+    "enterprise": {"chats_per_mo": 999_999,"calls_per_mo": 5_000, "staff": 999},
 }
 
 stripe.api_key = STRIPE_API_KEY
@@ -86,6 +117,7 @@ def init_db() -> None:
                 email              TEXT,
                 business_name      TEXT,
                 tier               TEXT,
+                billing_cycle      TEXT,
                 active             INTEGER DEFAULT 0,
                 subscription_id    TEXT,
                 period_end         INTEGER,
@@ -103,9 +135,28 @@ def init_db() -> None:
                 received_at  INTEGER
             );
 
+            -- Per-customer per-month usage counters. The brain proxy
+            -- increments these on every call so we can enforce tier caps
+            -- and surface usage in the customer dashboard.
+            CREATE TABLE IF NOT EXISTS usage (
+                api_key      TEXT NOT NULL,
+                period       TEXT NOT NULL,
+                chats_count  INTEGER DEFAULT 0,
+                calls_count  INTEGER DEFAULT 0,
+                tokens_in    INTEGER DEFAULT 0,
+                tokens_out   INTEGER DEFAULT 0,
+                updated_at   INTEGER,
+                PRIMARY KEY (api_key, period)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_customers_stripe
                 ON customers(stripe_customer_id);
         """)
+        # Backfill billing_cycle column on existing DBs (no-op if already added).
+        try:
+            conn.execute("ALTER TABLE customers ADD COLUMN billing_cycle TEXT")
+        except sqlite3.OperationalError:
+            pass
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -151,6 +202,7 @@ def get_customer_by_stripe_id(stripe_customer_id: str) -> dict | None:
 
 def upsert_customer(*, stripe_customer_id: str, email: str | None = None,
                     business_name: str | None = None, tier: str | None = None,
+                    billing_cycle: str | None = None,
                     active: bool | None = None, subscription_id: str | None = None,
                     period_end: int | None = None, grace_until: int | None = None) -> str:
     existing = get_customer_by_stripe_id(stripe_customer_id)
@@ -160,7 +212,8 @@ def upsert_customer(*, stripe_customer_id: str, email: str | None = None,
             params = []
             for field, value in (
                 ("email", email), ("business_name", business_name),
-                ("tier", tier), ("subscription_id", subscription_id),
+                ("tier", tier), ("billing_cycle", billing_cycle),
+                ("subscription_id", subscription_id),
                 ("period_end", period_end), ("grace_until", grace_until),
             ):
                 if value is not None:
@@ -181,16 +234,72 @@ def upsert_customer(*, stripe_customer_id: str, email: str | None = None,
             api_key = generate_api_key()
             conn.execute(
                 "INSERT INTO customers "
-                "(api_key, stripe_customer_id, email, business_name, tier, "
+                "(api_key, stripe_customer_id, email, business_name, tier, billing_cycle, "
                 "active, subscription_id, period_end, grace_until, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
-                    api_key, stripe_customer_id, email, business_name, tier,
+                    api_key, stripe_customer_id, email, business_name, tier, billing_cycle,
                     1 if active else 0, subscription_id, period_end, grace_until,
                     now(), now(),
                 ),
             )
             return api_key
+
+
+def get_customer_by_api_key(api_key: str) -> dict | None:
+    if not api_key:
+        return None
+    with db() as conn:
+        cur = conn.execute(
+            "SELECT * FROM customers WHERE api_key = ?", (api_key,)
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+
+# ---------------------------------------------------------------------------
+# Usage counters (used by the brain proxy)
+# ---------------------------------------------------------------------------
+
+def _current_period() -> str:
+    """YYYY-MM in UTC. Used as the partition key for monthly usage counters."""
+    return datetime.utcnow().strftime("%Y-%m")
+
+
+def get_usage(api_key: str, period: str | None = None) -> dict:
+    """Return the usage row for (api_key, period). Period defaults to current month."""
+    period = period or _current_period()
+    with db() as conn:
+        cur = conn.execute(
+            "SELECT chats_count, calls_count, tokens_in, tokens_out "
+            "FROM usage WHERE api_key = ? AND period = ?",
+            (api_key, period),
+        )
+        row = cur.fetchone()
+        if not row:
+            return {"period": period, "chats_count": 0, "calls_count": 0,
+                    "tokens_in": 0, "tokens_out": 0}
+        d = dict(row)
+        d["period"] = period
+        return d
+
+
+def increment_usage(api_key: str, *, chats: int = 0, calls: int = 0,
+                    tokens_in: int = 0, tokens_out: int = 0) -> None:
+    """Add to this customer's current-period usage counters."""
+    period = _current_period()
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO usage (api_key, period, chats_count, calls_count, "
+            "tokens_in, tokens_out, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(api_key, period) DO UPDATE SET "
+            "chats_count = chats_count + excluded.chats_count, "
+            "calls_count = calls_count + excluded.calls_count, "
+            "tokens_in   = tokens_in   + excluded.tokens_in, "
+            "tokens_out  = tokens_out  + excluded.tokens_out, "
+            "updated_at  = excluded.updated_at",
+            (api_key, period, chats, calls, tokens_in, tokens_out, now()),
+        )
 
 # ---------------------------------------------------------------------------
 # Install-token store  (Stripe-checkout → installer bridge)
@@ -305,14 +414,15 @@ def handle_checkout_completed(event: dict) -> None:
     subscription_id    = obj.get("subscription")
     email              = obj.get("customer_details", {}).get("email")
 
-    # Resolve which tier they bought
+    # Resolve which tier + billing cycle they bought
     tier = None
+    billing_cycle = None
     if subscription_id:
         sub = stripe.Subscription.retrieve(subscription_id)
         for item in sub["items"]["data"]:
             price_id = item["price"]["id"]
             if price_id in PRICE_TO_TIER:
-                tier = PRICE_TO_TIER[price_id]
+                tier, billing_cycle = PRICE_TO_TIER[price_id]
                 break
         period_end = sub["current_period_end"]
     else:
@@ -322,6 +432,7 @@ def handle_checkout_completed(event: dict) -> None:
         stripe_customer_id=stripe_customer_id,
         email=email,
         tier=tier,
+        billing_cycle=billing_cycle,
         active=True,
         subscription_id=subscription_id,
         period_end=period_end,
@@ -428,16 +539,18 @@ def handle_subscription_updated(event: dict) -> None:
     period_end         = sub["current_period_end"]
 
     new_tier = None
+    new_cycle = None
     for item in sub["items"]["data"]:
         price_id = item["price"]["id"]
         if price_id in PRICE_TO_TIER:
-            new_tier = PRICE_TO_TIER[price_id]
+            new_tier, new_cycle = PRICE_TO_TIER[price_id]
             break
 
     active = status in ("active", "trialing")
     upsert_customer(
         stripe_customer_id=stripe_customer_id,
         tier=new_tier,
+        billing_cycle=new_cycle,
         active=active,
         subscription_id=sub["id"],
         period_end=period_end,
@@ -598,6 +711,201 @@ def api_verify(token: str):
         "api_key":     rec["api_key"],
         "tier":        rec.get("tier") or "standard",
         "owner_email": rec.get("email") or "",
+    })
+
+
+# ---------------------------------------------------------------------------
+# Brain Proxy
+# ---------------------------------------------------------------------------
+#
+# The customer's local Orbi never talks to HuggingFace directly. It POSTs to
+# us with its api_key as a Bearer token, we look the key up, check the
+# subscription is active, check the monthly cap, then forward the request
+# to HF using OUR HF token.
+#
+# Result: a refunded/cancelled customer keeps the software but loses the
+# brain — no way to keep using Orbi on Frank's HF budget after they stop
+# paying.
+#
+# The proxy speaks the OpenAI chat-completions shape on purpose:
+#   - customer_install/llm_client.py already calls POST /v1/chat/completions
+#     with Bearer auth, so it works without any client changes (just point
+#     config.brain.url at billing.orbi.frank.com)
+#   - any future OpenAI-compatible tool will work too
+#
+# Endpoints:
+#   POST /v1/chat/completions           — OpenAI-shape chat (the workhorse)
+#   POST /api/brain/tts                 — text-to-speech proxy (placeholder)
+#   GET  /api/brain/usage/<api_key>     — current-month usage + caps
+
+HF_TOKEN          = os.environ.get("HF_TOKEN", "").strip()
+HF_API_BASE       = os.environ.get("HF_API_BASE",
+                                   "https://api-inference.huggingface.co/models")
+BRAIN_TIMEOUT_S   = int(os.environ.get("BRAIN_TIMEOUT_S", "60"))
+
+
+def _extract_bearer(req) -> str:
+    """Pull the api_key out of Authorization: Bearer / X-Orbi-Key / body."""
+    auth = (req.headers.get("Authorization") or "").strip()
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    hdr = (req.headers.get("X-Orbi-Key") or "").strip()
+    if hdr:
+        return hdr
+    try:
+        body = req.get_json(silent=True) or {}
+        return (body.get("api_key") or "").strip()
+    except Exception:
+        return ""
+
+
+def _hf_chat(model: str, messages: list, max_new_tokens: int = 512,
+             temperature: float = 0.7) -> dict:
+    """Call HF Inference and return the raw OpenAI-shaped JSON body."""
+    if not HF_TOKEN:
+        raise RuntimeError("HF_TOKEN not configured on brain server")
+
+    import urllib.request
+    url = f"{HF_API_BASE.rstrip('/')}/{model}/v1/chat/completions"
+    payload = {
+        "model":       model,
+        "messages":    messages,
+        "max_tokens":  max_new_tokens,
+        "temperature": temperature,
+        "stream":      False,
+    }
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {HF_TOKEN}",
+            "Content-Type":  "application/json",
+            "User-Agent":    "Orbi-Brain-Proxy/0.1",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=BRAIN_TIMEOUT_S) as resp:
+        return json.loads(resp.read().decode("utf-8", errors="replace"))
+
+
+@app.route("/v1/chat/completions", methods=["POST"])
+def brain_chat():
+    """OpenAI-compatible chat completions, gated by customer api_key.
+
+    Request:   { "messages": [...], "model"?: ..., "max_tokens"?: ..., "temperature"?: ... }
+    Auth:      Authorization: Bearer <api_key>  (or X-Orbi-Key header)
+    Routing:   TIER_TO_MODEL picks the model from the customer's tier; the
+               client's `model` field is treated as a hint only — we ignore
+               it if the customer's tier doesn't entitle them to it.
+    Cap:       TIER_CAPS[tier]["chats_per_mo"]. Returns 429 when exceeded.
+    Errors:    401 invalid key, 402 subscription inactive, 429 cap, 502 upstream.
+    Response:  Full OpenAI chat-completions JSON pass-through (model overridden
+               to what we actually called) so llm_client.py + any other
+               OpenAI-compatible tool just works.
+    """
+    api_key = _extract_bearer(request)
+    cust = get_customer_by_api_key(api_key)
+    if not cust:
+        return jsonify({"error": {"message": "invalid_api_key", "type": "auth_error"}}), 401
+    if not cust.get("active"):
+        return jsonify({"error": {
+            "message": "Your Orbi subscription isn't active. Visit your billing portal to resume service.",
+            "type":    "subscription_inactive",
+            "tier":    cust.get("tier"),
+        }}), 402
+
+    tier = cust.get("tier") or "small"
+    used = get_usage(api_key)
+    cap  = TIER_CAPS.get(tier, TIER_CAPS["small"])
+    if used["chats_count"] >= cap["chats_per_mo"]:
+        return jsonify({"error": {
+            "message": (f"You've used all {cap['chats_per_mo']} chats included in your "
+                        f"{tier.title()} tier this month. Upgrade to continue."),
+            "type":    "monthly_cap_exceeded",
+            "tier":    tier,
+            "cap":     cap["chats_per_mo"],
+            "used":    used["chats_count"],
+        }}), 429
+
+    body = request.get_json(silent=True) or {}
+    messages = body.get("messages") or []
+    if not isinstance(messages, list) or not messages:
+        return jsonify({"error": {"message": "messages required", "type": "bad_request"}}), 400
+
+    # Customer's `model` is a HINT — actual model is decided by tier.
+    model = TIER_TO_MODEL.get(tier, TIER_TO_MODEL["small"])
+
+    try:
+        upstream = _hf_chat(
+            model,
+            messages,
+            max_new_tokens=int(body.get("max_tokens", 512)),
+            temperature=float(body.get("temperature", 0.7)),
+        )
+    except Exception as e:
+        log.warning("brain upstream failed for %s: %s", api_key[:14], e)
+        return jsonify({"error": {
+            "message": "Brain is temporarily unavailable — your Orbi will fall back to its other tiers.",
+            "type":    "upstream_failure",
+            "detail":  str(e)[:200],
+        }}), 502
+
+    usage = upstream.get("usage") or {}
+    tin   = int(usage.get("prompt_tokens", 0))
+    tout  = int(usage.get("completion_tokens", 0))
+    increment_usage(api_key, chats=1, tokens_in=tin, tokens_out=tout)
+
+    upstream["model"] = model
+    upstream.setdefault("x_orbi", {})
+    upstream["x_orbi"].update({"tier": tier, "remaining_chats": max(0, cap["chats_per_mo"] - used["chats_count"] - 1)})
+    return jsonify(upstream)
+
+
+@app.route("/api/brain/tts", methods=["POST"])
+def brain_tts():
+    """Proxy text-to-speech. Placeholder for now — edge-tts runs locally on
+    the customer's box already, so this endpoint mostly exists to let us
+    flip TTS to a hosted provider later (ElevenLabs / OpenAI / Cartesia)
+    without touching customer installs.
+
+    Returns 501 today; the customer Orbi falls back to local edge-tts.
+    """
+    body = request.get_json(force=True, silent=True) or {}
+    api_key = (body.get("api_key")
+               or request.headers.get("X-Orbi-Key", "")).strip()
+    cust = get_customer_by_api_key(api_key)
+    if not cust:
+        return jsonify({"error": "invalid_api_key"}), 401
+    if not cust.get("active"):
+        return jsonify({"error": "subscription_inactive"}), 402
+
+    return jsonify({
+        "error":   "not_implemented",
+        "message": "Hosted TTS isn't wired yet — your local Orbi will use edge-tts directly.",
+    }), 501
+
+
+@app.route("/api/brain/usage/<api_key>", methods=["GET"])
+def brain_usage(api_key: str):
+    """Return current-month usage and the customer's caps."""
+    cust = get_customer_by_api_key(api_key)
+    if not cust:
+        return jsonify({"error": "invalid_api_key"}), 401
+    tier = cust.get("tier") or "small"
+    cap  = TIER_CAPS.get(tier, TIER_CAPS["small"])
+    used = get_usage(api_key)
+    return jsonify({
+        "tier":          tier,
+        "billing_cycle": cust.get("billing_cycle"),
+        "active":        bool(cust.get("active")),
+        "period":        used["period"],
+        "used": {
+            "chats":      used["chats_count"],
+            "calls":      used["calls_count"],
+            "tokens_in":  used["tokens_in"],
+            "tokens_out": used["tokens_out"],
+        },
+        "cap":  cap,
     })
 
 
