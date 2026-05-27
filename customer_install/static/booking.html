@@ -1,0 +1,565 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Book a time</title>
+  <meta name="theme-color" content="#0b0f1a">
+  <link rel="icon" type="image/png" sizes="32x32" href="/pwa/icons/icon-favicon.png">
+  <style>
+    :root {
+      --bg:         #0b0f1a;
+      --bg-card:    #1a2236;
+      --bg-card-2: #21294a;
+      --bg-input:   #0f1626;
+      --border:     #2c3957;
+      --text:       #eaf0ff;
+      --text-dim:   #b8c6e0;
+      --text-soft:  #8fa3c7;
+      --accent:     #4f8cff;
+      --accent-hov: #3a7af0;
+      --danger:     #ff5555;
+      --good:       #6fdc94;
+    }
+
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0; padding: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--text);
+      font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+      font-size: 16px;
+      line-height: 1.5;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    .container {
+      max-width: 720px;
+      margin: 0 auto;
+      padding: 32px 20px 80px;
+    }
+
+    .header {
+      text-align: center;
+      margin-bottom: 28px;
+    }
+    .business-name {
+      font-size: 22px;
+      font-weight: 600;
+      letter-spacing: -0.01em;
+      color: var(--text);
+    }
+    .owner-line {
+      margin-top: 4px;
+      font-size: 14px;
+      color: var(--text-soft);
+    }
+    .intro-text {
+      margin-top: 16px;
+      padding: 14px 16px;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      font-size: 14px;
+      color: var(--text-dim);
+      text-align: left;
+    }
+
+    .section {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 20px;
+      margin-bottom: 20px;
+    }
+    .section h2 {
+      margin: 0 0 14px;
+      font-size: 15px;
+      font-weight: 600;
+      color: var(--text-dim);
+      letter-spacing: 0.02em;
+      text-transform: uppercase;
+    }
+
+    .loading, .empty {
+      padding: 24px;
+      text-align: center;
+      color: var(--text-soft);
+      font-size: 14px;
+    }
+    .spinner {
+      display: inline-block;
+      width: 18px; height: 18px;
+      border: 2px solid var(--text-soft);
+      border-top-color: transparent;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+      vertical-align: middle;
+      margin-right: 8px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .days {
+      display: flex;
+      flex-direction: column;
+      gap: 18px;
+    }
+    .day-block { }
+    .day-label {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--accent);
+      margin-bottom: 8px;
+    }
+    .slots {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
+      gap: 8px;
+    }
+    .slot-btn {
+      padding: 10px 12px;
+      background: var(--bg-card-2);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      color: var(--text);
+      font-size: 14px;
+      font-family: inherit;
+      cursor: pointer;
+      transition: border-color 0.12s ease, background 0.12s ease;
+    }
+    .slot-btn:hover {
+      border-color: var(--accent);
+      background: rgba(79,140,255,0.12);
+    }
+    .slot-btn.selected {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: white;
+      font-weight: 600;
+    }
+
+    .form-row {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      margin-bottom: 14px;
+    }
+    .form-row label {
+      font-size: 13px;
+      color: var(--text-dim);
+      font-weight: 500;
+    }
+    .form-row .hint {
+      font-size: 12px;
+      color: var(--text-soft);
+    }
+    .form-row input,
+    .form-row textarea {
+      width: 100%;
+      padding: 11px 13px;
+      background: var(--bg-input);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      color: var(--text);
+      font-size: 15px;
+      font-family: inherit;
+      outline: none;
+    }
+    .form-row input:focus,
+    .form-row textarea:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px rgba(79,140,255,0.18);
+    }
+    .form-row textarea {
+      resize: vertical;
+      min-height: 80px;
+    }
+
+    .selected-summary {
+      padding: 12px 14px;
+      background: rgba(79,140,255,0.12);
+      border: 1px solid rgba(79,140,255,0.3);
+      border-radius: 10px;
+      font-size: 14px;
+      margin-bottom: 16px;
+      color: var(--text);
+    }
+
+    .submit-btn {
+      width: 100%;
+      padding: 14px 18px;
+      background: var(--accent);
+      border: none;
+      border-radius: 12px;
+      color: white;
+      font-size: 16px;
+      font-weight: 600;
+      font-family: inherit;
+      cursor: pointer;
+      transition: background 0.12s ease;
+    }
+    .submit-btn:hover:not(:disabled) {
+      background: var(--accent-hov);
+    }
+    .submit-btn:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
+
+    .error-banner {
+      padding: 12px 14px;
+      background: rgba(255,85,85,0.12);
+      border: 1px solid rgba(255,85,85,0.3);
+      border-radius: 10px;
+      color: var(--danger);
+      font-size: 14px;
+      margin-bottom: 14px;
+    }
+    .error-banner.hidden { display: none; }
+
+    .success-card {
+      text-align: center;
+      padding: 36px 28px;
+    }
+    .success-icon {
+      width: 64px; height: 64px;
+      margin: 0 auto 18px;
+      border-radius: 50%;
+      background: var(--good);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .success-icon svg { fill: var(--bg); width: 32px; height: 32px; }
+    .success-card h1 {
+      font-size: 22px;
+      margin: 0 0 10px;
+      font-weight: 600;
+    }
+    .success-card .when {
+      color: var(--accent);
+      font-weight: 600;
+      font-size: 17px;
+      margin: 8px 0 16px;
+    }
+    .success-card p {
+      color: var(--text-dim);
+      font-size: 14px;
+      margin: 4px 0;
+    }
+
+    .hidden { display: none !important; }
+
+    /* Mobile */
+    @media (max-width: 540px) {
+      .container { padding: 20px 16px 60px; }
+      .section { padding: 16px; }
+      .business-name { font-size: 19px; }
+      .slots { grid-template-columns: repeat(auto-fill, minmax(95px, 1fr)); }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+
+    <!-- ── Booking flow ───────────────────────────────────────── -->
+    <div id="booking-flow">
+      <div class="header">
+        <div class="business-name" id="business-name">Loading…</div>
+        <div class="owner-line" id="owner-line"></div>
+      </div>
+
+      <div class="intro-text hidden" id="intro-text"></div>
+
+      <div class="section">
+        <h2>Pick a time</h2>
+        <div id="slots-container">
+          <div class="loading">
+            <span class="spinner"></span>Finding open times…
+          </div>
+        </div>
+      </div>
+
+      <div class="section" id="form-section">
+        <h2>Your details</h2>
+
+        <div class="error-banner hidden" id="error-banner"></div>
+
+        <div class="selected-summary hidden" id="selected-summary">
+          Selected: <span id="selected-text"></span>
+        </div>
+
+        <form id="booking-form" autocomplete="on" novalidate>
+          <div class="form-row">
+            <label for="visitor-name">Your name <span class="hint">(required)</span></label>
+            <input id="visitor-name" name="name" type="text" autocomplete="name"
+                   required maxlength="120">
+          </div>
+          <div class="form-row">
+            <label for="visitor-email">Email <span class="hint">(required)</span></label>
+            <input id="visitor-email" name="email" type="email" autocomplete="email"
+                   required maxlength="200">
+          </div>
+          <div class="form-row">
+            <label for="visitor-phone">Phone <span class="hint" id="phone-hint">(optional)</span></label>
+            <input id="visitor-phone" name="phone" type="tel" autocomplete="tel"
+                   maxlength="40">
+          </div>
+          <div class="form-row">
+            <label for="visitor-notes">Anything I should know? <span class="hint">(optional)</span></label>
+            <textarea id="visitor-notes" name="notes" maxlength="2000"
+                      placeholder="A short note about what you'd like to discuss…"></textarea>
+          </div>
+
+          <button type="submit" class="submit-btn" id="submit-btn" disabled>
+            Confirm booking
+          </button>
+        </form>
+      </div>
+    </div>
+
+    <!-- ── Success state ─────────────────────────────────────── -->
+    <div id="success-flow" class="hidden">
+      <div class="section success-card">
+        <div class="success-icon">
+          <svg viewBox="0 0 24 24"><path d="M9 16.2L4.8 12l-1.4 1.4L9 19 21 7l-1.4-1.4z"/></svg>
+        </div>
+        <h1>You're booked!</h1>
+        <div class="when" id="success-when"></div>
+        <p>A confirmation will be in your inbox shortly.</p>
+        <p id="success-business" style="margin-top:14px;"></p>
+      </div>
+    </div>
+
+  </div>
+
+  <script>
+    (function () {
+      'use strict';
+
+      // ---- Read ?u=<username> ----
+      const params = new URLSearchParams(window.location.search);
+      const username = (params.get('u') || '').trim().toLowerCase();
+      if (!username) {
+        document.getElementById('business-name').textContent =
+          'Missing ?u=<username> in URL';
+        return;
+      }
+
+      // ---- State ----
+      let state = {
+        config:   null,
+        slots:    [],
+        selected: null,    // a slot dict
+        business: null,
+      };
+
+      // ---- DOM refs ----
+      const $businessName    = document.getElementById('business-name');
+      const $ownerLine       = document.getElementById('owner-line');
+      const $intro           = document.getElementById('intro-text');
+      const $slotsContainer  = document.getElementById('slots-container');
+      const $selectedSummary = document.getElementById('selected-summary');
+      const $selectedText    = document.getElementById('selected-text');
+      const $form            = document.getElementById('booking-form');
+      const $submitBtn       = document.getElementById('submit-btn');
+      const $errBanner       = document.getElementById('error-banner');
+      const $phoneHint       = document.getElementById('phone-hint');
+      const $phoneInput      = document.getElementById('visitor-phone');
+
+      // ---- Fetch slots + business info ----
+      async function loadSlots() {
+        try {
+          const res = await fetch(
+            '/api/public/booking/slots?u=' + encodeURIComponent(username)
+          );
+          if (res.status === 404) {
+            $businessName.textContent = 'Bookings unavailable';
+            $slotsContainer.innerHTML =
+              '<div class="empty">This booking page isn\'t available right now.</div>';
+            document.getElementById('form-section').classList.add('hidden');
+            return;
+          }
+          if (!res.ok) throw new Error('HTTP ' + res.status);
+          const data = await res.json();
+
+          state.config = data;
+          state.slots  = data.slots || [];
+
+          // Header
+          $businessName.textContent = data.business_name || 'Book a time';
+          if (data.owner_name) {
+            $ownerLine.textContent = 'with ' + data.owner_name;
+          }
+          if (data.intro_text) {
+            $intro.textContent = data.intro_text;
+            $intro.classList.remove('hidden');
+          }
+          if (data.require_phone) {
+            $phoneInput.setAttribute('required', 'required');
+            $phoneHint.textContent = '(required)';
+          }
+
+          renderSlots();
+        } catch (err) {
+          console.error('[booking] loadSlots failed', err);
+          $slotsContainer.innerHTML =
+            '<div class="empty">Could not load open times. Please refresh.</div>';
+        }
+      }
+
+      function renderSlots() {
+        if (!state.slots.length) {
+          $slotsContainer.innerHTML =
+            '<div class="empty">No open times in the next couple of weeks. ' +
+            'Please check back later or reach out directly.</div>';
+          return;
+        }
+
+        // Group by day_label
+        const byDay = new Map();
+        for (const s of state.slots) {
+          const key = s.day_label || '';
+          if (!byDay.has(key)) byDay.set(key, []);
+          byDay.get(key).push(s);
+        }
+
+        const container = document.createElement('div');
+        container.className = 'days';
+
+        for (const [day, slots] of byDay) {
+          const dayBlock = document.createElement('div');
+          dayBlock.className = 'day-block';
+
+          const dayLabel = document.createElement('div');
+          dayLabel.className = 'day-label';
+          dayLabel.textContent = day;
+          dayBlock.appendChild(dayLabel);
+
+          const slotsGrid = document.createElement('div');
+          slotsGrid.className = 'slots';
+          for (const slot of slots) {
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'slot-btn';
+            btn.textContent = slot.time_label || '';
+            btn.dataset.startIso = slot.start_iso;
+            btn.addEventListener('click', () => selectSlot(slot, btn));
+            slotsGrid.appendChild(btn);
+          }
+          dayBlock.appendChild(slotsGrid);
+          container.appendChild(dayBlock);
+        }
+
+        $slotsContainer.innerHTML = '';
+        $slotsContainer.appendChild(container);
+      }
+
+      function selectSlot(slot, btnEl) {
+        state.selected = slot;
+        document.querySelectorAll('.slot-btn.selected').forEach(b =>
+          b.classList.remove('selected'));
+        btnEl.classList.add('selected');
+
+        $selectedText.textContent =
+          (slot.day_label || '') + ' at ' + (slot.time_label || '');
+        $selectedSummary.classList.remove('hidden');
+        updateSubmitState();
+      }
+
+      function updateSubmitState() {
+        const name  = document.getElementById('visitor-name').value.trim();
+        const email = document.getElementById('visitor-email').value.trim();
+        const phone = $phoneInput.value.trim();
+        const needPhone = !!(state.config && state.config.require_phone);
+        const ok = !!state.selected && name && /@/.test(email) &&
+                   (!needPhone || phone);
+        $submitBtn.disabled = !ok;
+      }
+
+      function showError(msg) {
+        $errBanner.textContent = msg;
+        $errBanner.classList.remove('hidden');
+      }
+      function clearError() {
+        $errBanner.classList.add('hidden');
+        $errBanner.textContent = '';
+      }
+
+      // ---- Form interactions ----
+      ['visitor-name', 'visitor-email', 'visitor-phone'].forEach(id => {
+        document.getElementById(id).addEventListener('input', updateSubmitState);
+      });
+
+      $form.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        clearError();
+        if (!state.selected) { showError('Please pick a time.'); return; }
+
+        $submitBtn.disabled = true;
+        $submitBtn.textContent = 'Booking…';
+
+        const body = {
+          u:             username,
+          visitor_name:  document.getElementById('visitor-name').value.trim(),
+          visitor_email: document.getElementById('visitor-email').value.trim(),
+          visitor_phone: document.getElementById('visitor-phone').value.trim(),
+          start_iso:     state.selected.start_iso,
+          end_iso:       state.selected.end_iso,
+          duration_minutes: state.config.duration_minutes || 30,
+          notes:         document.getElementById('visitor-notes').value.trim(),
+        };
+
+        try {
+          const res = await fetch('/api/public/booking/book', {
+            method:  'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body:    JSON.stringify(body),
+          });
+          const data = await res.json().catch(() => ({}));
+
+          if (!res.ok) {
+            // Slot lost / validation error — refresh slots so user can pick again
+            showError(data.error ||
+              'Something went wrong. Please try a different time.');
+            $submitBtn.disabled = false;
+            $submitBtn.textContent = 'Confirm booking';
+            if (data.error && /taken|already/i.test(data.error)) {
+              await loadSlots();
+              state.selected = null;
+              $selectedSummary.classList.add('hidden');
+            }
+            return;
+          }
+
+          // Success
+          showSuccess(body);
+        } catch (err) {
+          console.error('[booking] submit failed', err);
+          showError('Network error. Please try again.');
+          $submitBtn.disabled = false;
+          $submitBtn.textContent = 'Confirm booking';
+        }
+      });
+
+      function showSuccess(submitted) {
+        document.getElementById('booking-flow').classList.add('hidden');
+        document.getElementById('success-flow').classList.remove('hidden');
+        const when = state.selected
+          ? `${state.selected.day_label} at ${state.selected.time_label}`
+          : '';
+        document.getElementById('success-when').textContent = when;
+        if (state.config && state.config.business_name) {
+          document.getElementById('success-business').textContent =
+            'See you at ' + state.config.business_name + '.';
+        }
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+      }
+
+      // ---- Boot ----
+      loadSlots();
+    })();
+  </script>
+</body>
+</html>

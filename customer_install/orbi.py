@@ -65,7 +65,12 @@ import ocr as ocr_mod
 import review_responder
 import safe_send
 import scheduler as meeting_scheduler
+import birthdays
+import booking
+import style_learner
+import translation
 import universal_search
+import voice_notes
 import llm_client
 import notifications as notify
 import pre_execute as pre_exec
@@ -86,6 +91,7 @@ from modules import quick_capture as mod_qc
 from modules import reminders as mod_reminders
 from modules import tasks as mod_tasks
 from modules import workspace as mod_workspace
+from tools import url_fetch as tool_url_fetch
 from tools import web_search as tool_web_search
 
 # ---------------------------------------------------------------------------
@@ -703,8 +709,6 @@ def public_chat():
         log.warning(f"public workspace context failed: {e}")
     if not workspace_hit and tool_web_search.needs_web_search(user_msg):
         try:
-            # On fresh queries we ALSO want workspace context if there's a match,
-            # but secondary to the live web data
             web_ctx = tool_web_search.context_block(user_msg)
             if web_ctx:
                 extras.append(
@@ -717,6 +721,18 @@ def public_chat():
                 log.info(f"public web search: {user_msg[:60]!r}")
         except Exception as e:
             log.warning(f"public web search failed: {e}")
+
+    # URL FETCH — if the visitor pasted a specific URL, go fetch the page
+    try:
+        urls_in_msg = tool_url_fetch.extract_urls(user_msg)[:3]
+        if urls_in_msg:
+            fetched = [tool_url_fetch.fetch(u) for u in urls_in_msg]
+            url_ctx = tool_url_fetch.context_block(fetched)
+            if url_ctx:
+                extras.append(url_ctx)
+                log.info(f"public url_fetch: {len(urls_in_msg)} url(s)")
+    except Exception as e:
+        log.warning(f"public url_fetch failed: {e}")
     if extras:
         system += "\n\n" + "\n\n".join(extras)
 
@@ -1373,6 +1389,19 @@ def owner_chat():
                 log.info(f"web search invoked for: {user_msg[:60]!r}")
         except Exception as e:
             log.warning(f"web search failed: {e}")
+
+    # URL FETCH — owner pasted a specific URL? Fetch it and quote from it.
+    try:
+        urls_in_msg = tool_url_fetch.extract_urls(user_msg)[:3]
+        if urls_in_msg:
+            fetched = [tool_url_fetch.fetch(u) for u in urls_in_msg]
+            url_ctx = tool_url_fetch.context_block(fetched)
+            if url_ctx:
+                extras.append(url_ctx)
+                log.info(f"owner url_fetch: {len(urls_in_msg)} url(s)")
+    except Exception as e:
+        log.warning(f"owner url_fetch failed: {e}")
+
     if extras:
         system += "\n\n" + "\n\n".join(extras)
 
@@ -2333,6 +2362,211 @@ def messages_update_tags(msg_id):
     tags = data.get("tags") or []
     ok = mod_messages.update_tags(DATA_DIR, msg_id, tags)
     return jsonify({"status": "ok" if ok else "not_found"}), 200 if ok else 404
+
+
+# ---------------------------------------------------------------------------
+# Tier 3 — public booking widget (visitor books a time on the owner's calendar)
+# ---------------------------------------------------------------------------
+
+
+@app.route("/book", methods=["GET"])
+def booking_page():
+    """Public booking page. URL: /book?u=<username>"""
+    return send_from_directory(STATIC_DIR, "booking.html")
+
+
+@app.route("/api/public/booking/slots", methods=["GET"])
+def booking_public_slots():
+    """No auth — visitor pulling open times for an owner."""
+    username = (request.args.get("u") or "").strip().lower()
+    if not username:
+        abort(404)
+    user_rec = users_mod.get_user(DATA_DIR, username)
+    if not user_rec:
+        abort(404)
+    user_dir = users_mod.get_user_dir(DATA_DIR, username)
+    cfg = booking.get_booking_config(CONFIG, user_dir)
+    if not cfg.get("enabled"):
+        abort(404)
+    slots = booking.get_public_availability(
+        CONFIG, DATA_DIR, user_dir,
+        duration_minutes=int(request.args.get("duration",
+                                              cfg.get("duration_minutes", 30))),
+        days_ahead=int(cfg.get("days_ahead", 14)),
+    )
+    return jsonify({"slots": slots, "config": {
+        k: v for k, v in cfg.items() if k != "owner_email"
+    }})
+
+
+@app.route("/api/public/booking/book", methods=["POST"])
+def booking_public_book():
+    data = request.get_json(silent=True) or {}
+    username = (data.get("username") or "").strip().lower()
+    if not username:
+        return jsonify({"error": "username required"}), 400
+    user_rec = users_mod.get_user(DATA_DIR, username)
+    if not user_rec:
+        return jsonify({"error": "not_found"}), 404
+    user_dir = users_mod.get_user_dir(DATA_DIR, username)
+    try:
+        result = booking.book_public_slot(
+            CONFIG, DATA_DIR, user_dir,
+            visitor_name=data.get("visitor_name", ""),
+            visitor_email=data.get("visitor_email", ""),
+            visitor_phone=data.get("visitor_phone", ""),
+            start_iso=data.get("start_iso", ""),
+            end_iso=data.get("end_iso", ""),
+            duration_minutes=int(data.get("duration_minutes", 30)),
+            notes=data.get("notes", ""),
+        )
+        return jsonify(result)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 409
+
+
+@app.route("/api/owner/booking/config", methods=["GET", "PUT"])
+def booking_owner_config():
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    user_dir = users_mod.get_user_dir(DATA_DIR, user["username"])
+    if request.method == "GET":
+        return jsonify(booking.get_booking_config(CONFIG, user_dir))
+    booking.set_booking_config(user_dir, request.get_json(silent=True) or {})
+    return jsonify(booking.get_booking_config(CONFIG, user_dir))
+
+
+# ---------------------------------------------------------------------------
+# Tier 3 — birthdays + anniversaries
+# ---------------------------------------------------------------------------
+
+
+@app.route("/api/owner/birthdays/upcoming", methods=["GET"])
+def birthdays_upcoming():
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    user_dir = users_mod.get_user_dir(DATA_DIR, user["username"])
+    days = int(request.args.get("days_ahead", "14"))
+    return jsonify({"upcoming": birthdays.find_upcoming_dates(user_dir, days_ahead=days)})
+
+
+@app.route("/api/owner/birthdays/draft", methods=["POST"])
+def birthdays_draft():
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    user_dir = users_mod.get_user_dir(DATA_DIR, user["username"])
+    data = request.get_json(silent=True) or {}
+    contact_id = data.get("contact_id", "")
+    kind = data.get("kind", "birthday")
+    # Find the contact
+    contacts_list = mod_contacts.list_all(user_dir)
+    contact = next((c for c in contacts_list if c.get("id") == contact_id), None)
+    if not contact:
+        return jsonify({"error": "contact_not_found"}), 404
+    return jsonify({"text": birthdays.draft_card_text(CONFIG, contact, kind)})
+
+
+@app.route("/api/owner/birthdays/sweep_now", methods=["POST"])
+def birthdays_sweep_now():
+    auth.require_role(ORBI_DIR, DATA_DIR, "owner")
+    created = birthdays.run_sweep(CONFIG, DATA_DIR)
+    return jsonify({"reminders_created": created})
+
+
+# ---------------------------------------------------------------------------
+# Tier 3 — translation
+# ---------------------------------------------------------------------------
+
+
+@app.route("/api/owner/translate", methods=["POST"])
+def translate_route():
+    auth.require_user(ORBI_DIR, DATA_DIR)
+    data = request.get_json(silent=True) or {}
+    text = (data.get("text") or "").strip()
+    if not text:
+        return jsonify({"error": "text required"}), 400
+    out = translation.translate(
+        CONFIG, text,
+        target_lang=data.get("target_lang", "en"),
+        source_lang=data.get("source_lang"),
+    )
+    return jsonify({"translated": out})
+
+
+@app.route("/api/owner/detect_language", methods=["POST"])
+def detect_language_route():
+    auth.require_user(ORBI_DIR, DATA_DIR)
+    data = request.get_json(silent=True) or {}
+    return jsonify({"lang": translation.detect_language(data.get("text", ""))})
+
+
+# ---------------------------------------------------------------------------
+# Tier 3 — voice notes (record → transcribe → quick_capture)
+# ---------------------------------------------------------------------------
+
+
+@app.route("/api/owner/voice_notes/process", methods=["POST"])
+def voice_notes_process():
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    user_dir = users_mod.get_user_dir(DATA_DIR, user["username"])
+    if "audio" not in request.files:
+        return jsonify({"error": "audio file required (multipart 'audio' field)"}), 400
+    audio = request.files["audio"].read()
+    hint = (request.form.get("hint") or "").strip()
+    try:
+        result = voice_notes.process(CONFIG, user_dir, audio, hint=hint)
+        audit.log_event(DATA_DIR, actor=user["username"],
+                        action=f"voice_note.{result.get('capture_kind','?')}",
+                        meta={"chars": len(result.get("transcript", ""))})
+        return jsonify(result)
+    except Exception as e:
+        log.warning(f"voice_note process failed: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/owner/voice_notes", methods=["GET"])
+def voice_notes_list():
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    user_dir = users_mod.get_user_dir(DATA_DIR, user["username"])
+    try:
+        return jsonify({"voice_notes": voice_notes.list_recordings(user_dir)})
+    except AttributeError:
+        # Helper not implemented yet — return empty
+        return jsonify({"voice_notes": []})
+
+
+# ---------------------------------------------------------------------------
+# Tier 3 — style learner (draft in owner's voice)
+# ---------------------------------------------------------------------------
+
+
+@app.route("/api/owner/style/refresh", methods=["POST"])
+def style_refresh():
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    user_dir = users_mod.get_user_dir(DATA_DIR, user["username"])
+    data = request.get_json(silent=True) or {}
+    result = style_learner.index_owner_sent(
+        CONFIG, user_dir, limit=int(data.get("limit", 200)))
+    audit.log_event(DATA_DIR, actor=user["username"],
+                    action="style.refresh", meta=result)
+    return jsonify(result)
+
+
+@app.route("/api/owner/style/status", methods=["GET"])
+def style_status():
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    user_dir = users_mod.get_user_dir(DATA_DIR, user["username"])
+    return jsonify(style_learner.corpus_status(user_dir))
+
+
+@app.route("/api/owner/style/draft", methods=["POST"])
+def style_draft():
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    user_dir = users_mod.get_user_dir(DATA_DIR, user["username"])
+    data = request.get_json(silent=True) or {}
+    text = style_learner.draft_in_owner_voice(
+        CONFIG, user_dir,
+        draft_context=data.get("draft_context", ""),
+        what_to_say=data.get("what_to_say", ""),
+    )
+    return jsonify({"draft": text})
 
 
 # ---------------------------------------------------------------------------

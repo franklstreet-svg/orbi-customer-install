@@ -574,6 +574,21 @@ def extract_file_request(message: str) -> dict | None:
     if not text:
         return None
 
+    # Hard exclusions — phrases that LOOK file-fetchy but aren't.
+    # "send me a website", "send me a link", etc. should fall through to
+    # the URL-fetcher path, not the file-search path.
+    lower = text.lower()
+    if any(kw in lower for kw in (
+        "a website", "the website", "this website",
+        "a link", "this link", "a url", "this url",
+        "send you a", "send you the", "send you something",
+        "give you a", "give you the",
+    )):
+        return None
+    # If the message contains a URL, that's definitively a url-fetch case
+    if re.search(r"https?://", text, re.IGNORECASE):
+        return None
+
     for pat in _INTENT_PATTERNS:
         m = pat.search(text)
         if not m:

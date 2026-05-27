@@ -1115,7 +1115,14 @@
       currentAudio = null;
       document.getElementById('owner-stop-speaking').hidden = true;
       setVoiceState(null);
-      if (wantsListening) safeStartMic();
+      // Echo guard — wait 600ms before re-arming the mic so the audio
+      // element's buffer fully drains and the tail of Ava's last word
+      // doesn't get picked up by the microphone and treated as user input.
+      if (wantsListening) {
+        setTimeout(() => {
+          if (wantsListening && !isSpeaking) safeStartMic();
+        }, 600);
+      }
     };
 
     try {
