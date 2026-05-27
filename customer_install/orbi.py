@@ -50,6 +50,8 @@ import audit
 import auth
 import backup
 import cross_search as xs
+import file_fetch
+import gcal
 import llm_client
 import notifications as notify
 import pre_execute as pre_exec
@@ -1102,6 +1104,11 @@ def owner_chat():
         return jsonify({"reply": pa_direct, "tier": "local", "latency_ms": 0,
                         "source": "personal_assistant"})
 
+    # FILE FETCH: "send me the Maxwell estimate from my computer"
+    ff = _try_file_fetch(user_msg, username)
+    if ff is not None:
+        return jsonify(ff)
+
     # CREATE patterns: route through quick_capture which classifies and files.
     qc_result = _try_quick_capture(user_msg, user_dir)
     if qc_result is not None:
@@ -1299,6 +1306,73 @@ def _try_quick_capture(message: str, user_dir: Path) -> dict | None:
     except Exception as e:
         log.warning(f"quick_capture failed: {e}")
         return None
+
+
+def _try_file_fetch(message: str, username: str) -> dict | None:
+    """If the message looks like 'send me the X file from my computer',
+    search the allowed scope and either return a download link (single
+    strong match), an ambiguous-result picker, or an honest 'not found'.
+    Returns None if the intent doesn't match (fall through to LLM)."""
+    intent = file_fetch.extract_file_request(message)
+    if not intent:
+        return None
+    query = intent.get("query", "").strip()
+    kind = intent.get("kind", "file")
+    if not query:
+        return None
+    try:
+        matches = file_fetch.search(DATA_DIR, query, limit=6)
+    except Exception as e:
+        log.warning(f"file_fetch search failed: {e}")
+        return None
+
+    audit.log_event(DATA_DIR, actor=username, action="file_fetch.query",
+                    meta={"query": query, "kind": kind, "hits": len(matches)})
+
+    if not matches:
+        scope = file_fetch.load_scope(DATA_DIR)
+        folders = ", ".join(scope.get("allowed_paths", []) or ["the allowed folders"])
+        return {
+            "reply": (f"I searched {folders} for \"{query}\" but didn't find anything. "
+                      f"Want me to widen the search, or tell me a more specific filename?"),
+            "tier": "local", "latency_ms": 0, "source": "file_fetch_miss",
+        }
+
+    if len(matches) == 1 or (matches[0].get("score", 0) > matches[1].get("score", 0) * 2 if len(matches) > 1 else True):
+        # Single strong match — mint and return link
+        m = matches[0]
+        path = m["path"]
+        try:
+            if kind == "folder" or m.get("is_dir"):
+                zip_path = file_fetch.prepare_folder_download(DATA_DIR, path)
+                token = file_fetch.mint_download_token(DATA_DIR, zip_path, ttl_minutes=10)
+                label = f"{m['name']} (zipped)"
+            else:
+                token = file_fetch.mint_download_token(DATA_DIR, path, ttl_minutes=10)
+                size_mb = (m.get("size_bytes", 0) / 1_000_000)
+                label = f"{m['name']} ({size_mb:.1f} MB)" if size_mb >= 0.05 else m["name"]
+            audit.log_event(DATA_DIR, actor=username, action="file_fetch.token_minted",
+                            resource=path, meta={"via": "chat", "kind": kind})
+            return {
+                "reply": f"Found it — [download {label}](/download/{token}) (link expires in 10 minutes, single-use).",
+                "tier": "local", "latency_ms": 0, "source": "file_fetch_hit",
+                "download_url": f"/download/{token}",
+            }
+        except (PermissionError, ValueError) as e:
+            return {"reply": f"I found that but can't share it: {e}",
+                    "tier": "local", "latency_ms": 0, "source": "file_fetch_blocked"}
+
+    # Multiple matches — ask which one
+    options = "\n".join(
+        f"  {i+1}. {m['name']} — in {m.get('parent_folder','?')}"
+        for i, m in enumerate(matches[:5])
+    )
+    return {
+        "reply": (f"I found {len(matches)} possible matches for \"{query}\":\n{options}\n\n"
+                  f"Tell me the number or be more specific."),
+        "tier": "local", "latency_ms": 0, "source": "file_fetch_ambiguous",
+        "candidates": matches[:5],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1516,6 +1590,199 @@ def users_purge_now():
     audit.log_event(DATA_DIR, actor=owner["username"],
                     action="users.purge_expired", meta={"purged": purged})
     return jsonify({"status": "ok", "purged": purged})
+
+
+# ---------------------------------------------------------------------------
+# Google Calendar two-way sync (per-user)
+# ---------------------------------------------------------------------------
+
+def _gcal_oauth_creds() -> tuple[str, str]:
+    """Read OAuth client credentials from CONFIG. These are baked in by the
+    installer (one Cloud project per Orbi deployment) or set via dashboard."""
+    g = CONFIG.get("gcal_oauth") or {}
+    return g.get("client_id", ""), g.get("client_secret", "")
+
+
+def _gcal_redirect_uri() -> str:
+    """Loopback redirect for Desktop-app OAuth client type. Customer connects
+    Google while on the same machine as their Orbi install (first-time setup)."""
+    port = (CONFIG.get("server") or {}).get("port") or 5050
+    return f"http://localhost:{port}/api/owner/gcal/callback"
+
+
+@app.route("/api/owner/gcal/connect", methods=["POST"])
+def gcal_connect():
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    client_id, client_secret = _gcal_oauth_creds()
+    if not client_id or not client_secret:
+        return jsonify({"error": "gcal_oauth_not_configured",
+                        "hint": "Owner must paste Google Cloud Client ID + Secret in Settings"}), 400
+    try:
+        auth_url = gcal.start_auth_flow(client_id, client_secret, _gcal_redirect_uri())
+        return jsonify({"auth_url": auth_url})
+    except Exception as e:
+        log.warning(f"gcal connect failed: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/owner/gcal/callback", methods=["GET"])
+def gcal_callback():
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    code = request.args.get("code", "")
+    if not code:
+        return "Missing authorization code", 400
+    client_id, client_secret = _gcal_oauth_creds()
+    user_dir = users_mod.get_user_dir(DATA_DIR, user["username"])
+    user_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        result = gcal.complete_auth_flow(client_id, client_secret,
+                                         _gcal_redirect_uri(), code, user_dir)
+        audit.log_event(DATA_DIR, actor=user["username"],
+                        action="gcal.connected", meta={"email": result.get("email")})
+        from flask import redirect
+        return redirect("/owner#gcal")
+    except Exception as e:
+        log.warning(f"gcal callback failed: {e}")
+        return f"Connect failed: {e}", 500
+
+
+@app.route("/api/owner/gcal/disconnect", methods=["POST"])
+def gcal_disconnect():
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    user_dir = users_mod.get_user_dir(DATA_DIR, user["username"])
+    gcal.disconnect(user_dir)
+    audit.log_event(DATA_DIR, actor=user["username"], action="gcal.disconnected")
+    return jsonify({"ok": True})
+
+
+@app.route("/api/owner/gcal/sync_now", methods=["POST"])
+def gcal_sync_now():
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    user_dir = users_mod.get_user_dir(DATA_DIR, user["username"])
+    try:
+        result = gcal.sync_all(user_dir)
+        return jsonify(result)
+    except Exception as e:
+        log.warning(f"gcal sync failed: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/owner/gcal/status", methods=["GET"])
+def gcal_status():
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    user_dir = users_mod.get_user_dir(DATA_DIR, user["username"])
+    return jsonify(gcal.get_status(user_dir))
+
+
+# Background gcal sync — runs every 5 min per active user
+def gcal_sync_loop():
+    time.sleep(90)
+    while True:
+        try:
+            for u in users_mod.list_users(DATA_DIR):
+                user_dir = users_mod.get_user_dir(DATA_DIR, u["username"])
+                if not user_dir.exists() or not gcal.is_connected(user_dir):
+                    continue
+                try:
+                    result = gcal.sync_all(user_dir)
+                    if result.get("pulled") or result.get("pushed"):
+                        log.info(f"gcal background sync {u['username']}: "
+                                 f"pulled={result.get('pulled',0)} pushed={result.get('pushed',0)}")
+                except Exception as e:
+                    log.warning(f"gcal sync error for {u['username']}: {e}")
+        except Exception as e:
+            log.warning(f"gcal loop error: {e}")
+        time.sleep(60 * 5)
+
+threading.Thread(target=gcal_sync_loop, daemon=True).start()
+
+
+# ---------------------------------------------------------------------------
+# Remote file fetch — "send me the Maxwell file from my computer"
+# Phone PWA → cloudflared tunnel → home Orbi → scoped file resolution
+# → one-time download token → file streams back.
+# Files NEVER leave the owner's computer except through the token-gated
+# /download/<token> route. Tunnel is transport-only.
+# ---------------------------------------------------------------------------
+
+
+@app.route("/api/owner/files/scope", methods=["GET", "PUT"])
+def file_scope_route():
+    auth.require_role(ORBI_DIR, DATA_DIR, "owner")
+    if request.method == "GET":
+        return jsonify(file_fetch.load_scope(DATA_DIR))
+    data = request.get_json(silent=True) or {}
+    file_fetch.save_scope(DATA_DIR, data)
+    return jsonify({"status": "ok", "scope": file_fetch.load_scope(DATA_DIR)})
+
+
+@app.route("/api/owner/files/search", methods=["GET"])
+def file_search_route():
+    auth.require_user(ORBI_DIR, DATA_DIR)
+    q = request.args.get("q", "").strip()
+    if not q:
+        return jsonify({"matches": []})
+    limit = int(request.args.get("limit", "10"))
+    return jsonify({"matches": file_fetch.search(DATA_DIR, q, limit=limit)})
+
+
+@app.route("/api/owner/files/request", methods=["POST"])
+def file_request_route():
+    """Owner picks a search result and requests a downloadable link for it.
+    Returns a public /download/<token> URL that's single-use and TTL-bound."""
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    data = request.get_json(silent=True) or {}
+    path = data.get("path", "")
+    kind = data.get("kind", "file")
+    ttl = int(data.get("ttl_minutes", 10))
+    if not path:
+        return jsonify({"error": "path required"}), 400
+    try:
+        if kind == "folder":
+            zip_path = file_fetch.prepare_folder_download(DATA_DIR, path)
+            token = file_fetch.mint_download_token(DATA_DIR, zip_path, ttl_minutes=ttl)
+        else:
+            token = file_fetch.mint_download_token(DATA_DIR, path, ttl_minutes=ttl)
+    except (PermissionError, ValueError) as e:
+        return jsonify({"error": str(e)}), 403
+    audit.log_event(DATA_DIR, actor=user["username"], action="file_fetch.token_minted",
+                    resource=path, meta={"kind": kind, "ttl_minutes": ttl})
+    return jsonify({"token": token, "url": f"/download/{token}", "ttl_minutes": ttl})
+
+
+@app.route("/download/<token>", methods=["GET"])
+def download_route(token):
+    """PUBLIC — single-use token-gated download. No session check on purpose:
+    the phone (away from the home computer) needs to fetch through the tunnel.
+    Token entropy + single-use + short TTL is the entire auth boundary."""
+    redeemed = file_fetch.redeem_token(DATA_DIR, token)
+    if not redeemed:
+        return ("Link expired or already used.", 410)
+    from flask import send_file
+    try:
+        return send_file(
+            redeemed["path"],
+            mimetype=redeemed.get("mime", "application/octet-stream"),
+            as_attachment=True,
+            download_name=redeemed["filename"],
+        )
+    except FileNotFoundError:
+        return ("File no longer exists.", 410)
+
+
+# Background sweep for stale zip temp files (folder downloads)
+def file_temp_sweep_loop():
+    time.sleep(120)
+    while True:
+        try:
+            purged = file_fetch.purge_old_temp_downloads(DATA_DIR, older_than_minutes=60)
+            if purged:
+                log.info(f"file_fetch temp sweep: purged {purged} stale zips")
+        except Exception as e:
+            log.warning(f"file_fetch temp sweep failed: {e}")
+        time.sleep(60 * 30)
+
+threading.Thread(target=file_temp_sweep_loop, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
