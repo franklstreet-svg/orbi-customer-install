@@ -581,7 +581,11 @@
       const data = await res.json();
       thinking.remove();
       const reply = data.reply || "I couldn't reach any AI tier just now.";
-      addOwnerBubble('assistant', reply, { tier: data.tier });
+      addOwnerBubble('assistant', reply, {
+        tier: data.tier,
+        source: data.source,
+        download_url: data.download_url,
+      });
       ownerChatHistory.push({ role: 'assistant', content: reply });
       if (window.__orbiSpeakReply) window.__orbiSpeakReply(reply);
     } catch (e) {
@@ -605,6 +609,21 @@
     const isOffline = opts.tier === 'none';
     div.className = 'owner-chat-bubble ' + role + (isOffline ? ' degraded' : '');
     div.textContent = text;
+    // Inline preview for PNG-producing tools (image_gen / chart_gen).
+    // Owner asked "draw me a picture" — they expect to SEE it in the chat,
+    // not click a download link. Decks (pptx_gen) stay as link-only.
+    if (opts.download_url && (opts.source === 'image_gen' || opts.source === 'chart_gen')) {
+      const wrap = document.createElement('div');
+      wrap.className = 'owner-chat-image-wrap';
+      wrap.style.cssText = 'margin-top:8px;';
+      const img = document.createElement('img');
+      img.src = opts.download_url;
+      img.alt = opts.source === 'chart_gen' ? 'chart' : 'generated image';
+      img.style.cssText = 'max-width:100%;border-radius:8px;display:block;cursor:zoom-in;';
+      img.addEventListener('click', () => window.open(opts.download_url, '_blank'));
+      wrap.appendChild(img);
+      div.appendChild(wrap);
+    }
     if (isOffline) {
       const hint = document.createElement('div');
       hint.className = 'owner-chat-tier-hint';

@@ -2658,19 +2658,78 @@ _QC_TRIGGER_RE = _re.compile(
 )
 
 
+# Two flavors of conversational lead-in:
+#   POLITE  — "can you", "could you", "please", "let's" — the verb is REQUIRED
+#             after this. ("can you" → "can you draw a picture")
+#   ACTION  — "i want", "give me", "show me", "i'd like" — the verb is IMPLIED,
+#             so the noun can follow directly. ("show me a chart" needs no verb)
+# Real users mix both. Without this split, "show me a chart of revenue" falls
+# through to the LLM because there's no draw/make/build verb in it.
+_POLITE_PREFIX = (
+    r"(?:(?:can|could|would|will)\s+you\s+(?:please\s+)?(?:try\s+(?:to|and)\s+)?"
+    r"|please\s+(?:can\s+you\s+)?"
+    r"|let'?s\s+"
+    r"|how\s+about\s+(?:you\s+)?"
+    r")?"
+)
+_ACTION_PREFIX = (
+    r"(?:i(?:'m| am)?\s+(?:want|need)(?:ing)?\s+(?:you\s+)?(?:to\s+(?:see|have|get)\s+)?"
+    r"|i(?:'d| would)\s+like(?:\s+(?:you\s+)?to\s+(?:see|have|get)?)?\s*"
+    r"|give\s+me\s+"
+    r"|show\s+me\s+"
+    r"|gimme\s+"
+    r"|may\s+i\s+have\s+"
+    r")"
+)
+_QUANT = r"(?:me\s+|us\s+)?(?:a\s+|an\s+|the\s+|some\s+)?"
+
+_CHART_VERBS = r"(?:make|build|create|generate|draw|render|plot|chart|graph)"
+_CHART_NOUNS = r"(?:bar|line|pie|scatter)?\s*(?:chart|graph|plot|visualization|visualisation)"
+
+_DECK_VERBS = r"(?:make|build|create|generate|put\s+together|throw\s+together|whip\s+up)"
+_DECK_NOUNS = r"(?:\d+[-\s]?slide\s+)?(?:pitch\s+)?(?:slide\s+)?(?:deck|presentation|powerpoint|pptx|slideshow)"
+
+# Image verbs cover everything from "draw" to "whip up" to "illustrate".
+_IMG_VERBS = (
+    r"(?:make|build|create|generate|design|draw|paint|render|sketch|"
+    r"mock\s*up|come\s+up\s+with|whip\s+up|illustrate|visualize|visualise)"
+)
+# Image nouns — anything someone might call a visual artifact.
+_IMG_NOUNS = (
+    r"(?:social\s+post|facebook\s+post|instagram\s+post|tiktok\s+post|"
+    r"flyer|banner|poster|image|graphic|picture|pic|post|"
+    r"logo|illustration|icon|headshot|thumbnail|infographic|"
+    r"diagram|sketch|drawing|mockup|mock\s?up|ad|advert|photo|"
+    r"meme|avatar|profile|cover|hero|wallpaper|art|artwork|visual)"
+)
+
 _CHART_TRIGGER_RE = _re.compile(
-    r"^(?:make|build|create|generate|draw)\s+(?:me\s+)?(?:a\s+)?"
-    r"(?:bar|line|pie|scatter)?\s*(?:chart|graph|plot|visualization)\b",
+    r"^\s*(?:"
+    + _ACTION_PREFIX + _QUANT + _CHART_NOUNS
+    + r"|" + _POLITE_PREFIX + _CHART_VERBS + r"\s+" + _QUANT + _CHART_NOUNS
+    + r")\b",
     _re.IGNORECASE,
 )
 _DECK_TRIGGER_RE = _re.compile(
-    r"^(?:make|build|create|generate)\s+(?:me\s+)?(?:a\s+)?"
-    r"(?:\d+[-\s]?slide\s+)?(?:pitch\s+)?(?:slide\s+)?(?:deck|presentation|powerpoint|pptx)\b",
+    r"^\s*(?:"
+    + _ACTION_PREFIX + _QUANT + _DECK_NOUNS
+    + r"|" + _POLITE_PREFIX + _DECK_VERBS + r"\s+" + _QUANT + _DECK_NOUNS
+    + r")\b",
     _re.IGNORECASE,
 )
 _IMAGE_TRIGGER_RE = _re.compile(
-    r"^(?:make|build|create|generate|design|draw)\s+(?:me\s+)?(?:a\s+)?"
-    r"(?:social|facebook|instagram|flyer|banner|poster|image|graphic|picture|post)\b",
+    r"^\s*(?:"
+    + _ACTION_PREFIX + _QUANT + _IMG_NOUNS
+    + r"|" + _POLITE_PREFIX + _IMG_VERBS + r"\s+" + _QUANT + _IMG_NOUNS
+    + r")\b",
+    _re.IGNORECASE,
+)
+# Loose catch-all: a bare drawing verb without an explicit noun.
+# "can you draw what an Orby user would look like" doesn't say "picture" —
+# still fire image gen because the verb is clearly visual.
+_IMAGE_LOOSE_RE = _re.compile(
+    r"^\s*" + _POLITE_PREFIX +
+    r"(?:draw|paint|sketch|illustrate|visualize|visualise)\s+",
     _re.IGNORECASE,
 )
 
@@ -2733,11 +2792,36 @@ def _try_office_gen(message: str, username: str) -> dict | None:
                     "tier": "local", "latency_ms": 0,
                     "source": "pptx_gen", "download_url": saved.get("download_url")}
 
-        if _IMAGE_TRIGGER_RE.match(msg):
-            # Strip the leading verb to get the visual prompt
-            prompt = _re.sub(
-                r"^(?:make|build|create|generate|design|draw)\s+(?:me\s+)?(?:a\s+)?",
-                "", msg, flags=_re.IGNORECASE).strip()
+        image_match = _IMAGE_TRIGGER_RE.match(msg) or _IMAGE_LOOSE_RE.match(msg)
+        if image_match:
+            # Strip conversational prefix + verb + filler to get the visual prompt.
+            # "can you draw me a picture of a robot" → "of a robot" → "a robot"
+            prompt = msg
+            for pat in (
+                # 1. conversational prefix (can you, please, i want, etc.)
+                r"^\s*(?:(?:can|could|would|will)\s+you\s+(?:please\s+)?(?:try\s+(?:to|and)\s+)?"
+                r"|please\s+(?:can\s+you\s+)?"
+                r"|i(?:'m| am)?\s+(?:want|need)(?:ing)?\s+(?:you\s+)?(?:to\s+)?"
+                r"|i(?:'d| would)\s+like(?:\s+(?:you\s+)?to)?\s+"
+                r"|let'?s\s+|how\s+about\s+(?:you\s+)?"
+                r"|may\s+i\s+have\s+|give\s+me\s+|show\s+me\s+|gimme\s+)",
+                # 2. drawing verb + me/us + a/an/the/some
+                r"^\s*(?:make|build|create|generate|design|draw|paint|render|sketch|"
+                r"mock\s*up|come\s+up\s+with|whip\s+up|illustrate|visualize|visualise)\s+"
+                r"(?:me\s+|us\s+)?(?:a\s+|an\s+|the\s+|some\s+)?",
+                # 3. leading noun-of: "picture of a robot" → "a robot"
+                r"^(?:social\s+post|facebook\s+post|instagram\s+post|tiktok\s+post|"
+                r"flyer|banner|poster|image|graphic|picture|pic|post|"
+                r"logo|illustration|icon|headshot|thumbnail|infographic|"
+                r"diagram|sketch|drawing|mockup|mock\s?up|ad|advert|photo|"
+                r"meme|avatar|profile|cover|hero|wallpaper|art|artwork|visual)\s+"
+                r"(?:of\s+|showing\s+|for\s+|that\s+(?:shows?|depicts?|has)\s+|"
+                r"depicting\s+|with\s+|about\s+)?",
+            ):
+                prompt = _re.sub(pat, "", prompt, flags=_re.IGNORECASE).strip()
+            # Fall back to original if stripping nuked everything
+            if not prompt:
+                prompt = msg
             png = image_gen.generate(CONFIG, prompt, kind="social_post")
             ws = mod_workspace.workspace_path(CONFIG)
             saved_path = image_gen.save_to_workspace(png, prompt, ws)
