@@ -684,7 +684,53 @@ def _print(msg: str = "") -> None:
     sys.stdout.flush()
 
 
-def run_interactive(install_dir: Path | None = None) -> int:
+def _read_clipboard() -> str:
+    """Best-effort clipboard read using stdlib tkinter. Works on Windows,
+    Mac, and Linux (with a display server). Silent fallback to empty
+    string if anything goes wrong — installer falls back to prompting."""
+    # Try platform-native tools first (Mac pbpaste / Linux xclip) since
+    # they don't require display server setup. Fall back to tkinter.
+    import subprocess as _sp
+    plat = platform.system().lower()
+    try:
+        if plat == "darwin":
+            r = _sp.run(["pbpaste"], capture_output=True, text=True, timeout=3)
+            if r.returncode == 0 and r.stdout:
+                return r.stdout.strip()
+        elif plat == "linux":
+            for cmd in (["xclip", "-selection", "clipboard", "-o"],
+                        ["wl-paste"],
+                        ["xsel", "--clipboard", "--output"]):
+                try:
+                    r = _sp.run(cmd, capture_output=True, text=True, timeout=3)
+                    if r.returncode == 0 and r.stdout:
+                        return r.stdout.strip()
+                except (FileNotFoundError, _sp.TimeoutExpired):
+                    continue
+        elif plat == "windows":
+            # Windows: use PowerShell's Get-Clipboard (built-in, no install)
+            r = _sp.run(["powershell", "-NoProfile", "-Command", "Get-Clipboard"],
+                        capture_output=True, text=True, timeout=4)
+            if r.returncode == 0 and r.stdout:
+                return r.stdout.strip()
+    except Exception:
+        pass
+    # Final fallback: tkinter (works everywhere with a display)
+    try:
+        import tkinter as _tk
+        root = _tk.Tk()
+        root.withdraw()
+        try:
+            value = root.clipboard_get()
+        finally:
+            root.destroy()
+        return (value or "").strip()
+    except Exception:
+        return ""
+
+
+def run_interactive(install_dir: Path | None = None,
+                    argv: list[str] | None = None) -> int:
     """Top-level installer flow. Returns the process exit code."""
     logging.basicConfig(
         level=logging.INFO,
@@ -693,13 +739,41 @@ def run_interactive(install_dir: Path | None = None) -> int:
     install_dir = install_dir or default_install_dir()
 
     _print(_BANNER)
-    _print("Welcome to the Orbi installer.")
+    _print("Welcome to the Orby installer.")
     _print("")
-    _print("Paste the install token you received in your Stripe receipt email.")
-    _print("It looks like:  inst_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXX")
-    _print("")
-    token = input("Install token: ").strip()
-    biz_name = input("Business name (optional, press Enter to skip): ").strip()
+
+    # ── Auto-detect token from clipboard or command-line arg ──
+    # The install page at twickell.com/install?t=<token> auto-copies the
+    # token to the clipboard on click. We try that first so the customer
+    # doesn't have to paste anything.
+    token = ""
+    # 1. Command-line arg wins (--token=inst_...)
+    for arg in (argv or sys.argv[1:]):
+        if arg.startswith("--token="):
+            token = arg.split("=", 1)[1].strip()
+            break
+        if arg.startswith("--t="):
+            token = arg.split("=", 1)[1].strip()
+            break
+    # 2. Clipboard (tkinter is in stdlib + works cross-platform without
+    #    extra packages — important for our PyInstaller bundle)
+    if not token:
+        clip = _read_clipboard()
+        if clip and clip.startswith("inst_"):
+            token = clip.strip()
+            _print(f"Found your install token in the clipboard: {token[:14]}…")
+    # 3. Manual prompt as fallback
+    if not token:
+        _print("Paste the install token you received in your email.")
+        _print("(Tip: visit the link in your email and the token is "
+               "copied automatically — you can also paste it here.)")
+        _print("It looks like:  inst_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXX")
+        _print("")
+        token = input("Install token: ").strip()
+
+    biz_name = ""
+    if not (argv and any(a == "--silent" or a == "--quiet" for a in argv)):
+        biz_name = input("Business name (optional, press Enter to skip): ").strip()
 
     _print("")
     _print("Verifying token with billing service …")
