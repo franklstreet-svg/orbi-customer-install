@@ -287,14 +287,20 @@ def _parse_when(phrase: str) -> str | None:
     if phrase == "next week":
         return _local_at(7, 9)
 
-    # "in N minutes/hours/days/weeks" — offset from now (no TZ involved)
-    m_in = re.match(r"^(?:in\s+)?(\d+)\s*(min|minute|hour|hr|day|week)s?$", phrase)
+    # "in N seconds/minutes/hours/days/weeks/months" — offset from now
+    m_in = re.match(
+        r"^(?:in\s+)?(\d+)\s*"
+        r"(sec|second|min|minute|hour|hr|day|week|month|mo)s?$",
+        phrase,
+    )
     if m_in:
         n = int(m_in.group(1))
         unit = m_in.group(2)
-        delta = {"min": timedelta(minutes=n), "minute": timedelta(minutes=n),
+        delta = {"sec": timedelta(seconds=n), "second": timedelta(seconds=n),
+                 "min": timedelta(minutes=n), "minute": timedelta(minutes=n),
                  "hour": timedelta(hours=n), "hr": timedelta(hours=n),
-                 "day": timedelta(days=n), "week": timedelta(weeks=n)}[unit]
+                 "day": timedelta(days=n), "week": timedelta(weeks=n),
+                 "month": timedelta(days=30 * n), "mo": timedelta(days=30 * n)}[unit]
         return (now + delta).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     weekdays = {"monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
