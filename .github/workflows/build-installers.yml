@@ -1,0 +1,90 @@
+name: Build Orby installers
+
+# Cross-platform build of the customer-side installer for Win/Mac/Linux.
+# Runs on every push to main + on demand from the Actions tab.
+# Free for public repos; private repos get 2,000 free minutes/month
+# (each build ~5 min × 3 platforms = ~15 min per push).
+#
+# Artifacts are attached to the workflow run AND, when the push has a
+# semver tag (v1.0.0, v1.2.3-beta, etc.), uploaded as a GitHub Release.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths:
+      - 'customer_install/**'
+      - 'billing/**'
+      - '.github/workflows/build-installers.yml'
+  workflow_dispatch:  # lets Frank trigger from the Actions tab anytime
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux
+            artifact: orby-installer-linux
+            artifact_path: customer_install/installer/dist/linux/
+          - os: macos-latest
+            target: mac
+            artifact: orby-installer-mac
+            artifact_path: customer_install/installer/dist/mac/
+          - os: windows-latest
+            target: windows
+            artifact: orby-installer-windows
+            artifact_path: customer_install/installer/dist/windows/
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install build deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+
+      - name: Build installer (${{ matrix.target }})
+        run: python customer_install/installer/build_orbi_installer.py --target ${{ matrix.target }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact_path }}
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Attach artifacts to GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Show what we got
+        run: find artifacts -type f | xargs -I {} ls -la {}
+
+      - name: Publish Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/orby-installer-linux/*
+            artifacts/orby-installer-mac/*
+            artifacts/orby-installer-windows/*
+          generate_release_notes: true
+          fail_on_unmatched_files: false
