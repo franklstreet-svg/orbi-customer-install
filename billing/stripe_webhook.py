@@ -163,6 +163,9 @@ def init_db() -> None:
             "ADD COLUMN last_heartbeat TEXT",
             "ADD COLUMN is_dark INTEGER DEFAULT 0",
             "ADD COLUMN dark_since INTEGER",
+            "ADD COLUMN public_url TEXT",        # customer's tunnel URL
+            "ADD COLUMN twilio_number TEXT",     # e.g. +17755551234
+            "ADD COLUMN twilio_number_sid TEXT", # for release/management
         ):
             try:
                 conn.execute(f"ALTER TABLE customers {col_def}")
@@ -450,6 +453,30 @@ def handle_checkout_completed(event: dict) -> None:
         grace_until=None,
     )
 
+    # Auto-provision a Twilio number for tiers that include the phone
+    # receptionist. NO-OPs if Twilio creds not in env (e.g., during
+    # bootstrap before Frank funds the account).
+    twilio_number = None
+    try:
+        import twilio_central
+        if tier in twilio_central.TIERS_WITH_PHONE and twilio_central.is_configured():
+            result = twilio_central.provision_for_customer(api_key)
+            if result.get("ok"):
+                twilio_number = result["phone_number"]
+                with db() as conn:
+                    conn.execute(
+                        "UPDATE customers SET twilio_number = ?, "
+                        "twilio_number_sid = ? WHERE api_key = ?",
+                        (twilio_number, result["sid"], api_key),
+                    )
+                print(f"[twilio] {api_key[:14]} got {twilio_number} ({result['sid']})")
+            else:
+                log.warning(f"twilio provision failed for {api_key[:14]}: {result}")
+        elif tier in twilio_central.TIERS_WITH_PHONE:
+            print(f"[twilio] skipped — credentials not set in env (tier={tier})")
+    except Exception as e:
+        log.warning(f"twilio provision crashed for {api_key[:14]}: {e}")
+
     # Mint an install token so the customer's downloaded installer can
     # claim its api_key without us emailing the raw key in plaintext.
     install_token = create_install_record(
@@ -458,13 +485,14 @@ def handle_checkout_completed(event: dict) -> None:
         tier=tier,
         api_key=api_key,
     )
-    print(f"[checkout] new customer {email} on tier {tier}, api_key={api_key[:14]}..., install_token={install_token[:14]}...")
-    _send_install_email(email, install_token, tier)
+    print(f"[checkout] new customer {email} on tier {tier}, api_key={api_key[:14]}..., install_token={install_token[:14]}..., phone={twilio_number or '(none)'}")
+    _send_install_email(email, install_token, tier, twilio_number=twilio_number)
     # TODO: in Phase 2, swap the print-based stub for Resend / SES.
 
 
 def _send_install_email(email: str | None, install_token: str,
-                        tier: str | None) -> None:
+                        tier: str | None,
+                        twilio_number: str | None = None) -> None:
     """Send the install email. Tries SMTP first (Yahoo / iCloud / Gmail —
     whatever Frank has an app password for), then Resend's HTTPS API as a
     fallback. Falls back to log-only if NEITHER is configured.
@@ -486,6 +514,25 @@ def _send_install_email(email: str | None, install_token: str,
 
     download_url = f"{DOWNLOAD_BASE_URL.rstrip('/')}/download/{tier or 'standard'}"
     subject = "Your Orby is ready — install token inside"
+
+    phone_line_text = ""
+    phone_line_html = ""
+    if twilio_number:
+        phone_line_text = (
+            f"\nYour business phone number: {twilio_number}\n"
+            f"This number is yours — give it to customers, put it on your "
+            f"site, your business cards, whatever. Orby will answer it 24/7 "
+            f"once the install finishes.\n"
+        )
+        phone_line_html = (
+            f'<p style="background:#0b0f1a;color:#4ade80;padding:14px;border-radius:8px;'
+            f'font-size:15px;text-align:center;margin:18px 0;">'
+            f'<strong>Your business phone number:</strong><br>'
+            f'<span style="font-size:22px;font-weight:700;color:#fff;">{twilio_number}</span><br>'
+            f'<span style="font-size:13px;color:#8aa3c8;">Orby answers 24/7 once your install finishes.</span>'
+            f'</p>'
+        )
+
     text = (
         f"Welcome to Orby!\n\n"
         f"Two things to do:\n\n"
@@ -493,6 +540,7 @@ def _send_install_email(email: str | None, install_token: str,
         f"   {download_url}\n\n"
         f"2) When the installer asks for your install token, paste:\n\n"
         f"   {install_token}\n\n"
+        f"{phone_line_text}"
         f"The token is single-use. Don't share it — anyone with this token "
         f"could install Orby as you.\n\n"
         f"Need help? Reply to this email.\n\n"
@@ -507,6 +555,7 @@ def _send_install_email(email: str | None, install_token: str,
         f'<p><strong>2.</strong> When the installer asks for your install token, paste this:</p>'
         f'<pre style="background:#0b0f1a;color:#eaf0ff;padding:14px;border-radius:8px;font-size:14px;'
         f'word-break:break-all">{install_token}</pre>'
+        f'{phone_line_html}'
         f'<p style="color:#666;font-size:13px">The token is single-use — anyone with it could install '
         f'Orby as you, so keep it private.</p>'
         f'<p style="color:#666;font-size:13px;margin-top:20px">Need help? Just reply to this email.</p>'
@@ -620,10 +669,32 @@ def handle_invoice_payment_failed(event: dict) -> None:
           f"{datetime.fromtimestamp(grace_until).isoformat()}")
 
 def handle_subscription_deleted(event: dict) -> None:
-    """Subscription canceled. Deactivate immediately."""
+    """Subscription canceled. Deactivate + release Twilio number."""
     sub = event["data"]["object"]
-    upsert_customer(stripe_customer_id=sub["customer"], active=False)
-    print(f"[canceled] {sub['customer']}")
+    stripe_customer_id = sub["customer"]
+    # Look up the customer to grab the Twilio SID BEFORE we deactivate
+    cust = get_customer_by_stripe_id(stripe_customer_id)
+    twilio_sid = cust.get("twilio_number_sid") if cust else None
+    upsert_customer(stripe_customer_id=stripe_customer_id, active=False)
+    print(f"[canceled] {stripe_customer_id}")
+
+    # Release the Twilio number so Frank stops paying $1/mo for it.
+    if twilio_sid:
+        try:
+            import twilio_central
+            result = twilio_central.release_number(twilio_sid)
+            if result.get("ok"):
+                with db() as conn:
+                    conn.execute(
+                        "UPDATE customers SET twilio_number = NULL, "
+                        "twilio_number_sid = NULL WHERE stripe_customer_id = ?",
+                        (stripe_customer_id,),
+                    )
+                print(f"[twilio] released {cust.get('twilio_number')} ({twilio_sid})")
+            else:
+                log.warning(f"twilio release failed for {twilio_sid}: {result}")
+        except Exception as e:
+            log.warning(f"twilio release crashed for {twilio_sid}: {e}")
 
 EVENT_HANDLERS = {
     "checkout.session.completed":   handle_checkout_completed,
@@ -985,12 +1056,24 @@ def customer_heartbeat(api_key: str):
     payload_blob = json.dumps(body)[:4000]
     ts = now()
     was_dark = bool(cust.get("is_dark"))
+    # Customer may have reported their current public tunnel URL — store
+    # it so the Twilio voice-webhook proxy knows where to forward calls.
+    new_public_url = (body.get("public_url") or "").strip() or None
     with db() as conn:
-        conn.execute(
-            "UPDATE customers SET last_seen_at = ?, last_heartbeat = ?, "
-            "is_dark = 0, dark_since = NULL, updated_at = ? WHERE api_key = ?",
-            (ts, payload_blob, ts, api_key),
-        )
+        if new_public_url and new_public_url != cust.get("public_url"):
+            conn.execute(
+                "UPDATE customers SET last_seen_at = ?, last_heartbeat = ?, "
+                "is_dark = 0, dark_since = NULL, public_url = ?, "
+                "updated_at = ? WHERE api_key = ?",
+                (ts, payload_blob, new_public_url, ts, api_key),
+            )
+        else:
+            conn.execute(
+                "UPDATE customers SET last_seen_at = ?, last_heartbeat = ?, "
+                "is_dark = 0, dark_since = NULL, updated_at = ? "
+                "WHERE api_key = ?",
+                (ts, payload_blob, ts, api_key),
+            )
     # If they were dark and just came back, log + tell Frank via inbox
     if was_dark:
         dark_for = ts - (cust.get("dark_since") or ts)
@@ -1166,6 +1249,97 @@ def admin_fleet_inbox():
         items = [i for i in items if not i.get("seen")]
     items.sort(key=lambda i: i.get("ts", 0), reverse=True)
     return jsonify({"items": items})
+
+
+# ---------------------------------------------------------------------------
+# Twilio webhook proxy — Twilio calls THE BRAIN, the brain proxies to the
+# customer's local Orby. Brain learns the customer's URL from heartbeats.
+# ---------------------------------------------------------------------------
+
+_TWIML_NO_CUSTOMER_URL = """<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say voice="Polly.Joanna">Our system is temporarily unavailable. Please try again in a few minutes, or send us an email instead. Goodbye.</Say>
+    <Hangup/>
+</Response>"""
+
+
+def _twiml_offline_message(business_name: str = "") -> str:
+    msg = (f"{business_name} is currently offline. " if business_name else
+           "We're currently offline. ")
+    msg += ("Please leave a brief message after the tone and we'll call you "
+            "back as soon as possible. Thank you.")
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say voice="Polly.Joanna">{msg}</Say>
+    <Record maxLength="120" playBeep="true"/>
+</Response>"""
+
+
+@app.route("/twilio/voice/<api_key>", methods=["POST", "GET"])
+def twilio_voice_proxy(api_key: str):
+    """Twilio sends incoming-call webhook here. We look up the customer
+    and forward the webhook to their local Orby (URL from heartbeat).
+    If the customer's machine isn't reachable, fall back to a friendly
+    voicemail TwiML so the caller isn't dropped on the floor."""
+    cust = get_customer_by_api_key(api_key)
+    if not cust:
+        log.warning(f"twilio voice: invalid api_key {api_key[:14]}")
+        return _TWIML_NO_CUSTOMER_URL, 200, {"Content-Type": "application/xml"}
+    if not cust.get("active"):
+        log.warning(f"twilio voice: inactive customer {api_key[:14]}")
+        return _twiml_offline_message(cust.get("business_name") or ""), 200, \
+               {"Content-Type": "application/xml"}
+
+    public_url = (cust.get("public_url") or "").rstrip("/")
+    if not public_url:
+        log.warning(f"twilio voice: no public_url for {api_key[:14]}")
+        return _twiml_offline_message(cust.get("business_name") or ""), 200, \
+               {"Content-Type": "application/xml"}
+
+    # Forward the Twilio webhook (form-encoded body) to the customer's
+    # local /voice/incoming endpoint. Pass through all the original form
+    # fields so Orby's voice.py receives exactly what Twilio sent.
+    forward_url = f"{public_url}/voice/incoming"
+    import urllib.request
+    import urllib.error
+    try:
+        form_data = request.form.to_dict()
+        encoded = urllib.parse.urlencode(form_data).encode("ascii")
+        req = urllib.request.Request(
+            forward_url, data=encoded,
+            headers={"Content-Type": "application/x-www-form-urlencoded",
+                     "User-Agent":   "Orbi-Brain-VoiceProxy/0.1"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            return resp.read(), resp.status, {"Content-Type": "application/xml"}
+    except (urllib.error.HTTPError, urllib.error.URLError, OSError) as e:
+        log.warning(f"twilio voice proxy to {forward_url} failed: {e}")
+        return _twiml_offline_message(cust.get("business_name") or ""), 200, \
+               {"Content-Type": "application/xml"}
+
+
+@app.route("/twilio/sms/<api_key>", methods=["POST", "GET"])
+def twilio_sms_proxy(api_key: str):
+    """Twilio inbound-SMS webhook. Same pattern as voice: lookup customer,
+    forward to their local /sms/incoming. Silent failure if offline."""
+    cust = get_customer_by_api_key(api_key)
+    if not cust or not cust.get("active") or not cust.get("public_url"):
+        return ("", 204)
+    forward_url = f"{cust['public_url'].rstrip('/')}/sms/incoming"
+    import urllib.request, urllib.error
+    try:
+        encoded = urllib.parse.urlencode(request.form.to_dict()).encode("ascii")
+        req = urllib.request.Request(
+            forward_url, data=encoded,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.read(), resp.status, {"Content-Type": "application/xml"}
+    except Exception as e:
+        log.warning(f"twilio sms proxy failed for {api_key[:14]}: {e}")
+        return ("", 204)
 
 
 @app.route("/health", methods=["GET"])

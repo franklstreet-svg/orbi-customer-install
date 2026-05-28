@@ -286,6 +286,13 @@ def _send_fleet_heartbeat() -> None:
         return  # not configured yet — silently skip
     import platform as _platform
     import urllib.request, urllib.error
+    # Customer's current public URL — needed so the brain can forward
+    # Twilio voice webhooks + visitor-chat traffic to this machine.
+    # cfg.tunnel_url is set by the installer (or by a future cloudflared
+    # auto-create step). Defaults to empty if no tunnel has been
+    # established yet — brain will skip Twilio routing in that case.
+    public_url = (CONFIG.get("tunnel_url") or
+                  (CONFIG.get("brain") or {}).get("local_public_url") or "")
     payload = {
         "uptime_sec":   int(time.time() - START_TIME),
         "version":      CONFIG.get("version", "0.1.0"),
@@ -293,6 +300,7 @@ def _send_fleet_heartbeat() -> None:
         "platform_rel": _platform.release(),
         "now_iso":      _dt_now_iso(),
         "billing_active": bool(BILLING_STATUS.get("active", True)),
+        "public_url":   public_url,
     }
     req = urllib.request.Request(
         f"{brain_url}/api/heartbeat/{api_key}",
