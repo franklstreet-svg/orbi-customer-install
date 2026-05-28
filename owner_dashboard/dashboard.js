@@ -3683,4 +3683,173 @@
   }
   document.addEventListener('DOMContentLoaded', wireInboxPolling);
 
+  // ------------------------------------------------------------------
+  // IMAP/SMTP email accounts (Yahoo, iCloud, AOL, Fastmail, custom)
+  // ------------------------------------------------------------------
+  let _imapProviders = null;
+
+  async function _loadImapProviders() {
+    if (_imapProviders) return _imapProviders;
+    try {
+      const r = await fetch('/api/owner/email/imap/providers');
+      _imapProviders = (await r.json()).providers || [];
+    } catch { _imapProviders = []; }
+    return _imapProviders;
+  }
+
+  function _renderImapAccount(a) {
+    const div = document.createElement('div');
+    div.className = 'imap-account-row';
+    div.innerHTML =
+      '<div class="imap-account-info">' +
+        '<div class="imap-account-email"></div>' +
+        '<div class="imap-account-meta muted"></div>' +
+      '</div>' +
+      '<div class="imap-account-actions">' +
+        '<button type="button" class="secondary-btn imap-test">Test</button>' +
+        '<button type="button" class="secondary-btn imap-remove">Remove</button>' +
+      '</div>';
+    div.querySelector('.imap-account-email').textContent = a.email;
+    div.querySelector('.imap-account-meta').textContent =
+      (a.label && a.label !== a.email ? a.label + ' • ' : '') +
+      (a.provider || 'custom') + ' • ' + a.imap_host;
+    div.querySelector('.imap-test').addEventListener('click', async () => {
+      const btn = div.querySelector('.imap-test');
+      btn.disabled = true; btn.textContent = 'Testing…';
+      try {
+        const r = await fetch('/api/owner/email/imap/accounts/' + a.id + '/test',
+                              {method: 'POST'});
+        const j = await r.json();
+        btn.textContent = j.ok ? 'OK ✓' : 'Failed';
+        if (!j.ok) alert('Test failed: ' + (j.error || 'unknown'));
+      } finally {
+        setTimeout(() => { btn.disabled = false; btn.textContent = 'Test'; }, 2500);
+      }
+    });
+    div.querySelector('.imap-remove').addEventListener('click', async () => {
+      if (!confirm('Disconnect ' + a.email + '?')) return;
+      await fetch('/api/owner/email/imap/accounts/' + a.id, {method: 'DELETE'});
+      _refreshImapAccounts();
+    });
+    return div;
+  }
+
+  async function _refreshImapAccounts() {
+    const list = document.getElementById('imap-accounts-list');
+    if (!list) return;
+    try {
+      const r = await fetch('/api/owner/email/imap/accounts');
+      const accounts = (await r.json()).accounts || [];
+      list.innerHTML = '';
+      if (accounts.length === 0) {
+        list.innerHTML = '<p class="muted" style="margin:6px 0">No email accounts connected yet.</p>';
+        return;
+      }
+      for (const a of accounts) list.appendChild(_renderImapAccount(a));
+    } catch (e) {
+      list.innerHTML = '<p class="muted">Failed to load accounts.</p>';
+    }
+  }
+
+  async function _openImapDialog() {
+    const providers = await _loadImapProviders();
+    const dlg      = document.getElementById('imap-dialog');
+    const sel      = document.getElementById('imap-provider');
+    const helpEl   = document.getElementById('imap-help');
+    const custom   = document.getElementById('imap-custom-fields');
+    if (!dlg || !sel) return;
+    sel.innerHTML = '';
+    for (const p of providers) {
+      const opt = document.createElement('option');
+      opt.value = p.id; opt.textContent = p.label;
+      sel.appendChild(opt);
+    }
+    function syncProvider() {
+      const p = providers.find(x => x.id === sel.value) || providers[0];
+      if (!p) return;
+      helpEl.innerHTML = '';
+      const helpText = document.createElement('span');
+      helpText.textContent = p.help || '';
+      helpEl.appendChild(helpText);
+      if (p.help_url) {
+        helpEl.appendChild(document.createTextNode(' '));
+        const a = document.createElement('a');
+        a.href = p.help_url; a.target = '_blank'; a.rel = 'noopener';
+        a.textContent = 'Open settings ↗';
+        helpEl.appendChild(a);
+      }
+      custom.hidden = (p.id !== 'custom');
+      document.getElementById('imap-host').value = p.imap_host || '';
+      document.getElementById('imap-port').value = p.imap_port || '';
+      document.getElementById('smtp-host').value = p.smtp_host || '';
+      document.getElementById('smtp-port').value = p.smtp_port || '';
+    }
+    sel.addEventListener('change', syncProvider);
+    syncProvider();
+    document.getElementById('imap-email').value = '';
+    document.getElementById('imap-password').value = '';
+    document.getElementById('imap-save-status').textContent = '';
+    if (typeof dlg.showModal === 'function') dlg.showModal();
+    else dlg.setAttribute('open', '');
+  }
+
+  async function _saveImapAccount() {
+    const status = document.getElementById('imap-save-status');
+    status.textContent = 'Testing connection…';
+    status.style.color = '';
+    const provider = document.getElementById('imap-provider').value;
+    const payload = {
+      provider:  provider,
+      email:     document.getElementById('imap-email').value.trim(),
+      password:  document.getElementById('imap-password').value,
+    };
+    if (provider === 'custom') {
+      payload.imap_host = document.getElementById('imap-host').value.trim();
+      payload.imap_port = parseInt(document.getElementById('imap-port').value, 10);
+      payload.smtp_host = document.getElementById('smtp-host').value.trim();
+      payload.smtp_port = parseInt(document.getElementById('smtp-port').value, 10);
+    }
+    try {
+      const r = await fetch('/api/owner/email/imap/accounts', {
+        method:  'POST',
+        headers: {'Content-Type': 'application/json'},
+        body:    JSON.stringify(payload),
+      });
+      const j = await r.json();
+      if (j.ok) {
+        status.style.color = '#82e9a5';
+        status.textContent = 'Connected ✓';
+        setTimeout(() => {
+          document.getElementById('imap-dialog').close();
+          _refreshImapAccounts();
+        }, 800);
+      } else {
+        status.style.color = '#ff8b8b';
+        status.textContent = j.error || 'Failed';
+      }
+    } catch (e) {
+      status.style.color = '#ff8b8b';
+      status.textContent = String(e);
+    }
+  }
+
+  function wireImap() {
+    const addBtn = document.getElementById('imap-add-btn');
+    if (addBtn) addBtn.addEventListener('click', _openImapDialog);
+    const saveBtn = document.getElementById('imap-save-btn');
+    if (saveBtn) saveBtn.addEventListener('click', _saveImapAccount);
+    const cancelBtn = document.getElementById('imap-cancel-btn');
+    if (cancelBtn) cancelBtn.addEventListener('click', () => {
+      document.getElementById('imap-dialog').close();
+    });
+    // Lazy-load accounts when Settings tab opens
+    const settingsTab = document.querySelector('.tab[data-tab="settings"]');
+    if (settingsTab) settingsTab.addEventListener('click', _refreshImapAccounts);
+    // Initial load if Settings is already the active tab
+    if (document.getElementById('tab-settings')?.classList.contains('active')) {
+      _refreshImapAccounts();
+    }
+  }
+  document.addEventListener('DOMContentLoaded', wireImap);
+
 })();

@@ -751,6 +751,65 @@
           <div class="empty-state-small">Loading integrations…</div>
         </div>
 
+        <!-- IMAP/SMTP email accounts (Yahoo, iCloud, AOL, Fastmail, custom) -->
+        <div class="integration-row" id="imap-row" style="margin-top:14px; flex-wrap:wrap">
+          <div class="integration-icon" aria-hidden="true">
+            <svg viewBox="0 0 32 32" width="28" height="28">
+              <rect x="3" y="7" width="26" height="18" rx="3" fill="#4f8cff" opacity="0.18"/>
+              <path d="M3 9l13 9 13-9" stroke="#4f8cff" stroke-width="2" fill="none"/>
+            </svg>
+          </div>
+          <div class="integration-body">
+            <div class="integration-title">Other email (Yahoo, iCloud, AOL, Fastmail, custom domains…)</div>
+            <div class="integration-status" id="imap-status">Connect any account that supports IMAP — most providers do.</div>
+          </div>
+          <div class="integration-actions">
+            <button type="button" class="primary-btn" id="imap-add-btn">+ Add email account</button>
+          </div>
+          <div id="imap-accounts-list" style="width:100%; margin-top:10px"></div>
+        </div>
+
+        <dialog id="imap-dialog">
+          <form method="dialog" id="imap-form">
+            <h2 style="margin-top:0">Connect an email account</h2>
+            <p class="muted" style="margin:2px 0 12px">Pick your provider — most use an "app password" instead of your regular password.</p>
+
+            <label>Provider
+              <select id="imap-provider" required></select>
+            </label>
+
+            <p class="muted" id="imap-help" style="margin:6px 0 12px; font-size:13px"></p>
+
+            <label>Email address
+              <input type="email" id="imap-email" required autocomplete="off"
+                     placeholder="you@example.com">
+            </label>
+
+            <label>Password (app password, NOT your normal password for Yahoo/iCloud/AOL)
+              <input type="password" id="imap-password" required autocomplete="off"
+                     placeholder="paste 16-character app password">
+            </label>
+
+            <!-- Custom server fields, shown only when provider=custom -->
+            <div id="imap-custom-fields" hidden>
+              <div class="row-2">
+                <label>IMAP host <input type="text" id="imap-host" placeholder="imap.example.com"></label>
+                <label>IMAP port <input type="number" id="imap-port" placeholder="993"></label>
+              </div>
+              <div class="row-2">
+                <label>SMTP host <input type="text" id="smtp-host" placeholder="smtp.example.com"></label>
+                <label>SMTP port <input type="number" id="smtp-port" placeholder="587"></label>
+              </div>
+            </div>
+
+            <div class="form-actions" style="margin-top:14px">
+              <button type="button" class="primary-btn" id="imap-save-btn">Test & Save</button>
+              <button type="button" class="secondary-btn" id="imap-cancel-btn">Cancel</button>
+              <span id="imap-save-status" class="save-status" style="margin-left:8px"></span>
+            </div>
+          </form>
+        </dialog>
+
         <dialog id="apikey-dialog">
           <form method="dialog" id="apikey-form">
             <h2 id="apikey-title">Save API key</h2>

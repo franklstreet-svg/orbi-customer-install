@@ -136,6 +136,15 @@ def fetch_inbox(config: dict, user_dir: Path,
             log.warning(f"outlook pull failed: {e}")
             errors["outlook"] = str(e)
 
+    if source in ("all", "imap"):
+        try:
+            import imap_smtp
+            messages.extend(imap_smtp.pull_inbox(user_dir, account_id=None,
+                                                 limit=fetch_limit, query=query))
+        except Exception as e:
+            log.warning(f"imap pull failed: {e}")
+            errors["imap"] = str(e)
+
     # Sort by date desc
     messages.sort(key=lambda m: m.get("date", ""), reverse=True)
 

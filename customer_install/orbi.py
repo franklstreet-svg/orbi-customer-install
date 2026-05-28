@@ -2832,6 +2832,76 @@ def email_settings():
 
 
 # ---------------------------------------------------------------------------
+# Generic IMAP/SMTP email accounts — Yahoo, iCloud, Fastmail, custom domains
+# ---------------------------------------------------------------------------
+
+@app.route("/api/owner/email/imap/providers", methods=["GET"])
+def email_imap_providers():
+    """Return the list of preset providers so the UI can show a dropdown."""
+    auth.require_user(ORBI_DIR, DATA_DIR)
+    import imap_smtp
+    out = []
+    for pid, p in imap_smtp.PROVIDER_PRESETS.items():
+        out.append({
+            "id":            pid,
+            "label":         p["label"],
+            "imap_host":     p["imap_host"],
+            "imap_port":     p["imap_port"],
+            "imap_ssl":      p["imap_ssl"],
+            "smtp_host":     p["smtp_host"],
+            "smtp_port":     p["smtp_port"],
+            "smtp_starttls": p["smtp_starttls"],
+            "help":          p.get("help", ""),
+            "help_url":      p.get("help_url", ""),
+        })
+    return jsonify({"providers": out})
+
+
+@app.route("/api/owner/email/imap/accounts", methods=["GET", "POST"])
+def email_imap_accounts():
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    user_dir = users_mod.get_user_dir(DATA_DIR, user["username"])
+    import imap_smtp
+    if request.method == "GET":
+        return jsonify({"accounts": imap_smtp.list_accounts(user_dir)})
+    data = request.get_json(silent=True) or {}
+    result = imap_smtp.add_account(
+        user_dir,
+        email_addr=data.get("email", ""),
+        password=data.get("password", ""),
+        provider=data.get("provider", "custom"),
+        imap_host=data.get("imap_host") or None,
+        imap_port=data.get("imap_port") or None,
+        imap_ssl=data.get("imap_ssl") if "imap_ssl" in data else None,
+        smtp_host=data.get("smtp_host") or None,
+        smtp_port=data.get("smtp_port") or None,
+        smtp_starttls=data.get("smtp_starttls") if "smtp_starttls" in data else None,
+        label=data.get("label") or None,
+    )
+    status = 200 if result.get("ok") else 400
+    return jsonify(result), status
+
+
+@app.route("/api/owner/email/imap/accounts/<account_id>", methods=["DELETE"])
+def email_imap_remove(account_id: str):
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    user_dir = users_mod.get_user_dir(DATA_DIR, user["username"])
+    import imap_smtp
+    ok = imap_smtp.remove_account(user_dir, account_id)
+    return jsonify({"ok": ok})
+
+
+@app.route("/api/owner/email/imap/accounts/<account_id>/test", methods=["POST"])
+def email_imap_test(account_id: str):
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    user_dir = users_mod.get_user_dir(DATA_DIR, user["username"])
+    import imap_smtp
+    result = imap_smtp.test_account(user_dir, account_id)
+    status = 200 if result.get("ok") else 400
+    return jsonify(result), status
+
+
+# ---------------------------------------------------------------------------
 # Office gaps — charts/graphs, PowerPoint, mail merge
 # ---------------------------------------------------------------------------
 

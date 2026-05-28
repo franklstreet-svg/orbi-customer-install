@@ -2012,3 +2012,56 @@ dialog .form-actions {
                 0 6px 20px rgba(0, 0, 0, 0.5);
   }
 }
+
+/* IMAP account rows (Settings → Integrations → "Other email") */
+.imap-account-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  background: #0f1626;
+  border: 1px solid #2c3957;
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin: 8px 0;
+}
+.imap-account-info { flex: 1; min-width: 0; }
+.imap-account-email {
+  font-weight: 600;
+  color: #eaf0ff;
+  word-break: break-all;
+}
+.imap-account-meta { font-size: 12px; }
+.imap-account-actions { display: flex; gap: 6px; flex-shrink: 0; }
+.imap-account-actions .secondary-btn {
+  padding: 6px 10px;
+  font-size: 12px;
+}
+
+/* IMAP dialog uses the same look as the existing apikey-dialog */
+#imap-dialog {
+  background: #111728;
+  color: #eaf0ff;
+  border: 1px solid #2c3957;
+  border-radius: 12px;
+  padding: 22px;
+  max-width: 500px;
+  width: 92%;
+}
+#imap-dialog::backdrop { background: rgba(0, 0, 0, 0.6); }
+#imap-dialog label { display: block; margin-bottom: 10px; }
+#imap-dialog input[type="email"],
+#imap-dialog input[type="password"],
+#imap-dialog input[type="text"],
+#imap-dialog input[type="number"],
+#imap-dialog select {
+  width: 100%;
+  margin-top: 4px;
+  background: #0f1626;
+  border: 1px solid #2c3957;
+  border-radius: 8px;
+  color: #eaf0ff;
+  padding: 10px 12px;
+  font-size: 14px;
+  font-family: inherit;
+}
+#imap-dialog .save-status { font-size: 13px; }
