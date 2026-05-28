@@ -443,7 +443,7 @@ def _strip_html(s: str) -> str:
 
 
 def _format_message(account: dict, uid: bytes, msg: email.message.Message,
-                    flags_raw: bytes) -> dict:
+                    flags_raw: bytes, folder: str = "INBOX") -> dict:
     subject = _decode_header(msg.get("Subject"))
     sender  = _decode_header(msg.get("From"))
     date_h  = msg.get("Date") or ""
@@ -458,6 +458,7 @@ def _format_message(account: dict, uid: bytes, msg: email.message.Message,
         "id":            f"imap-{account['id']}-{uid.decode('ascii', errors='replace')}",
         "provider":      "imap",
         "account_email": account["email"],
+        "folder":        folder,
         "subject":       subject or "(no subject)",
         "from":          sender,
         "snippet":       snippet,
@@ -467,6 +468,36 @@ def _format_message(account: dict, uid: bytes, msg: email.message.Message,
         "flagged":       False,
         "flag_reason":   "",
     }
+
+
+def list_folders(user_dir: Path, account_id: str | None = None) -> list[dict]:
+    """List the folders available on each connected IMAP account.
+    Diagnostic: confirms which folders Orby has access to. Each dict:
+        {account_email, folders: [name, ...]}"""
+    accounts = _read_accounts(user_dir)
+    if account_id:
+        accounts = [a for a in accounts if a["id"] == account_id]
+    out = []
+    for a in accounts:
+        names = []
+        try:
+            with _imap_connect(a) as m:
+                typ, data = m.list()
+                if typ == "OK" and data:
+                    for line in data:
+                        if not line:
+                            continue
+                        s = line.decode("utf-8", errors="replace") if isinstance(line, bytes) else str(line)
+                        # IMAP LIST format: (FLAGS) "/" "FolderName"
+                        # Grab the part after the last `"`.
+                        if '"' in s:
+                            names.append(s.rsplit('"', 2)[-2])
+                        else:
+                            names.append(s.split()[-1])
+        except Exception as e:
+            log.warning(f"list_folders {a['email']}: {e}")
+        out.append({"account_email": a["email"], "folders": names})
+    return out
 
 
 # ─── Send via SMTP ─────────────────────────────────────────────────────

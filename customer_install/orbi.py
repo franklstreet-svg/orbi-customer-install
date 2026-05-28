@@ -1397,6 +1397,13 @@ def owner_chat():
         return jsonify({"reply": pa_direct, "tier": "local", "latency_ms": 0,
                         "source": "personal_assistant"})
 
+    # List IMAP folders — diagnostic so the owner can see exactly which
+    # folders Orby has access to and which folder each email lives in.
+    folders_reply = _try_list_folders(user_msg, user_dir)
+    if folders_reply is not None:
+        return jsonify({"reply": folders_reply, "tier": "local", "latency_ms": 0,
+                        "source": "list_folders"})
+
     # INBOX check — fast-path so "check my email" doesn't bounce to the LLM
     # which has no awareness of the connected IMAP/Gmail/Outlook accounts.
     inbox_reply = _try_inbox_check(user_msg, user_dir)
@@ -1752,22 +1759,51 @@ def _try_inbox_check(message: str, user_dir: Path) -> str | None:
 
     lines.append("")
     show_n = min(len(messages), 40)
-    lines.append(f"Top {show_n} newest (of {len(messages)} I can see in INBOX):")
+    lines.append(f"Top {show_n} newest (of {len(messages)} I can see):")
     for m in messages[:show_n]:
         unread_mark = "● " if m.get("unread") else "  "
         date_str = _fmt_email_date(m.get("date", ""))
-        sender  = (m.get("from") or "?")[:28]
-        subject = (m.get("subject") or "(no subject)")[:50]
-        lines.append(f"  {unread_mark}[{date_str:>14}]  {sender:<28} — {subject}")
+        sender  = (m.get("from") or "?")[:26]
+        subject = (m.get("subject") or "(no subject)")[:46]
+        folder  = m.get("folder") or m.get("provider") or "?"
+        lines.append(f"  {unread_mark}[{folder:<6} {date_str:>13}]  {sender:<26} — {subject}")
 
     lines.append("")
-    lines.append(f"Say 'show me email number 3' or 'reply to Joe' for details.")
+    lines.append("Each row shows the folder it came from in brackets.")
+    lines.append("Say 'list my email folders' to see every folder Orby can see.")
 
     if errors:
         lines.append("")
         lines.append("(Some sources errored: " +
                      ", ".join(f"{k}={v[:50]}" for k, v in errors.items()) + ")")
 
+    return "\n".join(lines)
+
+
+_PA_FOLDERS_RE = _re.compile(
+    r"\b(?:list|show|what\s+are)\s+(?:me\s+)?(?:my\s+|the\s+|all\s+)?"
+    r"(?:e[\s-]?mail\s+)?(?:imap\s+)?folders?\b",
+    _re.IGNORECASE,
+)
+
+
+def _try_list_folders(message: str, user_dir: Path) -> str | None:
+    if not message or not _PA_FOLDERS_RE.search(message):
+        return None
+    try:
+        import imap_smtp
+        accounts = imap_smtp.list_folders(user_dir)
+    except Exception as e:
+        return f"I couldn't list folders: {e}"
+    if not accounts:
+        return "You don't have any IMAP accounts connected. Add one in Settings → Integrations → + Add email account."
+    lines = []
+    for acct in accounts:
+        lines.append(f"📁 {acct['account_email']} — {len(acct['folders'])} folders:")
+        for name in acct["folders"]:
+            lines.append(f"    • {name}")
+        lines.append("")
+    lines.append("Note: 'check my email' only pulls from INBOX. Tell me 'check my Bulk Mail' or 'check my Sent' to look at others.")
     return "\n".join(lines)
 
 
