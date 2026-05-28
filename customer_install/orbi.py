@@ -254,6 +254,80 @@ threading.Thread(target=reminder_fire_loop, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
+# Fleet heartbeat — phone home to Frank's central brain server every ~5 min
+# so the mother ship knows this install is alive. Layered on top of the
+# local watchdog (which restarts THIS Orby if it crashes); fleet heartbeat
+# is the only way the central server can know that a customer's machine
+# is OFF, their internet is DOWN, or their watchdog itself is dead.
+# ---------------------------------------------------------------------------
+
+HEARTBEAT_INTERVAL_SEC = int(os.environ.get("ORBI_HEARTBEAT_SEC", "300"))  # 5 min
+
+
+def fleet_heartbeat_loop():
+    """POST /api/heartbeat/<api_key> to the brain server every 5 min.
+    Silent on failure — the brain server's dark-detector will notice the
+    gap and alert Frank. We don't need to scream from this side."""
+    # Initial delay so we don't race the rest of Orby coming up
+    time.sleep(45)
+    while True:
+        try:
+            _send_fleet_heartbeat()
+        except Exception as e:
+            log.debug(f"heartbeat send failed (will retry): {e}")
+        time.sleep(HEARTBEAT_INTERVAL_SEC)
+
+
+def _send_fleet_heartbeat() -> None:
+    brain_cfg = CONFIG.get("brain") or {}
+    brain_url = (brain_cfg.get("url") or "").rstrip("/")
+    api_key   = brain_cfg.get("api_key") or ""
+    if not brain_url or not api_key or "placeholder" in api_key.lower():
+        return  # not configured yet — silently skip
+    import platform as _platform
+    import urllib.request, urllib.error
+    payload = {
+        "uptime_sec":   int(time.time() - START_TIME),
+        "version":      CONFIG.get("version", "0.1.0"),
+        "platform":     _platform.system().lower(),
+        "platform_rel": _platform.release(),
+        "now_iso":      _dt_now_iso(),
+        "billing_active": bool(BILLING_STATUS.get("active", True)),
+    }
+    req = urllib.request.Request(
+        f"{brain_url}/api/heartbeat/{api_key}",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json",
+                 "User-Agent":   "Orby-Heartbeat/0.1"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            body = json.loads(resp.read().decode("utf-8", errors="replace"))
+            # Honor any commands the server sent back (future: remote
+            # restart, force update, etc.). For now just log them.
+            cmds = body.get("commands") or []
+            if cmds:
+                log.info(f"heartbeat: server sent {len(cmds)} commands: {cmds}")
+    except (urllib.error.HTTPError, urllib.error.URLError, OSError) as e:
+        log.debug(f"heartbeat unreachable: {e}")
+
+
+def _dt_now_iso() -> str:
+    from datetime import datetime as _dt, timezone as _tz
+    return _dt.now(_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# START_TIME is set near the bottom of this file but we reference it at
+# import time — bind a placeholder that gets corrected once the module
+# finishes loading.
+if "START_TIME" not in dir():
+    START_TIME = time.time()
+
+threading.Thread(target=fleet_heartbeat_loop, daemon=True).start()
+
+
+# ---------------------------------------------------------------------------
 # Flask app
 # ---------------------------------------------------------------------------
 

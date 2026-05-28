@@ -122,6 +122,10 @@ def init_db() -> None:
                 subscription_id    TEXT,
                 period_end         INTEGER,
                 grace_until        INTEGER,
+                last_seen_at       INTEGER,            -- unix ts of last heartbeat
+                last_heartbeat     TEXT,               -- last heartbeat payload (JSON)
+                is_dark            INTEGER DEFAULT 0,  -- 1 = no heartbeat in 30+ min
+                dark_since         INTEGER,            -- unix ts of when they went dark
                 created_at         INTEGER,
                 updated_at         INTEGER
             );
@@ -152,11 +156,18 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_customers_stripe
                 ON customers(stripe_customer_id);
         """)
-        # Backfill billing_cycle column on existing DBs (no-op if already added).
-        try:
-            conn.execute("ALTER TABLE customers ADD COLUMN billing_cycle TEXT")
-        except sqlite3.OperationalError:
-            pass
+        # Backfill columns on existing DBs (no-op if already added).
+        for col_def in (
+            "ADD COLUMN billing_cycle TEXT",
+            "ADD COLUMN last_seen_at INTEGER",
+            "ADD COLUMN last_heartbeat TEXT",
+            "ADD COLUMN is_dark INTEGER DEFAULT 0",
+            "ADD COLUMN dark_since INTEGER",
+        ):
+            try:
+                conn.execute(f"ALTER TABLE customers {col_def}")
+            except sqlite3.OperationalError:
+                pass
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -945,6 +956,216 @@ def brain_usage(api_key: str):
         },
         "cap":  cap,
     })
+
+
+# ---------------------------------------------------------------------------
+# Fleet health — every customer Orby phones home every ~5 min so Frank
+# knows who's up and who's gone dark. Layered on top of each customer's
+# local watchdog (which restarts + rolls back THEIR Orby). Fleet health
+# catches the failures the local watchdog can't (their PC is off, their
+# internet is down, the watchdog itself crashed).
+# ---------------------------------------------------------------------------
+
+DARK_THRESHOLD_SEC = int(os.environ.get("ORBI_DARK_THRESHOLD_SEC", "1800"))  # 30 min
+FLEET_CHECK_INTERVAL_SEC = int(os.environ.get("ORBI_FLEET_CHECK_SEC", "300"))  # 5 min
+
+
+@app.route("/api/heartbeat/<api_key>", methods=["POST"])
+def customer_heartbeat(api_key: str):
+    """Customer Orby pings here every ~5 min so the central server knows
+    they're alive. Payload is whatever the customer wants to report —
+    uptime, version, OS, recent activity. Stored verbatim for the fleet
+    dashboard. Returns commands the central server wants the customer
+    to act on (currently always empty; reserved for remote-wake / update
+    nudges)."""
+    cust = get_customer_by_api_key(api_key)
+    if not cust:
+        return jsonify({"error": "invalid_api_key"}), 401
+    body = request.get_json(silent=True) or {}
+    payload_blob = json.dumps(body)[:4000]
+    ts = now()
+    was_dark = bool(cust.get("is_dark"))
+    with db() as conn:
+        conn.execute(
+            "UPDATE customers SET last_seen_at = ?, last_heartbeat = ?, "
+            "is_dark = 0, dark_since = NULL, updated_at = ? WHERE api_key = ?",
+            (ts, payload_blob, ts, api_key),
+        )
+    # If they were dark and just came back, log + tell Frank via inbox
+    if was_dark:
+        dark_for = ts - (cust.get("dark_since") or ts)
+        title = f"✅ {cust.get('business_name') or cust.get('email') or api_key[:14]} is back"
+        body_text = (f"Customer was offline for {_fmt_duration(dark_for)}. "
+                     f"They're checking in again now.")
+        try:
+            notifications_inbox_add(event="fleet_recovered", title=title, body=body_text)
+        except Exception as e:
+            log.warning(f"could not write fleet_recovered notification: {e}")
+    return jsonify({"ok": True, "now": ts, "commands": []})
+
+
+def _fmt_duration(seconds: int) -> str:
+    if seconds < 60: return f"{seconds}s"
+    if seconds < 3600: return f"{seconds // 60} min"
+    if seconds < 86400: return f"{seconds // 3600} hr"
+    return f"{seconds // 86400} days"
+
+
+def notifications_inbox_add(*, event: str, title: str, body: str) -> None:
+    """Append a fleet-health alert to the brain server's local inbox file.
+    Frank's dashboard can poll this. Path is configurable so the brain
+    server's data dir stays separate from any customer Orby's data dir."""
+    inbox_path = Path(os.environ.get(
+        "ORBI_BRAIN_INBOX", "/opt/orbi-brain/fleet_inbox.json"))
+    inbox_path.parent.mkdir(parents=True, exist_ok=True)
+    import secrets as _secrets
+    rec = {
+        "id":    _secrets.token_urlsafe(8),
+        "event": event,
+        "title": title,
+        "body":  body,
+        "ts":    now(),
+        "seen":  False,
+    }
+    try:
+        existing = json.loads(inbox_path.read_text(encoding="utf-8")) if inbox_path.exists() else []
+    except (json.JSONDecodeError, OSError):
+        existing = []
+    existing.append(rec)
+    if len(existing) > 500:
+        existing = existing[-500:]
+    tmp = inbox_path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(existing, indent=2, ensure_ascii=False),
+                   encoding="utf-8")
+    tmp.replace(inbox_path)
+
+
+def _fleet_health_loop():
+    """Background worker: every FLEET_CHECK_INTERVAL_SEC, find every
+    customer whose last_seen is older than DARK_THRESHOLD_SEC and flag
+    them as dark. Writes an alert to the brain-server inbox the FIRST
+    time we notice — does NOT re-alert until they come back (heartbeat
+    handler clears is_dark + sends a 'they came back' note)."""
+    time.sleep(60)  # let the server come up first
+    while True:
+        try:
+            _scan_for_dark_customers()
+        except Exception as e:
+            log.warning(f"fleet health loop error: {e}")
+        time.sleep(FLEET_CHECK_INTERVAL_SEC)
+
+
+def _scan_for_dark_customers() -> None:
+    cutoff = now() - DARK_THRESHOLD_SEC
+    with db() as conn:
+        # Find customers who are active, have phoned home before, haven't
+        # done so recently, and aren't already flagged as dark.
+        cur = conn.execute(
+            "SELECT api_key, business_name, email, tier, last_seen_at "
+            "FROM customers "
+            "WHERE active = 1 "
+            "AND last_seen_at IS NOT NULL "
+            "AND last_seen_at < ? "
+            "AND (is_dark = 0 OR is_dark IS NULL)",
+            (cutoff,),
+        )
+        going_dark = [dict(r) for r in cur.fetchall()]
+    for cust in going_dark:
+        ts = now()
+        dark_for = ts - cust["last_seen_at"]
+        title = f"⚠ {cust.get('business_name') or cust.get('email') or cust['api_key'][:14]} went dark"
+        body = (f"Customer hasn't checked in for {_fmt_duration(dark_for)}. "
+                f"Tier: {cust.get('tier') or '?'}. Their machine may be off, "
+                f"their internet may be down, or their watchdog couldn't recover.")
+        try:
+            notifications_inbox_add(event="fleet_dark", title=title, body=body)
+        except Exception as e:
+            log.warning(f"could not write fleet_dark notification: {e}")
+        with db() as conn:
+            conn.execute(
+                "UPDATE customers SET is_dark = 1, dark_since = ? WHERE api_key = ?",
+                (ts, cust["api_key"]),
+            )
+        log.warning(f"fleet: {cust['api_key'][:14]} went dark "
+                    f"({_fmt_duration(dark_for)} since last heartbeat)")
+
+
+_threading.Thread(target=_fleet_health_loop, daemon=True).start()
+log.info("fleet health worker started (dark threshold: %ds, check interval: %ds)",
+         DARK_THRESHOLD_SEC, FLEET_CHECK_INTERVAL_SEC)
+
+
+# ── Admin: fleet status + inbox  ────────────────────────────────────────
+
+
+@app.route("/api/admin/fleet", methods=["GET"])
+def admin_fleet():
+    """JSON dump of every customer's health status. Use to power a fleet
+    dashboard or just to curl-and-grep when something's wrong.
+
+    Auth: X-Admin-Token header must match ORBI_ADMIN_TOKEN env var."""
+    if request.headers.get("X-Admin-Token") != ADMIN_TOKEN:
+        return jsonify({"error": "unauthorized"}), 401
+    customers = []
+    with db() as conn:
+        cur = conn.execute(
+            "SELECT api_key, email, business_name, tier, billing_cycle, "
+            "active, period_end, last_seen_at, is_dark, dark_since, "
+            "created_at, last_heartbeat FROM customers ORDER BY created_at DESC"
+        )
+        for row in cur.fetchall():
+            c = dict(row)
+            last_seen = c.get("last_seen_at") or 0
+            age = now() - last_seen if last_seen else None
+            if not c.get("active"):
+                status = "inactive"
+            elif not last_seen:
+                status = "never_seen"
+            elif c.get("is_dark"):
+                status = "dark"
+            elif age and age > 600:  # 10 min
+                status = "stale"
+            else:
+                status = "healthy"
+            c["status"] = status
+            c["last_seen_ago_sec"] = age
+            # Hide raw payload from the brief summary; include separately if needed
+            try:
+                c["last_heartbeat_parsed"] = json.loads(c.get("last_heartbeat") or "{}")
+            except (json.JSONDecodeError, TypeError):
+                c["last_heartbeat_parsed"] = {}
+            del c["last_heartbeat"]
+            customers.append(c)
+    counts = {"healthy": 0, "stale": 0, "dark": 0, "never_seen": 0, "inactive": 0}
+    for c in customers:
+        counts[c["status"]] = counts.get(c["status"], 0) + 1
+    return jsonify({
+        "now":       now(),
+        "total":     len(customers),
+        "counts":    counts,
+        "customers": customers,
+    })
+
+
+@app.route("/api/admin/fleet/inbox", methods=["GET"])
+def admin_fleet_inbox():
+    """Read the fleet-alert inbox (written by _scan_for_dark_customers
+    and the heartbeat-recovered handler)."""
+    if request.headers.get("X-Admin-Token") != ADMIN_TOKEN:
+        return jsonify({"error": "unauthorized"}), 401
+    inbox_path = Path(os.environ.get(
+        "ORBI_BRAIN_INBOX", "/opt/orbi-brain/fleet_inbox.json"))
+    if not inbox_path.exists():
+        return jsonify({"items": []})
+    try:
+        items = json.loads(inbox_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        items = []
+    unseen_only = request.args.get("unseen", "").lower() in ("1", "true", "yes")
+    if unseen_only:
+        items = [i for i in items if not i.get("seen")]
+    items.sort(key=lambda i: i.get("ts", 0), reverse=True)
+    return jsonify({"items": items})
 
 
 @app.route("/health", methods=["GET"])
