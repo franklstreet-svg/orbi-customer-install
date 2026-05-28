@@ -320,41 +320,45 @@ def pull_inbox(user_dir: Path, account_id: str | None = None,
 
 
 def _pull_one(account: dict, limit: int, query: str) -> list[dict]:
+    """Pull the most recent `limit` messages from INBOX.
+
+    Strategy:
+      - SEARCH (not SORT) — fast on Yahoo, returns sequence numbers in
+        arrival order (newest is typically the last UID).
+      - Take the last N IDs and reverse so we fetch newest first.
+      - PEEK headers only (FROM, TO, SUBJECT, DATE) — much faster than
+        full RFC822 and doesn't mark messages as read.
+      - Final ordering by Date header is done in email_inbox.fetch_inbox
+        (it sorts the combined gmail+outlook+imap result), so we don't
+        need IMAP-side sort here.
+    """
     out = []
+    timeout_s = 40  # generous — Yahoo + 20 large headers can be slow
     try:
         m = imaplib.IMAP4_SSL(account["imap_host"], int(account["imap_port"]),
-                              timeout=20) \
+                              timeout=timeout_s) \
             if account.get("imap_ssl", True) \
-            else imaplib.IMAP4(account["imap_host"], int(account["imap_port"]), timeout=20)
+            else imaplib.IMAP4(account["imap_host"], int(account["imap_port"]),
+                               timeout=timeout_s)
         if not account.get("imap_ssl", True):
             m.starttls()
         m.login(account["email"], account["password"])
         try:
             m.select("INBOX", readonly=True)
-
-            # Prefer the IMAP SORT extension — gives newest-first explicitly
-            # using the message Date header. Some servers (including Yahoo)
-            # support SORT; if it fails, fall back to plain SEARCH which
-            # returns sequence numbers in arrival order.
-            ids = []
             criteria = f'(SUBJECT "{query}")' if query else "ALL"
-            try:
-                typ, data = m.uid("sort", "(REVERSE DATE)", "UTF-8", criteria)
-                if typ == "OK" and data and data[0]:
-                    ids = data[0].split()[:limit]
-                    # Sorted newest-first already; keep as-is.
-            except imaplib.IMAP4.error:
-                ids = []
-
-            if not ids:
-                typ, data = m.uid("search", None, criteria)
-                if typ != "OK" or not data or not data[0]:
-                    return []
-                ids = data[0].split()
-                ids = list(reversed(ids))[:limit]  # newest UIDs typically last
-
-            for uid in ids:
-                typ, msg_data = m.uid("fetch", uid, "(RFC822 FLAGS)")
+            typ, data = m.search(None, criteria)
+            if typ != "OK" or not data or not data[0]:
+                return []
+            ids = data[0].split()
+            ids = list(reversed(ids))[:limit]  # newest seq-nums are at the end
+            for seq in ids:
+                # PEEK keeps unread state intact; fetch only the header fields
+                # we need (snippet drops out, but we don't display snippets
+                # in the chat list so this is fine).
+                typ, msg_data = m.fetch(
+                    seq,
+                    "(FLAGS BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE MESSAGE-ID)])",
+                )
                 if typ != "OK" or not msg_data:
                     continue
                 raw = next((x[1] for x in msg_data if isinstance(x, tuple)), None)
@@ -362,7 +366,7 @@ def _pull_one(account: dict, limit: int, query: str) -> list[dict]:
                 if not raw:
                     continue
                 msg = email.message_from_bytes(raw)
-                out.append(_format_message(account, uid, msg, flags_raw))
+                out.append(_format_message(account, seq, msg, flags_raw))
         finally:
             try: m.logout()
             except Exception: pass

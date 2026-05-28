@@ -1719,7 +1719,7 @@ def _try_inbox_check(message: str, user_dir: Path) -> str | None:
         return None
     try:
         result = email_inbox.fetch_inbox(CONFIG, user_dir, source="all",
-                                         limit=50, force_refresh=True)
+                                         limit=30, force_refresh=True)
     except Exception as e:
         log.warning(f"inbox fetch_inbox failed: {e}")
         return f"I tried to check your inbox but hit an error: {e}"
