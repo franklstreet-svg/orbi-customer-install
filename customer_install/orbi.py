@@ -1397,6 +1397,13 @@ def owner_chat():
         return jsonify({"reply": pa_direct, "tier": "local", "latency_ms": 0,
                         "source": "personal_assistant"})
 
+    # World time — 'what time is it in Tokyo'. Accurate to the second,
+    # no LLM call. Falls through if the place isn't recognized.
+    world_time = _try_world_time(user_msg)
+    if world_time is not None:
+        return jsonify({"reply": world_time, "tier": "local", "latency_ms": 0,
+                        "source": "world_time"})
+
     # List IMAP folders — diagnostic so the owner can see exactly which
     # folders Orby has access to and which folder each email lives in.
     folders_reply = _try_list_folders(user_msg, user_dir)
@@ -1691,6 +1698,16 @@ _PA_INBOX_RE = _re.compile(
     _re.IGNORECASE,
 )
 
+# Capture the explicit count when the user asks for a specific number of
+# emails: 'show me my last 25 emails', 'give me 10 messages', 'last 50 emails'.
+_PA_INBOX_COUNT_RE = _re.compile(
+    r"\b(?:show|list|read|give|fetch|pull|see|get|tell)\s+(?:me\s+)?"
+    r"(?:my\s+)?(?:last\s+|recent\s+|latest\s+|top\s+)?"
+    r"(?P<n>\d{1,3})\s+"
+    r"(?:e[\s-]?mails?|messages?|mails?)\b",
+    _re.IGNORECASE,
+)
+
 
 # Sender local-parts that almost never represent a real person.
 # We hide emails from these by default. The user can override with
@@ -1794,11 +1811,26 @@ def _try_inbox_check(message: str, user_dir: Path) -> str | None:
     directly from email_inbox.fetch_inbox. Without this fast-path the
     request bounces to the LLM, which has no idea the IMAP/Gmail/Outlook
     accounts are connected and tells the user 'I don't have access'."""
-    if not message or not _PA_INBOX_RE.search(message):
+    # Match either the broad inbox-check pattern OR the explicit-count one.
+    count_match = _PA_INBOX_COUNT_RE.search(message or "")
+    if not message or (not _PA_INBOX_RE.search(message) and not count_match):
         return None
+
+    # If the user said "show me 25 emails", honor that count exactly. Cap at
+    # 200 so we don't accidentally pull the entire inbox.
+    requested_n = None
+    if count_match:
+        try:
+            requested_n = max(1, min(200, int(count_match.group("n"))))
+        except ValueError:
+            requested_n = None
+    fetch_limit = max(100, (requested_n or 0) * 2)  # pull extra so the filter
+                                                    # can hide promos and still
+                                                    # leave the requested count
+
     try:
         result = email_inbox.fetch_inbox(CONFIG, user_dir, source="all",
-                                         limit=100, force_refresh=True)
+                                         limit=fetch_limit, force_refresh=True)
     except Exception as e:
         log.warning(f"inbox fetch_inbox failed: {e}")
         return f"I tried to check your inbox but hit an error: {e}"
@@ -1812,9 +1844,12 @@ def _try_inbox_check(message: str, user_dir: Path) -> str | None:
             msg += f" Errors: {details}"
         return msg
 
-    # Filter out promo / newsletter noise unless the user explicitly asked
-    # for everything ("show me all emails", "include newsletters").
-    show_all = bool(_PA_INBOX_INCLUDE_ALL_RE.search(message))
+    # When the user asks for a specific N emails, treat that as "include
+    # all" — don't pre-filter newsletters or the count won't match.
+    if requested_n is not None:
+        show_all = True
+    else:
+        show_all = bool(_PA_INBOX_INCLUDE_ALL_RE.search(message))
     if show_all:
         kept = messages
         hidden_promo = []
@@ -1847,9 +1882,13 @@ def _try_inbox_check(message: str, user_dir: Path) -> str | None:
                          f"{m.get('subject','(no subject)')[:55]}")
 
     lines.append("")
-    show_n = min(len(kept), 40)
-    label = "everything" if show_all else "newest (filtered)"
-    lines.append(f"Top {show_n} {label}:")
+    if requested_n is not None:
+        show_n = min(len(kept), requested_n)
+        lines.append(f"Your last {show_n} emails:")
+    else:
+        show_n = min(len(kept), 40)
+        label = "everything" if show_all else "newest (filtered)"
+        lines.append(f"Top {show_n} {label}:")
     for m in kept[:show_n]:
         unread_mark = "● " if m.get("unread") else "  "
         date_str = _fmt_email_date(m.get("date", ""))
@@ -1878,6 +1917,185 @@ def _try_inbox_check(message: str, user_dir: Path) -> str | None:
                      ", ".join(f"{k}={v[:50]}" for k, v in errors.items()) + ")")
 
     return "\n".join(lines)
+
+
+# ─── World-time fast-path ──────────────────────────────────────────────
+# Orby should know the local time anywhere in the world. We map city /
+# country names to IANA timezones and look up the live time with
+# zoneinfo. No LLM call — accurate to the second.
+_WORLD_TIMEZONES = {
+    # United States (cities + states)
+    "new york": "America/New_York", "nyc": "America/New_York",
+    "boston": "America/New_York", "philadelphia": "America/New_York",
+    "miami": "America/New_York", "atlanta": "America/New_York",
+    "washington": "America/New_York", "washington dc": "America/New_York",
+    "florida": "America/New_York", "georgia": "America/New_York",
+    "new york city": "America/New_York",
+    "chicago": "America/Chicago", "dallas": "America/Chicago",
+    "houston": "America/Chicago", "austin": "America/Chicago",
+    "new orleans": "America/Chicago", "texas": "America/Chicago",
+    "minneapolis": "America/Chicago",
+    "denver": "America/Denver", "salt lake city": "America/Denver",
+    "phoenix": "America/Phoenix", "arizona": "America/Phoenix",
+    "los angeles": "America/Los_Angeles", "la": "America/Los_Angeles",
+    "san francisco": "America/Los_Angeles", "sf": "America/Los_Angeles",
+    "seattle": "America/Los_Angeles", "portland": "America/Los_Angeles",
+    "reno": "America/Los_Angeles", "las vegas": "America/Los_Angeles",
+    "vegas": "America/Los_Angeles", "san diego": "America/Los_Angeles",
+    "california": "America/Los_Angeles", "nevada": "America/Los_Angeles",
+    "oregon": "America/Los_Angeles", "washington state": "America/Los_Angeles",
+    "anchorage": "America/Anchorage", "alaska": "America/Anchorage",
+    "honolulu": "Pacific/Honolulu", "hawaii": "Pacific/Honolulu",
+    # Canada
+    "toronto": "America/Toronto", "ottawa": "America/Toronto",
+    "montreal": "America/Montreal", "vancouver": "America/Vancouver",
+    "calgary": "America/Edmonton",
+    # Mexico
+    "mexico city": "America/Mexico_City", "mexico": "America/Mexico_City",
+    # UK + Europe
+    "london": "Europe/London", "manchester": "Europe/London",
+    "edinburgh": "Europe/London", "dublin": "Europe/Dublin",
+    "uk": "Europe/London", "england": "Europe/London", "ireland": "Europe/Dublin",
+    "paris": "Europe/Paris", "france": "Europe/Paris",
+    "berlin": "Europe/Berlin", "germany": "Europe/Berlin",
+    "madrid": "Europe/Madrid", "spain": "Europe/Madrid",
+    "barcelona": "Europe/Madrid",
+    "rome": "Europe/Rome", "italy": "Europe/Rome", "milan": "Europe/Rome",
+    "amsterdam": "Europe/Amsterdam", "netherlands": "Europe/Amsterdam",
+    "brussels": "Europe/Brussels", "belgium": "Europe/Brussels",
+    "athens": "Europe/Athens", "greece": "Europe/Athens",
+    "moscow": "Europe/Moscow", "russia": "Europe/Moscow",
+    "stockholm": "Europe/Stockholm", "sweden": "Europe/Stockholm",
+    "oslo": "Europe/Oslo", "norway": "Europe/Oslo",
+    "copenhagen": "Europe/Copenhagen", "denmark": "Europe/Copenhagen",
+    "warsaw": "Europe/Warsaw", "poland": "Europe/Warsaw",
+    "lisbon": "Europe/Lisbon", "portugal": "Europe/Lisbon",
+    "vienna": "Europe/Vienna", "austria": "Europe/Vienna",
+    "zurich": "Europe/Zurich", "switzerland": "Europe/Zurich",
+    "istanbul": "Europe/Istanbul", "turkey": "Europe/Istanbul",
+    "kyiv": "Europe/Kyiv", "kiev": "Europe/Kyiv", "ukraine": "Europe/Kyiv",
+    # Middle East
+    "dubai": "Asia/Dubai", "uae": "Asia/Dubai",
+    "abu dhabi": "Asia/Dubai", "united arab emirates": "Asia/Dubai",
+    "riyadh": "Asia/Riyadh", "saudi arabia": "Asia/Riyadh",
+    "tel aviv": "Asia/Jerusalem", "jerusalem": "Asia/Jerusalem",
+    "israel": "Asia/Jerusalem",
+    "tehran": "Asia/Tehran", "iran": "Asia/Tehran",
+    # Asia
+    "tokyo": "Asia/Tokyo", "osaka": "Asia/Tokyo", "japan": "Asia/Tokyo",
+    "seoul": "Asia/Seoul", "korea": "Asia/Seoul", "south korea": "Asia/Seoul",
+    "beijing": "Asia/Shanghai", "shanghai": "Asia/Shanghai",
+    "china": "Asia/Shanghai", "hong kong": "Asia/Hong_Kong",
+    "taipei": "Asia/Taipei", "taiwan": "Asia/Taipei",
+    "singapore": "Asia/Singapore",
+    "bangkok": "Asia/Bangkok", "thailand": "Asia/Bangkok",
+    "jakarta": "Asia/Jakarta", "indonesia": "Asia/Jakarta",
+    "manila": "Asia/Manila", "philippines": "Asia/Manila",
+    "kuala lumpur": "Asia/Kuala_Lumpur", "malaysia": "Asia/Kuala_Lumpur",
+    "ho chi minh city": "Asia/Ho_Chi_Minh", "saigon": "Asia/Ho_Chi_Minh",
+    "hanoi": "Asia/Ho_Chi_Minh", "vietnam": "Asia/Ho_Chi_Minh",
+    "mumbai": "Asia/Kolkata", "delhi": "Asia/Kolkata",
+    "new delhi": "Asia/Kolkata", "kolkata": "Asia/Kolkata",
+    "bangalore": "Asia/Kolkata", "bengaluru": "Asia/Kolkata",
+    "chennai": "Asia/Kolkata", "india": "Asia/Kolkata",
+    "karachi": "Asia/Karachi", "lahore": "Asia/Karachi",
+    "islamabad": "Asia/Karachi", "pakistan": "Asia/Karachi",
+    "dhaka": "Asia/Dhaka", "bangladesh": "Asia/Dhaka",
+    # Australia + Pacific
+    "sydney": "Australia/Sydney", "canberra": "Australia/Sydney",
+    "melbourne": "Australia/Melbourne", "brisbane": "Australia/Brisbane",
+    "perth": "Australia/Perth", "australia": "Australia/Sydney",
+    "auckland": "Pacific/Auckland", "wellington": "Pacific/Auckland",
+    "new zealand": "Pacific/Auckland",
+    # South America
+    "sao paulo": "America/Sao_Paulo", "rio": "America/Sao_Paulo",
+    "rio de janeiro": "America/Sao_Paulo", "brazil": "America/Sao_Paulo",
+    "buenos aires": "America/Argentina/Buenos_Aires", "argentina": "America/Argentina/Buenos_Aires",
+    "santiago": "America/Santiago", "chile": "America/Santiago",
+    "lima": "America/Lima", "peru": "America/Lima",
+    "bogota": "America/Bogota", "colombia": "America/Bogota",
+    "caracas": "America/Caracas", "venezuela": "America/Caracas",
+    # Africa
+    "lagos": "Africa/Lagos", "nigeria": "Africa/Lagos",
+    "johannesburg": "Africa/Johannesburg", "south africa": "Africa/Johannesburg",
+    "cape town": "Africa/Johannesburg",
+    "cairo": "Africa/Cairo", "egypt": "Africa/Cairo",
+    "nairobi": "Africa/Nairobi", "kenya": "Africa/Nairobi",
+    "addis ababa": "Africa/Addis_Ababa", "ethiopia": "Africa/Addis_Ababa",
+    "casablanca": "Africa/Casablanca", "morocco": "Africa/Casablanca",
+    # Common abbreviations
+    "est": "America/New_York", "edt": "America/New_York",
+    "cst": "America/Chicago", "cdt": "America/Chicago",
+    "mst": "America/Denver", "mdt": "America/Denver",
+    "pst": "America/Los_Angeles", "pdt": "America/Los_Angeles",
+    "gmt": "Etc/GMT", "utc": "Etc/UTC",
+}
+
+_TIME_IN_PLACE_RE = _re.compile(
+    r"\b(?:what(?:'s|s| is)\s+|current\s+|the\s+)?"
+    r"time\s+(?:is\s+it\s+|right\s+now\s+)?(?:in|at)\s+"
+    r"(?P<place>[A-Za-z][A-Za-z\s\-/_.]+?)\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+
+
+def _try_world_time(message: str) -> str | None:
+    """Answer 'what time is it in X' from zoneinfo, no LLM call needed.
+    Falls through to None if the place isn't recognized so the LLM gets
+    a chance (and an honest 'I don't have that timezone' response is the
+    expected behavior for obscure places)."""
+    if not message:
+        return None
+    m = _TIME_IN_PLACE_RE.search(message)
+    if not m:
+        return None
+    place = m.group("place").strip().rstrip("?.!").strip().lower()
+    # Direct IANA name (e.g. 'America/Los_Angeles')
+    tz_name = None
+    try:
+        from zoneinfo import ZoneInfo, available_timezones
+        if "/" in place and place in {z.lower() for z in available_timezones()}:
+            for z in available_timezones():
+                if z.lower() == place:
+                    tz_name = z
+                    break
+        if not tz_name:
+            tz_name = _WORLD_TIMEZONES.get(place)
+        if not tz_name:
+            # Try removing trailing words: 'time in tokyo japan' →
+            # try 'tokyo japan' then 'tokyo'
+            words = place.split()
+            for i in range(len(words), 0, -1):
+                candidate = " ".join(words[:i])
+                if candidate in _WORLD_TIMEZONES:
+                    tz_name = _WORLD_TIMEZONES[candidate]
+                    place = candidate
+                    break
+        if not tz_name:
+            return (f"I don't have the timezone for \"{place}\" yet — "
+                    f"if you tell me the country it's in (e.g. 'time in "
+                    f"Reykjavik Iceland') I can usually find it.")
+        from datetime import datetime as _dt
+        now_there = _dt.now(ZoneInfo(tz_name))
+        time_str = now_there.strftime("%I:%M %p").lstrip("0")
+        day_str  = now_there.strftime("%A, %B %-d") \
+                   if hasattr(now_there, "strftime") else ""
+        try:
+            day_str = now_there.strftime("%A, %B %-d")
+        except (ValueError, OSError):
+            day_str = now_there.strftime("%A, %B %d").replace(" 0", " ")
+        # Diff from owner's local
+        my_now = _dt.now().astimezone()
+        diff_hours = (now_there.utcoffset().total_seconds() - my_now.utcoffset().total_seconds()) / 3600
+        if abs(diff_hours) < 0.01:
+            diff_str = "(same as you)"
+        else:
+            sign = "+" if diff_hours > 0 else ""
+            diff_str = f"({sign}{diff_hours:g} hr from your time)"
+        return (f"It's **{time_str}** in {place.title()} — {day_str} {diff_str}. "
+                f"(Timezone: {tz_name})")
+    except Exception as e:
+        return f"Couldn't resolve the time in {place}: {e}"
 
 
 _PA_FOLDERS_RE = _re.compile(
@@ -1919,7 +2137,8 @@ def _try_personal_assistant_read(message: str, user_dir: Path) -> str | None:
         if not events:
             return "Nothing on your calendar for today."
         return "Today's calendar:\n" + "\n".join(
-            f"  - {e.get('start','')[11:16]}  {e.get('title','')}" for e in events
+            f"  - {_fmt_email_date(e.get('start',''))}  {e.get('title','')}"
+            for e in events
         )
 
     if _PA_WEEK_RE.search(message):
@@ -1927,7 +2146,8 @@ def _try_personal_assistant_read(message: str, user_dir: Path) -> str | None:
         if not events:
             return "Nothing on your calendar this week."
         return "Upcoming this week:\n" + "\n".join(
-            f"  - {e.get('start','')[:16].replace('T',' ')}  {e.get('title','')}" for e in events
+            f"  - {_fmt_email_date(e.get('start',''))}  {e.get('title','')}"
+            for e in events
         )
 
     if _PA_TASKS_RE.search(message):
@@ -1941,7 +2161,8 @@ def _try_personal_assistant_read(message: str, user_dir: Path) -> str | None:
         if not items:
             return "No pending reminders."
         return "Pending reminders:\n" + "\n".join(
-            f"  - {r.get('due','')[:16].replace('T',' ')}  {r.get('text','')}" for r in items
+            f"  - {_fmt_email_date(r.get('due',''))}  {r.get('text','')}"
+            for r in items
         )
 
     if _PA_STAFF_RE.search(message):

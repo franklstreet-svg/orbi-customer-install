@@ -62,6 +62,24 @@ _REMIND_END_TIME_RE = re.compile(
 _REMIND_SIMPLE_RE = re.compile(
     r"^(?:remind|nudge)\s+me\s+(?:to\s+)?(.+)$", re.IGNORECASE,
 )
+# Does the message body contain ANY hint of when the reminder should fire?
+# If not, we ASK instead of silently defaulting to tomorrow 9am. Hints:
+#   - any digit (5, 5:45, 4pm, in 30 min)
+#   - day-words: today, tomorrow, tonight, monday..sunday, weekend, weekday
+#   - time-of-day words: morning, noon, afternoon, evening, midnight
+#   - relative: later, soon, asap, now, in N units (already digit-matched above)
+#   - quarters / next-N
+_HAS_TIME_SIGNAL_RE = re.compile(
+    r"\d"
+    r"|\b(?:today|tomorrow|tonight|tomorrow\s+morning|tomorrow\s+night|"
+    r"this\s+(?:morning|afternoon|evening|weekend)|"
+    r"next\s+(?:week|month|year|monday|tuesday|wednesday|thursday|friday|saturday|sunday)|"
+    r"monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
+    r"morning|afternoon|evening|noon|midnight|"
+    r"later|soon|asap|right\s+now|in\s+a\s+(?:minute|sec|second|moment|bit|while)|"
+    r"first\s+thing|end\s+of\s+(?:the\s+)?(?:day|week|month))\b",
+    re.IGNORECASE,
+)
 
 _TASK_RE = re.compile(
     r"^(?:add|put)\s+(?:to\s+)?(?:my\s+)?(?:todo|to[\s-]?do|task)s?\s*(?:list)?[:\s]+(.+)$",
@@ -124,15 +142,16 @@ def capture(user_dir: Path, text: str) -> dict:
     m = _REMIND_SIMPLE_RE.match(text)
     if m:
         body = m.group(1).strip()
-        # Catch incomplete requests like "remind me to call Jeffrey at" —
-        # the user pressed send before typing the time. We only treat "at"
-        # and "on" as dangling because "in"/"to"/"by" are also natural at
-        # the end of verb phrases ("check in", "talk to", "drive by").
-        # Also bail when the body is empty or is only a stub preposition
-        # ("remind me to" gets parsed as body='to').
-        if (not body
-                or re.fullmatch(r"(to|at|on|in|by|for)", body, re.IGNORECASE)
-                or re.search(r"\b(at|on)\s*$", body, re.IGNORECASE)):
+        # Catch incomplete requests:
+        #   - 'remind me to call Jeffrey at' (dangling preposition)
+        #   - 'remind me to' (stub)
+        #   - 'remind me to call Bob' (no time signal AT ALL)
+        # Don't default to tomorrow 9am — the user almost never means that
+        # and silent defaults make Orby look like she invented a time.
+        has_time_signal = bool(_HAS_TIME_SIGNAL_RE.search(body))
+        is_stub        = bool(re.fullmatch(r"(to|at|on|in|by|for)", body, re.IGNORECASE))
+        is_dangling    = bool(re.search(r"\b(at|on)\s*$", body, re.IGNORECASE))
+        if not body or is_stub or is_dangling or not has_time_signal:
             cleaned = re.sub(r"\b(at|on)\s*$", "", body, flags=re.IGNORECASE).strip()
             if cleaned:
                 ask = f"Sure — what time should I remind you to {cleaned}?"
@@ -154,6 +173,17 @@ def capture(user_dir: Path, text: str) -> dict:
     if m:
         title = m.group(1).strip()
         when_phrase = m.group(2).strip()
+        # Same body-absorption fix as reminders: 'book a meeting with Joe
+        # tomorrow at 2pm' captures title='a meeting with Joe tomorrow'
+        # when_phrase='2pm' — but we want title='meeting with Joe' and
+        # when='tomorrow at 2pm'. Move the trailing day-word out of title.
+        for day_word in ("tomorrow", "today", "tonight"):
+            if title.lower().endswith(" " + day_word):
+                title = title[: -(len(day_word) + 1)].strip()
+                when_phrase = day_word + " at " + when_phrase
+                break
+        # Drop leading article 'a/an/the' that the regex includes
+        title = re.sub(r"^(?:a|an|the)\s+", "", title, flags=re.IGNORECASE)
         start_iso = _parse_when(when_phrase) or _default_tomorrow_9am()
         item = mod_calendar.add(user_dir, title, start_iso)
         return {"kind": "calendar", "item": item,
