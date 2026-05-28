@@ -1404,6 +1404,13 @@ def owner_chat():
         return jsonify({"reply": world_time, "tier": "local", "latency_ms": 0,
                         "source": "world_time"})
 
+    # 'Why didn't I get the reminder' — explain her actual reminder
+    # system honestly so she never hallucinates 'I can't set reminders'.
+    rdiag = _try_reminder_diagnostic(user_msg, user_dir)
+    if rdiag is not None:
+        return jsonify({"reply": rdiag, "tier": "local", "latency_ms": 0,
+                        "source": "reminder_diagnostic"})
+
     # List IMAP folders — diagnostic so the owner can see exactly which
     # folders Orby has access to and which folder each email lives in.
     folders_reply = _try_list_folders(user_msg, user_dir)
@@ -1665,21 +1672,29 @@ def _try_capabilities_overview(message: str) -> str | None:
     doc = _load_capabilities_doc()
     if not doc:
         return None
-    # Pull the section headers + the first non-header line as a short
-    # one-line summary. The full doc is also in the Help tab.
+    # Pull H1, H2 and H3 headers — but skip the document title (the very
+    # first H1) and admin-y sections users don't care about as "things
+    # she can do".
     lines = doc.split("\n")
     sections = []
-    current = None
+    saw_first_h1 = False
     for ln in lines:
-        if ln.startswith("## ") or ln.startswith("### "):
-            current = ln.lstrip("# ").strip()
-            sections.append(current)
+        if ln.startswith("# ") and not ln.startswith("## "):
+            if not saw_first_h1:
+                saw_first_h1 = True
+                continue
+            sections.append(ln.lstrip("# ").strip())
+        elif ln.startswith("## ") or ln.startswith("### "):
+            sections.append(ln.lstrip("# ").strip())
     if not sections:
         return None
-    bullets = "\n".join(f"  • {s}" for s in sections if s and s.lower()
-                        not in {"quick start — your first 10 minutes",
-                                "when something's wrong",
-                                "what orbi won't do"})
+    skip = {
+        "quick start — your first 10 minutes",
+        "when something's wrong",
+        "what orby won't do",
+    }
+    bullets = "\n".join(f"  • {s}" for s in sections
+                        if s and s.lower() not in skip)
     return ("Here's everything I can do — pick any one and I'll walk you "
             "through it (or open the **Help** tab for the full guide with "
             "example phrases):\n\n" + bullets)
@@ -1725,7 +1740,33 @@ _NOISE_SUBJECT_RE = _re.compile(
     r"unsubscribe|cyber\s+monday|black\s+friday|flash\s+sale|"
     r"don'?t\s+miss|act\s+now|today\s+only|hurry|"
     r"open\s+rate|click\s+here|claim\s+now|invitation\s+to\s+earn|"
-    r"survey|webinar)\b",
+    r"survey|webinar|"
+    # extra patterns caught in real-world testing:
+    r"\$\d+\s+down|no\s+perfect\s+credit|apply\s+for\s+the|"
+    r"qualified\s+for|qualify\s+for|up\s+to\s+\d+%|save\s+(?:up\s+to|\d+)|"
+    r"discount|coupon|special\s+offer|grand\s+opening|new\s+arrival|"
+    r"summer.?ready|new\s+listings|cover\s+your\s+vehicle|"
+    r"betting\s+outlook|mlb\s+plays|free\s+trial|risk[- ]?free|"
+    r"\bad\s+credit\b|just\s+for\s+you|today's\s+outlook|"
+    r"membership\s+deal|metal\s+roof|insurance\s+options|"
+    r"social\s+security\s+update|benefits\s+now\s+available|"
+    r"flexible\s+pricing|cost-effective|"
+    r"final\s+(?:offer|opportunity|hours)|smb\s+month|"
+    r"phone\s+making|making\s+more\s+money|"
+    r"steady\s+energy|gut\s+doctor|"
+    r"perfect\s+credit\s*needed|reliable\s+and\s+cost)\b",
+    _re.IGNORECASE,
+)
+# Sender display-name patterns that scream "marketing list"
+_NOISE_DISPLAY_NAME_RE = _re.compile(
+    r"\b(?:save\s+big|cheap|discount|insure|insurance|vehicle\s+protection|"
+    r"protection\s+usa|roofing|mastercard|credit\s+card|cash\s+for\s+you|"
+    r"endurance\s+auto|seniors?\s+(?:save|discount)|deals?|"
+    r"quote\s*reduction|loans?\s+(?:for|to)|sweepstake|"
+    r"ballot\s+news|betting\s+daily|inside.?vegas|"
+    r"\bads?\b|advertising|advertiser|coach\s+\(re\)?loved|"
+    r"morning\s+health\s+fix|ancient\s+remedies|"
+    r"casino|gambling|sports?\s+book|free\s+spins?)\b",
     _re.IGNORECASE,
 )
 # Subjects with these stay — even if other heuristics would hide them.
@@ -1770,7 +1811,90 @@ def _is_promotional(msg: dict) -> bool:
     # Subject contains classic promo language
     if _NOISE_SUBJECT_RE.search(subj):
         return True
+    # Display name contains marketing-list signals
+    display_name = sender.split("<", 1)[0].strip(' "')
+    if display_name and _NOISE_DISPLAY_NAME_RE.search(display_name):
+        return True
+    # Subject starts with "Frank, $X" / "Frank, $300" — classic personalized
+    # marketing pattern
+    if _re.match(r"^frank,?\s*\$\d", subj.strip(), _re.IGNORECASE):
+        return True
     return False
+
+
+_PA_REMINDER_DIAGNOSTIC_RE = _re.compile(
+    r"\bwhy\s+(?:didn'?t|did\s+not)\s+i\s+(?:get|see|hear)\s+(?:the|a|my)?\s*reminder\b"
+    r"|\bdid\s+(?:you|orby)\s+remind\s+me\b"
+    r"|\bwhere'?s\s+my\s+reminder\b"
+    r"|\bwhat\s+happened\s+to\s+(?:the|my)\s+reminder\b"
+    r"|\bdid\s+my\s+reminder\s+(?:fire|go\s+off|come)\b",
+    _re.IGNORECASE,
+)
+
+
+def _try_reminder_diagnostic(message: str, user_dir: Path) -> str | None:
+    """Honest answer for 'why didn't I get the reminder I just set'.
+    Without this, the LLM hallucinates 'I don't have the capability to
+    set reminders that trigger outside of our conversation' — total
+    fabrication because she literally has a firing worker and a toast/
+    voice/chat-bubble pipeline."""
+    if not message or not _PA_REMINDER_DIAGNOSTIC_RE.search(message):
+        return None
+    try:
+        items = mod_reminders.list_all(user_dir)
+    except Exception as e:
+        return f"I couldn't read your reminders to check: {e}"
+    pending = [r for r in items if r.get("status") == "pending"]
+    fired = [r for r in items if r.get("status") == "fired"]
+    notify_cfg = (CONFIG.get("notifications") or {})
+    channels = []
+    if notify_cfg.get("owner_pwa_push", True):
+        channels.append("web push (if you installed the PWA + allowed notifications)")
+    if notify_cfg.get("owner_email") and (CONFIG.get("owner") or {}).get("email"):
+        channels.append("email")
+    if notify_cfg.get("owner_sms") and (CONFIG.get("owner") or {}).get("phone"):
+        channels.append("SMS")
+    lines = [
+        "My reminder system IS working — here's what's actually happening:",
+        "",
+        f"  • Pending reminders: {len(pending)}",
+        f"  • Fired (already triggered): {len(fired)}",
+        "",
+        "When a reminder fires, I do ALL of these:",
+        "  1. Play a chime",
+        "  2. Speak it out loud (TTS): 'Hey Frank, this is your reminder. <body>'",
+        "  3. Show a big yellow pulsing banner with Got It + Snooze buttons",
+        "  4. Drop a ⏰ message into the Ask Orby chat history",
+        "  5. Repeat the chime + voice every 3 min (up to 3x) until you click Got It",
+    ]
+    if fired:
+        lines.append("")
+        lines.append("Most recent fires:")
+        for r in fired[-3:]:
+            fired_at = _fmt_email_date(r.get("fired_at", ""))
+            lines.append(f"  • {fired_at} — \"{r.get('text','')}\"")
+    lines.append("")
+    if channels:
+        lines.append("External channels configured: " + ", ".join(channels))
+    else:
+        lines.append("⚠ No external channels (push / email / SMS) are configured "
+                     "in your notification settings — that means the in-app toast "
+                     "+ chime + voice are your ONLY signals. If the dashboard tab "
+                     "is closed or the chime is muted, you'd miss it.")
+    lines.append("")
+    lines.append("If you DIDN'T see/hear the in-app signals: refresh the dashboard "
+                 "and try a 1-min test reminder. If you still don't, that's a real "
+                 "bug — tell me and I'll dig in.")
+    return "\n".join(lines)
+
+
+# Capture 'emails from X' / 'any new emails from Bill'
+_PA_EMAIL_FROM_RE = _re.compile(
+    r"\b(?:any\s+(?:new\s+)?|got\s+|do\s+i\s+have\s+(?:any\s+)?)?"
+    r"(?:e[\s-]?mails?|messages?|mails?)\s+from\s+"
+    r"(?P<sender>[A-Za-z][A-Za-z0-9\s.@'-]+?)\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
 
 
 _PA_INBOX_INCLUDE_ALL_RE = _re.compile(
@@ -1811,10 +1935,16 @@ def _try_inbox_check(message: str, user_dir: Path) -> str | None:
     directly from email_inbox.fetch_inbox. Without this fast-path the
     request bounces to the LLM, which has no idea the IMAP/Gmail/Outlook
     accounts are connected and tells the user 'I don't have access'."""
-    # Match either the broad inbox-check pattern OR the explicit-count one.
-    count_match = _PA_INBOX_COUNT_RE.search(message or "")
-    if not message or (not _PA_INBOX_RE.search(message) and not count_match):
+    # Match either the broad inbox-check pattern, the explicit-count one,
+    # or the "emails from X" sender filter.
+    count_match  = _PA_INBOX_COUNT_RE.search(message or "")
+    sender_match = _PA_EMAIL_FROM_RE.search(message or "")
+    if not message or (not _PA_INBOX_RE.search(message)
+                       and not count_match and not sender_match):
         return None
+    sender_filter = None
+    if sender_match:
+        sender_filter = sender_match.group("sender").strip().rstrip("?.!").strip()
 
     # If the user said "show me 25 emails", honor that count exactly. Cap at
     # 200 so we don't accidentally pull the entire inbox.
@@ -1837,6 +1967,15 @@ def _try_inbox_check(message: str, user_dir: Path) -> str | None:
 
     messages = result.get("messages") or []
     errors   = result.get("errors") or {}
+    # Sender filter — narrow to just the sender the user asked about
+    if sender_filter:
+        sf = sender_filter.lower()
+        messages = [m for m in messages
+                    if sf in (m.get("from") or "").lower()]
+        if not messages:
+            return (f"I don't see any recent emails from \"{sender_filter}\" "
+                    f"in your inbox. (Check the spelling, or try a partial "
+                    f"match like just the first name.)")
     if not messages:
         msg = "Your inbox is empty (or I can't see anything new)."
         if errors:
@@ -1844,9 +1983,10 @@ def _try_inbox_check(message: str, user_dir: Path) -> str | None:
             msg += f" Errors: {details}"
         return msg
 
-    # When the user asks for a specific N emails, treat that as "include
-    # all" — don't pre-filter newsletters or the count won't match.
-    if requested_n is not None:
+    # When the user asks for a specific N emails OR for emails from a
+    # specific sender, treat as 'include all' — don't pre-filter promos
+    # or the count won't match / the sender filter will look broken.
+    if requested_n is not None or sender_filter is not None:
         show_all = True
     else:
         show_all = bool(_PA_INBOX_INCLUDE_ALL_RE.search(message))
