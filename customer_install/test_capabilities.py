@@ -132,7 +132,7 @@ def test_help_capabilities(ctx):
     if "markdown" not in ctype:
         return Result("/api/help/capabilities returns 200", "FAIL",
                       f"wrong Content-Type: {ctype}", cat="A. Static")
-    if "# What Orbi Can Do" not in body:
+    if "# What Orby Can Do" not in body and "# What Orbi Can Do" not in body:
         return Result("/api/help/capabilities returns 200", "FAIL",
                       "missing expected header in markdown", cat="A. Static")
     return Result(f"/api/help/capabilities ({len(body)} bytes md)", "PASS",
