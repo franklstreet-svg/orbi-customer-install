@@ -377,6 +377,30 @@ def health():
     })
 
 
+@app.route("/api/owner/notifications/inbox")
+def owner_notifications_inbox():
+    """Return in-app notifications for the current user. Used by the
+    dashboard's polling loop to show toasts for fired reminders + leads
+    when no other channel (push/email/sms) is configured."""
+    auth.require_user(ORBI_DIR, DATA_DIR)
+    unseen_only = request.args.get("unseen", "").lower() in ("1", "true", "yes")
+    return jsonify({"items": notify.list_inbox(DATA_DIR, unseen_only=unseen_only)})
+
+
+@app.route("/api/owner/notifications/<nid>/seen", methods=["POST"])
+def owner_notifications_mark_seen(nid: str):
+    auth.require_user(ORBI_DIR, DATA_DIR)
+    ok = notify.mark_inbox_seen(DATA_DIR, nid)
+    return jsonify({"ok": ok})
+
+
+@app.route("/api/owner/notifications/all_seen", methods=["POST"])
+def owner_notifications_mark_all_seen():
+    auth.require_user(ORBI_DIR, DATA_DIR)
+    n = notify.mark_inbox_all_seen(DATA_DIR)
+    return jsonify({"ok": True, "marked": n})
+
+
 @app.route("/api/help/capabilities")
 def help_capabilities():
     """Serve the Orbi capabilities markdown. The dashboard renders it
@@ -1352,6 +1376,13 @@ def owner_chat():
         return jsonify({"error": "empty message"}), 400
 
     # ── Fast-path personal-assistant intents (no LLM needed) ──────────────
+    # Capability overview — answers "give me a full list of your capabilities"
+    # without touching the LLM, so it works in offline mode.
+    cap_overview = _try_capabilities_overview(user_msg)
+    if cap_overview is not None:
+        return jsonify({"reply": cap_overview, "tier": "local", "latency_ms": 0,
+                        "source": "capabilities_overview"})
+
     # READ patterns: answer directly from the user's per-user data.
     pa_direct = _try_personal_assistant_read(user_msg, user_dir)
     if pa_direct is not None:
@@ -1582,6 +1613,47 @@ def _capabilities_context_block(message: str) -> str | None:
         "headline capabilities) then ask which area they'd like to dive into.\n\n"
         + doc
     )
+
+
+# Voice-to-text spells Orbi as "Orbeez" / "orby" / "orbie" sometimes —
+# normalize so capability queries still match.
+_ORBI_PHONETIC_RE = _re.compile(r"\borb(?:eez|y|ie|i)\b", _re.IGNORECASE)
+_CAPABILITIES_RE = _re.compile(r"\bcapabilit(?:y|ies)\b", _re.IGNORECASE)
+_WHAT_CAN_YOU_DO_RE = _re.compile(r"\bwhat\s+(?:can|do)\s+you\s+do\b", _re.IGNORECASE)
+
+
+def _try_capabilities_overview(message: str) -> str | None:
+    """Fast-path for 'list your capabilities' / 'what can you do' that
+    works even when the LLM is offline. Returns a curated overview text
+    directly from the shipped doc — no LLM call needed."""
+    if not message:
+        return None
+    # Run polite-prefix strip + Orbeez→Orbi normalization first, then test.
+    cleaned = _strip_polite_prefix(message)
+    cleaned = _ORBI_PHONETIC_RE.sub("orbi", cleaned)
+    if not (_CAPABILITIES_RE.search(cleaned) or _WHAT_CAN_YOU_DO_RE.search(cleaned)):
+        return None
+    doc = _load_capabilities_doc()
+    if not doc:
+        return None
+    # Pull the section headers + the first non-header line as a short
+    # one-line summary. The full doc is also in the Help tab.
+    lines = doc.split("\n")
+    sections = []
+    current = None
+    for ln in lines:
+        if ln.startswith("## ") or ln.startswith("### "):
+            current = ln.lstrip("# ").strip()
+            sections.append(current)
+    if not sections:
+        return None
+    bullets = "\n".join(f"  • {s}" for s in sections if s and s.lower()
+                        not in {"quick start — your first 10 minutes",
+                                "when something's wrong",
+                                "what orbi won't do"})
+    return ("Here's everything I can do — pick any one and I'll walk you "
+            "through it (or open the **Help** tab for the full guide with "
+            "example phrases):\n\n" + bullets)
 
 
 def _try_personal_assistant_read(message: str, user_dir: Path) -> str | None:

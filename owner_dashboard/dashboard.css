@@ -1877,3 +1877,68 @@ dialog .form-actions {
   color: #8aa3c8;
   font-style: italic;
 }
+
+/* TOAST NOTIFICATIONS (bottom-right) — fires when reminder / lead /
+   voicemail comes in and no other channel (push/email/sms) is set up */
+.toast-stack {
+  position: fixed;
+  bottom: 20px;
+  right: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  z-index: 9999;
+  pointer-events: none;
+  max-width: 360px;
+}
+.toast {
+  pointer-events: auto;
+  background: linear-gradient(135deg, #1a2236, #232c44);
+  border: 1px solid #2c3a5e;
+  border-left: 4px solid #4f8cff;
+  border-radius: 10px;
+  padding: 14px 16px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.45);
+  color: #eaf0ff;
+  font-size: 14px;
+  line-height: 1.4;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  animation: toast-in 0.22s ease-out;
+  cursor: pointer;
+}
+.toast.reminder { border-left-color: #ffb84f; }
+.toast.lead     { border-left-color: #4fffa3; }
+.toast.message  { border-left-color: #4f8cff; }
+.toast-icon {
+  flex: 0 0 22px;
+  font-size: 18px;
+  line-height: 1.1;
+  padding-top: 1px;
+}
+.toast-body { flex: 1; min-width: 0; }
+.toast-title {
+  font-weight: 600;
+  margin-bottom: 2px;
+  color: #fff;
+}
+.toast-text  { opacity: 0.92; word-wrap: break-word; }
+.toast-close {
+  background: transparent;
+  border: none;
+  color: #8aa3c8;
+  font-size: 18px;
+  padding: 0;
+  cursor: pointer;
+  line-height: 1;
+}
+.toast-close:hover { color: #fff; }
+@keyframes toast-in {
+  from { transform: translateX(20px); opacity: 0; }
+  to   { transform: translateX(0);     opacity: 1; }
+}
+.toast.dismissing { animation: toast-out 0.2s ease-in forwards; }
+@keyframes toast-out {
+  to { transform: translateX(20px); opacity: 0; }
+}

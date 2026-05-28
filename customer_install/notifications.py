@@ -283,16 +283,124 @@ def urllib_parse_encode(d: dict) -> str:
 # Public API
 # ---------------------------------------------------------------------------
 
+INBOX_FILE = "notifications_inbox.json"
+INBOX_MAX  = 200  # keep last 200 — older auto-purged
+_INBOX_LOCK = threading.Lock()
+
+
+def _save_in_app(data_dir: Path, *, event: str, title: str, body: str,
+                 url: str = "/owner") -> str:
+    """Append a notification to the in-app inbox so the dashboard can
+    show a toast next time it polls. This is the SAFETY NET channel —
+    always runs so reminders never silently disappear when push/email/
+    sms aren't configured. Returns the notification id."""
+    import secrets
+    nid = secrets.token_urlsafe(8)
+    rec = {
+        "id":      nid,
+        "event":   event,
+        "title":   title,
+        "body":    body,
+        "url":     url,
+        "ts":      time.time(),
+        "seen":    False,
+    }
+    path = data_dir / INBOX_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _INBOX_LOCK:
+        try:
+            inbox = json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
+        except (json.JSONDecodeError, OSError):
+            inbox = []
+        inbox.append(rec)
+        if len(inbox) > INBOX_MAX:
+            inbox = inbox[-INBOX_MAX:]
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(inbox, indent=2, ensure_ascii=False),
+                       encoding="utf-8")
+        tmp.replace(path)
+    return nid
+
+
+def list_inbox(data_dir: Path, unseen_only: bool = False) -> list[dict]:
+    path = data_dir / INBOX_FILE
+    if not path.exists():
+        return []
+    try:
+        inbox = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return []
+    if unseen_only:
+        inbox = [n for n in inbox if not n.get("seen")]
+    return sorted(inbox, key=lambda n: n.get("ts", 0), reverse=True)
+
+
+def mark_inbox_seen(data_dir: Path, notification_id: str) -> bool:
+    path = data_dir / INBOX_FILE
+    if not path.exists():
+        return False
+    with _INBOX_LOCK:
+        try:
+            inbox = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return False
+        hit = False
+        for n in inbox:
+            if n.get("id") == notification_id and not n.get("seen"):
+                n["seen"] = True
+                n["seen_at"] = time.time()
+                hit = True
+        if hit:
+            tmp = path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(inbox, indent=2, ensure_ascii=False),
+                           encoding="utf-8")
+            tmp.replace(path)
+        return hit
+
+
+def mark_inbox_all_seen(data_dir: Path) -> int:
+    path = data_dir / INBOX_FILE
+    if not path.exists():
+        return 0
+    with _INBOX_LOCK:
+        try:
+            inbox = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return 0
+        n_marked = 0
+        for n in inbox:
+            if not n.get("seen"):
+                n["seen"] = True
+                n["seen_at"] = time.time()
+                n_marked += 1
+        if n_marked:
+            tmp = path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(inbox, indent=2, ensure_ascii=False),
+                           encoding="utf-8")
+            tmp.replace(path)
+        return n_marked
+
+
 def send(config: dict, data_dir: Path, *, event: str,
          title: str, body: str, url: str = "/owner") -> dict:
     """Fire a notification across all enabled channels for this event.
-    Non-blocking: runs in a background thread, returns immediately."""
+    Non-blocking for external channels (push/email/sms); in-app inbox
+    is written synchronously so the dashboard sees it on the next poll."""
     result = {"queued": True, "channels": []}
 
     notify_cfg = config.get("notifications", {})
     event_flag = EVENT_TO_FLAG.get(event)
     if event_flag and not notify_cfg.get(event_flag, True):
         return {"queued": False, "reason": f"event '{event}' disabled"}
+
+    # 0. In-app inbox — ALWAYS write, sync. This is the safety net so a
+    # missing push subscription / unconfigured email / no Twilio never
+    # results in a silently-dropped reminder.
+    try:
+        nid = _save_in_app(data_dir, event=event, title=title, body=body, url=url)
+        result["channels"].append(f"in_app({nid})")
+    except Exception as e:
+        log.warning(f"in_app inbox write failed: {e}")
 
     def _run():
         channels = []
@@ -322,7 +430,7 @@ def send(config: dict, data_dir: Path, *, event: str,
             except Exception as e:
                 log.warning(f"sms channel failed: {e}")
         if channels:
-            log.info(f"notify[{event}] delivered: {','.join(channels)}")
+            log.info(f"notify[{event}] external delivered: {','.join(channels)}")
 
     threading.Thread(target=_run, daemon=True).start()
     return result

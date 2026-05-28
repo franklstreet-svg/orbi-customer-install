@@ -3451,4 +3451,112 @@
   }
   document.addEventListener('DOMContentLoaded', wireHelpTab);
 
+  // ------------------------------------------------------------------
+  // In-app notification toasts
+  // ------------------------------------------------------------------
+  // Polls the inbox every 15s. New notifications appear as toasts in
+  // the bottom-right. This is the SAFETY-NET channel that fires when
+  // push/email/sms aren't configured — without it, reminders fire
+  // silently in the background and the user never sees them.
+
+  const _shownToasts = new Set();
+
+  function _toastIcon(event) {
+    if (event === 'reminder_due') return '⏰';
+    if (event === 'new_lead')     return '⚡';
+    if (event === 'new_message')  return '✉️';
+    if (event === 'new_voicemail')return '☎️';
+    if (event && event.startsWith('watchdog')) return '\u{1F6E0}';
+    return '\u{1F514}';
+  }
+  function _toastClass(event) {
+    if (event === 'reminder_due')   return 'reminder';
+    if (event === 'new_lead')       return 'lead';
+    if (event === 'new_voicemail')  return 'message';
+    if (event === 'new_message')    return 'message';
+    return '';
+  }
+
+  function _showToast(n) {
+    const stack = document.getElementById('toast-stack');
+    if (!stack) return;
+    const el = document.createElement('div');
+    el.className = 'toast ' + _toastClass(n.event);
+    el.setAttribute('role', 'alert');
+    el.innerHTML =
+      '<div class="toast-icon">' + _toastIcon(n.event) + '</div>' +
+      '<div class="toast-body">' +
+        '<div class="toast-title"></div>' +
+        '<div class="toast-text"></div>' +
+      '</div>' +
+      '<button class="toast-close" aria-label="Dismiss">×</button>';
+    el.querySelector('.toast-title').textContent = n.title || 'Notification';
+    el.querySelector('.toast-text').textContent  = n.body  || '';
+    stack.appendChild(el);
+    if (n.event === 'reminder_due') {
+      try { _playChime(); } catch (e) {}
+    }
+    const dismiss = function () {
+      if (!el.parentNode) return;
+      el.classList.add('dismissing');
+      setTimeout(function () { el.remove(); }, 220);
+      fetch('/api/owner/notifications/' + n.id + '/seen', {method: 'POST'})
+        .catch(function () {});
+    };
+    el.querySelector('.toast-close').addEventListener('click', function (e) {
+      e.stopPropagation();
+      dismiss();
+    });
+    el.addEventListener('click', function () {
+      if (n.url) {
+        const tabName = n.url.replace(/^\/+|\/+$/g, '').split('/').pop();
+        const tab = document.querySelector('.tab[data-tab="' + tabName + '"]');
+        if (tab) tab.click();
+      }
+      dismiss();
+    });
+    setTimeout(dismiss, 12000);
+  }
+
+  let _chimeCtx = null;
+  function _playChime() {
+    if (!_chimeCtx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return;
+      _chimeCtx = new AC();
+    }
+    const ctx = _chimeCtx;
+    const t = ctx.currentTime;
+    const o = ctx.createOscillator();
+    const g = ctx.createGain();
+    o.connect(g); g.connect(ctx.destination);
+    o.type = 'sine'; o.frequency.value = 880;
+    g.gain.setValueAtTime(0, t);
+    g.gain.linearRampToValueAtTime(0.18, t + 0.02);
+    g.gain.linearRampToValueAtTime(0, t + 0.4);
+    o.start(t); o.stop(t + 0.45);
+  }
+
+  async function _pollInbox() {
+    try {
+      const resp = await fetch('/api/owner/notifications/inbox?unseen=1');
+      if (!resp.ok) return;
+      const body = await resp.json();
+      const items = body.items || [];
+      for (const n of items) {
+        if (_shownToasts.has(n.id)) continue;
+        _shownToasts.add(n.id);
+        _showToast(n);
+      }
+    } catch (e) { /* offline / paused — try again next tick */ }
+  }
+
+  function wireInboxPolling() {
+    // On initial mount, mark everything pre-existing as seen so we don't
+    // toast old reminders that fired before the user opened the dashboard.
+    fetch('/api/owner/notifications/all_seen', {method: 'POST'}).catch(function () {});
+    setInterval(_pollInbox, 15000);
+  }
+  document.addEventListener('DOMContentLoaded', wireInboxPolling);
+
 })();
