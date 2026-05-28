@@ -1692,6 +1692,78 @@ _PA_INBOX_RE = _re.compile(
 )
 
 
+# Sender local-parts that almost never represent a real person.
+# We hide emails from these by default. The user can override with
+# "show all my email" / "include newsletters" / etc.
+_NOISE_LOCAL_PARTS = {
+    "noreply", "no-reply", "donotreply", "do-not-reply", "do_not_reply",
+    "marketing", "newsletter", "newsletters", "news", "updates",
+    "notifications", "notification", "alerts", "alert", "deals", "promo",
+    "promos", "promotions", "offers", "ads", "sales", "info",
+    "auto", "automated", "auto-reply", "system",
+}
+_NOISE_SUBJECT_RE = _re.compile(
+    r"\b(?:\d{1,3}\s*%\s*off|off!|on\s+sale|limited\s+time|free\s+shipping|"
+    r"exclusive\s+(?:deal|offer)|memorial\s+day\s+sale|labor\s+day\s+sale|"
+    r"unsubscribe|cyber\s+monday|black\s+friday|flash\s+sale|"
+    r"don'?t\s+miss|act\s+now|today\s+only|hurry|"
+    r"open\s+rate|click\s+here|claim\s+now|invitation\s+to\s+earn|"
+    r"survey|webinar)\b",
+    _re.IGNORECASE,
+)
+# Subjects with these stay — even if other heuristics would hide them.
+_KEEP_SUBJECT_RE = _re.compile(
+    r"\b(?:invoice|receipt|order|payment|refund|appointment|meeting|"
+    r"booking|reservation|delivery|shipped|tracking|security\s+alert|"
+    r"sign[- ]?in|verify|verification|password\s+(?:was|changed|reset)|"
+    r"two[- ]factor|2fa|action\s+required|account|deposit|paid|"
+    r"thank\s+you|quote|estimate|lead|inquiry|contract|signed|"
+    r"complaint|cancellation)\b",
+    _re.IGNORECASE,
+)
+
+
+def _is_promotional(msg: dict) -> bool:
+    """Quick heuristic to decide whether an email is noisy newsletter/promo
+    junk vs something a human owner cares about. Conservative: when in
+    doubt, treat as personal (false negatives are MUCH better than hiding
+    a real lead)."""
+    subj = (msg.get("subject") or "").strip()
+    sender = (msg.get("from") or "").lower()
+
+    # KEEP overrides — receipts, security, real-business signals
+    if _KEEP_SUBJECT_RE.search(subj):
+        return False
+
+    # Extract local-part from From header
+    local = ""
+    if "<" in sender and ">" in sender:
+        addr = sender.split("<", 1)[1].split(">", 1)[0]
+    else:
+        addr = sender
+    if "@" in addr:
+        local = addr.split("@", 1)[0]
+
+    if local in _NOISE_LOCAL_PARTS:
+        return True
+    # Local-parts that LOOK auto-generated: long random strings, lots of
+    # digits, hyphenated marketing-y compounds
+    if local and len(local) > 18 and any(c.isdigit() for c in local):
+        return True
+    # Subject contains classic promo language
+    if _NOISE_SUBJECT_RE.search(subj):
+        return True
+    return False
+
+
+_PA_INBOX_INCLUDE_ALL_RE = _re.compile(
+    r"\b(?:include|with|show)\s+(?:newsletters?|promos?|promotions?|all|everything)\b"
+    r"|\b(?:show|see)\s+(?:me\s+)?(?:all|everything)\b"
+    r"|\bincluding\s+(?:newsletters?|promos?)\b",
+    _re.IGNORECASE,
+)
+
+
 def _fmt_email_date(iso: str) -> str:
     """Turn the email's Date header into a friendly local-time string the
     owner can compare against what they see in their inbox UI."""
@@ -1740,12 +1812,29 @@ def _try_inbox_check(message: str, user_dir: Path) -> str | None:
             msg += f" Errors: {details}"
         return msg
 
+    # Filter out promo / newsletter noise unless the user explicitly asked
+    # for everything ("show me all emails", "include newsletters").
+    show_all = bool(_PA_INBOX_INCLUDE_ALL_RE.search(message))
+    if show_all:
+        kept = messages
+        hidden_promo = []
+    else:
+        kept = []
+        hidden_promo = []
+        for m in messages:
+            (hidden_promo if _is_promotional(m) else kept).append(m)
+
     by_provider = result.get("by_provider") or {}
-    unread = sum(1 for m in messages if m.get("unread"))
-    important = [m for m in messages if m.get("flagged") or
+    unread = sum(1 for m in kept if m.get("unread"))
+    important = [m for m in kept if m.get("flagged") or
                  any(t in ("lead", "urgent", "complaint") for t in (m.get("tags") or []))]
 
-    lines = [f"You have {len(messages)} recent messages ({unread} unread)."]
+    if show_all:
+        lines = [f"You have {len(messages)} recent messages ({unread} unread)."]
+    else:
+        lines = [f"You have {len(kept)} important / personal messages "
+                 f"({unread} unread). I filtered out {len(hidden_promo)} "
+                 f"newsletters & promos — say 'show me everything' to see them."]
     if by_provider:
         lines.append("Sources: " + ", ".join(f"{k} ({v})" for k, v in by_provider.items()) + ".")
 
@@ -1758,9 +1847,10 @@ def _try_inbox_check(message: str, user_dir: Path) -> str | None:
                          f"{m.get('subject','(no subject)')[:55]}")
 
     lines.append("")
-    show_n = min(len(messages), 40)
-    lines.append(f"Top {show_n} newest (of {len(messages)} I can see):")
-    for m in messages[:show_n]:
+    show_n = min(len(kept), 40)
+    label = "everything" if show_all else "newest (filtered)"
+    lines.append(f"Top {show_n} {label}:")
+    for m in kept[:show_n]:
         unread_mark = "● " if m.get("unread") else "  "
         date_str = _fmt_email_date(m.get("date", ""))
         sender  = (m.get("from") or "?")[:26]
@@ -1768,9 +1858,19 @@ def _try_inbox_check(message: str, user_dir: Path) -> str | None:
         folder  = m.get("folder") or m.get("provider") or "?"
         lines.append(f"  {unread_mark}[{folder:<6} {date_str:>13}]  {sender:<26} — {subject}")
 
-    lines.append("")
-    lines.append("Each row shows the folder it came from in brackets.")
-    lines.append("Say 'list my email folders' to see every folder Orby can see.")
+    if not show_all and hidden_promo:
+        lines.append("")
+        lines.append(f"📭 Hidden ({len(hidden_promo)} promos / newsletters):")
+        # Just list the senders so Frank knows who's been emailing him
+        senders = {}
+        for m in hidden_promo:
+            s = (m.get("from") or "?").split("<", 1)[0].strip(' "')
+            senders[s] = senders.get(s, 0) + 1
+        sender_list = sorted(senders.items(), key=lambda x: -x[1])
+        for s, n in sender_list[:8]:
+            lines.append(f"  - {s[:50]}" + (f" ({n})" if n > 1 else ""))
+        if len(sender_list) > 8:
+            lines.append(f"  ...and {len(sender_list) - 8} more")
 
     if errors:
         lines.append("")
