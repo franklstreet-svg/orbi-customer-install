@@ -1944,28 +1944,33 @@ dialog .form-actions {
 }
 
 /* The LOUD reminder banner — persistent until acknowledged.
-   Bigger, taller, can't be missed; has Got It + Snooze buttons. */
+   Actually yellow, actually pulsing — impossible to miss in peripheral vision. */
 .reminder-banner {
-  background: linear-gradient(135deg, #2a1f0e, #3a2e16);
+  background: linear-gradient(135deg, #ffd24a, #ffb020);
+  border: 2px solid #ffe08a;
   border-left-width: 6px;
-  border-left-color: #ffb84f;
-  box-shadow: 0 8px 32px rgba(255, 184, 79, 0.18),
-              0 4px 16px rgba(0, 0, 0, 0.5);
-  padding: 18px 18px;
+  color: #1a1306;
+  padding: 20px 22px;
   max-width: 380px;
   cursor: default;
-  animation: toast-in 0.22s ease-out, banner-pulse 1.6s ease-in-out infinite;
+  animation: toast-in 0.22s ease-out, banner-pulse 1.2s ease-in-out infinite;
+  transform-origin: bottom right;
 }
-.reminder-banner .toast-icon { font-size: 24px; }
+.reminder-banner .toast-icon {
+  font-size: 28px;
+  color: #1a1306;
+}
 .reminder-banner .toast-title {
   font-size: 15px;
   margin-bottom: 4px;
+  color: #3a2810;
+  font-weight: 700;
 }
 .reminder-banner .toast-text {
-  font-size: 16px;
-  font-weight: 500;
-  color: #fff;
-  margin-bottom: 12px;
+  font-size: 17px;
+  font-weight: 600;
+  color: #1a1306;
+  margin-bottom: 14px;
 }
 .reminder-actions {
   display: flex;
@@ -1975,23 +1980,35 @@ dialog .form-actions {
 .reminder-actions .primary-btn,
 .reminder-actions .secondary-btn {
   font-size: 13px;
-  padding: 8px 14px;
+  padding: 9px 16px;
+  font-weight: 600;
 }
 .reminder-actions .primary-btn {
-  background: #ffb84f;
+  background: #1a1306;
+  color: #ffd24a;
+  border: none;
+}
+.reminder-actions .primary-btn:hover { background: #2a2210; }
+.reminder-actions .secondary-btn {
+  background: rgba(26, 19, 6, 0.12);
+  border: 1px solid rgba(26, 19, 6, 0.35);
   color: #1a1306;
 }
-.reminder-actions .primary-btn:hover { background: #ffcd7a; }
-.reminder-actions .secondary-btn {
-  background: transparent;
-  border: 1px solid #5a4520;
-  color: #ffd89a;
+.reminder-actions .secondary-btn:hover {
+  background: rgba(26, 19, 6, 0.22);
 }
-.reminder-actions .secondary-btn:hover { background: #2a2210; }
 
+/* Visible pulse — scale + brightness throb so it catches the eye even
+   in peripheral vision. */
 @keyframes banner-pulse {
-  0%, 100% { box-shadow: 0 8px 32px rgba(255, 184, 79, 0.18),
-                          0 4px 16px rgba(0, 0, 0, 0.5); }
-  50%      { box-shadow: 0 8px 32px rgba(255, 184, 79, 0.38),
-                          0 4px 16px rgba(0, 0, 0, 0.5); }
+  0%, 100% {
+    transform: scale(1);
+    box-shadow: 0 8px 28px rgba(255, 200, 60, 0.55),
+                0 4px 16px rgba(0, 0, 0, 0.5);
+  }
+  50% {
+    transform: scale(1.035);
+    box-shadow: 0 12px 40px rgba(255, 200, 60, 0.85),
+                0 6px 20px rgba(0, 0, 0, 0.5);
+  }
 }
