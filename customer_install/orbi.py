@@ -1943,8 +1943,29 @@ def _capabilities_context_block(message: str) -> str | None:
 # Voice-to-text spells Orby as "Orbeez" / "orby" / "orbie" sometimes —
 # normalize so capability queries still match.
 _ORBI_PHONETIC_RE = _re.compile(r"\borb(?:eez|y|ie|i)\b", _re.IGNORECASE)
-_CAPABILITIES_RE = _re.compile(r"\bcapabilit(?:y|ies)\b", _re.IGNORECASE)
-_WHAT_CAN_YOU_DO_RE = _re.compile(r"\bwhat\s+(?:can|do)\s+you\s+do\b", _re.IGNORECASE)
+# Must be the subject of a request — "list your capabilities", "what are
+# your capabilities", "show me everything you can do". The bare word
+# "capabilities" anywhere in a message used to fire — that was wrong
+# (pasted text saying "advanced AI capabilities" shouldn't trigger an
+# overview of Orby's own features).
+_CAPABILITIES_RE = _re.compile(
+    r"^\s*(?:(?:can|could|would|will)\s+you\s+(?:please\s+)?)?"
+    r"(?:please\s+)?"
+    r"(?:list|show\s+me|tell\s+me|give\s+me|share|run\s+through|walk\s+me\s+through|"
+    r"what\s+(?:are|is)|what'?s)\s+"
+    r"(?:me\s+|us\s+)?(?:all\s+(?:of\s+)?)?"
+    r"(?:your|the|orbi'?s|orby'?s)\s+"
+    r"(?:full\s+|complete\s+|entire\s+)?(?:list\s+of\s+)?"
+    r"(?:capabilit(?:y|ies)|abilit(?:y|ies)|features)\b",
+    _re.IGNORECASE,
+)
+_WHAT_CAN_YOU_DO_RE = _re.compile(
+    r"^\s*(?:(?:can|could|would|will)\s+you\s+)?"
+    r"(?:please\s+)?"
+    r"(?:tell\s+me\s+|show\s+me\s+)?"
+    r"what\s+(?:(?:can|do)\s+you\s+do|you\s+(?:can|could|do)\s+do)\b",
+    _re.IGNORECASE,
+)
 
 
 def _try_capabilities_overview(message: str) -> str | None:
