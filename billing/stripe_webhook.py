@@ -1342,6 +1342,189 @@ def twilio_sms_proxy(api_key: str):
         return ("", 204)
 
 
+@app.route("/admin", methods=["GET"])
+@app.route("/admin/", methods=["GET"])
+def admin_dashboard():
+    """Single-page HTML fleet dashboard. Auto-refreshes every 30s.
+    Auth via ?token=<ORBI_ADMIN_TOKEN> in the URL (token-protected)
+    OR via X-Admin-Token header. Bookmark with the token query string."""
+    token_qs = request.args.get("token", "")
+    if token_qs != ADMIN_TOKEN and request.headers.get("X-Admin-Token") != ADMIN_TOKEN:
+        return ("<h1>Forbidden</h1><p>Add <code>?token=YOUR_ORBI_ADMIN_TOKEN</code> "
+                "to the URL.</p>"), 403, {"Content-Type": "text/html"}
+    return _FLEET_DASHBOARD_HTML.replace("__ADMIN_TOKEN__", ADMIN_TOKEN), 200, \
+           {"Content-Type": "text/html; charset=utf-8"}
+
+
+_FLEET_DASHBOARD_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Orby Fleet — Frank's Dashboard</title>
+<style>
+  :root {
+    --bg: #0a0f1e; --surface: #111827; --surface2: #1a2235;
+    --text: #e8eaf0; --text-muted: #aab0bc; --border: rgba(45,212,191,0.18);
+    --good: #4ade80; --warn: #f59e0b; --err: #ef4444; --gold: #2dd4bf;
+  }
+  *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+       padding:18px;min-height:100vh}
+  header{display:flex;justify-content:space-between;align-items:center;margin-bottom:18px;flex-wrap:wrap;gap:12px}
+  h1{font-size:20px;color:var(--gold)}
+  .meta{font-size:12px;color:var(--text-muted)}
+  .meta strong{color:var(--text)}
+  .summary{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:18px}
+  .pill{padding:8px 14px;border-radius:20px;font-size:13px;font-weight:600;
+        background:var(--surface);border:1px solid var(--border)}
+  .pill.healthy{color:var(--good);border-color:rgba(74,222,128,0.35)}
+  .pill.stale  {color:var(--warn);border-color:rgba(245,158,11,0.35)}
+  .pill.dark   {color:var(--err); border-color:rgba(239,68,68,0.45);background:rgba(239,68,68,0.06)}
+  .pill.never_seen{color:var(--text-muted)}
+  .pill.inactive{color:var(--text-muted);opacity:0.6}
+  table{width:100%;border-collapse:collapse;background:var(--surface);border-radius:10px;overflow:hidden;font-size:13px}
+  thead{background:var(--surface2)}
+  th,td{padding:10px 12px;text-align:left;border-bottom:1px solid var(--border)}
+  th{color:var(--text-muted);font-weight:600;text-transform:uppercase;font-size:11px;letter-spacing:0.5px}
+  tr:last-child td{border-bottom:none}
+  tr:hover{background:rgba(45,212,191,0.04)}
+  td.email{color:var(--text);font-weight:500}
+  td.bizname{color:var(--gold)}
+  .status-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;vertical-align:middle}
+  .status-dot.healthy{background:var(--good)}
+  .status-dot.stale{background:var(--warn)}
+  .status-dot.dark{background:var(--err)}
+  .status-dot.never_seen, .status-dot.inactive{background:var(--text-muted)}
+  .ago{color:var(--text-muted);font-size:12px}
+  .empty{padding:40px;text-align:center;color:var(--text-muted)}
+  .err-banner{background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.35);
+              color:#fca5a5;padding:12px 16px;border-radius:8px;margin-bottom:18px}
+  details summary{cursor:pointer;color:var(--gold);font-size:13px}
+  details pre{background:#0b0f1a;color:#cfe0ff;padding:12px;border-radius:6px;
+              font-size:11px;overflow-x:auto;margin-top:8px}
+  code{font-family:ui-monospace,"SF Mono",Consolas,monospace;font-size:12px;color:var(--gold)}
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>Orby Fleet</h1>
+    <div class="meta">My Orby AI Solutions — every customer Orby reports here every 5 min</div>
+  </div>
+  <div class="meta" id="last-update">Loading…</div>
+</header>
+
+<div id="err-zone"></div>
+<div class="summary" id="summary"></div>
+<table>
+  <thead>
+    <tr>
+      <th>Status</th>
+      <th>Business</th>
+      <th>Email</th>
+      <th>Tier</th>
+      <th>Phone</th>
+      <th>Last seen</th>
+      <th>Version</th>
+      <th>Public URL</th>
+    </tr>
+  </thead>
+  <tbody id="rows">
+    <tr><td colspan="8" class="empty">Loading customers…</td></tr>
+  </tbody>
+</table>
+
+<details style="margin-top:20px">
+  <summary>Recent alerts (fleet inbox)</summary>
+  <pre id="inbox-pre">Loading…</pre>
+</details>
+
+<script>
+const TOKEN = "__ADMIN_TOKEN__";
+const H = {"X-Admin-Token": TOKEN};
+
+function fmtAgo(sec){
+  if (sec == null) return "never";
+  if (sec < 60) return sec + "s ago";
+  if (sec < 3600) return Math.floor(sec/60) + " min ago";
+  if (sec < 86400) return Math.floor(sec/3600) + " hr ago";
+  return Math.floor(sec/86400) + " days ago";
+}
+
+async function loadFleet(){
+  try {
+    const r = await fetch("/api/admin/fleet", {headers: H});
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const data = await r.json();
+
+    document.getElementById("last-update").innerHTML =
+      "Updated <strong>" + new Date().toLocaleTimeString() + "</strong> · " +
+      data.total + " customers";
+
+    const counts = data.counts || {};
+    document.getElementById("summary").innerHTML = [
+      ["healthy", "✓ Healthy"],
+      ["stale", "⏳ Stale"],
+      ["dark", "⚠ Dark"],
+      ["never_seen", "○ Never seen"],
+      ["inactive", "⊘ Inactive"],
+    ].map(function([key, label]){
+      const n = counts[key] || 0;
+      return '<div class="pill ' + key + '">' + label + ': ' + n + '</div>';
+    }).join("");
+
+    const tbody = document.getElementById("rows");
+    if (!data.customers || data.customers.length === 0){
+      tbody.innerHTML = '<tr><td colspan="8" class="empty">No customers yet. They\\'ll show up here after their first heartbeat.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = data.customers.map(function(c){
+      return "<tr>" +
+        '<td><span class="status-dot ' + c.status + '"></span>' + c.status + "</td>" +
+        '<td class="bizname">' + (c.business_name || '—') + "</td>" +
+        '<td class="email">' + (c.email || '—') + "</td>" +
+        "<td>" + (c.tier || '—') + (c.billing_cycle ? ' / ' + c.billing_cycle : '') + "</td>" +
+        "<td>" + (c.twilio_number || '—') + "</td>" +
+        '<td><span class="ago">' + fmtAgo(c.last_seen_ago_sec) + "</span></td>" +
+        "<td>" + ((c.last_heartbeat_parsed && c.last_heartbeat_parsed.version) || '—') + "</td>" +
+        '<td><code>' + ((c.public_url || '').replace('https://', '').slice(0, 40)) + "</code></td>" +
+      "</tr>";
+    }).join("");
+
+    document.getElementById("err-zone").innerHTML = "";
+  } catch (e) {
+    document.getElementById("err-zone").innerHTML =
+      '<div class="err-banner">Couldn\\'t reach the brain server: ' + e + '</div>';
+  }
+}
+
+async function loadInbox(){
+  try {
+    const r = await fetch("/api/admin/fleet/inbox?unseen=1", {headers: H});
+    if (!r.ok) return;
+    const data = await r.json();
+    const pre = document.getElementById("inbox-pre");
+    if (!data.items || data.items.length === 0){
+      pre.textContent = "(no unseen alerts)";
+      return;
+    }
+    pre.textContent = data.items.slice(0, 20).map(function(i){
+      return "[" + new Date(i.ts * 1000).toLocaleString() + "] " +
+        i.event + " — " + i.title + "\\n    " + i.body;
+    }).join("\\n\\n");
+  } catch (e) { /* silent */ }
+}
+
+loadFleet(); loadInbox();
+setInterval(loadFleet, 30000);
+setInterval(loadInbox, 60000);
+</script>
+
+</body>
+</html>"""
+
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "service": "stripe-webhook"})
