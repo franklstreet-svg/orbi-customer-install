@@ -45,7 +45,7 @@ def call_brain(config: dict, system: str, messages: list[dict]) -> LLMResponse:
         # 2048 covers ~1500 words — enough for marketing campaigns,
         # multi-section letters, blog drafts. 512 was cutting long
         # responses off mid-list.
-        "max_tokens": 2048,
+        "max_tokens": 4096,
         "stream": False,
     }
     headers = {
@@ -81,7 +81,7 @@ def call_huggingface(config: dict, system: str, messages: list[dict]) -> LLMResp
         "model": model,
         "messages": [{"role": "system", "content": system}] + messages,
         "temperature": 0.6,
-        "max_tokens": 2048,
+        "max_tokens": 4096,
         "stream": False,
     }
     resp = _http_chat("https://router.huggingface.co/v1/chat/completions",
