@@ -1397,6 +1397,13 @@ def owner_chat():
         return jsonify({"reply": pa_direct, "tier": "local", "latency_ms": 0,
                         "source": "personal_assistant"})
 
+    # INBOX check — fast-path so "check my email" doesn't bounce to the LLM
+    # which has no awareness of the connected IMAP/Gmail/Outlook accounts.
+    inbox_reply = _try_inbox_check(user_msg, user_dir)
+    if inbox_reply is not None:
+        return jsonify({"reply": inbox_reply, "tier": "local", "latency_ms": 0,
+                        "source": "inbox_check"})
+
     # FILE FETCH: "send me the Maxwell estimate from my computer"
     ff = _try_file_fetch(user_msg, username)
     if ff is not None:
@@ -1662,6 +1669,73 @@ def _try_capabilities_overview(message: str) -> str | None:
     return ("Here's everything I can do — pick any one and I'll walk you "
             "through it (or open the **Help** tab for the full guide with "
             "example phrases):\n\n" + bullets)
+
+
+_PA_INBOX_RE = _re.compile(
+    # Covers: 'check my email', 'check that email', 'show me my email',
+    # 'read me my email', 'any new emails?', 'what's in my inbox',
+    # 'do I have any new mail', 'what's important in my inbox'.
+    # "(?:e[\s-]?mails?|inbox|mails?|messages?)" tolerates plurals.
+    r"\b(?:check|read|show|list|see|fetch|get|pull|look\s+at|tell\s+me\s+about)"
+    r"\s+(?:me\s+)?(?:my\s+|the\s+|that\s+|some\s+)?(?:e[\s-]?mails?|inbox|mails?|messages?)\b"
+    r"|\b(?:any|got|have|do\s+i\s+have)\s+(?:any\s+)?(?:new\s+)?(?:e[\s-]?mails?|mails?|messages?)\b"
+    r"|\bwhat(?:'s|s| is)?\s+(?:important\s+)?(?:in|on)\s+(?:my\s+)?(?:e[\s-]?mails?|inbox|mails?)\b"
+    r"|\bwhat(?:'s|s| is)\s+new\s+in\s+(?:my\s+)?(?:e[\s-]?mails?|inbox|mails?)\b",
+    _re.IGNORECASE,
+)
+
+
+def _try_inbox_check(message: str, user_dir: Path) -> str | None:
+    """Detect 'check my email / what's in my inbox' and pull a live summary
+    directly from email_inbox.fetch_inbox. Without this fast-path the
+    request bounces to the LLM, which has no idea the IMAP/Gmail/Outlook
+    accounts are connected and tells the user 'I don't have access'."""
+    if not message or not _PA_INBOX_RE.search(message):
+        return None
+    try:
+        result = email_inbox.fetch_inbox(CONFIG, user_dir, source="all", limit=20)
+    except Exception as e:
+        log.warning(f"inbox fetch_inbox failed: {e}")
+        return f"I tried to check your inbox but hit an error: {e}"
+
+    messages = result.get("messages") or []
+    errors   = result.get("errors") or {}
+    if not messages:
+        msg = "Your inbox is empty (or I can't see anything new)."
+        if errors:
+            details = "; ".join(f"{k}: {v[:80]}" for k, v in errors.items())
+            msg += f" Errors: {details}"
+        return msg
+
+    by_provider = result.get("by_provider") or {}
+    unread = sum(1 for m in messages if m.get("unread"))
+    important = [m for m in messages if m.get("flagged") or
+                 any(t in ("lead", "urgent", "complaint") for t in (m.get("tags") or []))]
+
+    lines = [f"You have {len(messages)} recent messages ({unread} unread)."]
+    if by_provider:
+        lines.append("Sources: " + ", ".join(f"{k} ({v})" for k, v in by_provider.items()) + ".")
+
+    if important:
+        lines.append("")
+        lines.append(f"⚡ {len(important)} flagged as important:")
+        for m in important[:5]:
+            lines.append(f"  - {m.get('from','?')}: {m.get('subject','(no subject)')[:60]}")
+
+    lines.append("")
+    lines.append("Most recent:")
+    for m in messages[:8]:
+        unread_mark = "● " if m.get("unread") else "  "
+        sender  = (m.get("from") or "?")[:30]
+        subject = (m.get("subject") or "(no subject)")[:55]
+        lines.append(f"  {unread_mark}{sender} — {subject}")
+
+    if errors:
+        lines.append("")
+        lines.append("(Some sources errored: " +
+                     ", ".join(f"{k}={v[:50]}" for k, v in errors.items()) + ")")
+
+    return "\n".join(lines)
 
 
 def _try_personal_assistant_read(message: str, user_dir: Path) -> str | None:
