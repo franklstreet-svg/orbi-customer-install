@@ -475,12 +475,98 @@ def favicon():
 
 _DEFAULT_VOICE = (CONFIG.get("voice", {}) or {}).get("name", "en-US-AvaNeural")
 
+def _tts_via_piper(text: str, voice: str, rate: str, tts_cfg: dict):
+    """Synthesize via the bundled Piper binary. Returns a Flask Response
+    on success, None if Piper is not available (caller falls back to
+    edge_tts). Output is WAV from Piper, transcoded to MP3 via the
+    bundled ffmpeg so the browser can stream it like edge_tts output."""
+    bin_dir = ORBI_DIR / "bin"
+    piper_bin = bin_dir / ("piper.exe" if os.name == "nt" else "piper")
+    if not piper_bin.exists():
+        import shutil as _shutil
+        found = _shutil.which("piper")
+        if not found:
+            return None
+        piper_bin = Path(found)
+
+    # Voice model selection — defaults to one that sounds close to
+    # Polly.Joanna (the phone receptionist voice) for cross-product
+    # consistency. Customer / Frank can override via config.tts.voice_model.
+    model_dir = ORBI_DIR / "tts_models"
+    model_name = (tts_cfg.get("voice_model") or
+                  "en_US-amy-medium")
+    model_path = model_dir / f"{model_name}.onnx"
+    if not model_path.exists():
+        log.warning(f"piper voice model {model_path} not found — skipping")
+        return None
+
+    ffmpeg_bin = bin_dir / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
+    if not ffmpeg_bin.exists():
+        import shutil as _shutil
+        found = _shutil.which("ffmpeg")
+        if not found:
+            log.warning("ffmpeg not found — piper output stays as WAV "
+                        "(browser will still play it)")
+            ffmpeg_bin = None
+        else:
+            ffmpeg_bin = Path(found)
+
+    import subprocess
+    from flask import Response
+
+    def stream_chunks():
+        try:
+            # Piper reads text on stdin, writes WAV on stdout
+            piper = subprocess.Popen(
+                [str(piper_bin), "--model", str(model_path), "--output_raw"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+            piper.stdin.write(text.encode("utf-8"))
+            piper.stdin.close()
+
+            if ffmpeg_bin:
+                # WAV → MP3
+                ff = subprocess.Popen(
+                    [str(ffmpeg_bin), "-loglevel", "quiet",
+                     "-f", "s16le", "-ar", "22050", "-ac", "1", "-i", "-",
+                     "-f", "mp3", "-b:a", "64k", "-"],
+                    stdin=piper.stdout, stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                )
+                while True:
+                    chunk = ff.stdout.read(4096)
+                    if not chunk:
+                        break
+                    yield chunk
+                ff.wait()
+            else:
+                # Stream raw WAV (browser still plays it; bigger payload)
+                while True:
+                    chunk = piper.stdout.read(4096)
+                    if not chunk:
+                        break
+                    yield chunk
+            piper.wait()
+        except Exception as e:
+            log.warning(f"piper tts stream failed: {e}")
+
+    return Response(
+        stream_chunks(),
+        mimetype="audio/mpeg" if ffmpeg_bin else "audio/wav",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 @app.route("/tts", methods=["GET", "POST"])
 def tts():
-    """Generate MP3 audio for text using Edge TTS neural voices.
-    Same engine as twickell.com. Streams chunks as edge_tts produces them
-    so the browser can start playing within ~300ms instead of waiting 1-2s
-    for the full file. GET form lets <audio src="/tts?text=..."> work directly."""
+    """Generate MP3 audio for text. Two engines:
+      - 'piper'  → self-hosted, MIT-licensed, commercially safe (preferred)
+      - 'edge'   → Edge TTS reverse-engineered (free but legally gray;
+                   acceptable for personal use + first few customers)
+    Pick via config.tts.engine. Defaults to 'edge' for backward compat;
+    customer installer sets 'piper' as the default once the binary is
+    bundled."""
     if request.method == "GET":
         text  = (request.args.get("text") or "").strip()
         voice = request.args.get("voice") or _DEFAULT_VOICE
@@ -494,6 +580,18 @@ def tts():
         return jsonify({"error": "empty_text"}), 400
     if len(text) > 1500:
         text = text[:1500]
+
+    tts_cfg = CONFIG.get("tts") or {}
+    engine = tts_cfg.get("engine", "edge").lower()
+
+    # Try Piper first if configured. Falls back to edge on failure so a
+    # missing binary doesn't break TTS entirely.
+    if engine == "piper":
+        piper_response = _tts_via_piper(text, voice, rate, tts_cfg)
+        if piper_response is not None:
+            return piper_response
+        # Fall through to edge if Piper not available
+        log.warning("piper TTS unavailable — falling back to edge_tts")
 
     try:
         import edge_tts
