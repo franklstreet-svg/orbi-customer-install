@@ -109,7 +109,8 @@ POLLINATIONS_TIMEOUT_SECONDS = 45
 # ---------------------------------------------------------------------------
 
 
-def generate(config: dict, prompt: str, kind: str = DEFAULT_KIND) -> bytes:
+def generate(config: dict, prompt: str, kind: str = DEFAULT_KIND,
+             seed: int | None = None) -> bytes:
     """
     Generate a PNG for `prompt` at the size matching `kind`. Tries
     HuggingFace first if a key is configured, falls back to the PIL template
@@ -129,7 +130,7 @@ def generate(config: dict, prompt: str, kind: str = DEFAULT_KIND) -> bytes:
     img_cfg = (config or {}).get("image_gen") or {}
     if img_cfg.get("pollinations_enabled", True):
         try:
-            png = _generate_pollinations(prompt, kind, img_cfg)
+            png = _generate_pollinations(prompt, kind, img_cfg, seed=seed)
             if png:
                 log.info("pollinations generated %d bytes for kind=%s", len(png), kind)
                 return png
@@ -343,7 +344,8 @@ def templated_post(text: str, kind: str = DEFAULT_KIND,
 # ---------------------------------------------------------------------------
 
 
-def _generate_pollinations(prompt: str, kind: str, img_cfg: dict) -> bytes:
+def _generate_pollinations(prompt: str, kind: str, img_cfg: dict,
+                            seed: int | None = None) -> bytes:
     """
     Generate a PNG via Pollinations.ai. No API key required. The whole
     request is a single GET against an encoded URL — they generate the image
@@ -352,17 +354,23 @@ def _generate_pollinations(prompt: str, kind: str, img_cfg: dict) -> bytes:
     Free tier rate limit (anonymous) is generous enough for a single
     customer install — minutes-per-minute, not seconds. If you hit it
     you'll get a 429 and we'll fall through to the HF or PIL tier.
+
+    `seed` defaults to a fresh random value so re-running the same prompt
+    produces a new image. Pass an explicit seed to get reproducible output
+    (useful for "show me this same one but bigger" workflows).
     """
     import urllib.parse
+    import random
 
     width, height = SIZES[kind]
     model = (img_cfg.get("pollinations_model") or "flux").strip()
     timeout = int(img_cfg.get("pollinations_timeout_seconds", POLLINATIONS_TIMEOUT_SECONDS))
 
-    # Pollinations puts the prompt in the URL path, not query string. Stable
-    # seed gives reproducible images for the same prompt; we use a hash of
-    # the prompt so re-running gives the same picture (useful for testing).
-    seed = int(hashlib.sha1(prompt.encode("utf-8")).hexdigest()[:8], 16) % 100000
+    # Pollinations puts the prompt in the URL path, not query string.
+    # Random seed by default — owners asking for "an instagram post" multiple
+    # times expect variety, not the cached same image.
+    if seed is None:
+        seed = random.randint(1, 999_999)
     encoded = urllib.parse.quote(prompt, safe="")
     url = (f"{POLLINATIONS_BASE}{encoded}"
            f"?width={width}&height={height}"
