@@ -69,9 +69,19 @@ FONT_CANDIDATES = (
 )
 
 # HuggingFace endpoint for the free-tier fast text-to-image model.
+# NOTE 2026-05-28: HF deprecated api-inference.huggingface.co and migrated
+# image gen behind the paid Inference Providers tier on router.huggingface.co.
+# The old URL now returns NXDOMAIN. We keep the HF code path for owners with
+# a paid HF Pro account, but it's no longer Tier 1.
 HF_MODEL = "black-forest-labs/FLUX.1-schnell"
-HF_URL   = f"https://api-inference.huggingface.co/models/{HF_MODEL}"
+HF_URL   = f"https://router.huggingface.co/hf-inference/models/{HF_MODEL}"
 HF_TIMEOUT_SECONDS = 60
+
+# Pollinations.ai — keyless, free, no signup. Generates from a plain URL,
+# returns PNG bytes. Default tier 1 since it Just Works without any setup
+# the customer has to do. Their FLUX model is the same family as HF's.
+POLLINATIONS_BASE = "https://image.pollinations.ai/prompt/"
+POLLINATIONS_TIMEOUT_SECONDS = 45
 
 
 # ---------------------------------------------------------------------------
@@ -95,7 +105,18 @@ def generate(config: dict, prompt: str, kind: str = DEFAULT_KIND) -> bytes:
         log.info("unknown kind=%r, defaulting to %s", kind, DEFAULT_KIND)
         kind = DEFAULT_KIND
 
-    # ── Path A: HuggingFace ───────────────────────────────────────────────
+    # ── Path A: Pollinations.ai (keyless, free, default) ─────────────────
+    img_cfg = (config or {}).get("image_gen") or {}
+    if img_cfg.get("pollinations_enabled", True):
+        try:
+            png = _generate_pollinations(prompt, kind, img_cfg)
+            if png:
+                log.info("pollinations generated %d bytes for kind=%s", len(png), kind)
+                return png
+        except Exception as exc:    # noqa: BLE001 — fall through to next tier
+            log.warning("pollinations generation failed (%s), trying next tier", exc)
+
+    # ── Path B: HuggingFace (requires HF Pro account on the new Router) ──
     hf_cfg = (config or {}).get("huggingface") or {}
     if hf_cfg.get("api_key"):
         try:
@@ -107,7 +128,7 @@ def generate(config: dict, prompt: str, kind: str = DEFAULT_KIND) -> bytes:
             log.warning("hf generation failed (%s), falling back to template",
                         exc)
 
-    # ── Path B: PIL template fallback ─────────────────────────────────────
+    # ── Path C: PIL template fallback ─────────────────────────────────────
     try:
         png = templated_post(prompt, kind)
         log.info("template generated %d bytes for kind=%s", len(png), kind)
@@ -230,6 +251,85 @@ def templated_post(text: str, kind: str = DEFAULT_KIND,
     buf = io.BytesIO()
     img.save(buf, format="PNG", optimize=True)
     return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Pollinations.ai path (default — keyless, free)
+# ---------------------------------------------------------------------------
+
+
+def _generate_pollinations(prompt: str, kind: str, img_cfg: dict) -> bytes:
+    """
+    Generate a PNG via Pollinations.ai. No API key required. The whole
+    request is a single GET against an encoded URL — they generate the image
+    on their backend (FLUX family) and return raw PNG bytes.
+
+    Free tier rate limit (anonymous) is generous enough for a single
+    customer install — minutes-per-minute, not seconds. If you hit it
+    you'll get a 429 and we'll fall through to the HF or PIL tier.
+    """
+    import urllib.parse
+
+    width, height = SIZES[kind]
+    model = (img_cfg.get("pollinations_model") or "flux").strip()
+    timeout = int(img_cfg.get("pollinations_timeout_seconds", POLLINATIONS_TIMEOUT_SECONDS))
+
+    # Pollinations puts the prompt in the URL path, not query string. Stable
+    # seed gives reproducible images for the same prompt; we use a hash of
+    # the prompt so re-running gives the same picture (useful for testing).
+    seed = int(hashlib.sha1(prompt.encode("utf-8")).hexdigest()[:8], 16) % 100000
+    encoded = urllib.parse.quote(prompt, safe="")
+    url = (f"{POLLINATIONS_BASE}{encoded}"
+           f"?width={width}&height={height}"
+           f"&model={urllib.parse.quote(model)}"
+           f"&seed={seed}"
+           f"&nologo=true&enhance=true&safe=true")
+
+    req = urllib.request.Request(url, method="GET", headers={
+        "Accept":     "image/png, image/jpeg, image/*",
+        "User-Agent": ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
+    })
+
+    start = time.time()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            payload = resp.read()
+            ctype = (resp.headers.get("Content-Type") or "").lower()
+    except urllib.error.HTTPError as exc:
+        try:
+            err_body = exc.read().decode("utf-8", errors="ignore")
+        except Exception:    # noqa: BLE001
+            err_body = ""
+        raise RuntimeError(f"pollinations HTTP {exc.code}: {err_body[:300]}") from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise RuntimeError(f"pollinations network error: {exc}") from exc
+
+    elapsed_ms = int((time.time() - start) * 1000)
+    log.info("pollinations GET took %dms (%d bytes, ctype=%s)",
+             elapsed_ms, len(payload), ctype)
+
+    # They may return jpeg — accept that, convert to PNG so downstream is uniform
+    if _looks_like_png(payload):
+        return payload
+    if _looks_like_jpeg(payload):
+        return _jpeg_to_png(payload)
+    snippet = payload[:300].decode("utf-8", errors="ignore")
+    raise RuntimeError(f"pollinations returned non-image payload: {snippet!r}")
+
+
+def _looks_like_jpeg(buf: bytes) -> bool:
+    """JPEG magic = b'\\xff\\xd8\\xff' (3 bytes)."""
+    return len(buf) >= 3 and buf[:3] == b"\xff\xd8\xff"
+
+
+def _jpeg_to_png(jpeg_bytes: bytes) -> bytes:
+    """Re-encode JPEG → PNG so save_to_workspace() always writes .png."""
+    from PIL import Image
+    img = Image.open(io.BytesIO(jpeg_bytes)).convert("RGB")
+    out = io.BytesIO()
+    img.save(out, format="PNG", optimize=True)
+    return out.getvalue()
 
 
 # ---------------------------------------------------------------------------

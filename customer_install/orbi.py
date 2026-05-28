@@ -2755,10 +2755,8 @@ def _try_office_gen(message: str, username: str) -> dict | None:
             saved = _save_and_token(png, fname)
             audit.log_event(DATA_DIR, actor=username, action="chart.via_chat",
                             meta={"req": msg[:120]})
-            return {"reply": (f"Made a {parsed.get('kind','bar')} chart titled "
-                              f"\"{parsed.get('title','Chart')}\". "
-                              f"[Download it]({saved['download_url']}) — "
-                              f"it's also saved to your Files tab."),
+            return {"reply": (f"Here's the {parsed.get('kind','bar')} chart titled "
+                              f"\"{parsed.get('title','Chart')}\" — also saved to your Files tab."),
                     "tier": "local", "latency_ms": 0,
                     "source": "chart_gen", "download_url": saved.get("download_url")}
 
@@ -2834,9 +2832,11 @@ def _try_office_gen(message: str, username: str) -> dict | None:
                 url = None
             audit.log_event(DATA_DIR, actor=username, action="image.via_chat",
                             meta={"prompt": prompt[:120]})
-            return {"reply": (f"Generated an image for \"{prompt}\". "
-                              + (f"[Download it]({url})" if url else "Saved to Files.")
-                              + " — saved to your Files tab."),
+            # Short caption only — the inline <img> in the bubble IS the
+            # preview, so a separate "[Download it](...)" markdown link
+            # would render as ugly raw text. Click the image for full size.
+            short_prompt = prompt if len(prompt) <= 80 else prompt[:77] + "..."
+            return {"reply": f"Here's what I drew for \"{short_prompt}\" — also saved to your Files tab.",
                     "tier": "local", "latency_ms": 0,
                     "source": "image_gen", "download_url": url}
     except Exception as e:
