@@ -2749,6 +2749,49 @@ _IMAGE_SELF_RE = _re.compile(
     _re.IGNORECASE,
 )
 
+# Refinement detector: the user is following up on a JUST-GENERATED image.
+# "more humanoid" / "make it bigger" / "different style" / "with blue eyes" /
+# "I'd like to see X" / "try again with Y" / "less Z". When this matches AND
+# we have a recent prior image for this user, we re-fire image_gen with a
+# rebuilt prompt instead of falling through to the LLM (which would just
+# describe what it would draw, not draw it).
+_IMAGE_REFINE_RE = _re.compile(
+    r"\b(?:"
+    r"more|less|bigger|smaller|brighter|darker|softer|sharper|"
+    r"with(?:out)?|add|remove|drop|change(?:\s+(?:it|to))?|make\s+it|"
+    r"i(?:'d| would)\s+like\s+(?:to\s+see\s+)?|i\s+(?:want|prefer)\s+|"
+    r"how\s+about|what\s+about|"
+    r"try\s+(?:again|once\s+more|something|with|it)|"
+    r"different|another|instead|but|except|"
+    r"redo|retry|do\s+(?:it|that)\s+again"
+    r")\b",
+    _re.IGNORECASE,
+)
+
+# In-memory cache of the last image prompt per username. 10-minute TTL.
+# Tuple shape: (base_prompt: str, generated_at: float, mode: "self"|"free")
+# Cleared on process restart — that's fine, refinement is short-window UX.
+_LAST_IMAGE_PROMPT: dict[str, tuple[str, float, str]] = {}
+_IMAGE_REFINE_TTL_SECONDS = 600  # 10 minutes
+
+# Anchor used when the prior image was a self-portrait, so refinements like
+# "more humanoid" keep brand identity (purple, glowing, friendly) instead
+# of drifting into generic stock imagery.
+_ORBY_SELF_BASE = (
+    "Orbi the friendly AI assistant, translucent glowing purple aura, "
+    "soft blue and violet accent lighting, modern minimalist digital art, "
+    "cosmic background with gentle aurora wisps, square composition, "
+    "high detail, cinematic, no text, no watermark"
+)
+_ORBY_SELF_ORB = (
+    "a friendly glowing translucent purple orb of light, "
+    "floating in a soft dark cosmic background with gentle "
+    "blue and violet wisps of aurora, smooth volumetric "
+    "lighting, ethereal, abstract, no human figures, no faces, "
+    "no text, modern minimalist digital art, square composition, "
+    "high detail, cinematic"
+)
+
 
 def _try_office_gen(message: str, username: str) -> dict | None:
     """Detect chart / deck / image generation intents and fire the
@@ -2806,6 +2849,46 @@ def _try_office_gen(message: str, username: str) -> dict | None:
                     "tier": "local", "latency_ms": 0,
                     "source": "pptx_gen", "download_url": saved.get("download_url")}
 
+        # ── Refinement-after-image shortcut ─────────────────────────────────
+        # "more humanoid" / "make it bigger" / "different style" — these
+        # don't have a drawing verb, but the user is following up on the
+        # last image. Cached prompt + refinement text → re-fire image_gen.
+        refine_now = time.time()
+        cached = _LAST_IMAGE_PROMPT.get(username)
+        is_refinement = (
+            cached
+            and (refine_now - cached[1]) < _IMAGE_REFINE_TTL_SECONDS
+            and len(msg) < 200
+            and _IMAGE_REFINE_RE.search(msg)
+            and not _IMAGE_TRIGGER_RE.match(msg)
+            and not _IMAGE_LOOSE_RE.match(msg)
+        )
+        if is_refinement:
+            base_prompt, _, mode = cached
+            refinement = msg.strip().rstrip(".?!")
+            # For self-portrait refinements, swap to a humanoid-friendly
+            # Orby base so "more humanoid" stops conflicting with the
+            # orb-prompt's "no human figures" negative tokens.
+            base = _ORBY_SELF_BASE if (mode == "self") else base_prompt
+            prompt = f"{base}, {refinement}"
+            png = image_gen.generate(CONFIG, prompt, kind="social_post")
+            ws = mod_workspace.workspace_path(CONFIG)
+            saved_path = image_gen.save_to_workspace(png, prompt, ws)
+            try:
+                token = file_fetch.mint_download_token(
+                    DATA_DIR, str(saved_path), ttl_minutes=30,
+                    extra_allowed_roots=[ws])
+                url = f"/download/{token}"
+            except Exception:
+                url = None
+            _LAST_IMAGE_PROMPT[username] = (prompt, refine_now, mode)
+            audit.log_event(DATA_DIR, actor=username, action="image.refine",
+                            meta={"refinement": refinement[:120]})
+            short = refinement if len(refinement) <= 80 else refinement[:77] + "..."
+            return {"reply": f"Here's a new version — {short}. Also saved to your Files tab.",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "image_gen", "download_url": url}
+
         image_match = _IMAGE_TRIGGER_RE.match(msg) or _IMAGE_LOOSE_RE.match(msg)
         if image_match:
             # ── Self-portrait shortcut ──────────────────────────────────────
@@ -2813,13 +2896,10 @@ def _try_office_gen(message: str, username: str) -> dict | None:
             # would look like" — the user wants Orby's self-image, not a
             # generic prompt. Use a brand-aligned orb portrait so FLUX
             # doesn't default to a stock photo of a person.
+            mode = "free"
             if _IMAGE_SELF_RE.search(msg):
-                prompt = ("a friendly glowing translucent purple orb of light, "
-                          "floating in a soft dark cosmic background with gentle "
-                          "blue and violet wisps of aurora, smooth volumetric "
-                          "lighting, ethereal, abstract, no human figures, no faces, "
-                          "no text, modern minimalist digital art, square composition, "
-                          "high detail, cinematic")
+                mode = "self"
+                prompt = _ORBY_SELF_ORB
             else:
                 # Strip conversational prefix + verb + filler to get the
                 # visual prompt. "can you draw me a picture of a robot"
@@ -2860,12 +2940,17 @@ def _try_office_gen(message: str, username: str) -> dict | None:
                 url = f"/download/{token}"
             except Exception:
                 url = None
+            # Cache for refinement follow-ups ("more humanoid", "make it bigger")
+            _LAST_IMAGE_PROMPT[username] = (prompt, time.time(), mode)
             audit.log_event(DATA_DIR, actor=username, action="image.via_chat",
                             meta={"prompt": prompt[:120]})
             # Short caption only — the inline <img> in the bubble IS the
             # preview, so a separate "[Download it](...)" markdown link
             # would render as ugly raw text. Click the image for full size.
-            short_prompt = prompt if len(prompt) <= 80 else prompt[:77] + "..."
+            # For self-portraits the prompt is a long brand template; show
+            # the original user message instead so the caption is readable.
+            caption_src = msg if mode == "self" else prompt
+            short_prompt = caption_src if len(caption_src) <= 80 else caption_src[:77] + "..."
             return {"reply": f"Here's what I drew for \"{short_prompt}\" — also saved to your Files tab.",
                     "tier": "local", "latency_ms": 0,
                     "source": "image_gen", "download_url": url}
