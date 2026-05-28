@@ -578,8 +578,13 @@ def tts():
         rate  = data.get("rate", "+0%")
     if not text:
         return jsonify({"error": "empty_text"}), 400
-    if len(text) > 1500:
-        text = text[:1500]
+    # Cap on text length sent to TTS. Was 1500 chars (~2 min speech) which
+    # cut off any long response — letters, marketing campaigns, multi-part
+    # answers all got truncated mid-sentence. 12000 covers ~15 min of
+    # continuous speech which is plenty; longer than that and the user
+    # would lose interest before the TTS finished anyway.
+    if len(text) > 12000:
+        text = text[:12000]
 
     tts_cfg = CONFIG.get("tts") or {}
     engine = tts_cfg.get("engine", "edge").lower()

@@ -959,7 +959,7 @@ def brain_chat():
         upstream = _hf_chat(
             model,
             messages,
-            max_new_tokens=int(body.get("max_tokens", 512)),
+            max_new_tokens=int(body.get("max_tokens", 2048)),
             temperature=float(body.get("temperature", 0.7)),
         )
     except Exception as e:

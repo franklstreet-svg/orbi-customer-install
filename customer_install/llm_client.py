@@ -42,7 +42,10 @@ def call_brain(config: dict, system: str, messages: list[dict]) -> LLMResponse:
         "model": "llama-3.1-8b-instruct",
         "messages": [{"role": "system", "content": system}] + messages,
         "temperature": 0.6,
-        "max_tokens": 512,
+        # 2048 covers ~1500 words — enough for marketing campaigns,
+        # multi-section letters, blog drafts. 512 was cutting long
+        # responses off mid-list.
+        "max_tokens": 2048,
         "stream": False,
     }
     headers = {
@@ -78,7 +81,7 @@ def call_huggingface(config: dict, system: str, messages: list[dict]) -> LLMResp
         "model": model,
         "messages": [{"role": "system", "content": system}] + messages,
         "temperature": 0.6,
-        "max_tokens": 512,
+        "max_tokens": 2048,
         "stream": False,
     }
     resp = _http_chat("https://router.huggingface.co/v1/chat/completions",
@@ -106,7 +109,9 @@ def call_local(config: dict, system: str, messages: list[dict]) -> LLMResponse:
         "model": "llama-3.2-3b-instruct",
         "messages": [{"role": "system", "content": system}] + messages,
         "temperature": 0.5,
-        "max_tokens": 320,
+        # Local 3B is slow — keep its cap lower (~750 words) so
+        # offline-mode fallback doesn't hang the browser for 2 min.
+        "max_tokens": 1024,
         "stream": False,
     }
     headers = {"Content-Type": "application/json"}
