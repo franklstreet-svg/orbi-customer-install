@@ -1914,20 +1914,29 @@ def _fmt_email_date(iso: str) -> str:
         return ""
     from datetime import datetime as _dt, timedelta as _td, timezone as _tz
     try:
-        dt = _dt.fromisoformat(iso)
+        # Python 3.10's fromisoformat doesn't accept trailing 'Z' (it
+        # expects '+00:00'); strip it so reminder UTC timestamps like
+        # '2026-05-29T00:00:00Z' parse instead of falling to the
+        # raw-UTC fallback.
+        s = iso.rstrip().replace("Z", "+00:00")
+        dt = _dt.fromisoformat(s)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=_tz.utc)
         local = dt.astimezone()
         now_local = _dt.now().astimezone()
         same_day = local.date() == now_local.date()
         yesterday = local.date() == (now_local - _td(days=1)).date()
+        time_str = local.strftime("%I:%M %p").lstrip("0").lower()
         if same_day:
-            return local.strftime("%I:%M %p").lstrip("0").lower()
+            return time_str
         if yesterday:
-            return "yesterday " + local.strftime("%I:%M %p").lstrip("0").lower()
+            return "yesterday " + time_str
+        tomorrow = local.date() == (now_local + _td(days=1)).date()
+        if tomorrow:
+            return "tomorrow " + time_str
         if local.year == now_local.year:
-            return local.strftime("%b %d").lower()
-        return local.strftime("%Y-%m-%d").lower()
+            return local.strftime("%a %b %d ").lower() + time_str
+        return local.strftime("%Y-%m-%d ").lower() + time_str
     except (ValueError, TypeError):
         return iso[:16].replace("T", " ")
 
