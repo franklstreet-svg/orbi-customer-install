@@ -298,6 +298,11 @@ def write_config(install_dir: Path, billing_data: dict,
     cfg.setdefault("brain", {})["api_key"] = api_key
     cfg["brain"]["url"] = BRAIN_BASE_URL.rstrip("/")
     cfg["brain"].setdefault("timeout_seconds", 30)
+    # Auto-start a cloudflared trycloudflare tunnel on boot so the
+    # brain server can forward Twilio webhooks + visitor traffic back
+    # to this machine. URL is reported via heartbeat. Zero-config —
+    # customer never touches Cloudflare.
+    cfg.setdefault("tunnel", {})["enabled"] = True
     cfg.setdefault("billing", {})["check_url"] = (
         f"{BILLING_BASE_URL.rstrip('/')}/api/active"
     )

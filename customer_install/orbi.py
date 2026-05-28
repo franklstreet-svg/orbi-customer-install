@@ -288,10 +288,10 @@ def _send_fleet_heartbeat() -> None:
     import urllib.request, urllib.error
     # Customer's current public URL — needed so the brain can forward
     # Twilio voice webhooks + visitor-chat traffic to this machine.
-    # cfg.tunnel_url is set by the installer (or by a future cloudflared
-    # auto-create step). Defaults to empty if no tunnel has been
-    # established yet — brain will skip Twilio routing in that case.
-    public_url = (CONFIG.get("tunnel_url") or
+    # Reads from the live cloudflared tunnel runner; falls back to
+    # config-pinned URLs for dev / advanced setups.
+    public_url = (current_tunnel_url() or
+                  CONFIG.get("tunnel_url") or
                   (CONFIG.get("brain") or {}).get("local_public_url") or "")
     payload = {
         "uptime_sec":   int(time.time() - START_TIME),
@@ -333,6 +333,108 @@ if "START_TIME" not in dir():
     START_TIME = time.time()
 
 threading.Thread(target=fleet_heartbeat_loop, daemon=True).start()
+
+
+# ---------------------------------------------------------------------------
+# Cloudflare tunnel — give the customer a stable-ish public URL so Twilio
+# voice webhooks (from Frank's brain server) and visitor-chat traffic can
+# reach this machine. Uses cloudflared's quick mode (trycloudflare.com)
+# which is FREE and requires zero account setup — perfect for the
+# zero-tech-customer install. URL is ephemeral (regenerated on each
+# cloudflared restart) but the heartbeat reports the current URL so the
+# brain always knows where to forward.
+# ---------------------------------------------------------------------------
+
+TUNNEL_URL_FILE = DATA_DIR / "tunnel.url"
+_CURRENT_TUNNEL_URL = [""]  # mutable so loop can update + heartbeat can read
+
+
+def _find_cloudflared() -> str | None:
+    """Look for the cloudflared binary the installer bundled, or on PATH."""
+    bin_dir = ORBI_DIR / "bin"
+    for name in ("cloudflared", "cloudflared.exe"):
+        candidate = bin_dir / name
+        if candidate.exists():
+            return str(candidate)
+    import shutil as _shutil
+    found = _shutil.which("cloudflared")
+    return found
+
+
+def tunnel_runner_loop():
+    """Spawn cloudflared in quick mode, capture the assigned URL, restart
+    on failure. Silent if cloudflared isn't installed (Twilio just won't
+    work — every other Orby feature is unaffected)."""
+    import subprocess
+    import re as _re
+    import shutil
+
+    binpath = _find_cloudflared()
+    if not binpath:
+        log.info("cloudflared not found — tunnel disabled (no public URL)")
+        return
+
+    # Restore last-known URL while we wait for cloudflared to come up,
+    # so the first heartbeat after restart isn't completely empty.
+    if TUNNEL_URL_FILE.exists():
+        try:
+            _CURRENT_TUNNEL_URL[0] = TUNNEL_URL_FILE.read_text(encoding="utf-8").strip()
+        except OSError:
+            pass
+
+    port = int(CONFIG.get("port", 5050))
+    target = f"http://localhost:{port}"
+    backoff = 5
+    url_pattern = _re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
+
+    while True:
+        try:
+            log.info(f"cloudflared starting tunnel → {target}")
+            proc = subprocess.Popen(
+                [binpath, "tunnel", "--no-autoupdate", "--url", target],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1,
+            )
+            # Parse stdout for the assigned URL
+            for line in proc.stdout:
+                m = url_pattern.search(line)
+                if m and m.group(0) != _CURRENT_TUNNEL_URL[0]:
+                    new_url = m.group(0)
+                    _CURRENT_TUNNEL_URL[0] = new_url
+                    try:
+                        TUNNEL_URL_FILE.parent.mkdir(parents=True, exist_ok=True)
+                        TUNNEL_URL_FILE.write_text(new_url, encoding="utf-8")
+                    except OSError as e:
+                        log.warning(f"could not write tunnel.url: {e}")
+                    log.info(f"cloudflared assigned URL: {new_url}")
+                    backoff = 5  # reset backoff on successful URL
+            # Pipe closed = process exited
+            rc = proc.wait()
+            log.warning(f"cloudflared exited rc={rc} — restarting in {backoff}s")
+        except Exception as e:
+            log.warning(f"tunnel_runner_loop error: {e}")
+        time.sleep(backoff)
+        backoff = min(backoff * 2, 300)  # cap at 5 min
+
+
+def current_tunnel_url() -> str:
+    """Return the current public URL of this Orby (for heartbeat etc.)."""
+    if _CURRENT_TUNNEL_URL[0]:
+        return _CURRENT_TUNNEL_URL[0]
+    if TUNNEL_URL_FILE.exists():
+        try:
+            return TUNNEL_URL_FILE.read_text(encoding="utf-8").strip()
+        except OSError:
+            return ""
+    return ""
+
+
+# Only start the tunnel if config.json opts in (default ON for installed
+# customers; lets Frank disable on his dev machine via config flag).
+if (CONFIG.get("tunnel") or {}).get("enabled", True):
+    threading.Thread(target=tunnel_runner_loop, daemon=True).start()
+else:
+    log.info("tunnel disabled in config — no public URL")
 
 
 # ---------------------------------------------------------------------------
