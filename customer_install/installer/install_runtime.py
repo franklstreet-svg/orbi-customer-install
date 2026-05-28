@@ -203,11 +203,11 @@ def verify_token(token: str) -> dict | None:
 # ---------------------------------------------------------------------------
 
 def setup_directories(install_dir: Path) -> None:
-    """Create /opt/orbi/{data,snapshots,llm_local,tunnel,bin} (or platform-equiv).
-    Idempotent — won't clobber existing data."""
+    """Create /opt/orbi/{data,snapshots,llm_local,tunnel,bin,tts_models}
+    (or platform-equiv). Idempotent — won't clobber existing data."""
     install_dir = Path(install_dir)
     install_dir.mkdir(parents=True, exist_ok=True)
-    for sub in ("data", "snapshots", "llm_local", "tunnel", "bin"):
+    for sub in ("data", "snapshots", "llm_local", "tunnel", "bin", "tts_models"):
         (install_dir / sub).mkdir(parents=True, exist_ok=True)
     # Lock down data dir on POSIX
     if not _SYS.startswith("win"):
@@ -215,10 +215,40 @@ def setup_directories(install_dir: Path) -> None:
             os.chmod(install_dir / "data", 0o700)
         except OSError as e:
             log.warning("chmod 700 on data/ failed: %s", e)
-    # Move any bundled binaries (ffmpeg, cloudflared) from the PyInstaller
-    # temp dir into install_dir/bin/ so they survive the installer exiting.
+    # Move any bundled binaries (ffmpeg, cloudflared, piper) from the
+    # PyInstaller temp dir into install_dir/bin/ so they survive the
+    # installer exiting.
     extract_bundled_binaries(install_dir / "bin")
+    # Voice models for Piper TTS go in a separate dir.
+    extract_bundled_voice_models(install_dir / "tts_models")
     log.info("install dirs ready under %s", install_dir)
+
+
+def extract_bundled_voice_models(models_dir: Path) -> list[Path]:
+    """Copy Piper voice models (.onnx + .onnx.json) from the PyInstaller
+    bundle's tts_models/ into the persistent install_dir/tts_models/."""
+    models_dir.mkdir(parents=True, exist_ok=True)
+    out: list[Path] = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if not meipass:
+        return out
+    src = Path(meipass) / "tts_models"
+    if not src.exists() or not src.is_dir():
+        log.info("no tts_models/ in bundle — Piper TTS will fall back to edge_tts")
+        return out
+    import shutil
+    for f in src.iterdir():
+        if not f.is_file():
+            continue
+        dst = models_dir / f.name
+        try:
+            shutil.copy2(f, dst)
+            out.append(dst)
+            log.info("installed voice model: %s (%.1f MB)",
+                     dst.name, dst.stat().st_size / 1e6)
+        except OSError as e:
+            log.warning("could not install voice model %s: %s", f.name, e)
+    return out
 
 
 def extract_bundled_binaries(bin_dir: Path) -> list[Path]:
@@ -303,6 +333,12 @@ def write_config(install_dir: Path, billing_data: dict,
     # to this machine. URL is reported via heartbeat. Zero-config —
     # customer never touches Cloudflare.
     cfg.setdefault("tunnel", {})["enabled"] = True
+    # TTS: prefer Piper (self-hosted, MIT, commercially clean). orbi.py
+    # automatically falls back to edge_tts if the bundled Piper binary
+    # or voice model isn't present, so customer installs survive a
+    # voice-model download failure during the build.
+    cfg.setdefault("tts", {})["engine"] = "piper"
+    cfg["tts"].setdefault("voice_model", "en_US-amy-medium")
     cfg.setdefault("billing", {})["check_url"] = (
         f"{BILLING_BASE_URL.rstrip('/')}/api/active"
     )

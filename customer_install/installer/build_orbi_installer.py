@@ -100,10 +100,12 @@ def _clean() -> None:
 
 
 def _pyinstaller_cmd(out_subdir: Path, name: str = "orbi-installer",
-                     bundled_bins: list[Path] | None = None) -> list:
+                     bundled_bins: list[Path] | None = None,
+                     voice_models: list[Path] | None = None) -> list:
     """Common PyInstaller args used for all three targets.
-    `bundled_bins` is a list of already-downloaded binaries (ffmpeg,
-    cloudflared) to ship inside the installer for the target platform."""
+    `bundled_bins` = ffmpeg / cloudflared / piper binaries → install_dir/bin/
+    `voice_models` = Piper .onnx / .onnx.json files → install_dir/tts_models/
+    """
     cmd = [
         sys.executable, "-m", "PyInstaller",
         "--onefile",
@@ -125,11 +127,17 @@ def _pyinstaller_cmd(out_subdir: Path, name: str = "orbi-installer",
             f"{CUSTOMER_INSTALL / 'users.py'}{sep}."]
     cmd += ["--add-data",
             f"{CUSTOMER_INSTALL / 'auth.py'}{sep}."]
-    # Ship the helper binaries (ffmpeg + cloudflared) so the customer gets
-    # a self-contained install with no internet needed at install time.
+    # Ship the helper binaries (ffmpeg + cloudflared + piper) so the
+    # customer gets a self-contained install with no internet needed at
+    # install time.
     for binpath in bundled_bins or []:
         if binpath and binpath.exists():
             cmd += ["--add-binary", f"{binpath}{sep}bin"]
+    # Ship the Piper voice model files into a separate tts_models/ dir
+    # so install_runtime can extract them to install_dir/tts_models/.
+    for model in voice_models or []:
+        if model and model.exists():
+            cmd += ["--add-data", f"{model}{sep}tts_models"]
     cmd.append(str(RUNTIME_ENTRY))
     return cmd
 
@@ -147,15 +155,30 @@ _BINARY_SOURCES = {
     "linux": {
         "ffmpeg":      "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz",
         "cloudflared": "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64",
+        "piper":       "https://github.com/rhasspy/piper/releases/latest/download/piper_linux_x86_64.tar.gz",
     },
     "darwin": {
         "ffmpeg":      "https://evermeet.cx/ffmpeg/getrelease/zip",
         "cloudflared": "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-amd64.tgz",
+        "piper":       "https://github.com/rhasspy/piper/releases/latest/download/piper_macos_x64.tar.gz",
     },
     "windows": {
         "ffmpeg":      "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip",
         "cloudflared": "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe",
+        "piper":       "https://github.com/rhasspy/piper/releases/latest/download/piper_windows_amd64.zip",
     },
+}
+
+# Piper voice models — small dictionary of ONNX + JSON files to bundle.
+# Adding more voices = bigger installer; default is one good US-English
+# voice that sounds close to Twilio's Polly.Joanna (the phone receptionist
+# voice) so phone + dashboard feel consistent. Customer can drop more
+# .onnx files into install_dir/tts_models/ to add voices later.
+PIPER_VOICE_MODELS = {
+    "en_US-amy-medium.onnx":
+        "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/amy/medium/en_US-amy-medium.onnx",
+    "en_US-amy-medium.onnx.json":
+        "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/amy/medium/en_US-amy-medium.onnx.json",
 }
 
 
@@ -222,8 +245,9 @@ def _extract_binary(archive: Path, target_name: str, out_dir: Path) -> Path | No
 
 
 def fetch_platform_binaries(target: str) -> list[Path]:
-    """Download ffmpeg + cloudflared for `target` (linux/darwin/windows)
-    and return the list of paths PyInstaller should --add-binary in."""
+    """Download ffmpeg + cloudflared + piper for `target` (linux/darwin/
+    windows) and return the list of paths PyInstaller should --add-binary
+    in."""
     if target not in _BINARY_SOURCES:
         log.warning("no binary sources defined for %s — skipping bundling", target)
         return []
@@ -251,6 +275,28 @@ def fetch_platform_binaries(target: str) -> list[Path]:
     return out
 
 
+def fetch_piper_voice_models() -> list[Path]:
+    """Download Piper voice model files (ONNX + matching JSON metadata).
+    Same files for every platform — Piper is portable. Returns a list of
+    paths PyInstaller should --add-data in (target dir = tts_models/)."""
+    out_dir = BIN_CACHE / "voice_models"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out: list[Path] = []
+    for fname, url in PIPER_VOICE_MODELS.items():
+        try:
+            dst = out_dir / fname
+            _download(url, dst)
+            if dst.exists() and dst.stat().st_size > 1024:
+                out.append(dst)
+                log.info("✓ bundling voice model: %s (%.1f MB)",
+                         fname, dst.stat().st_size / 1e6)
+        except Exception as e:
+            log.warning("failed to fetch voice model %s: %s — TTS will fall "
+                        "back to edge_tts (still works, less commercially clean)",
+                        fname, e)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Per-platform build steps
 # ---------------------------------------------------------------------------
@@ -261,7 +307,9 @@ def build_windows() -> Path:
     out.mkdir(parents=True, exist_ok=True)
     _ensure_pyinstaller()
     bins = fetch_platform_binaries("windows")
-    cmd = _pyinstaller_cmd(out, name="orbi-installer", bundled_bins=bins)
+    models = fetch_piper_voice_models()
+    cmd = _pyinstaller_cmd(out, name="orbi-installer", bundled_bins=bins,
+                           voice_models=models)
     _run(cmd)
     exe = out / "orbi-installer.exe"
     if not exe.exists():
@@ -285,7 +333,9 @@ def build_mac() -> Path:
     _ensure_pyinstaller()
     # Stage 1: PyInstaller binary
     bins = fetch_platform_binaries("darwin")
-    _run(_pyinstaller_cmd(out, name="orbi-installer", bundled_bins=bins))
+    models = fetch_piper_voice_models()
+    _run(_pyinstaller_cmd(out, name="orbi-installer", bundled_bins=bins,
+                          voice_models=models))
     binary = out / "orbi-installer"
     if not binary.exists():
         raise RuntimeError("PyInstaller did not produce orbi-installer")
@@ -341,7 +391,9 @@ def build_linux() -> Path:
     out.mkdir(parents=True, exist_ok=True)
     _ensure_pyinstaller()
     bins = fetch_platform_binaries("linux")
-    _run(_pyinstaller_cmd(out, name="orbi-installer", bundled_bins=bins))
+    models = fetch_piper_voice_models()
+    _run(_pyinstaller_cmd(out, name="orbi-installer", bundled_bins=bins,
+                          voice_models=models))
     binary = out / "orbi-installer"
     if not binary.exists():
         raise RuntimeError("PyInstaller did not produce orbi-installer")
