@@ -3537,24 +3537,39 @@
     o.start(t); o.stop(t + 0.45);
   }
 
+  // Anchor "newness" to when this tab loaded. Items with ts <= this are
+  // pre-existing and won't toast in this session, but stay UNSEEN in the
+  // DB so we don't lose them. Items with ts > this DO toast — including
+  // ones that fire while the dashboard is open. CRITICAL: never call
+  // mark_all_seen on mount — that races with brand-new fires and silently
+  // eats them, which is what burned us in the 5:34/5:38 PM reminders.
+  const _sessionStartTs = Date.now() / 1000;
+
   async function _pollInbox() {
     try {
       const resp = await fetch('/api/owner/notifications/inbox?unseen=1');
       if (!resp.ok) return;
       const body = await resp.json();
       const items = body.items || [];
+      // Process oldest-first within this poll so toasts stack naturally
+      items.sort(function (a, b) { return (a.ts || 0) - (b.ts || 0); });
       for (const n of items) {
         if (_shownToasts.has(n.id)) continue;
         _shownToasts.add(n.id);
+        if ((n.ts || 0) <= _sessionStartTs) {
+          // Pre-existing at mount — skip the toast but remember we
+          // saw it so a later poll doesn't double-process it.
+          continue;
+        }
         _showToast(n);
       }
     } catch (e) { /* offline / paused — try again next tick */ }
   }
 
   function wireInboxPolling() {
-    // On initial mount, mark everything pre-existing as seen so we don't
-    // toast old reminders that fired before the user opened the dashboard.
-    fetch('/api/owner/notifications/all_seen', {method: 'POST'}).catch(function () {});
+    // Run the first poll immediately so a reminder that fired in the
+    // last 15s isn't missed.
+    _pollInbox();
     setInterval(_pollInbox, 15000);
   }
   document.addEventListener('DOMContentLoaded', wireInboxPolling);
