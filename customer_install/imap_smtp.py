@@ -331,18 +331,30 @@ def _pull_one(account: dict, limit: int, query: str) -> list[dict]:
         m.login(account["email"], account["password"])
         try:
             m.select("INBOX", readonly=True)
-            criteria = "ALL"
-            if query:
-                # Lightweight: search subject for the query. Full IMAP query
-                # syntax is more powerful but most users want subject search.
-                criteria = f'(SUBJECT "{query}")'
-            typ, data = m.search(None, criteria)
-            if typ != "OK" or not data or not data[0]:
-                return []
-            uids = data[0].split()
-            uids = uids[-limit:]  # newest at the end
-            for uid in reversed(uids):  # newest first
-                typ, msg_data = m.fetch(uid, "(RFC822 FLAGS)")
+
+            # Prefer the IMAP SORT extension — gives newest-first explicitly
+            # using the message Date header. Some servers (including Yahoo)
+            # support SORT; if it fails, fall back to plain SEARCH which
+            # returns sequence numbers in arrival order.
+            ids = []
+            criteria = f'(SUBJECT "{query}")' if query else "ALL"
+            try:
+                typ, data = m.uid("sort", "(REVERSE DATE)", "UTF-8", criteria)
+                if typ == "OK" and data and data[0]:
+                    ids = data[0].split()[:limit]
+                    # Sorted newest-first already; keep as-is.
+            except imaplib.IMAP4.error:
+                ids = []
+
+            if not ids:
+                typ, data = m.uid("search", None, criteria)
+                if typ != "OK" or not data or not data[0]:
+                    return []
+                ids = data[0].split()
+                ids = list(reversed(ids))[:limit]  # newest UIDs typically last
+
+            for uid in ids:
+                typ, msg_data = m.uid("fetch", uid, "(RFC822 FLAGS)")
                 if typ != "OK" or not msg_data:
                     continue
                 raw = next((x[1] for x in msg_data if isinstance(x, tuple)), None)

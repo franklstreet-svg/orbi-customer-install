@@ -1685,6 +1685,31 @@ _PA_INBOX_RE = _re.compile(
 )
 
 
+def _fmt_email_date(iso: str) -> str:
+    """Turn the email's Date header into a friendly local-time string the
+    owner can compare against what they see in their inbox UI."""
+    if not iso:
+        return ""
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    try:
+        dt = _dt.fromisoformat(iso)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=_tz.utc)
+        local = dt.astimezone()
+        now_local = _dt.now().astimezone()
+        same_day = local.date() == now_local.date()
+        yesterday = local.date() == (now_local - _td(days=1)).date()
+        if same_day:
+            return local.strftime("%I:%M %p").lstrip("0").lower()
+        if yesterday:
+            return "yesterday " + local.strftime("%I:%M %p").lstrip("0").lower()
+        if local.year == now_local.year:
+            return local.strftime("%b %d").lower()
+        return local.strftime("%Y-%m-%d").lower()
+    except (ValueError, TypeError):
+        return iso[:16].replace("T", " ")
+
+
 def _try_inbox_check(message: str, user_dir: Path) -> str | None:
     """Detect 'check my email / what's in my inbox' and pull a live summary
     directly from email_inbox.fetch_inbox. Without this fast-path the
@@ -1693,7 +1718,8 @@ def _try_inbox_check(message: str, user_dir: Path) -> str | None:
     if not message or not _PA_INBOX_RE.search(message):
         return None
     try:
-        result = email_inbox.fetch_inbox(CONFIG, user_dir, source="all", limit=20)
+        result = email_inbox.fetch_inbox(CONFIG, user_dir, source="all",
+                                         limit=50, force_refresh=True)
     except Exception as e:
         log.warning(f"inbox fetch_inbox failed: {e}")
         return f"I tried to check your inbox but hit an error: {e}"
@@ -1720,15 +1746,21 @@ def _try_inbox_check(message: str, user_dir: Path) -> str | None:
         lines.append("")
         lines.append(f"⚡ {len(important)} flagged as important:")
         for m in important[:5]:
-            lines.append(f"  - {m.get('from','?')}: {m.get('subject','(no subject)')[:60]}")
+            date_str = _fmt_email_date(m.get("date", ""))
+            lines.append(f"  - [{date_str}] {m.get('from','?')[:35]}: "
+                         f"{m.get('subject','(no subject)')[:55]}")
 
     lines.append("")
-    lines.append("Most recent:")
-    for m in messages[:8]:
+    lines.append(f"Top {min(len(messages), 15)} newest:")
+    for m in messages[:15]:
         unread_mark = "● " if m.get("unread") else "  "
-        sender  = (m.get("from") or "?")[:30]
-        subject = (m.get("subject") or "(no subject)")[:55]
-        lines.append(f"  {unread_mark}{sender} — {subject}")
+        date_str = _fmt_email_date(m.get("date", ""))
+        sender  = (m.get("from") or "?")[:28]
+        subject = (m.get("subject") or "(no subject)")[:50]
+        lines.append(f"  {unread_mark}[{date_str:>14}]  {sender:<28} — {subject}")
+
+    lines.append("")
+    lines.append(f"Say 'show me email number 3' or 'reply to Joe' for details.")
 
     if errors:
         lines.append("")
