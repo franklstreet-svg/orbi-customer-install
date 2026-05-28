@@ -3480,6 +3480,11 @@
   function _showToast(n) {
     const stack = document.getElementById('toast-stack');
     if (!stack) return;
+    // Reminders get the LOUD path — persistent, spoken, repeats until ack.
+    if (n.event === 'reminder_due') {
+      _showReminderBanner(n);
+      return;
+    }
     const el = document.createElement('div');
     el.className = 'toast ' + _toastClass(n.event);
     el.setAttribute('role', 'alert');
@@ -3493,9 +3498,6 @@
     el.querySelector('.toast-title').textContent = n.title || 'Notification';
     el.querySelector('.toast-text').textContent  = n.body  || '';
     stack.appendChild(el);
-    if (n.event === 'reminder_due') {
-      try { _playChime(); } catch (e) {}
-    }
     const dismiss = function () {
       if (!el.parentNode) return;
       el.classList.add('dismissing');
@@ -3516,6 +3518,102 @@
       dismiss();
     });
     setTimeout(dismiss, 12000);
+  }
+
+  // ────────────────────────────────────────────────────────────────────
+  // Reminder banner — the LOUD path: persistent, spoken via TTS,
+  // re-fires every 3 minutes until the user clicks "Got it". Maxes out
+  // after 3 nag-cycles so we don't infinite-loop on a forgotten reminder.
+  // ────────────────────────────────────────────────────────────────────
+  const _REMINDER_NAG_INTERVAL_MS = 3 * 60 * 1000;  // 3 min between nags
+  const _REMINDER_MAX_NAGS = 3;                      // 3 nag cycles total
+
+  function _speakReminder(text) {
+    try {
+      const a = new Audio('/tts?text=' + encodeURIComponent(text));
+      a.volume = 1.0;
+      // Browsers can block auto-play until the user has interacted with
+      // the page. A user who's been clicking around the dashboard will
+      // satisfy that; a fresh-load no-interact case will silently fail
+      // and the chime + visual banner are still there as the safety net.
+      const p = a.play();
+      if (p && typeof p.catch === 'function') p.catch(function () {});
+    } catch (e) { /* ignore */ }
+  }
+
+  function _showReminderBanner(n) {
+    const stack = document.getElementById('toast-stack');
+    if (!stack) return;
+    const el = document.createElement('div');
+    el.className = 'toast reminder reminder-banner';
+    el.setAttribute('role', 'alertdialog');
+    el.innerHTML =
+      '<div class="toast-icon">⏰</div>' +
+      '<div class="toast-body">' +
+        '<div class="toast-title"></div>' +
+        '<div class="toast-text"></div>' +
+        '<div class="reminder-actions">' +
+          '<button class="primary-btn reminder-ack-btn">Got it</button>' +
+          '<button class="secondary-btn reminder-snooze-btn">Remind me in 5 min</button>' +
+        '</div>' +
+      '</div>';
+    el.querySelector('.toast-title').textContent = n.title || 'Reminder';
+    el.querySelector('.toast-text').textContent  = n.body  || '';
+    stack.appendChild(el);
+
+    let nagCount = 0;
+    let nagTimer = null;
+    let dismissed = false;
+    const spokenText = 'Hey Frank, this is your reminder. ' + (n.body || '');
+
+    function fireRound() {
+      if (dismissed) return;
+      try { _playChime(); } catch (e) {}
+      _speakReminder(spokenText);
+      nagCount += 1;
+      if (nagCount >= _REMINDER_MAX_NAGS) {
+        // Last nag — turn off auto-re-fire but keep banner on screen.
+        return;
+      }
+      nagTimer = setTimeout(fireRound, _REMINDER_NAG_INTERVAL_MS);
+    }
+    fireRound();
+
+    function gotIt() {
+      if (dismissed) return;
+      dismissed = true;
+      if (nagTimer) clearTimeout(nagTimer);
+      el.classList.add('dismissing');
+      setTimeout(function () { el.remove(); }, 220);
+      fetch('/api/owner/notifications/' + n.id + '/ack', {method: 'POST'})
+        .catch(function () {});
+    }
+    function snooze5() {
+      if (dismissed) return;
+      dismissed = true;
+      if (nagTimer) clearTimeout(nagTimer);
+      el.classList.add('dismissing');
+      setTimeout(function () { el.remove(); }, 220);
+      // Mark seen so the poll doesn't refire it; the 5-min snooze is
+      // purely a client-side re-toast after the wait.
+      fetch('/api/owner/notifications/' + n.id + '/seen', {method: 'POST'})
+        .catch(function () {});
+      setTimeout(function () {
+        // re-toast with a fresh banner (server-side already marked seen,
+        // but client can synthesize a new banner with the same body)
+        _shownToasts.delete(n.id);  // allow the same id to nag again
+        _showReminderBanner(Object.assign({}, n, {title: '⏰ Snoozed reminder'}));
+      }, 5 * 60 * 1000);
+    }
+
+    el.querySelector('.reminder-ack-btn').addEventListener('click', function (e) {
+      e.stopPropagation();
+      gotIt();
+    });
+    el.querySelector('.reminder-snooze-btn').addEventListener('click', function (e) {
+      e.stopPropagation();
+      snooze5();
+    });
   }
 
   let _chimeCtx = null;

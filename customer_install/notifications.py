@@ -358,6 +358,33 @@ def mark_inbox_seen(data_dir: Path, notification_id: str) -> bool:
         return hit
 
 
+def mark_inbox_acknowledged(data_dir: Path, notification_id: str) -> bool:
+    """Mark a notification as acknowledged — distinct from 'seen'. Used
+    by reminder events that need an explicit 'got it' from the user, so
+    the dashboard can stop re-firing the chime + TTS prompt."""
+    path = data_dir / INBOX_FILE
+    if not path.exists():
+        return False
+    with _INBOX_LOCK:
+        try:
+            inbox = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return False
+        hit = False
+        for n in inbox:
+            if n.get("id") == notification_id and not n.get("acknowledged"):
+                n["acknowledged"] = True
+                n["seen"] = True
+                n["acknowledged_at"] = time.time()
+                hit = True
+        if hit:
+            tmp = path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(inbox, indent=2, ensure_ascii=False),
+                           encoding="utf-8")
+            tmp.replace(path)
+        return hit
+
+
 def mark_inbox_all_seen(data_dir: Path) -> int:
     path = data_dir / INBOX_FILE
     if not path.exists():

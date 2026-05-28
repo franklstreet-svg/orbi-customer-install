@@ -401,6 +401,14 @@ def owner_notifications_mark_all_seen():
     return jsonify({"ok": True, "marked": n})
 
 
+@app.route("/api/owner/notifications/<nid>/ack", methods=["POST"])
+def owner_notifications_ack(nid: str):
+    """Mark a reminder acknowledged — stops the re-fire / re-speak loop."""
+    auth.require_user(ORBI_DIR, DATA_DIR)
+    ok = notify.mark_inbox_acknowledged(DATA_DIR, nid)
+    return jsonify({"ok": ok})
+
+
 @app.route("/api/help/capabilities")
 def help_capabilities():
     """Serve the Orbi capabilities markdown. The dashboard renders it

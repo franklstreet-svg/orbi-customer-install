@@ -1942,3 +1942,56 @@ dialog .form-actions {
 @keyframes toast-out {
   to { transform: translateX(20px); opacity: 0; }
 }
+
+/* The LOUD reminder banner — persistent until acknowledged.
+   Bigger, taller, can't be missed; has Got It + Snooze buttons. */
+.reminder-banner {
+  background: linear-gradient(135deg, #2a1f0e, #3a2e16);
+  border-left-width: 6px;
+  border-left-color: #ffb84f;
+  box-shadow: 0 8px 32px rgba(255, 184, 79, 0.18),
+              0 4px 16px rgba(0, 0, 0, 0.5);
+  padding: 18px 18px;
+  max-width: 380px;
+  cursor: default;
+  animation: toast-in 0.22s ease-out, banner-pulse 1.6s ease-in-out infinite;
+}
+.reminder-banner .toast-icon { font-size: 24px; }
+.reminder-banner .toast-title {
+  font-size: 15px;
+  margin-bottom: 4px;
+}
+.reminder-banner .toast-text {
+  font-size: 16px;
+  font-weight: 500;
+  color: #fff;
+  margin-bottom: 12px;
+}
+.reminder-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.reminder-actions .primary-btn,
+.reminder-actions .secondary-btn {
+  font-size: 13px;
+  padding: 8px 14px;
+}
+.reminder-actions .primary-btn {
+  background: #ffb84f;
+  color: #1a1306;
+}
+.reminder-actions .primary-btn:hover { background: #ffcd7a; }
+.reminder-actions .secondary-btn {
+  background: transparent;
+  border: 1px solid #5a4520;
+  color: #ffd89a;
+}
+.reminder-actions .secondary-btn:hover { background: #2a2210; }
+
+@keyframes banner-pulse {
+  0%, 100% { box-shadow: 0 8px 32px rgba(255, 184, 79, 0.18),
+                          0 4px 16px rgba(0, 0, 0, 0.5); }
+  50%      { box-shadow: 0 8px 32px rgba(255, 184, 79, 0.38),
+                          0 4px 16px rgba(0, 0, 0, 0.5); }
+}
