@@ -2795,6 +2795,54 @@ _IMAGE_REFINE_RE = _re.compile(
 _LAST_IMAGE_PROMPT: dict[str, tuple[str, float, str]] = {}
 _IMAGE_REFINE_TTL_SECONDS = 600  # 10 minutes
 
+# Platform/format detection — pick the right canvas size from natural
+# language. Order matters: more specific patterns first (instagram_story
+# before instagram_square, facebook_cover before facebook_post).
+_IMAGE_KIND_RULES = [
+    # (regex, kind)
+    (r"\binstagram\s+stor(?:y|ies)\b|\big\s+stor(?:y|ies)\b",          "instagram_story"),
+    (r"\binstagram\s+portrait\b|\bportrait\s+(?:for\s+)?(?:ig|insta(?:gram)?)\b", "instagram_portrait"),
+    (r"\binstagram\s+(?:post|square)\b|\big\s+post\b|\binsta(?:gram)?\b", "instagram_square"),
+    (r"\bfacebook\s+cover\b|\bfb\s+cover\b",                            "facebook_cover"),
+    (r"\bfacebook\s+post\b|\bfb\s+post\b|\bfacebook\b",                 "facebook_post"),
+    (r"\btwitter\s+post\b|\bx\s+post\b|\btweet\b|\btwitter\b|\bx\.com\b","twitter_post"),
+    (r"\blinkedin\s+(?:post)?\b",                                        "linkedin_post"),
+    (r"\btiktok\b|\btik[-\s]?tok\b",                                     "tiktok_post"),
+    (r"\byoutube\s+thumbnail\b|\byt\s+thumb(?:nail)?\b|\byoutube\b",     "youtube_thumbnail"),
+    (r"\bpinterest\s+pin\b|\bpin(?:terest)?\b",                          "pinterest_pin"),
+    (r"\bbusiness\s+card\b",                                             "business_card"),
+    (r"\bflyer\b|\bhandout\b",                                           "flyer_portrait"),
+    (r"\bposter\b",                                                      "poster_portrait"),
+    (r"\bstory\b",                                                       "instagram_story"),
+    (r"\b(?:wide|landscape|horizontal|widescreen|16[:x]9)\b",            "wide"),
+    (r"\b(?:tall|portrait|vertical|9[:x]16)\b",                          "tall"),
+    (r"\b(?:square|1[:x]1)\b",                                           "square"),
+    (r"\bbanner\b",                                                      "banner"),
+]
+_IMAGE_KIND_RES = [(_re.compile(p, _re.IGNORECASE), k) for p, k in _IMAGE_KIND_RULES]
+
+def _detect_image_kind(msg: str) -> str:
+    for rx, kind in _IMAGE_KIND_RES:
+        if rx.search(msg):
+            return kind
+    return "instagram_square"  # default — most-used marketing format
+
+# Caption extraction — "with the text 'X'", "with caption 'X'", "saying 'X'",
+# "that says 'X'". Extracts X (inside quotes if present, else up to end).
+_CAPTION_RES = [
+    _re.compile(r"""(?:with\s+(?:the\s+)?(?:text|caption|words|title|headline)|saying|that\s+says|reads?)\s*[:]?\s*['"“‘]([^'"”’]+)['"”’]""", _re.IGNORECASE),
+    _re.compile(r"""(?:with\s+(?:the\s+)?(?:text|caption|words|title|headline)|saying|that\s+says|reads?)\s*[:]?\s+(.{2,80}?)(?:\s*$|[\.!?])""", _re.IGNORECASE),
+]
+def _extract_caption(msg: str) -> str:
+    for rx in _CAPTION_RES:
+        m = rx.search(msg)
+        if m:
+            cap = m.group(1).strip().strip('"“”‘’')
+            # Don't accept obvious garbage like a single word "X" or 1 char
+            if len(cap) >= 2 and len(cap) <= 120:
+                return cap
+    return ""
+
 # Anchor used when the prior image was a self-portrait, so refinements like
 # "more humanoid" keep brand identity (purple, glowing, friendly) instead
 # of drifting into generic stock imagery.
@@ -2892,7 +2940,11 @@ def _try_office_gen(message: str, username: str) -> dict | None:
             # orb-prompt's "no human figures" negative tokens.
             base = _ORBY_SELF_BASE if (mode == "self") else base_prompt
             prompt = f"{base}, {refinement}"
-            png = image_gen.generate(CONFIG, prompt, kind="social_post")
+            kind = _detect_image_kind(msg) if _detect_image_kind(msg) != "instagram_square" else _detect_image_kind(base_prompt)
+            png = image_gen.generate(CONFIG, prompt, kind=kind)
+            caption = _extract_caption(msg)
+            if caption:
+                png = image_gen.overlay_caption(png, caption)
             ws = mod_workspace.workspace_path(CONFIG)
             saved_path = image_gen.save_to_workspace(png, prompt, ws)
             try:
@@ -2951,7 +3003,16 @@ def _try_office_gen(message: str, username: str) -> dict | None:
                 # Fall back to original if stripping nuked everything
                 if not prompt:
                     prompt = msg
-            png = image_gen.generate(CONFIG, prompt, kind="social_post")
+            # Detect platform/format ("for instagram story", "twitter post",
+            # "wide", "tall", "flyer", "youtube thumbnail") and pick the
+            # right canvas size. Falls back to instagram_square if no hint.
+            kind = _detect_image_kind(msg)
+            png = image_gen.generate(CONFIG, prompt, kind=kind)
+            # If the owner asked for caption text ("with text X" / "saying X"),
+            # PIL-overlay it on top — FLUX can't render readable text itself.
+            caption = _extract_caption(msg)
+            if caption:
+                png = image_gen.overlay_caption(png, caption)
             ws = mod_workspace.workspace_path(CONFIG)
             saved_path = image_gen.save_to_workspace(png, prompt, ws)
             try:

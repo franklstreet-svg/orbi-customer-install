@@ -46,11 +46,31 @@ log = logging.getLogger("orbi.image_gen")
 # ---------------------------------------------------------------------------
 
 SIZES = {
-    "social_post": (1080, 1080),     # Instagram / Facebook square
-    "flyer":       (612,  792),      # 8.5x11 portrait @ 72dpi
-    "banner":      (1500, 500),      # Twitter / X / website banner
+    # Platform-specific (use these when the owner names the platform)
+    "instagram_square":    (1080, 1080),
+    "instagram_story":     (1080, 1920),
+    "instagram_portrait":  (1080, 1350),
+    "facebook_post":       (1200, 1200),
+    "facebook_cover":      (1640,  856),
+    "twitter_post":        (1600,  900),
+    "linkedin_post":       (1200, 1200),
+    "tiktok_post":         (1080, 1920),
+    "youtube_thumbnail":   (1280,  720),
+    "pinterest_pin":       (1000, 1500),
+    # Print / general
+    "flyer_portrait":      (1224, 1584),    # 8.5x11 @ 144dpi
+    "poster_portrait":     (1080, 1620),
+    "business_card":       (1050,  600),    # 3.5x2 @ 300dpi (resampled down)
+    # Generic shape aliases
+    "square":              (1080, 1080),
+    "wide":                (1600,  900),
+    "tall":                (1080, 1920),
+    "banner":              (1500,  500),
+    # Legacy aliases kept for backward compat
+    "social_post":         (1080, 1080),
+    "flyer":               (1224, 1584),
 }
-DEFAULT_KIND = "social_post"
+DEFAULT_KIND = "instagram_square"
 
 # Default accent — Orbi violet. Owners can override per-call.
 ACCENT_DEFAULT = (139, 92, 246)
@@ -136,6 +156,71 @@ def generate(config: dict, prompt: str, kind: str = DEFAULT_KIND) -> bytes:
     except Exception as exc:
         log.exception("template fallback crashed — image_gen is broken")
         raise RuntimeError(f"image_gen totally failed: {exc}") from exc
+
+
+def overlay_caption(png_bytes: bytes, caption: str,
+                    position: str = "bottom",
+                    accent: tuple[int, int, int] = ACCENT_DEFAULT) -> bytes:
+    """
+    Lay clean readable caption text on top of an existing image.
+
+    FLUX (and most image models) generate garbled text when asked to
+    render words inside the image. So instead we have FLUX produce a
+    clean background, then PIL stamps the caption on top using a real
+    system font. Result: marketing-grade composites with sharp, correct
+    text.
+
+    `position` ∈ {"bottom", "top", "center"} — where the caption band
+    sits on the image.
+    """
+    from PIL import Image, ImageDraw, ImageFont
+
+    if not caption:
+        return png_bytes
+    img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
+    W, H = img.size
+    draw = ImageDraw.Draw(img, "RGBA")
+
+    # Sizing scales with width so it looks right on square OR portrait OR wide
+    font_size = max(28, int(W * 0.055))
+    font = _load_font(font_size, bold=True)
+    max_text_width = int(W * 0.86)
+    lines = _wrap(draw, caption, font, max_text_width)
+    line_h = _line_height(draw, "Ag", font)
+    block_h = line_h * len(lines)
+    pad_v = max(20, int(font_size * 0.6))
+    pad_h = max(24, int(W * 0.05))
+    band_h = block_h + pad_v * 2
+
+    # Y position of the caption block
+    if position == "top":
+        band_y0 = 0
+    elif position == "center":
+        band_y0 = (H - band_h) // 2
+    else:  # bottom
+        band_y0 = H - band_h
+
+    # Semi-transparent dark band for legibility over busy backgrounds
+    draw.rectangle((0, band_y0, W, band_y0 + band_h), fill=(0, 0, 0, 160))
+    # Accent stripe at the band edge for brand cue
+    stripe_h = max(4, int(font_size * 0.12))
+    if position == "top":
+        draw.rectangle((0, band_y0 + band_h - stripe_h, W, band_y0 + band_h), fill=accent)
+    else:
+        draw.rectangle((0, band_y0, W, band_y0 + stripe_h), fill=accent)
+
+    # Draw each line, centered, with a tight shadow for crispness
+    y = band_y0 + pad_v
+    for ln in lines:
+        w = _text_width(draw, ln, font)
+        x = (W - w) // 2
+        draw.text((x + 2, y + 2), ln, fill=(0, 0, 0, 200), font=font)
+        draw.text((x, y), ln, fill=(255, 255, 255), font=font)
+        y += line_h
+
+    out = io.BytesIO()
+    img.save(out, format="PNG", optimize=True)
+    return out.getvalue()
 
 
 def save_to_workspace(image_bytes: bytes, prompt: str,
