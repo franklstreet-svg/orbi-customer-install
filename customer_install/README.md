@@ -1,4 +1,4 @@
-# Orbi Customer Install
+# Orby Customer Install
 
 This is what gets installed on each business's box. Lean, ~10MB, four modules, three-tier LLM failover.
 

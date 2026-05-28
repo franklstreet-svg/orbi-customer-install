@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Orbi — customer-side service.
+Orby — customer-side service.
 
 Runs on the customer's box. Exposes:
 
@@ -107,7 +107,7 @@ def _default_orbi_dir() -> Path:
     """Platform-appropriate default if ORBI_DIR isn't set."""
     import platform as _p
     if _p.system() == "Windows":
-        return Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Orbi"
+        return Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Orby"
     if _p.system() == "Darwin":
         return Path.home() / ".orbi"
     return Path("/opt/orbi")
@@ -269,7 +269,7 @@ def index():
     chat_shell = STATIC_DIR / "chat.html"
     if chat_shell.exists():
         return send_from_directory(STATIC_DIR, "chat.html")
-    return (f"Orbi is running but no chat shell is installed. "
+    return (f"Orby is running but no chat shell is installed. "
             f"Place chat.html in {STATIC_DIR}.", 503)
 
 @app.route("/pwa/<path:filename>")
@@ -411,7 +411,7 @@ def owner_notifications_ack(nid: str):
 
 @app.route("/api/help/capabilities")
 def help_capabilities():
-    """Serve the Orbi capabilities markdown. The dashboard renders it
+    """Serve the Orby capabilities markdown. The dashboard renders it
     client-side; the chat teach-intent reads it too so a single source
     feeds both surfaces.
 
@@ -451,7 +451,7 @@ def catalog_search():
 @app.route("/api/owner/catalog/status")
 def owner_catalog_status():
     """Owner-only — how many items are indexed, when was the last import,
-    which columns did Orbi map. Powers the 'Catalog' widget in the
+    which columns did Orby map. Powers the 'Catalog' widget in the
     owner dashboard."""
     auth.require_owner(ORBI_DIR)
     return jsonify(mod_catalog.status(DATA_DIR))
@@ -653,7 +653,7 @@ def public_chat():
     # WELLBEING — scan EVERY public-chat message for crisis / distress signals
     # BEFORE we route to learned answers, catalog, or the LLM. If a signal
     # fires, log it for the owner's dashboard AND inject the appropriate
-    # system-prompt context so Orbi handles the moment with care instead
+    # system-prompt context so Orby handles the moment with care instead
     # of barreling into the buy flow. (Ported from orby_5050/engine/wellbeing.py)
     _wb_level = "ok"
     try:
@@ -681,7 +681,7 @@ def public_chat():
     # PRIORITY 0b — LEARNED ANSWERS (never-guess pattern). If the OWNER has
     # already answered this exact question for a previous visitor, return
     # that answer instantly without calling the LLM. This is what makes
-    # Orbi's knowledge compound over time and never invent facts about
+    # Orby's knowledge compound over time and never invent facts about
     # the business.
     learned = mod_learning.find_learned(DATA_DIR, user_msg)
     if learned:
@@ -702,7 +702,7 @@ def public_chat():
         log.info("pre_execute data hit: kind=%s len=%d", pre_kind, len(pre_resp))
 
     # Public chat gets workspace context first (so she can answer about
-    # promotions, menus, FAQs the owner dropped into ~/Orbi/) — these are
+    # promotions, menus, FAQs the owner dropped into ~/Orby/) — these are
     # AUTHORITATIVE. Web search only fires if workspace had no strong match
     # AND the query smells like it needs current info.
     extras = []
@@ -710,7 +710,7 @@ def public_chat():
     # PRIORITY 1 — PRODUCT CATALOG (highest authority).
     # If the owner has dropped a CSV / Excel into Orby/Catalog/, surface
     # matching items BEFORE workspace and web. Catalog data is the most
-    # specific real-world info Orbi can use (real SKUs, real prices, real
+    # specific real-world info Orby can use (real SKUs, real prices, real
     # stock counts) — never let the LLM invent product details when the
     # catalog has the answer.
     try:
@@ -814,10 +814,10 @@ def public_chat():
 
     resp = llm_client.generate(CONFIG, system, messages)
 
-    # LEARNING-LOOP TRIGGER — if Orbi's reply reads like "I don't know"
+    # LEARNING-LOOP TRIGGER — if Orby's reply reads like "I don't know"
     # AND the visitor was actually asking a question, kick off the
     # learning loop: capture the question for the owner to answer, ask
-    # the visitor for their contact info, and override Orbi's bluff
+    # the visitor for their contact info, and override Orby's bluff
     # with a clear "I'll find out and get back to you" reply.
     pending_record = None
     if (mod_learning.reply_indicates_unknown(resp.text or "")
@@ -859,7 +859,7 @@ def public_chat():
                 )
             except Exception as e:
                 log.warning(f"owner notify failed: {e}")
-            # Override Orbi's reply with the standard "I'll find out" ask.
+            # Override Orby's reply with the standard "I'll find out" ask.
             # If the visitor already gave us contact info, thank them; if
             # not, ask for it so we can deliver the owner's answer back.
             have_contact = bool(asker.get("phone") or asker.get("email"))
@@ -1247,7 +1247,7 @@ def owner_workspace_convert(filename):
         log.warning(f"post-convert scan failed: {e}")
 
     # Mint a one-time download token. The workspace folder is implicitly safe
-    # for these tokens since Orbi just wrote the file there itself — we pass
+    # for these tokens since Orby just wrote the file there itself — we pass
     # it as an extra allowed root so the owner doesn't have to widen their
     # global file-fetch scope just to download their own cleaned-up doc.
     try:
@@ -1558,7 +1558,7 @@ _PA_PHONE_OF_RE = _re.compile(
 )
 
 
-# Phrases that mean "teach me what Orbi can do" or "walk me through how".
+# Phrases that mean "teach me what Orby can do" or "walk me through how".
 # Conservative on purpose — a vague "help" alone shouldn't trigger.
 _TEACH_INTENT_PATTERNS = [
     _re.compile(r"\bwhat\s+(can|do)\s+you\s+do\b", _re.I),
@@ -1582,7 +1582,7 @@ _CAPABILITIES_CACHE: dict = {"text": None, "mtime": 0.0}
 def _load_capabilities_doc() -> str:
     """Return the orbi_capabilities.md text. Re-reads on file mtime change so
     edits to the doc (or a customer override at ORBI_DIR/orbi_capabilities.md)
-    take effect without restarting Orbi."""
+    take effect without restarting Orby."""
     candidates = [
         ORBI_DIR / "orbi_capabilities.md",
         Path(__file__).parent / "orbi_capabilities.md",
@@ -1604,7 +1604,7 @@ def _load_capabilities_doc() -> str:
 
 
 def _capabilities_context_block(message: str) -> str | None:
-    """When the owner is asking what Orbi can do or how to do something,
+    """When the owner is asking what Orby can do or how to do something,
     inject the capabilities doc into the prompt so the answer is grounded
     in the documented features (not invented). Returns None when the user
     isn't asking a teach-style question."""
@@ -1623,7 +1623,7 @@ def _capabilities_context_block(message: str) -> str | None:
     )
 
 
-# Voice-to-text spells Orbi as "Orbeez" / "orby" / "orbie" sometimes —
+# Voice-to-text spells Orby as "Orbeez" / "orby" / "orbie" sometimes —
 # normalize so capability queries still match.
 _ORBI_PHONETIC_RE = _re.compile(r"\borb(?:eez|y|ie|i)\b", _re.IGNORECASE)
 _CAPABILITIES_RE = _re.compile(r"\bcapabilit(?:y|ies)\b", _re.IGNORECASE)
@@ -1636,7 +1636,7 @@ def _try_capabilities_overview(message: str) -> str | None:
     directly from the shipped doc — no LLM call needed."""
     if not message:
         return None
-    # Run polite-prefix strip + Orbeez→Orbi normalization first, then test.
+    # Run polite-prefix strip + Orbeez→Orby normalization first, then test.
     cleaned = _strip_polite_prefix(message)
     cleaned = _ORBI_PHONETIC_RE.sub("orbi", cleaned)
     if not (_CAPABILITIES_RE.search(cleaned) or _WHAT_CAN_YOU_DO_RE.search(cleaned)):
@@ -2185,14 +2185,14 @@ def users_purge_now():
 
 def _gcal_oauth_creds() -> tuple[str, str]:
     """Read OAuth client credentials from CONFIG. These are baked in by the
-    installer (one Cloud project per Orbi deployment) or set via dashboard."""
+    installer (one Cloud project per Orby deployment) or set via dashboard."""
     g = CONFIG.get("gcal_oauth") or {}
     return g.get("client_id", ""), g.get("client_secret", "")
 
 
 def _gcal_redirect_uri() -> str:
     """Loopback redirect for Desktop-app OAuth client type. Customer connects
-    Google while on the same machine as their Orbi install (first-time setup)."""
+    Google while on the same machine as their Orby install (first-time setup)."""
     port = (CONFIG.get("server") or {}).get("port") or 5050
     return f"http://localhost:{port}/api/owner/gcal/callback"
 
@@ -2424,7 +2424,7 @@ threading.Thread(target=gcal_sync_loop, daemon=True).start()
 
 # ---------------------------------------------------------------------------
 # Remote file fetch — "send me the Maxwell file from my computer"
-# Phone PWA → cloudflared tunnel → home Orbi → scoped file resolution
+# Phone PWA → cloudflared tunnel → home Orby → scoped file resolution
 # → one-time download token → file streams back.
 # Files NEVER leave the owner's computer except through the token-gated
 # /download/<token> route. Tunnel is transport-only.
@@ -3490,7 +3490,7 @@ def internal_notify():
     if request.headers.get("X-Watchdog") != "1":
         abort(403)
     data = request.get_json(silent=True) or {}
-    title = data.get("title") or "Orbi alert"
+    title = data.get("title") or "Orby alert"
     body  = data.get("body") or ""
     urgent = bool(data.get("urgent"))
     log.info(f"[watchdog notify] {title}: {body}")
@@ -3538,7 +3538,7 @@ def push_test():
     auth.require_owner(ORBI_DIR)
     notify.send(CONFIG, DATA_DIR,
                 event="new_message",
-                title="Orbi test notification",
+                title="Orby test notification",
                 body="If you're seeing this, push notifications are working.",
                 url="/owner")
     return jsonify({"status": "test_sent"})
@@ -3578,7 +3578,7 @@ def main():
     server = CONFIG.get("server", {})
     host = server.get("host", "127.0.0.1")
     port = int(server.get("port", 5050))
-    log.info(f"Orbi starting on {host}:{port}")
+    log.info(f"Orby starting on {host}:{port}")
     log.info(f"  Brain:       {(CONFIG.get('brain') or {}).get('url', 'not configured')}")
     log.info(f"  HuggingFace: {'enabled' if (CONFIG.get('huggingface') or {}).get('enabled') else 'disabled'}")
     log.info(f"  Local LLM:   {'enabled' if (CONFIG.get('local_llm') or {}).get('enabled') else 'disabled'}")

@@ -1,5 +1,5 @@
 {
-  "_comment": "Orbi customer install configuration. Copy to config.json and fill in real values during onboarding.",
+  "_comment": "Orby customer install configuration. Copy to config.json and fill in real values during onboarding.",
 
   "business": {
     "name": "REPLACE_WITH_BUSINESS_NAME",

@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Orbi Dashboard</title>
+  <title>Orby Dashboard</title>
   <link rel="manifest" href="/pwa/manifest.json">
   <meta name="theme-color" content="#0b0f1a">
   <link rel="icon" type="image/png" sizes="32x32" href="/pwa/icons/icon-favicon.png">
@@ -12,13 +12,13 @@
   <link rel="stylesheet" href="/static/dashboard-mobile.css">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-  <meta name="apple-mobile-web-app-title" content="Orbi">
+  <meta name="apple-mobile-web-app-title" content="Orby">
 </head>
 <body>
   <header class="top-bar">
     <div class="brand">
       <div class="logo-dot"></div>
-      <span class="brand-name">Orbi</span>
+      <span class="brand-name">Orby</span>
       <span class="business-name" id="business-name">—</span>
     </div>
 
@@ -40,7 +40,7 @@
     <button class="tab" data-tab="messages">
       Messages <span class="badge" id="message-count">0</span>
     </button>
-    <button class="tab active" data-tab="chat">Ask Orbi</button>
+    <button class="tab active" data-tab="chat">Ask Orby</button>
     <button class="tab" data-tab="myday">My Day</button>
     <button class="tab" data-tab="voicemails">Voicemails <span class="badge" id="voicemail-count" hidden>0</span></button>
     <button class="tab" data-tab="email">Email <span class="badge" id="email-count" hidden>0</span></button>
@@ -49,7 +49,7 @@
     <button class="tab" data-tab="business">Business</button>
     <button class="tab owner-only" data-tab="people" hidden>Staff</button>
     <button class="tab" data-tab="settings">Settings</button>
-    <button class="tab" data-tab="help" title="What can Orbi do?">Help</button>
+    <button class="tab" data-tab="help" title="What can Orby do?">Help</button>
   </nav>
 
   <main class="content">
@@ -130,8 +130,8 @@
             </svg>
             <span class="voice-label">Voice</span>
           </button>
-          <textarea id="owner-chat-input" rows="1" placeholder="Ask Orbi (or tap Voice to talk)" autocomplete="off"></textarea>
-          <button class="stop-btn" id="owner-stop-speaking" aria-label="Stop speaking" title="Stop Orbi" hidden>
+          <textarea id="owner-chat-input" rows="1" placeholder="Ask Orby (or tap Voice to talk)" autocomplete="off"></textarea>
+          <button class="stop-btn" id="owner-stop-speaking" aria-label="Stop speaking" title="Stop Orby" hidden>
             <svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor">
               <rect x="6" y="6" width="12" height="12" rx="2"/>
             </svg>
@@ -170,7 +170,7 @@
           <form method="dialog" id="schedule-meeting-form">
             <h2>Schedule a meeting</h2>
             <p class="muted" style="margin:4px 0 12px;font-size:13px">
-              Pick the attendee + duration. Orbi finds 3 open times in your calendar.
+              Pick the attendee + duration. Orby finds 3 open times in your calendar.
               You choose one — she emails them a confirmation and adds it to your calendar (and Google Calendar if connected).
             </p>
             <label>Attendee name <input type="text" name="attendee_name" required></label>
@@ -207,7 +207,7 @@
             <div class="empty-state-small">Loading tasks…</div>
           </div>
           <form id="myday-add-task" class="myday-add-row">
-            <input type="text" name="text" placeholder="Add a task (or say 'add to my todo: X' to Orbi)" required>
+            <input type="text" name="text" placeholder="Add a task (or say 'add to my todo: X' to Orby)" required>
             <button type="submit" class="primary-btn">Add</button>
           </form>
         </div>
@@ -326,11 +326,11 @@
       </dialog>
     </section>
 
-    <!-- VOICEMAILS TAB — calls Orbi couldn't answer, transcribed -->
+    <!-- VOICEMAILS TAB — calls Orby couldn't answer, transcribed -->
     <section class="tab-panel" id="tab-voicemails">
       <div class="toolbar">
         <h2 style="margin:0">Voicemails</h2>
-        <span class="muted" id="voicemails-empty-hint" hidden>When a caller leaves a message, Orbi transcribes it and shows it here.</span>
+        <span class="muted" id="voicemails-empty-hint" hidden>When a caller leaves a message, Orby transcribes it and shows it here.</span>
       </div>
       <div id="voicemails-list" class="voicemails-list">
         <div class="empty-state-small">Loading…</div>
@@ -369,7 +369,7 @@
         <form method="dialog">
           <h2>Email settings</h2>
           <p class="muted" style="margin:4px 0 12px;font-size:13px">
-            Keywords here will FLAG any incoming email containing them — Orbi shows flagged messages with a red dot so they stand out.
+            Keywords here will FLAG any incoming email containing them — Orby shows flagged messages with a red dot so they stand out.
           </p>
           <label>Flag keywords (comma-separated)
             <textarea id="email-flag-keywords" rows="2"
@@ -388,15 +388,15 @@
       </dialog>
     </section>
 
-    <!-- FILES TAB — drop docs/spreadsheets/pdfs for Orbi to read -->
+    <!-- FILES TAB — drop docs/spreadsheets/pdfs for Orby to read -->
     <section class="tab-panel" id="tab-files">
       <div class="toolbar">
         <h2 style="margin:0">Workspace files</h2>
         <button class="primary-btn" id="files-pick-btn">+ Upload</button>
       </div>
       <p class="muted" style="margin:4px 0 14px">
-        Drop spreadsheets, PDFs, letters, or notes here. Orbi reads the contents and
-        can answer questions about them in the Ask Orbi tab.
+        Drop spreadsheets, PDFs, letters, or notes here. Orby reads the contents and
+        can answer questions about them in the Ask Orby tab.
         Supported: .txt, .md, .csv, .pdf, .docx, .xlsx, .html, .json, .log, images.
       </p>
 
@@ -426,7 +426,7 @@
       <div id="receipts-section" style="margin-top:24px" hidden>
         <h2 style="margin:0 0 8px">🧾 Receipts</h2>
         <p class="muted" style="margin:0 0 12px;font-size:13px">
-          Upload a photo of a receipt and click "Scan" — Orbi extracts vendor, total, and date.
+          Upload a photo of a receipt and click "Scan" — Orby extracts vendor, total, and date.
         </p>
         <div id="receipts-list" class="receipts-list"></div>
       </div>
@@ -434,7 +434,7 @@
       <dialog id="convert-dialog">
         <form method="dialog" id="convert-form">
           <h2 id="convert-title">Clean &amp; convert</h2>
-          <p class="muted" id="convert-subtitle" style="margin:2px 0 14px">Choose a target format and Orbi will clean up the file then save it back to your workspace.</p>
+          <p class="muted" id="convert-subtitle" style="margin:2px 0 14px">Choose a target format and Orby will clean up the file then save it back to your workspace.</p>
 
           <label>Target format
             <select name="target" id="convert-target">
@@ -470,7 +470,7 @@
       <dialog id="chart-dialog">
         <form method="dialog" id="chart-form">
           <h2>📊 Make a chart</h2>
-          <p class="muted" style="margin:2px 0 12px">Describe the data in plain English — Orbi picks a chart type and renders a PNG you can download.</p>
+          <p class="muted" style="margin:2px 0 12px">Describe the data in plain English — Orby picks a chart type and renders a PNG you can download.</p>
           <label>Describe the chart
             <textarea name="request" id="chart-request" rows="4" required
               placeholder="e.g. monthly revenue: Jan 1000, Feb 1500, Mar 2200, Apr 2800 — bar chart"></textarea>
@@ -487,7 +487,7 @@
       <dialog id="pptx-dialog">
         <form method="dialog" id="pptx-form">
           <h2>📽️ Build slide deck</h2>
-          <p class="muted" style="margin:2px 0 12px">Orbi writes an outline and builds a .pptx file you can open in PowerPoint or Keynote.</p>
+          <p class="muted" style="margin:2px 0 12px">Orby writes an outline and builds a .pptx file you can open in PowerPoint or Keynote.</p>
           <label>Topic
             <input type="text" name="topic" id="pptx-topic" required
               placeholder="e.g. Q2 marketing plan for our deli">
@@ -514,7 +514,7 @@
       <dialog id="image-dialog">
         <form method="dialog" id="image-form">
           <h2>🎨 Generate image</h2>
-          <p class="muted" style="margin:2px 0 12px">Describe what you want — Orbi generates an image sized for the use case you pick.</p>
+          <p class="muted" style="margin:2px 0 12px">Describe what you want — Orby generates an image sized for the use case you pick.</p>
           <label>Describe what you want
             <textarea name="prompt" id="image-prompt" rows="3" required
               placeholder="e.g. cozy deli storefront at sunset, warm lighting, photographic"></textarea>
@@ -538,7 +538,7 @@
       <dialog id="translate-dialog">
         <form method="dialog" id="translate-form">
           <h2>🌐 Translate</h2>
-          <p class="muted" style="margin:2px 0 12px">Paste text, pick a target language, and Orbi translates it.</p>
+          <p class="muted" style="margin:2px 0 12px">Paste text, pick a target language, and Orby translates it.</p>
           <label>Source text
             <textarea name="text" id="translate-source" rows="4" required
               placeholder="Paste the text you want translated"></textarea>
@@ -575,7 +575,7 @@
         <h2 style="margin:0">Active staff</h2>
         <button class="primary-btn" id="people-add-btn">+ Add Staff Member</button>
       </div>
-      <p class="muted" style="margin:4px 0 12px">People who work for your business and need their own Orbi login (with their own private calendar, tasks, and contacts). Different from the Contacts tab, which is for customers and vendors.</p>
+      <p class="muted" style="margin:4px 0 12px">People who work for your business and need their own Orby login (with their own private calendar, tasks, and contacts). Different from the Contacts tab, which is for customers and vendors.</p>
       <div id="people-active-list" class="people-list">
         <div class="empty-state-small">Loading staff…</div>
       </div>
@@ -661,15 +661,15 @@
       <div class="form-section">
         <h2>🪄 First-time setup</h2>
         <p class="muted" style="margin:4px 0 10px;font-size:13px">
-          Walk through the wizard to teach Orbi about your business, connect your phone, email, and the rest.
+          Walk through the wizard to teach Orby about your business, connect your phone, email, and the rest.
           Takes about 10 minutes. You can re-run it any time.
         </p>
         <button type="button" class="primary-btn" id="open-onboarding-btn">Start the setup wizard</button>
       </div>
 
       <div class="form-section">
-        <h2>Orbi's Personality</h2>
-        <label>How should Orbi sound?
+        <h2>Orby's Personality</h2>
+        <label>How should Orby sound?
           <select name="tone" id="tone-select">
             <option value="friendly_professional">Friendly & professional</option>
             <option value="warm_casual">Warm & casual</option>
@@ -677,14 +677,14 @@
             <option value="playful">Playful</option>
           </select>
         </label>
-        <label>Topics Orbi should NOT discuss with customers
+        <label>Topics Orby should NOT discuss with customers
           <textarea name="topics_to_avoid" rows="2"
             placeholder="One per line — e.g. internal pricing, competitor names"></textarea>
         </label>
       </div>
 
       <div class="form-section">
-        <h2>What Orbi can do for customers</h2>
+        <h2>What Orby can do for customers</h2>
         <label class="checkbox">
           <input type="checkbox" name="public_can_take_orders"> Take orders
         </label>
@@ -724,7 +724,7 @@
 
       <div class="form-section" id="integrations-section">
         <h2>Integrations</h2>
-        <p class="muted" style="margin:4px 0 14px">Connect Orbi to your other accounts so she can read and act on them.</p>
+        <p class="muted" style="margin:4px 0 14px">Connect Orby to your other accounts so she can read and act on them.</p>
 
         <!-- Google Calendar (special — kept inline because it predates the generic connector framework) -->
         <div class="integration-row" id="gcal-row">
@@ -856,11 +856,11 @@
         <span class="save-status" id="booking-save-status"></span>
       </div>
 
-      <!-- Style learner — train Orbi on your writing -->
+      <!-- Style learner — train Orby on your writing -->
       <div class="form-section">
-        <h2>Train Orbi to write in your voice</h2>
+        <h2>Train Orby to write in your voice</h2>
         <p class="muted" style="margin:4px 0 12px;font-size:13px">
-          Orbi reads your past sent emails (Gmail or Outlook must be connected) and learns your writing style.
+          Orby reads your past sent emails (Gmail or Outlook must be connected) and learns your writing style.
           When she drafts replies for you, she'll sound like you — same vocabulary, same warmth, same sign-offs.
         </p>
         <div id="style-status" class="muted" style="font-size:13px;margin-bottom:10px">Checking corpus…</div>
@@ -881,14 +881,14 @@
       </div>
     </section>
 
-    <!-- HELP TAB — what Orbi can do + how to ask -->
+    <!-- HELP TAB — what Orby can do + how to ask -->
     <section class="tab-panel help-panel" id="tab-help">
       <div class="help-toolbar">
         <input type="search" id="help-search" placeholder="Search this guide…" autocomplete="off">
-        <button class="secondary-btn" id="help-tour-btn" title="Have Orbi walk me through it">Walk me through it</button>
+        <button class="secondary-btn" id="help-tour-btn" title="Have Orby walk me through it">Walk me through it</button>
       </div>
       <article id="help-content" class="help-content">
-        <p class="help-loading">Loading your Orbi guide…</p>
+        <p class="help-loading">Loading your Orby guide…</p>
       </article>
     </section>
   </main>
