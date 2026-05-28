@@ -2732,6 +2732,22 @@ _IMAGE_LOOSE_RE = _re.compile(
     r"(?:draw|paint|sketch|illustrate|visualize|visualise)\s+",
     _re.IGNORECASE,
 )
+# Self-portrait detector: the user wants Orby to draw HERSELF, not a
+# generic prompt. "what you look like / what you imagine / draw yourself /
+# your own appearance / what orbi looks like". When this matches we
+# substitute a brand-aligned orb portrait prompt so FLUX doesn't default
+# to a stock photo of a person.
+_IMAGE_SELF_RE = _re.compile(
+    r"\b(?:"
+    r"(?:what|how)\s+(?:does?\s+)?(?:you|orbi|orby)\s+(?:would\s+|might\s+|could\s+)?"
+    r"(?:imagine|look|appear)(?:s|ed|ing)?(?:\s+like)?"
+    r"|you(?:r|rself)?\s+(?:would\s+)?(?:imagine|look|appear)(?:\s+like)?"
+    r"|(?:draw|paint|sketch|render)\s+yourself"
+    r"|yourself|your\s+(?:own\s+)?(?:appearance|self\s?-?portrait|avatar|image|face|likeness|look)"
+    r"|self[-\s]?portrait\s+of\s+(?:you|orbi|orby)"
+    r")\b",
+    _re.IGNORECASE,
+)
 
 
 def _try_office_gen(message: str, username: str) -> dict | None:
@@ -2792,34 +2808,48 @@ def _try_office_gen(message: str, username: str) -> dict | None:
 
         image_match = _IMAGE_TRIGGER_RE.match(msg) or _IMAGE_LOOSE_RE.match(msg)
         if image_match:
-            # Strip conversational prefix + verb + filler to get the visual prompt.
-            # "can you draw me a picture of a robot" → "of a robot" → "a robot"
-            prompt = msg
-            for pat in (
-                # 1. conversational prefix (can you, please, i want, etc.)
-                r"^\s*(?:(?:can|could|would|will)\s+you\s+(?:please\s+)?(?:try\s+(?:to|and)\s+)?"
-                r"|please\s+(?:can\s+you\s+)?"
-                r"|i(?:'m| am)?\s+(?:want|need)(?:ing)?\s+(?:you\s+)?(?:to\s+)?"
-                r"|i(?:'d| would)\s+like(?:\s+(?:you\s+)?to)?\s+"
-                r"|let'?s\s+|how\s+about\s+(?:you\s+)?"
-                r"|may\s+i\s+have\s+|give\s+me\s+|show\s+me\s+|gimme\s+)",
-                # 2. drawing verb + me/us + a/an/the/some
-                r"^\s*(?:make|build|create|generate|design|draw|paint|render|sketch|"
-                r"mock\s*up|come\s+up\s+with|whip\s+up|illustrate|visualize|visualise)\s+"
-                r"(?:me\s+|us\s+)?(?:a\s+|an\s+|the\s+|some\s+)?",
-                # 3. leading noun-of: "picture of a robot" → "a robot"
-                r"^(?:social\s+post|facebook\s+post|instagram\s+post|tiktok\s+post|"
-                r"flyer|banner|poster|image|graphic|picture|pic|post|"
-                r"logo|illustration|icon|headshot|thumbnail|infographic|"
-                r"diagram|sketch|drawing|mockup|mock\s?up|ad|advert|photo|"
-                r"meme|avatar|profile|cover|hero|wallpaper|art|artwork|visual)\s+"
-                r"(?:of\s+|showing\s+|for\s+|that\s+(?:shows?|depicts?|has)\s+|"
-                r"depicting\s+|with\s+|about\s+)?",
-            ):
-                prompt = _re.sub(pat, "", prompt, flags=_re.IGNORECASE).strip()
-            # Fall back to original if stripping nuked everything
-            if not prompt:
+            # ── Self-portrait shortcut ──────────────────────────────────────
+            # "draw yourself" / "what you look like" / "what you imagine you
+            # would look like" — the user wants Orby's self-image, not a
+            # generic prompt. Use a brand-aligned orb portrait so FLUX
+            # doesn't default to a stock photo of a person.
+            if _IMAGE_SELF_RE.search(msg):
+                prompt = ("a friendly glowing translucent purple orb of light, "
+                          "floating in a soft dark cosmic background with gentle "
+                          "blue and violet wisps of aurora, smooth volumetric "
+                          "lighting, ethereal, abstract, no human figures, no faces, "
+                          "no text, modern minimalist digital art, square composition, "
+                          "high detail, cinematic")
+            else:
+                # Strip conversational prefix + verb + filler to get the
+                # visual prompt. "can you draw me a picture of a robot"
+                # → "of a robot" → "a robot"
                 prompt = msg
+                for pat in (
+                    # 1. conversational prefix (can you, please, i want, etc.)
+                    r"^\s*(?:(?:can|could|would|will)\s+you\s+(?:please\s+)?(?:try\s+(?:to|and)\s+)?"
+                    r"|please\s+(?:can\s+you\s+)?"
+                    r"|i(?:'m| am)?\s+(?:want|need)(?:ing)?\s+(?:you\s+)?(?:to\s+)?"
+                    r"|i(?:'d| would)\s+like(?:\s+(?:you\s+)?to)?\s+"
+                    r"|let'?s\s+|how\s+about\s+(?:you\s+)?"
+                    r"|may\s+i\s+have\s+|give\s+me\s+|show\s+me\s+|gimme\s+)",
+                    # 2. drawing verb + me/us + a/an/the/some
+                    r"^\s*(?:make|build|create|generate|design|draw|paint|render|sketch|"
+                    r"mock\s*up|come\s+up\s+with|whip\s+up|illustrate|visualize|visualise)\s+"
+                    r"(?:me\s+|us\s+)?(?:a\s+|an\s+|the\s+|some\s+)?",
+                    # 3. leading noun-of: "picture of a robot" → "a robot"
+                    r"^(?:social\s+post|facebook\s+post|instagram\s+post|tiktok\s+post|"
+                    r"flyer|banner|poster|image|graphic|picture|pic|post|"
+                    r"logo|illustration|icon|headshot|thumbnail|infographic|"
+                    r"diagram|sketch|drawing|mockup|mock\s?up|ad|advert|photo|"
+                    r"meme|avatar|profile|cover|hero|wallpaper|art|artwork|visual)\s+"
+                    r"(?:of\s+|showing\s+|for\s+|that\s+(?:shows?|depicts?|has)\s+|"
+                    r"depicting\s+|with\s+|about\s+)?",
+                ):
+                    prompt = _re.sub(pat, "", prompt, flags=_re.IGNORECASE).strip()
+                # Fall back to original if stripping nuked everything
+                if not prompt:
+                    prompt = msg
             png = image_gen.generate(CONFIG, prompt, kind="social_post")
             ws = mod_workspace.workspace_path(CONFIG)
             saved_path = image_gen.save_to_workspace(png, prompt, ws)
