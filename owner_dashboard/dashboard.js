@@ -3566,6 +3566,17 @@
     let dismissed = false;
     const spokenText = 'Hey Frank, this is your reminder. ' + (n.body || '');
 
+    // Also drop the reminder into the chat so it's part of the conversation
+    // record — when Frank comes back later he can see what Orbi said and
+    // when, even if he missed the live ding/voice. Done only on the FIRST
+    // fire (not on every nag repeat) so we don't spam the chat.
+    try {
+      const now = new Date();
+      const stamp = now.toLocaleTimeString([], {hour: 'numeric', minute: '2-digit'});
+      addOwnerBubble('assistant',
+                     '⏰ ' + stamp + ' — ' + spokenText);
+    } catch (e) { /* chat scope not ready — banner + chime are still up */ }
+
     function fireRound() {
       if (dismissed) return;
       try { _playChime(); } catch (e) {}
