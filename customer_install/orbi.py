@@ -1719,7 +1719,7 @@ def _try_inbox_check(message: str, user_dir: Path) -> str | None:
         return None
     try:
         result = email_inbox.fetch_inbox(CONFIG, user_dir, source="all",
-                                         limit=30, force_refresh=True)
+                                         limit=100, force_refresh=True)
     except Exception as e:
         log.warning(f"inbox fetch_inbox failed: {e}")
         return f"I tried to check your inbox but hit an error: {e}"
@@ -1751,8 +1751,9 @@ def _try_inbox_check(message: str, user_dir: Path) -> str | None:
                          f"{m.get('subject','(no subject)')[:55]}")
 
     lines.append("")
-    lines.append(f"Top {min(len(messages), 15)} newest:")
-    for m in messages[:15]:
+    show_n = min(len(messages), 40)
+    lines.append(f"Top {show_n} newest (of {len(messages)} I can see in INBOX):")
+    for m in messages[:show_n]:
         unread_mark = "● " if m.get("unread") else "  "
         date_str = _fmt_email_date(m.get("date", ""))
         sender  = (m.get("from") or "?")[:28]
