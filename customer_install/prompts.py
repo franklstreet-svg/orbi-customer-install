@@ -404,29 +404,39 @@ def _format_hours(h: dict) -> str:
     return "\n".join(lines) if lines else "  Hours not listed"
 
 def _format_services(services: list) -> str:
-    """Format services as a reference list. The model is told elsewhere NOT
-    to recite this verbatim — only quote individual items when asked specifically."""
+    """Format services as a reference list. Handles BOTH the legacy
+    {price_from, price_to} numeric schema AND the newer {price: '$99 / month',
+    description: '...'} string schema (business_info.json uses the latter)."""
     if not services:
         return ""
-    lines = ["\nSERVICES OFFERED (reference — answer specifically when asked, "
-             "do NOT recite this whole list in a single reply):"]
-    for s in services[:12]:
+    lines = ["\nSERVICES & PRICING (AUTHORITATIVE — quote these prices "
+             "VERBATIM when asked. Do NOT invent tier names or prices "
+             "from your training data):"]
+    for s in services[:15]:
         if not isinstance(s, dict):
             continue
         name = s.get("name")
         if not name:
             continue
-        # Include name + price only — no description (keeps it terse)
         line = f"  - {name}"
-        if s.get("price_from") is not None:
+        # New schema: price as a string
+        if isinstance(s.get("price"), str) and s["price"].strip():
+            line += f" — {s['price']}"
+        # Legacy schema: numeric price_from / price_to
+        elif s.get("price_from") is not None:
             if s.get("price_to") is not None and s["price_to"] != s["price_from"]:
                 line += f" (${s['price_from']:.0f}-${s['price_to']:.0f})"
             else:
                 line += f" (${s['price_from']:.0f})"
+        # Description (trim long ones)
+        desc = (s.get("description") or "").strip()
+        if desc:
+            line += f"\n      {desc[:200]}"
         lines.append(line)
-    lines.append("\nWhen asked 'what services do you offer?' give a one-sentence "
-                 "category overview (e.g. websites, payments, AI assistants, tech help) "
-                 "and ASK what they need. Don't list all 12.")
+    lines.append("\nWhen the owner asks 'what tiers do we offer' or 'what's "
+                 "our pricing' — list these EXACT names and prices. If you "
+                 "see 'Small Business' here, do NOT call it 'Starter'. If "
+                 "the price is '$99 / month', do NOT say '$149/month'.")
     return "\n".join(lines) + "\n"
 
 def _format_faq(faq: list) -> str:

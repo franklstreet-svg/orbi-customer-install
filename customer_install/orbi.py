@@ -1559,12 +1559,14 @@ _PA_WEEK_RE = _re.compile(
     _re.IGNORECASE,
 )
 _PA_TASKS_RE = _re.compile(
-    r"\b(?:show|list|what(?:'s|s| are))\s+(?:my\s+)?(?:open\s+)?(?:todo|to[\s-]?do|tasks?)(?:\s+list)?\b",
+    r"\b(?:show|list|what(?:'s|s| are))\s+(?:me\s+)?(?:my\s+)?(?:open\s+)?"
+    r"(?:todo|to[\s-]?do|tasks?)(?:\s+list)?\b",
     _re.IGNORECASE,
 )
 _PA_REMINDERS_RE = _re.compile(
-    r"\b(?:show|list|what(?:'s|s| are))\s+(?:my\s+)?(?:pending\s+)?reminders?\b|"
-    r"\bwhat\s+do\s+i\s+need\s+to\s+be\s+reminded\s+(?:about|of)\b",
+    r"\b(?:show|list|what(?:'s|s| are))\s+(?:me\s+)?(?:my\s+)?(?:pending\s+)?"
+    r"reminders?\b"
+    r"|\bwhat\s+do\s+i\s+need\s+to\s+be\s+reminded\s+(?:about|of)\b",
     _re.IGNORECASE,
 )
 _PA_WHO_IS_RE = _re.compile(
