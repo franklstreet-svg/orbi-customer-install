@@ -2782,11 +2782,23 @@ _IMAGE_SUBJECT_LED_RE = _re.compile(
 # to a stock photo of a person.
 _IMAGE_SELF_RE = _re.compile(
     r"\b(?:"
-    r"(?:what|how)\s+(?:does?\s+)?(?:you|orbi|orby)\s+(?:would\s+|might\s+|could\s+)?"
-    r"(?:imagine|look|appear)(?:s|ed|ing)?(?:\s+like)?"
-    r"|you(?:r|rself)?\s+(?:would\s+)?(?:imagine|look|appear)(?:\s+like)?"
-    r"|(?:draw|paint|sketch|render)\s+yourself"
-    r"|yourself|your\s+(?:own\s+)?(?:appearance|self\s?-?portrait|avatar|image|face|likeness|look)"
+    # "what/how (does) you/orbi (think you should | imagine you might | etc.)
+    #  look/appear/imagine like" — flexible clause between subject and verb
+    r"(?:what|how)\s+(?:does?\s+|do\s+)?(?:you|orbi|orby)"
+    r"(?:\s+(?:think|believe|feel|imagine|reckon|figure|should|would|could|"
+    r"might|ought\s+to|hope\s+to|want\s+to|like\s+to)){0,3}"
+    r"(?:\s+(?:you|orbi|orby|i|it|she|he|they))?\s+"
+    r"(?:would\s+|might\s+|could\s+|should\s+|ought\s+to\s+|hope\s+to\s+|"
+    r"want\s+to\s+|like\s+to\s+|be\s+)*"
+    r"(?:imagine|look|appear|be)(?:s|ed|ing)?(?:\s+like)?"
+    # OR  "yourself" with a drawing verb
+    r"|(?:draw|paint|sketch|render|design|generate|make)\s+yourself"
+    # OR plain "yourself" anywhere
+    r"|yourself"
+    # OR "your (own) appearance/avatar/face/etc"
+    r"|your\s+(?:own\s+)?(?:appearance|self\s?-?portrait|avatar|image|face|"
+    r"likeness|look|body|form)"
+    # OR "self-portrait of you/orbi"
     r"|self[-\s]?portrait\s+of\s+(?:you|orbi|orby)"
     r")\b",
     _re.IGNORECASE,
