@@ -1107,6 +1107,34 @@
   // ==================================================================
 
   let voiceOn = false;
+  // Separate from voiceOn — owner can have Orby READ HER REPLIES aloud
+  // without turning on mic listening. Persisted in localStorage so it
+  // stays on across sessions.
+  let speakRepliesOn = (function() {
+    try { return localStorage.getItem('orbi_speak_replies') === '1'; }
+    catch { return false; }
+  })();
+  function setSpeakReplies(on) {
+    speakRepliesOn = !!on;
+    try { localStorage.setItem('orbi_speak_replies', on ? '1' : '0'); } catch {}
+    const btn = document.getElementById('owner-speaker-toggle');
+    if (btn) {
+      btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+      btn.title = on
+        ? "Reading Orby's replies out loud (on) — tap to mute"
+        : "Read Orby's replies out loud (off) — tap to turn on";
+      btn.style.background = on ? '#8b5cf6' : 'transparent';
+      btn.style.color      = on ? 'white'    : '#9aa4c0';
+      btn.style.borderColor = on ? '#8b5cf6' : '#2c3756';
+    }
+  }
+  document.addEventListener('DOMContentLoaded', () => {
+    const btn = document.getElementById('owner-speaker-toggle');
+    if (btn) {
+      btn.addEventListener('click', () => setSpeakReplies(!speakRepliesOn));
+      setSpeakReplies(speakRepliesOn);   // apply initial state styling
+    }
+  });
   let recognition = null;
   let isListening = false;
   let isSpeaking = false;
@@ -1202,8 +1230,13 @@
   // Uses server-side /tts endpoint (edge_tts, en-US-AvaNeural by default
   // — same voice as orbi_test on twickell.com). Falls back to browser
   // synthesis only if the server endpoint fails.
+  //
+  // Speaks when EITHER:
+  //   - voiceOn is true (full voice mode — mic listening + reply spoken)
+  //   - speakRepliesOn is true (just speaker — owner types but wants
+  //                              Orby to read replies aloud)
   async function speakReply(text) {
-    if (!voiceOn || !text) return;
+    if ((!voiceOn && !speakRepliesOn) || !text) return;
     stopSpeaking();
     isSpeaking = true;
     // Mute the mic while Orbi talks so we don't echo-loop her own voice
