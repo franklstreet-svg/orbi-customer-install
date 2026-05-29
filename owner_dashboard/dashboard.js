@@ -1225,16 +1225,15 @@
       currentAudio.onerror = finish;
       await currentAudio.play();
     } catch (err) {
-      console.warn('[Orbi] server TTS failed, falling back to browser voice:', err);
-      // Last-resort fallback so something speaks
-      if (window.speechSynthesis) {
-        const u = new SpeechSynthesisUtterance(cleanText);
-        u.onend = finish;
-        u.onerror = finish;
-        window.speechSynthesis.speak(u);
-      } else {
-        finish();
-      }
+      // PREVIOUSLY: silently fell back to window.speechSynthesis, which on
+      // Linux/Chrome picks a robotic default male voice — Frank reported
+      // "she lost her voice now it's a robotic man's voice". That fallback
+      // was misleading because the user couldn't tell TTS had failed.
+      // Now we log + show a visible status instead of swapping voices.
+      console.warn('[Orbi] /tts failed:', err);
+      setVoiceState('Voice playback unavailable — text reply still works.', 'error');
+      setTimeout(() => { try { setVoiceState(null); } catch {} }, 5000);
+      finish();
     }
   }
 
