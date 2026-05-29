@@ -3325,6 +3325,12 @@ _POLITE_PREFIX = (
     r"|please\s+(?:can\s+you\s+)?"
     r"|let'?s\s+"
     r"|how\s+about\s+(?:you\s+)?"
+    # "I need you to X" / "I want you to X" / "I'd like you to X" —
+    # treats these the same as polite-prefix + verb. Required so
+    # "I need you to create me a Facebook ad" actually fires the ad
+    # trigger (was leaking to the LLM and producing 'free trial' text).
+    r"|i\s+(?:need|want)\s+you\s+to\s+"
+    r"|i(?:'d| would)\s+like\s+you\s+to\s+"
     r")?"
 )
 _ACTION_PREFIX = (
