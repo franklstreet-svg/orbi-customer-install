@@ -91,8 +91,66 @@
       <button type="submit" id="submit-btn">Sign in</button>
     </form>
 
-    <div class="footer">
+    <div class="footer" style="display:flex;flex-direction:column;gap:10px;align-items:center">
+      <a href="#" id="install-help-link" style="color:#8b5cf6;text-decoration:underline;font-weight:600">
+        📱 How to install Orby on your phone
+      </a>
       <a href="#" id="forgot-link" style="color:#9aa4c0;text-decoration:underline">Forgot your password?</a>
+    </div>
+
+    <!-- Install help modal — open to everyone, no auth required -->
+    <div id="install-help-modal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.8);z-index:1000;align-items:center;justify-content:center;padding:20px;overflow-y:auto">
+      <div style="background:#131a2e;padding:24px;border-radius:14px;max-width:480px;width:100%;max-height:90vh;overflow-y:auto">
+        <h2 style="margin:0 0 14px;font-size:20px;color:#eaf0ff">📱 Add Orby to your phone</h2>
+
+        <!-- iPhone section -->
+        <div style="background:#1a2240;border-radius:10px;padding:14px;margin-bottom:14px">
+          <h3 style="margin:0 0 8px;font-size:15px;color:#eaf0ff">On iPhone — use Chrome (not Safari)</h3>
+          <div style="background:#2a3460;border-left:3px solid #8b5cf6;padding:8px 10px;border-radius:6px;margin-bottom:10px;font-size:12px;color:#dce3f6">
+            <b>Important:</b> Safari blocks Orby's voice when installed.
+            Chrome works fully.
+          </div>
+          <ol style="margin:0;padding-left:20px;line-height:1.7;font-size:13px;color:#dce3f6">
+            <li>If you don't have Chrome, get it from the App Store (free).</li>
+            <li>Open <b>Chrome</b> and go to this same Orby URL.</li>
+            <li>Sign in.</li>
+            <li>Tap the <b>⋯ menu</b> (three dots, bottom-right of Chrome).</li>
+            <li>Scroll down, tap <b>Add to Home Screen</b>.</li>
+            <li>Tap <b>Add</b>. Done — Orby icon on home screen.</li>
+          </ol>
+        </div>
+
+        <!-- Android section -->
+        <div style="background:#1a2240;border-radius:10px;padding:14px;margin-bottom:14px">
+          <h3 style="margin:0 0 8px;font-size:15px;color:#eaf0ff">On Android — Chrome or Edge</h3>
+          <ol style="margin:0;padding-left:20px;line-height:1.7;font-size:13px;color:#dce3f6">
+            <li>Open <b>Chrome</b> (or Edge / Brave / Samsung Internet).</li>
+            <li>Go to this Orby URL and sign in.</li>
+            <li>Chrome shows a banner at the bottom — <b>"Install Orby"</b> — tap it.</li>
+            <li>If you miss the banner: tap the <b>⋮ menu</b> top-right → <b>Install app</b>.</li>
+            <li>Done — Orby icon on home screen, opens like a real app.</li>
+          </ol>
+        </div>
+
+        <!-- Desktop section -->
+        <div style="background:#1a2240;border-radius:10px;padding:14px;margin-bottom:14px">
+          <h3 style="margin:0 0 8px;font-size:15px;color:#eaf0ff">On desktop (Mac / Windows / Linux)</h3>
+          <ol style="margin:0;padding-left:20px;line-height:1.7;font-size:13px;color:#dce3f6">
+            <li>Open <b>Chrome</b> or <b>Edge</b>.</li>
+            <li>Sign in to Orby.</li>
+            <li>Look for the <b>install icon</b> in the address bar (looks like a screen with a down-arrow), OR ⋮ menu → <b>Install Orby</b>.</li>
+            <li>Click <b>Install</b>. Orby gets a real app window + dock/taskbar icon.</li>
+          </ol>
+        </div>
+
+        <p class="muted" style="margin:0;font-size:12px;color:#9aa4c0">
+          After installing, sign in with your username + password. Each staff
+          member uses their own credentials to get into their own per-user data.
+        </p>
+
+        <button type="button" class="primary-btn" style="width:100%;margin-top:16px"
+                id="install-help-close">Got it</button>
+      </div>
     </div>
 
     <!-- Forgot-password modal -->
@@ -151,6 +209,34 @@
         submitBtn.textContent = 'Sign in';
       }
     });
+
+    // Install-help modal (open to everyone, no auth needed)
+    const installModal = document.getElementById('install-help-modal');
+    document.getElementById('install-help-link').addEventListener('click', (e) => {
+      e.preventDefault();
+      installModal.style.display = 'flex';
+    });
+    document.getElementById('install-help-close').addEventListener('click', () => {
+      installModal.style.display = 'none';
+    });
+    installModal.addEventListener('click', (e) => {
+      if (e.target === installModal) installModal.style.display = 'none';
+    });
+    // Auto-open on first mobile visit so new users don't miss the
+    // Chrome-on-iPhone gotcha. Dismissed via localStorage flag.
+    (function() {
+      try {
+        const ua = navigator.userAgent || '';
+        const isMobile = /iPhone|iPad|iPod|Android/.test(ua);
+        const standalone = window.matchMedia('(display-mode: standalone)').matches
+          || window.navigator.standalone === true;
+        if (isMobile && !standalone &&
+            !localStorage.getItem('orbi_install_help_seen')) {
+          setTimeout(() => { installModal.style.display = 'flex'; }, 800);
+          localStorage.setItem('orbi_install_help_seen', '1');
+        }
+      } catch {}
+    })();
 
     // Forgot-password modal
     const modal = document.getElementById('forgot-modal');
