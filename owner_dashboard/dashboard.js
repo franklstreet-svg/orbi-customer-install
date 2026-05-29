@@ -1118,6 +1118,54 @@
   // ANY audio inside a click handler, the persistent Audio element is
   // "unlocked" for subsequent .play() calls without further gestures.
   let _persistentAudio = null;
+
+  // speechSynthesis fallback — used when Audio() rejects (iOS PWA block,
+  // network failure, etc). iOS loads voices asynchronously: the first
+  // getVoices() call sometimes returns []. We pre-warm + retry on
+  // voiceschanged.
+  let _ssVoices = [];
+  function _refreshSpeechVoices() {
+    if (window.speechSynthesis && window.speechSynthesis.getVoices) {
+      _ssVoices = window.speechSynthesis.getVoices() || [];
+    }
+  }
+  if (window.speechSynthesis) {
+    _refreshSpeechVoices();
+    window.speechSynthesis.onvoiceschanged = _refreshSpeechVoices;
+  }
+  function _speakViaSpeechSynthesis(text, onDone) {
+    if (!window.speechSynthesis || !window.SpeechSynthesisUtterance) {
+      setVoiceState('Voice playback unavailable.', 'error');
+      setTimeout(() => { try { setVoiceState(null); } catch {} }, 4000);
+      onDone && onDone();
+      return;
+    }
+    // Voices may still be empty on iOS at this moment — give it 1 retry
+    if (!_ssVoices.length) _refreshSpeechVoices();
+    try {
+      window.speechSynthesis.cancel();
+      const u = new SpeechSynthesisUtterance(text);
+      u.rate = 1.05;
+      u.pitch = 1.0;
+      u.lang = 'en-US';
+      // Prefer a female English voice (rough Ava match)
+      const female = _ssVoices.find(v =>
+        /female|samantha|karen|moira|tessa|ava|nicky|nora/i.test(v.name) &&
+        /^en/i.test(v.lang));
+      if (female) u.voice = female;
+      u.onend = onDone || (() => {});
+      u.onerror = () => {
+        setVoiceState('Voice playback unavailable — text reply still works.', 'error');
+        setTimeout(() => { try { setVoiceState(null); } catch {} }, 4000);
+        onDone && onDone();
+      };
+      window.speechSynthesis.speak(u);
+    } catch (e) {
+      setVoiceState('Voice playback unavailable.', 'error');
+      setTimeout(() => { try { setVoiceState(null); } catch {} }, 4000);
+      onDone && onDone();
+    }
+  }
   function _unlockAudio() {
     if (_persistentAudio) return;
     _persistentAudio = new Audio();
@@ -1177,7 +1225,13 @@
       return;
     }
 
-    btn.addEventListener('click', () => setVoiceMode(!voiceOn));
+    btn.addEventListener('click', () => {
+      // Unlock iOS PWA audio on this click too — voice mode also wants
+      // Orby to speak replies, and the unlock only happens once per
+      // session via a user gesture.
+      _unlockAudio();
+      setVoiceMode(!voiceOn);
+    });
     stopBtn.addEventListener('click', stopSpeaking);
 
     // Wrapped in a function so we can RECREATE the recognition object
@@ -1375,27 +1429,7 @@
           // iOS PWA blocked it OR /tts failed. Try speechSynthesis as the
           // safety net — iOS's built-in voices work in PWAs.
           console.warn('[Orbi] Audio() blocked or failed:', err);
-          if (window.speechSynthesis && window.SpeechSynthesisUtterance) {
-            try {
-              const u = new SpeechSynthesisUtterance(cleanText);
-              u.rate = 1.05;
-              u.pitch = 1.0;
-              // Prefer a female voice if available (matches Ava on the server)
-              const voices = window.speechSynthesis.getVoices();
-              const female = voices.find(v =>
-                /female|samantha|karen|moira|tessa|ava/i.test(v.name) &&
-                /^en/i.test(v.lang));
-              if (female) u.voice = female;
-              u.onend = finish;
-              u.onerror = finish;
-              window.speechSynthesis.cancel();
-              window.speechSynthesis.speak(u);
-              return;
-            } catch (e) { /* fall through to error message */ }
-          }
-          setVoiceState('Voice playback unavailable — text reply still works.', 'error');
-          setTimeout(() => { try { setVoiceState(null); } catch {} }, 5000);
-          finish();
+          _speakViaSpeechSynthesis(cleanText, finish);
         });
       }
     } catch (err) {
