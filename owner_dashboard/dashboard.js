@@ -1293,32 +1293,47 @@
         debug(`Testing audio... UA: ${(/iPhone/.test(ua) ? 'iPhone' : /Android/.test(ua) ? 'Android' : 'Desktop')}, standalone PWA: ${standalone}`, 'info');
         // Try server /tts first
         const url = '/tts?text=' + encodeURIComponent("Hi Frank, this is Orby. Can you hear me?");
+
+        // After playback, restore mic if voice mode was on — iOS routes
+        // audio to OUTPUT during playback and the SpeechRecognition can
+        // get stuck. Rebuild + restart gives it a fresh input channel.
+        const restoreMic = () => {
+          if (!voiceOn || !wantsListening) return;
+          setTimeout(() => {
+            try {
+              if (window._orbiRebuildRecognition) window._orbiRebuildRecognition();
+            } catch {}
+            try { safeStartMic(); } catch {}
+          }, 400);
+        };
+
         try {
           const a = new Audio(url);
           a.playsInline = true;
           a.setAttribute('playsinline', '');
-          a.onerror = () => debug('❌ Audio() error event fired — /tts may have failed', 'err');
-          a.onended = () => debug('✓ Audio played end-to-end. Voice path works.', 'ok');
+          a.onerror = () => { debug('❌ Audio() error event fired — /tts may have failed', 'err'); restoreMic(); };
+          a.onended = () => { debug('✓ Audio played end-to-end. Voice path works.', 'ok'); restoreMic(); };
           const p = a.play();
           if (p && typeof p.then === 'function') {
             p.then(() => debug('▶ Server audio started playing — you should hear Orby now', 'ok'))
               .catch((err) => {
                 debug(`❌ Server audio rejected: ${err.name} — trying iOS built-in voice...`, 'err');
-                // Fallback to speechSynthesis
                 if (window.speechSynthesis) {
                   const u = new SpeechSynthesisUtterance("Hi Frank, this is Orby. Can you hear me?");
                   u.lang = 'en-US';
-                  u.onend = () => debug('✓ Built-in iOS voice played. Server /tts is blocked.', 'ok');
-                  u.onerror = () => debug('❌ Both server AND iOS voice failed. Check phone volume/silent switch.', 'err');
+                  u.onend = () => { debug('✓ Built-in iOS voice played. Server /tts is blocked.', 'ok'); restoreMic(); };
+                  u.onerror = () => { debug('❌ Both server AND iOS voice failed. Check phone volume/silent switch.', 'err'); restoreMic(); };
                   window.speechSynthesis.cancel();
                   window.speechSynthesis.speak(u);
                 } else {
                   debug('❌ No speechSynthesis available either', 'err');
+                  restoreMic();
                 }
               });
           }
         } catch (e) {
           debug(`❌ Audio() throw: ${e.message}`, 'err');
+          restoreMic();
         }
       });
     }
@@ -1453,22 +1468,9 @@
     }
   }
 
-  // Watchdog — every 1.5s, if voice mode is on but mic isn't actively
-  // listening AND Orby isn't speaking, REBUILD recognition + restart.
-  // Catches iOS Safari's silent recognition death so owner doesn't
-  // wait 3+ seconds wondering why the mic isn't responding.
-  let _watchdogStalls = 0;
-  setInterval(() => {
-    if (voiceOn && wantsListening && !isListening && !isSpeaking) {
-      _watchdogStalls++;
-      if (_watchdogStalls >= 1 && window._orbiRebuildRecognition) {
-        try { window._orbiRebuildRecognition(); } catch {}
-      }
-      safeStartMic();
-    } else if (isListening) {
-      _watchdogStalls = 0;   // healthy — reset
-    }
-  }, 1500);
+  // (Watchdog removed — was firing every 1.5s and fighting the natural
+  // recognition lifecycle. Simpler flow now: speakReply stops mic when
+  // Orby starts talking, finish() restarts it when she ends. No polling.)
 
   // Uses server-side /tts endpoint (edge_tts, en-US-AvaNeural by default
   // — same voice as orbi_test on twickell.com). Falls back to browser
@@ -1501,38 +1503,20 @@
       currentAudio = null;
       document.getElementById('owner-stop-speaking').hidden = true;
       setVoiceState(null);
-      // Echo guard — short wait so the audio element's tail doesn't get
-      // picked up by the mic. Chrome on iOS has decent built-in echo
-      // cancellation so 300ms is plenty.
-      // Also REBUILD the recognition object — iOS Safari often refuses
-      // .start() on the same instance once audio has played in the
-      // session. Rebuilding gives us a fresh engine.
+      // Echo guard — short wait so the audio tail doesn't get picked up
+      // by the mic. Then restart. Plain restart first; the InvalidState
+      // handler in safeStartMic will rebuild only if needed.
       if (wantsListening) {
         setTimeout(() => {
           if (!wantsListening || isSpeaking) return;
-          try {
-            if (window._orbiRebuildRecognition) window._orbiRebuildRecognition();
-          } catch {}
           safeStartMic();
         }, 300);
       }
     };
 
-    // SAFETY NET: if neither onended nor onerror nor the play() rejection
-    // fires within the expected playback time, force-call finish() so
-    // isSpeaking gets reset and the mic can restart. Without this, a
-    // silently-failed audio leaves the system stuck on isSpeaking=true
-    // forever and the mic never re-arms.
-    // Estimate: ~15 chars/sec speech + 3s buffer for network/startup,
-    // capped between 5s and 60s.
-    const estimatedSec = Math.min(60, Math.max(5,
-      Math.ceil(cleanText.length / 15) + 3));
-    setTimeout(() => {
-      if (!_finishCalled) {
-        console.warn('[Orbi] audio safety timeout fired — forcing finish()');
-        finish();
-      }
-    }, estimatedSec * 1000);
+    // (Removed safety timeout — onended/onerror/promise.catch should fire
+    // reliably enough that we don't need a forced finish. The complexity
+    // was causing timing conflicts with the rebuild logic.)
 
     // iOS PWA strategy: reuse the persistent Audio element that was
     // unlocked by the speaker-toggle click. iOS treats new Audio() as
