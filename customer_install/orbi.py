@@ -2900,6 +2900,12 @@ import threading as _threading
 _IMAGE_USER_LOCKS: dict[str, "_threading.Lock"] = {}
 _IMAGE_LOCKS_GUARD = _threading.Lock()
 
+# Pending ad brief — set when we ask the user clarifying questions,
+# consumed on the next user message which we treat as their answers.
+# Tuple: (original_brief, platform, set_at_ts). 5 minute TTL.
+_PENDING_AD_BRIEF: dict[str, tuple[str, str, float]] = {}
+_PENDING_AD_TTL_SECONDS = 300
+
 def _user_image_lock(username: str) -> "_threading.Lock":
     with _IMAGE_LOCKS_GUARD:
         lk = _IMAGE_USER_LOCKS.get(username)
@@ -2994,6 +3000,57 @@ def _try_office_gen(message: str, username: str) -> dict | None:
     # Visibility for diagnosing "wrong thing got drawn" / "she didn't draw" reports.
     log.info("office_gen entry msg=%r first_line=%r",
              msg[:120], first_line[:80])
+
+    # ── Pending-ad-clarification consumer ───────────────────────────────────
+    # If we asked the user 2-3 questions about their ad on the previous turn,
+    # this turn's message is the answers. Combine with the original partial
+    # brief and route straight to ad_gen.build_ad (skip the clarification
+    # check that triggered the questions in the first place).
+    pending = _PENDING_AD_BRIEF.get(username)
+    if pending and (time.time() - pending[2]) < _PENDING_AD_TTL_SECONDS:
+        original_brief, platform, _ = pending
+        del _PENDING_AD_BRIEF[username]
+        combined_brief = (f"{original_brief}. {msg}" if original_brief else msg).strip()
+        log.info("office_gen ad clarification answered: combined_brief=%r",
+                 combined_brief[:120])
+        biz = mod_business.load(DATA_DIR)
+        try:
+            with _user_image_lock(username):
+                png, components = ad_gen.build_ad(
+                    CONFIG, combined_brief, business=biz, platform=platform)
+        except RuntimeError as e:
+            if "image_service_unavailable" in str(e):
+                return {"reply": ("Image service is busy — try saying \"redo\" "
+                                   "in a few seconds."),
+                        "tier": "local", "latency_ms": 0,
+                        "source": "image_gen_busy"}
+            return {"reply": f"Ad build failed: {e}",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "ad_gen_error"}
+        ws = mod_workspace.workspace_path(CONFIG)
+        saved_path = ad_gen.save_ad_to_workspace(png, combined_brief, ws)
+        try:
+            token = file_fetch.mint_download_token(
+                DATA_DIR, str(saved_path), ttl_minutes=30,
+                extra_allowed_roots=[ws])
+            url = f"/download/{token}"
+        except Exception:
+            url = None
+        audit.log_event(DATA_DIR, actor=username, action="ad.via_chat",
+                        meta={"brief": combined_brief[:120],
+                              "headline": components["headline"][:80]})
+        _LAST_IMAGE_PROMPT[username] = (
+            components["image_brief"], time.time(), "free")
+        alts = components.get("headline_alts") or []
+        alts_line = (" Alt headlines: "
+                     + " · ".join(f'"{a}"' for a in alts[:2])) if alts else ""
+        reply = (f"Built your {platform.replace('_', ' ')} ad — "
+                 f"headline: \"{components['headline']}\" · "
+                 f"CTA: \"{components['cta']}\".{alts_line} "
+                 "Composited image + copy + button, saved to your Files tab.")
+        return {"reply": reply,
+                "tier": "local", "latency_ms": 0,
+                "source": "ad_gen", "download_url": url}
 
     try:
         if _CHART_TRIGGER_RE.match(first_line):
@@ -3193,8 +3250,24 @@ def _try_office_gen(message: str, username: str) -> dict | None:
             brief = _re.sub(r"^(?:for|about|on|to\s+promote)\s+",
                             "", brief, flags=_re.IGNORECASE).strip()
             if not brief:
-                brief = "a general brand ad for the business"
+                brief = ""
             biz = mod_business.load(DATA_DIR)
+            # ChatGPT-style: if the brief is thin, ASK 2-3 clarifying
+            # questions before burning a Pollinations call on a vague ad.
+            clarifications = ad_gen.brief_needs_clarification(brief)
+            if clarifications:
+                q_lines = "\n".join(f"  {i+1}. {q}" for i, q in enumerate(clarifications))
+                reply = ("Before I build the ad, can you fill in a couple of "
+                          "details so it actually performs?\n\n"
+                          f"{q_lines}\n\n"
+                          "Reply with the answers (one line is fine) and I'll "
+                          "design the headline, body, CTA, and the image — all "
+                          "composited into one PNG ready to upload.")
+                # Cache the partial brief so the next answer message rebuilds
+                # the request with the original "make me an ad" intent.
+                _PENDING_AD_BRIEF[username] = (brief, platform, time.time())
+                return {"reply": reply, "tier": "local", "latency_ms": 0,
+                        "source": "ad_clarify"}
             try:
                 with _user_image_lock(username):
                     png, components = ad_gen.build_ad(
@@ -3226,9 +3299,12 @@ def _try_office_gen(message: str, username: str) -> dict | None:
             # Cache the image_brief so refinements ("make it brighter") still work
             _LAST_IMAGE_PROMPT[username] = (
                 components["image_brief"], time.time(), "free")
+            alts = components.get("headline_alts") or []
+            alts_line = (" Alt headlines: "
+                         + " · ".join(f'"{a}"' for a in alts[:2])) if alts else ""
             reply = (f"Built a {platform.replace('_', ' ')} ad — "
                      f"headline: \"{components['headline']}\" · "
-                     f"CTA: \"{components['cta']}\". "
+                     f"CTA: \"{components['cta']}\".{alts_line} "
                      "Composited image + copy + button, saved to your Files tab.")
             return {"reply": reply,
                     "tier": "local", "latency_ms": 0,

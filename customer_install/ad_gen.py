@@ -54,26 +54,91 @@ DEFAULT_ACCENT = (139, 92, 246)
 
 
 AD_DESIGNER_SYSTEM = (
-    "You are a senior performance-marketing copywriter and ad designer. "
-    "Given a brief from a small-business owner, design ONE complete ad "
-    "creative for the requested platform. Output STRICT JSON with EXACTLY "
-    "these keys:\n"
-    "  headline    — 4 to 8 words, punchy, benefit-focused\n"
-    "  body        — 12 to 25 words, conversational, one specific value prop\n"
-    "  cta         — 1 to 3 words for the button label (e.g. \"Order Now\",\n"
-    "                \"Get Started\", \"Book Today\")\n"
-    "  image_brief — 1 sentence describing the BACKGROUND image only.\n"
-    "                Concrete, photographic, no text in the image (text is\n"
-    "                overlaid separately). Avoid loaded military words.\n\n"
+    "You are a senior performance-marketing copywriter at a top agency. "
+    "Use the AIDA framework (Attention, Interest, Desire, Action) for the "
+    "copy. Output STRICT JSON only — no preamble, no code fences, no "
+    "explanations outside the JSON.\n\n"
+    "SCHEMA — exact keys:\n"
+    "  headline       — 4-8 words. ATTENTION step. Hook them with a\n"
+    "                   benefit, a question, or a sharp number. No vague\n"
+    "                   filler like 'Welcome to' / 'Discover'.\n"
+    "  body           — 18-30 words. Combines INTEREST (specific value prop)\n"
+    "                   + DESIRE (one concrete proof/sensory detail). Plain\n"
+    "                   conversational tone. NO em-dashes inside the body.\n"
+    "  cta            — 1-3 words. ACTION step. Imperative verb +\n"
+    "                   object: 'Order Now' / 'Book a Table' / 'Get a Quote'.\n"
+    "                   Match the offer ('Try' if free, 'Buy' if paid).\n"
+    "  headline_alts  — array of TWO alternate headlines, same rules as\n"
+    "                   headline. Used for A/B test variants.\n"
+    "  image_brief    — 1-2 sentences. PHOTOGRAPHIC, specific. Say what\n"
+    "                   it shows + lighting + mood. End with: 'shot with\n"
+    "                   ample negative space in the lower third for text\n"
+    "                   overlay'. NO words inside the image (rendered text\n"
+    "                   garbles in AI gen). NO 'campaign' / 'army' / 'troops'\n"
+    "                   / loaded military words.\n\n"
     "RULES:\n"
-    "- Output ONLY the JSON object. No preamble. No code fences. No comments.\n"
-    "- Pull facts from the business profile when provided. NEVER invent a\n"
-    "  discount, sale, hours, address, or feature the business doesn't have.\n"
-    "- If the business has explicit no-discount / no-trial policies, do NOT\n"
-    "  promise either in the ad.\n"
-    "- Keep claims defensible. \"Loved by 100s of regulars\" is fine; "
-    "  \"#1 in town\" is not unless they actually are.\n"
+    "- Pull facts ONLY from the business profile when provided. NEVER\n"
+    "  invent a discount, sale, hours, address, phone, or feature.\n"
+    "- If the business policy says no-trials / no-money-back, do NOT\n"
+    "  promise either in the ad. Use 'cancel anytime, no penalties'\n"
+    "  if applicable.\n"
+    "- Keep claims defensible. 'Loved by hundreds of regulars' is fine if\n"
+    "  plausible. '#1 in town' / 'voted best' require proof in the profile.\n"
+    "- The headline must NOT repeat the business name (it goes in the\n"
+    "  Facebook ad's separate name field). Lead with the BENEFIT.\n"
+    "- Vary the headline alts — don't just rephrase. One can be a question,\n"
+    "  one can be a stat or curiosity hook.\n"
 )
+
+
+# Brief-quality detector — if the brief is too thin, we ask 2-3 clarifying
+# questions before generating. Mirrors what ChatGPT does ("Sure! Before I
+# build it, can you tell me the audience and the offer?").
+def brief_needs_clarification(brief: str) -> list[str]:
+    """Return a list of questions to ask the owner, or [] if brief is rich
+    enough to design from. Questions are tailored to what's missing."""
+    b = (brief or "").strip().lower()
+    if not b:
+        return [
+            "What's the OFFER — what action do you want a viewer to take? "
+                "(e.g. book a table, buy a product, sign up, visit the shop)",
+            "Who's the AUDIENCE — locals, families, professionals, hobbyists, "
+                "a specific age range?",
+            "What TONE — premium / friendly / urgent / playful / professional?",
+        ]
+    questions: list[str] = []
+    has_offer = any(w in b for w in (
+        "sale", "% off", "discount", "free", "new", "launch", "open",
+        "brunch", "lunch", "dinner", "menu", "happy hour", "special",
+        "buy", "order", "book", "rsvp", "register", "sign up", "try",
+        "visit", "stop by", "come in", "promotion"))
+    has_audience = any(w in b for w in (
+        "for ", "people who", "anyone", "moms", "dads", "parents", "kids",
+        "families", "couples", "locals", "tourists", "professionals",
+        "students", "small business", "homeowners", "fans"))
+    has_format_hint = any(w in b for w in (
+        "facebook", "instagram", "story", "post", "tiktok", "linkedin",
+        "youtube", "reels", "carousel", "flyer", "poster"))
+
+    if len(b) < 30:
+        questions.append(
+            "Can you say more about the ad — what's the specific OFFER "
+            "or message? (e.g. 'weekend brunch, $2 mimosas' or 'free "
+            "delivery on orders over $30')")
+    if not has_offer and "weekend brunch" not in b and "menu" not in b:
+        questions.append(
+            "What's the OFFER? What action should a viewer take after "
+            "seeing the ad — book, buy, visit, call, sign up?")
+    if not has_audience:
+        questions.append(
+            "Who's the AUDIENCE? Are you targeting locals, families, "
+            "professionals, or some other specific group?")
+    if not has_format_hint:
+        questions.append(
+            "What FORMAT — Facebook square post, Instagram story (tall), "
+            "Facebook cover banner, or something else?")
+    # Cap at 3 questions — more feels like an interrogation
+    return questions[:3]
 
 
 def design_ad(config: dict, brief: str, business: dict | None = None,
