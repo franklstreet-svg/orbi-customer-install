@@ -1180,6 +1180,26 @@
     btn.addEventListener('click', () => setVoiceMode(!voiceOn));
     stopBtn.addEventListener('click', stopSpeaking);
 
+    // Wrapped in a function so we can RECREATE the recognition object
+    // after Orby finishes speaking — iOS Safari often refuses subsequent
+    // .start() on the same instance once audio has played in the session.
+    // Recreating is the workaround.
+    function _buildRecognition() {
+      const r = new Recognition();
+      r.lang = 'en-US';
+      r.continuous = true;
+      r.interimResults = false;
+      r.onstart = recognition?.onstart;
+      r.onend = recognition?.onend;
+      r.onerror = recognition?.onerror;
+      r.onresult = recognition?.onresult;
+      return r;
+    }
+    window._orbiRebuildRecognition = function() {
+      try { recognition && recognition.stop(); } catch {}
+      recognition = _buildRecognition();
+    };
+
     recognition = new Recognition();
     recognition.lang = 'en-US';
     recognition.continuous = true;
@@ -1261,14 +1281,21 @@
   }
 
   // Watchdog — every 3s, if voice mode is on but mic isn't actively
-  // listening AND Orby isn't speaking, restart it. This catches iOS
-  // Safari pausing recognition silently after a long quiet stretch,
-  // and Chrome's similar behavior. Without this, the mic can quietly
-  // die mid-conversation and the owner has to manually toggle it
-  // off/on to get it going again.
+  // listening AND Orby isn't speaking, REBUILD recognition + restart.
+  // Rebuilding is required because iOS Safari often refuses .start()
+  // on a recognition instance that's been stopped after audio playback.
+  // After two consecutive stalls we always rebuild; on the first stall
+  // we try a plain restart first (cheaper).
+  let _watchdogStalls = 0;
   setInterval(() => {
     if (voiceOn && wantsListening && !isListening && !isSpeaking) {
+      _watchdogStalls++;
+      if (_watchdogStalls >= 1 && window._orbiRebuildRecognition) {
+        try { window._orbiRebuildRecognition(); } catch {}
+      }
       safeStartMic();
+    } else if (isListening) {
+      _watchdogStalls = 0;   // healthy — reset
     }
   }, 3000);
 
@@ -1303,9 +1330,16 @@
       // Echo guard — wait 600ms before re-arming the mic so the audio
       // element's buffer fully drains and the tail of Ava's last word
       // doesn't get picked up by the microphone and treated as user input.
+      // Also REBUILD the recognition object — iOS Safari often refuses
+      // .start() on the same instance once audio has played in the
+      // session. Rebuilding gives us a fresh engine.
       if (wantsListening) {
         setTimeout(() => {
-          if (wantsListening && !isSpeaking) safeStartMic();
+          if (!wantsListening || isSpeaking) return;
+          try {
+            if (window._orbiRebuildRecognition) window._orbiRebuildRecognition();
+          } catch {}
+          safeStartMic();
         }, 600);
       }
     };
