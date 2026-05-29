@@ -405,7 +405,7 @@
   }
 
   function populateSettingsForm(s) {
-    document.getElementById('tone-select').value = s.tone || 'friendly_professional';
+    document.getElementById('tone-select').value = s.tone || 'friend';
     document.querySelector('[name="topics_to_avoid"]').value =
       (s.topics_to_avoid || []).join('\n');
     [

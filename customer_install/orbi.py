@@ -1376,7 +1376,7 @@ def owner_get_settings():
     business = mod_business.load(DATA_DIR)
     personality = business.get("personality", {}) or {}
     return jsonify({
-        "tone": personality.get("tone", "friendly_professional"),
+        "tone": personality.get("tone", "friend"),
         "topics_to_avoid": scope.get("topics_to_avoid", []),
         **{k: scope.get(k, False) for k in (
             "public_can_take_orders", "public_can_book_appointments",
