@@ -1519,13 +1519,19 @@
       document.getElementById('owner-stop-speaking').hidden = true;
       setVoiceState(null);
       // Echo guard — short wait so the audio tail doesn't get picked up
-      // by the mic. Then restart. Plain restart first; the InvalidState
-      // handler in safeStartMic will rebuild only if needed.
+      // by the mic. On mobile, recreate the recognition object first:
+      // iOS routes audio differently after playback and a plain
+      // recognition.start() silently no-ops — start() resolves but
+      // onstart never fires and no audio is captured. Rebuilding is
+      // the proven workaround (Test button uses the same trick).
       if (wantsListening) {
         setTimeout(() => {
           if (!wantsListening || isSpeaking) return;
+          if (_isMobile()) {
+            try { window._orbiRebuildRecognition && window._orbiRebuildRecognition(); } catch {}
+          }
           safeStartMic();
-        }, 300);
+        }, 400);
       }
     };
 
