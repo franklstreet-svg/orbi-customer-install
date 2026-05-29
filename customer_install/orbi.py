@@ -2753,6 +2753,19 @@ _IMAGE_LOOSE_RE = _re.compile(
     r"(?:draw|paint|sketch|illustrate|visualize|visualise)\s+",
     _re.IGNORECASE,
 )
+# Subject-led catch-all: "show me a robot", "i want a sunset", "give me a
+# logo for a deli". The user named a subject and used an action prefix —
+# in chat context that almost always means "draw it". The LLM has no
+# tool-calling so falling through there just produces a text description.
+# We restrict this to messages that LOOK visual: must follow an action
+# prefix AND name "a/an/the/some [subject]", AND the message is short
+# enough that it's clearly a request, not a paragraph of context.
+_IMAGE_SUBJECT_LED_RE = _re.compile(
+    r"^\s*" + _ACTION_PREFIX +
+    r"(?:a\s+|an\s+|the\s+|some\s+)"
+    r"[a-z][a-z\-' ]{1,60}$",   # any concrete-looking subject, short request
+    _re.IGNORECASE,
+)
 # Self-portrait detector: the user wants Orby to draw HERSELF, not a
 # generic prompt. "what you look like / what you imagine / draw yourself /
 # your own appearance / what orbi looks like". When this matches we
@@ -2869,6 +2882,8 @@ def _try_office_gen(message: str, username: str) -> dict | None:
     msg = (message or "").strip()
     if not msg:
         return None
+    # Visibility for diagnosing "wrong thing got drawn" reports.
+    log.debug("office_gen msg=%r", msg[:200])
 
     try:
         if _CHART_TRIGGER_RE.match(msg):
@@ -2962,7 +2977,9 @@ def _try_office_gen(message: str, username: str) -> dict | None:
                     "tier": "local", "latency_ms": 0,
                     "source": "image_gen", "download_url": url}
 
-        image_match = _IMAGE_TRIGGER_RE.match(msg) or _IMAGE_LOOSE_RE.match(msg)
+        image_match = (_IMAGE_TRIGGER_RE.match(msg)
+                       or _IMAGE_LOOSE_RE.match(msg)
+                       or _IMAGE_SUBJECT_LED_RE.match(msg))
         if image_match:
             # ── Self-portrait shortcut ──────────────────────────────────────
             # "draw yourself" / "what you look like" / "what you imagine you
@@ -2972,7 +2989,31 @@ def _try_office_gen(message: str, username: str) -> dict | None:
             mode = "free"
             if _IMAGE_SELF_RE.search(msg):
                 mode = "self"
-                prompt = _ORBY_SELF_ORB
+                # Hybrid request? "draw yourself as a robot", "draw you in a
+                # forest", "draw your face on a t-shirt". Pull the descriptor
+                # so we don't drop the user's actual subject hint.
+                as_match = _re.search(
+                    r"\bas\s+(?:an?\s+)?(.{2,120}?)(?:[\.!?]|$)",
+                    msg, _re.IGNORECASE)
+                descriptor = as_match.group(1).strip().rstrip(",") if as_match else ""
+                # Form keywords that imply the user wants a body, not an orb
+                form_words = _re.search(
+                    r"\b(?:robot|humanoid|character|figure|person|human|woman|"
+                    r"man|girl|guy|cyborg|android|hero|mascot|cartoon|anime)\b",
+                    msg, _re.IGNORECASE)
+                if descriptor or form_words:
+                    # Hybrid — use the humanoid Orby base + descriptor so
+                    # "draw yourself as a robot" actually produces a robot
+                    # in Orby colors instead of a pure orb.
+                    prompt = _ORBY_SELF_BASE
+                    if descriptor:
+                        prompt = f"{prompt}, depicted as {descriptor}"
+                    elif form_words:
+                        prompt = f"{prompt}, {form_words.group(0)} form"
+                else:
+                    prompt = _ORBY_SELF_ORB
+                log.info("image_gen: self-portrait branch fired msg=%r descriptor=%r form=%r",
+                         msg[:120], descriptor, bool(form_words))
             else:
                 # Strip conversational prefix + verb + filler to get the
                 # visual prompt. "can you draw me a picture of a robot"
