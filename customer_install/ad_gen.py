@@ -70,12 +70,33 @@ AD_DESIGNER_SYSTEM = (
     "                   Match the offer ('Try' if free, 'Buy' if paid).\n"
     "  headline_alts  — array of TWO alternate headlines, same rules as\n"
     "                   headline. Used for A/B test variants.\n"
-    "  image_brief    — 1-2 sentences. PHOTOGRAPHIC, specific. Say what\n"
-    "                   it shows + lighting + mood. End with: 'shot with\n"
-    "                   ample negative space in the lower third for text\n"
-    "                   overlay'. NO words inside the image (rendered text\n"
-    "                   garbles in AI gen). NO 'campaign' / 'army' / 'troops'\n"
-    "                   / loaded military words.\n\n"
+    "  image_brief    — 1-2 sentences. The image MUST literally depict the\n"
+    "                   SUBJECT of the headline / offer — not a generic\n"
+    "                   'business person at desk' or 'man at breakfast'\n"
+    "                   scene. Examples:\n"
+    "                     * Headline about WEEKEND BRUNCH → 'overhead\n"
+    "                       photograph of a brunch table: eggs benedict,\n"
+    "                       coffee, mimosas, golden morning sunlight, food-\n"
+    "                       magazine style, shallow depth of field'\n"
+    "                     * Headline about AI RECEPTIONIST → 'professional\n"
+    "                       woman wearing a wireless headset at a clean\n"
+    "                       modern desk, smiling while taking a call, glowing\n"
+    "                       laptop screen, soft office lighting, editorial\n"
+    "                       commercial photography'\n"
+    "                     * Headline about a SALE / PRODUCT → 'hero product\n"
+    "                       shot of the specific item, studio softbox\n"
+    "                       lighting, clean white background, e-commerce\n"
+    "                       style, 50mm lens look'\n"
+    "                   Required slots: SUBJECT + SETTING + LIGHTING + STYLE\n"
+    "                   ('commercial photography' / 'editorial' / 'product\n"
+    "                   hero shot' / 'lifestyle photography' / 'food magazine').\n"
+    "                   Frame the subject so the UPPER 65% of the image\n"
+    "                   contains the action and the LOWER 35% is cleaner\n"
+    "                   (sky / table surface / blurred floor / wall) for\n"
+    "                   the text overlay.\n"
+    "                   NO words inside the image (AI image models garble\n"
+    "                   text). NO 'campaign' / 'army' / 'troops' / loaded\n"
+    "                   military words.\n\n"
     "RULES:\n"
     "- Pull facts ONLY from the business profile when provided. NEVER\n"
     "  invent a discount, sale, hours, address, phone, or feature.\n"
@@ -219,58 +240,93 @@ def build_ad(config: dict, brief: str, business: dict | None = None,
 
 def _composite_ad(bg_png: bytes, *, headline: str, body: str, cta: str,
                    platform: str, accent: tuple[int, int, int]) -> bytes:
-    """Lay headline, body, and CTA button on top of the background image."""
+    """Lay headline, body, and CTA button on top of the background image.
+
+    Layout choice: a SOFT GRADIENT fade from transparent (top) to dark
+    (bottom) over the lower ~40% of the image, with text on top. Reads
+    much more modern than a hard dark rectangle — the image is still
+    visible through the gradient, but the text stays crisp.
+    """
     from PIL import Image, ImageDraw
 
-    img = Image.open(io.BytesIO(bg_png)).convert("RGB")
+    img = Image.open(io.BytesIO(bg_png)).convert("RGBA")
     W, H = img.size
-    draw = ImageDraw.Draw(img, "RGBA")
 
-    # Sizing scales with width so it looks proportional on any aspect ratio
-    headline_size = max(40, int(W * 0.058))
-    body_size     = max(22, int(W * 0.030))
-    cta_size      = max(24, int(W * 0.035))
+    # Sizing scales with width so it looks proportional on any aspect ratio.
+    # Slightly smaller than before so the band can shrink.
+    headline_size = max(36, int(W * 0.050))
+    body_size     = max(20, int(W * 0.026))
+    cta_size      = max(22, int(W * 0.030))
 
     headline_font = image_gen._load_font(headline_size, bold=True)
     body_font     = image_gen._load_font(body_size, bold=False)
     cta_font      = image_gen._load_font(cta_size, bold=True)
 
-    max_text_w = int(W * 0.86)
-    headline_lines = image_gen._wrap(draw, headline, headline_font, max_text_w)
-    body_lines     = image_gen._wrap(draw, body, body_font, max_text_w)
+    # Use a measurement-only draw for wrapping before we know band size
+    measure = ImageDraw.Draw(img)
+    max_text_w = int(W * 0.84)
+    headline_lines = image_gen._wrap(measure, headline, headline_font, max_text_w)
+    body_lines     = image_gen._wrap(measure, body, body_font, max_text_w)
 
-    headline_h = image_gen._line_height(draw, "Ag", headline_font)
-    body_h     = image_gen._line_height(draw, "Ag", body_font)
+    headline_h = image_gen._line_height(measure, "Ag", headline_font)
+    body_h     = image_gen._line_height(measure, "Ag", body_font)
 
-    line_gap = int(headline_size * 0.18)
-    section_gap = int(headline_size * 0.55)
-    cta_pad_x = max(28, int(W * 0.04))
-    cta_pad_y = max(14, int(cta_size * 0.5))
+    line_gap = int(headline_size * 0.16)
+    section_gap = int(headline_size * 0.45)
+    cta_pad_x = max(24, int(W * 0.035))
+    cta_pad_y = max(12, int(cta_size * 0.45))
 
     block_h = (
         headline_h * len(headline_lines)
-        + line_gap * (len(headline_lines) - 1)
+        + line_gap * max(0, len(headline_lines) - 1)
         + section_gap
         + body_h * len(body_lines)
-        + line_gap * (len(body_lines) - 1)
+        + line_gap * max(0, len(body_lines) - 1)
         + section_gap
         + cta_size + cta_pad_y * 2
     )
-    band_pad = max(36, int(H * 0.04))
-    band_h = block_h + band_pad * 2
-    band_y0 = H - band_h
+    # Cap text-region height at 38% of canvas — never let it eat the
+    # image. Anything over that and the gradient just extends further
+    # above without enlarging.
+    band_pad = max(28, int(H * 0.035))
+    text_region_h = block_h + band_pad * 2
+    max_text_region = int(H * 0.38)
+    text_region_h = min(text_region_h, max_text_region)
+    # The gradient fades in over a region 50% taller than the text region
+    # so the transition is smooth and the image keeps breathing room.
+    gradient_h = min(int(text_region_h * 1.5), int(H * 0.55))
+    gradient_y0 = H - gradient_h
+    text_y0 = H - text_region_h
 
-    # Dark semi-transparent band so text reads on busy photos
-    draw.rectangle((0, band_y0, W, H), fill=(0, 0, 0, 175))
-    # Accent stripe at the top of the band — brand cue
-    stripe_h = max(6, int(headline_size * 0.13))
-    draw.rectangle((0, band_y0, W, band_y0 + stripe_h), fill=accent)
+    # ── Soft black gradient overlay ──────────────────────────────────────
+    # Build a 1-pixel-wide alpha column then stretch horizontally.
+    overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    overlay_pixels = overlay.load()
+    for y in range(gradient_y0, H):
+        t = (y - gradient_y0) / max(1, gradient_h)        # 0 → 1
+        t = t * t                                          # ease-in (slower start)
+        alpha = int(t * 195)                               # max ~76% opacity at bottom
+        for x in range(W):
+            overlay_pixels[x, y] = (0, 0, 0, alpha)
+    img = Image.alpha_composite(img, overlay)
+    draw = ImageDraw.Draw(img, "RGBA")
 
-    y = band_y0 + band_pad
+    # Accent dot above the headline as a subtle brand cue (instead of a
+    # full-width stripe which felt like a hard divider).
+    dot_r = max(5, int(headline_size * 0.12))
+    dot_y = text_y0 + band_pad - dot_r * 3
+    if dot_y > 0:
+        draw.ellipse(
+            (W // 2 - dot_r, dot_y, W // 2 + dot_r, dot_y + dot_r * 2),
+            fill=accent)
+
+    # ── Text ─────────────────────────────────────────────────────────────
+    y = text_y0 + band_pad
     for ln in headline_lines:
         w = image_gen._text_width(draw, ln, headline_font)
         x = (W - w) // 2
-        draw.text((x + 2, y + 2), ln, fill=(0, 0, 0, 220), font=headline_font)
+        # Soft drop-shadow for crisp legibility on busy photos
+        draw.text((x + 2, y + 3), ln, fill=(0, 0, 0, 200), font=headline_font)
         draw.text((x, y), ln, fill=(255, 255, 255), font=headline_font)
         y += headline_h + line_gap
     y += section_gap - line_gap
@@ -278,7 +334,8 @@ def _composite_ad(bg_png: bytes, *, headline: str, body: str, cta: str,
     for ln in body_lines:
         w = image_gen._text_width(draw, ln, body_font)
         x = (W - w) // 2
-        draw.text((x, y), ln, fill=(230, 230, 230), font=body_font)
+        draw.text((x + 1, y + 2), ln, fill=(0, 0, 0, 180), font=body_font)
+        draw.text((x, y), ln, fill=(235, 235, 235), font=body_font)
         y += body_h + line_gap
     y += section_gap - line_gap
 
@@ -291,11 +348,10 @@ def _composite_ad(bg_png: bytes, *, headline: str, body: str, cta: str,
     btn_x1 = btn_x0 + btn_w
     btn_y1 = btn_y0 + btn_h
 
-    # Rounded rect; fall back to plain rect if Pillow is too old
     try:
         draw.rounded_rectangle(
             (btn_x0, btn_y0, btn_x1, btn_y1),
-            radius=int(btn_h * 0.35), fill=accent)
+            radius=int(btn_h * 0.45), fill=accent)
     except AttributeError:
         draw.rectangle((btn_x0, btn_y0, btn_x1, btn_y1), fill=accent)
 
@@ -304,7 +360,7 @@ def _composite_ad(bg_png: bytes, *, headline: str, body: str, cta: str,
     draw.text((cta_text_x, cta_text_y), cta, fill=(255, 255, 255), font=cta_font)
 
     out = io.BytesIO()
-    img.save(out, format="PNG", optimize=True)
+    img.convert("RGB").save(out, format="PNG", optimize=True)
     return out.getvalue()
 
 
