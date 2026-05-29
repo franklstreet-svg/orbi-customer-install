@@ -2704,16 +2704,24 @@ _ACTION_PREFIX = (
 )
 _QUANT = r"(?:me\s+|us\s+)?(?:a\s+|an\s+|the\s+|some\s+)?"
 
-_CHART_VERBS = r"(?:make|build|create|generate|draw|render|plot|chart|graph)"
+# Verbs tolerate the natural conjugations users actually type: "makes",
+# "drew", "drawing", "creating" — without this, "makes a picture" silently
+# fails the trigger and the LLM has to fall back to hallucinating.
+_CHART_VERBS = r"(?:make(?:s|d|ing)?|build(?:s|ing)?|create(?:s|d|ing)?|generate(?:s|d|ing)?|draw(?:s|ing|n)?|drew|render(?:s|ed|ing)?|plot(?:s|ted|ting)?|chart(?:s|ed|ing)?|graph(?:s|ed|ing)?)"
 _CHART_NOUNS = r"(?:bar|line|pie|scatter)?\s*(?:chart|graph|plot|visualization|visualisation)"
 
-_DECK_VERBS = r"(?:make|build|create|generate|put\s+together|throw\s+together|whip\s+up)"
+_DECK_VERBS = r"(?:make(?:s|d|ing)?|build(?:s|ing)?|create(?:s|d|ing)?|generate(?:s|d|ing)?|put(?:s|ting)?\s+together|throw(?:s|n|ing)?\s+together|whip(?:s|ping|ped)?\s+up)"
 _DECK_NOUNS = r"(?:\d+[-\s]?slide\s+)?(?:pitch\s+)?(?:slide\s+)?(?:deck|presentation|powerpoint|pptx|slideshow)"
 
-# Image verbs cover everything from "draw" to "whip up" to "illustrate".
+# Image verbs cover everything from "draw" to "whip up" to "illustrate",
+# plus their natural conjugations.
 _IMG_VERBS = (
-    r"(?:make|build|create|generate|design|draw|paint|render|sketch|"
-    r"mock\s*up|come\s+up\s+with|whip\s+up|illustrate|visualize|visualise)"
+    r"(?:make(?:s|d|ing)?|build(?:s|ing)?|create(?:s|d|ing)?|generate(?:s|d|ing)?|"
+    r"design(?:s|ed|ing)?|draw(?:s|ing|n)?|drew|paint(?:s|ed|ing)?|"
+    r"render(?:s|ed|ing)?|sketch(?:es|ed|ing)?|"
+    r"mock(?:s|ed|ing)?\s*up|come(?:s)?\s+up\s+with|came\s+up\s+with|"
+    r"whip(?:s|ping|ped)?\s+up|illustrate(?:s|d|ing)?|"
+    r"visualize(?:s|d|ing)?|visualise(?:s|d|ing)?)"
 )
 # Image nouns — anything someone might call a visual artifact.
 _IMG_NOUNS = (
@@ -2750,7 +2758,8 @@ _IMAGE_TRIGGER_RE = _re.compile(
 # still fire image gen because the verb is clearly visual.
 _IMAGE_LOOSE_RE = _re.compile(
     r"^\s*" + _POLITE_PREFIX +
-    r"(?:draw|paint|sketch|illustrate|visualize|visualise)\s+",
+    r"(?:draw(?:s|ing|n)?|drew|paint(?:s|ed|ing)?|sketch(?:es|ed|ing)?|"
+    r"illustrate(?:s|d|ing)?|visualize(?:s|d|ing)?|visualise(?:s|d|ing)?)\s+",
     _re.IGNORECASE,
 )
 # Subject-led catch-all: "show me a robot", "i want a sunset", "give me a
@@ -2882,8 +2891,8 @@ def _try_office_gen(message: str, username: str) -> dict | None:
     msg = (message or "").strip()
     if not msg:
         return None
-    # Visibility for diagnosing "wrong thing got drawn" reports.
-    log.debug("office_gen msg=%r", msg[:200])
+    # Visibility for diagnosing "wrong thing got drawn" / "she didn't draw" reports.
+    log.info("office_gen entry msg=%r", msg[:200])
 
     try:
         if _CHART_TRIGGER_RE.match(msg):
@@ -2934,19 +2943,35 @@ def _try_office_gen(message: str, username: str) -> dict | None:
                     "source": "pptx_gen", "download_url": saved.get("download_url")}
 
         # ── Refinement-after-image shortcut ─────────────────────────────────
-        # "more humanoid" / "make it bigger" / "different style" — these
-        # don't have a drawing verb, but the user is following up on the
-        # last image. Cached prompt + refinement text → re-fire image_gen.
+        # "more humanoid" / "make it bigger" / "different style" / "(for
+        # instagram)" — these don't have a drawing verb, but the user is
+        # following up on the last image. Cached prompt + refinement text
+        # → re-fire image_gen.
         refine_now = time.time()
         cached = _LAST_IMAGE_PROMPT.get(username)
+        msg_for_check = msg.strip("() ")
+        looks_like_platform_only = (
+            len(msg_for_check) < 60
+            and bool(_re.match(r"^\s*(?:for\s+)?", msg_for_check, _re.IGNORECASE))
+            and any(rx.search(msg_for_check) for rx, _ in _IMAGE_KIND_RES)
+        )
         is_refinement = (
             cached
             and (refine_now - cached[1]) < _IMAGE_REFINE_TTL_SECONDS
             and len(msg) < 200
-            and _IMAGE_REFINE_RE.search(msg)
+            and (_IMAGE_REFINE_RE.search(msg) or looks_like_platform_only)
             and not _IMAGE_TRIGGER_RE.match(msg)
             and not _IMAGE_LOOSE_RE.match(msg)
         )
+        if cached and not is_refinement:
+            log.info("office_gen refinement skipped: msg=%r cache_age=%.0fs "
+                     "refine_kw=%s platform_only=%s",
+                     msg[:80], refine_now - cached[1],
+                     bool(_IMAGE_REFINE_RE.search(msg)),
+                     looks_like_platform_only)
+        elif is_refinement:
+            log.info("office_gen refinement HIT: msg=%r cache_age=%.0fs mode=%s",
+                     msg[:80], refine_now - cached[1], cached[2])
         if is_refinement:
             base_prompt, _, mode = cached
             refinement = msg.strip().rstrip(".?!")
@@ -3035,9 +3060,12 @@ def _try_office_gen(message: str, username: str) -> dict | None:
                     r"|i(?:'d| would)\s+like(?:\s+(?:you\s+)?to)?\s+"
                     r"|let'?s\s+|how\s+about\s+(?:you\s+)?"
                     r"|may\s+i\s+have\s+|give\s+me\s+|show\s+me\s+|gimme\s+)",
-                    # 2. drawing verb + me/us + a/an/the/some
-                    r"^\s*(?:make|build|create|generate|design|draw|paint|render|sketch|"
-                    r"mock\s*up|come\s+up\s+with|whip\s+up|illustrate|visualize|visualise)\s+"
+                    # 2. drawing verb (+ conjugation) + me/us + a/an/the/some
+                    r"^\s*(?:make(?:s|d|ing)?|build(?:s|ing)?|create(?:s|d|ing)?|"
+                    r"generate(?:s|d|ing)?|design(?:s|ed|ing)?|draw(?:s|ing|n)?|drew|"
+                    r"paint(?:s|ed|ing)?|render(?:s|ed|ing)?|sketch(?:es|ed|ing)?|"
+                    r"mock\s*up|come\s+up\s+with|whip\s+up|illustrate(?:s|d|ing)?|"
+                    r"visualize(?:s|d|ing)?|visualise(?:s|d|ing)?)\s+"
                     r"(?:me\s+|us\s+)?(?:a\s+|an\s+|the\s+|some\s+)?",
                     # 3. leading noun-of: "picture of a robot" → "a robot"
                     r"^(?:social\s+post|facebook\s+post|instagram\s+post|tiktok\s+post|"
