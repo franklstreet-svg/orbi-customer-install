@@ -1241,29 +1241,38 @@
   // toggle button — that "primes" the audio session. Subsequent fresh
   // Audio() plays work without further gestures.
   let _audioUnlocked = false;
+  let _audioCtx = null;
+  let _currentAudioSource = null;   // Web Audio source node currently playing
+  function _ensureAudioCtx() {
+    if (_audioCtx) return _audioCtx;
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return null;
+    try { _audioCtx = new AC(); } catch { return null; }
+    return _audioCtx;
+  }
   function _unlockAudio() {
-    if (_audioUnlocked) return;
-    if (!_isMobile()) { _audioUnlocked = true; return; }
-    try {
-      const a = new Audio();
-      a.preload = 'auto';
-      a.playsInline = true;
-      a.setAttribute('playsinline', '');
-      a.src = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=';
-      a.play()
-        .then(() => { _audioUnlocked = true; })
-        .catch(() => { /* unlock failed — speechSynthesis fallback */ });
-    } catch {}
-    // iOS standalone PWA still wants a PERSISTENT element for reliability;
-    // every other mobile case uses fresh Audio() per reply.
-    if (_isIosStandalonePwa() && !_persistentAudio) {
-      _persistentAudio = new Audio();
-      _persistentAudio.preload = 'auto';
-      _persistentAudio.playsInline = true;
-      _persistentAudio.setAttribute('playsinline', '');
-      _persistentAudio.src =
-        'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=';
-      _persistentAudio.play().then(() => {}).catch(() => {});
+    // Resume the AudioContext inside the user gesture. Once resumed, it
+    // stays "running" for the whole session and we can play arbitrary
+    // audio from any callback context (fetch responses, timers, etc.)
+    // without needing another user gesture. This is the only iOS-Chrome-
+    // PWA-compatible way to autoplay chat replies.
+    const ctx = _ensureAudioCtx();
+    if (ctx && ctx.state === 'suspended') {
+      ctx.resume().then(() => { _audioUnlocked = true; }).catch(() => {});
+    } else if (ctx) {
+      _audioUnlocked = true;
+    }
+    // Also play a silent WAV via plain <audio> as a belt-and-suspenders
+    // unlock — some browsers prefer one path or the other.
+    if (_isMobile()) {
+      try {
+        const a = new Audio();
+        a.preload = 'auto';
+        a.playsInline = true;
+        a.setAttribute('playsinline', '');
+        a.src = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=';
+        a.play().catch(() => {});
+      } catch {}
     }
   }
 
@@ -1516,6 +1525,7 @@
         currentAudioUrl = null;
       }
       currentAudio = null;
+      _currentAudioSource = null;
       document.getElementById('owner-stop-speaking').hidden = true;
       setVoiceState(null);
       // Echo guard — short wait so the audio tail doesn't get picked up
@@ -1539,14 +1549,40 @@
     // reliably enough that we don't need a forced finish. The complexity
     // was causing timing conflicts with the rebuild logic.)
 
-    // Use fresh Audio() every time — this is the same path the Test
-    // button uses, and the Test button works on Chrome iPhone. The
-    // first-gesture unlock has already opened the iOS audio session;
-    // we don't need to reuse a persistent element. (Reusing one was
-    // sometimes leaving the player on the silent unlock WAV instead
-    // of the real /tts source, and we'd miss onended → mic never
-    // restarted → user stuck toggling manually.)
     const url = '/tts?text=' + encodeURIComponent(cleanText);
+
+    // Strategy 1 (preferred): Web Audio API. Once AudioContext is resumed
+    // inside a user gesture (handled by _unlockAudio on first tap), it
+    // stays "running" for the whole session and can play arbitrary audio
+    // from any callback — including fetch responses like /tts replies.
+    // This is the ONLY reliable autoplay path on iOS Chrome PWA.
+    const ctx = _ensureAudioCtx();
+    if (ctx && ctx.state === 'running') {
+      try {
+        const res = await fetch(url);
+        if (!res.ok) throw new Error('tts ' + res.status);
+        const arr = await res.arrayBuffer();
+        const decoded = await new Promise((resolve, reject) => {
+          // Use callback form for Safari compatibility (older webkit
+          // AudioContext returns nothing from the Promise overload).
+          ctx.decodeAudioData(arr, resolve, reject);
+        });
+        const source = ctx.createBufferSource();
+        source.buffer = decoded;
+        source.connect(ctx.destination);
+        source.onended = finish;
+        _currentAudioSource = source;
+        currentAudio = source;   // so stopSpeaking can pause it
+        source.start(0);
+        return;
+      } catch (err) {
+        console.warn('[Orbi] Web Audio path failed, falling back:', err);
+        // Fall through to plain Audio() below.
+      }
+    }
+
+    // Strategy 2 (fallback): plain <audio> element. Works on desktop and
+    // in user-gesture contexts on mobile. Same path the Test button uses.
     try {
       currentAudio = new Audio(url);
       currentAudio.preload = 'auto';
@@ -1557,7 +1593,6 @@
       const playPromise = currentAudio.play();
       if (playPromise && typeof playPromise.catch === 'function') {
         playPromise.catch((err) => {
-          // /tts blocked or failed. Fall back to iOS built-in voice.
           console.warn('[Orbi] Audio() blocked or failed:', err);
           _speakViaSpeechSynthesis(cleanText, finish);
         });
@@ -1571,7 +1606,11 @@
   }
 
   function stopSpeaking() {
-    if (currentAudio) {
+    if (_currentAudioSource) {
+      try { _currentAudioSource.onended = null; _currentAudioSource.stop(0); } catch {}
+      _currentAudioSource = null;
+    }
+    if (currentAudio && typeof currentAudio.pause === 'function') {
       try { currentAudio.pause(); currentAudio.src = ''; } catch {}
     }
     if (window.speechSynthesis) {
