@@ -4089,132 +4089,214 @@
 
 
   // ====================================================================
-  // INTERNAL STAFF MESSAGES (Team messages panel inside People tab)
+  // TEAM CHAT — dedicated tab with iMessage-style per-staff threads
   // ====================================================================
-  let _imsgCurrentUsername = null;
+  let _teamMe = null;             // logged-in user's identity (cached)
+  let _teamActiveOther = null;    // currently-open thread (other user)
+  let _teamPollHandle = null;     // setInterval handle for thread polling
 
-  async function _loadImsgList() {
-    const list = document.getElementById('imsg-list');
+  async function _teamLoadMe() {
+    if (_teamMe) return _teamMe;
+    try {
+      const r = await fetch('/api/owner/whoami');
+      if (r.ok) _teamMe = await r.json();
+    } catch {}
+    return _teamMe;
+  }
+
+  async function _teamRenderStaffList() {
+    const list = document.getElementById('team-staff-list');
     if (!list) return;
     try {
-      const r = await fetch('/api/owner/internal_messages?limit=50');
-      if (!r.ok) throw new Error('Failed to load');
-      const data = await r.json();
-      // Remember who "me" is by checking the dashboard's known user
-      // Falls back to the first message's "to" if both ends are present.
-      if (!_imsgCurrentUsername) {
-        try {
-          const meRes = await fetch('/api/owner/whoami');
-          if (meRes.ok) {
-            const me = await meRes.json();
-            _imsgCurrentUsername = me.username;
-          }
-        } catch {}
+      await _teamLoadMe();
+      const [staffRes, msgRes] = await Promise.all([
+        fetch('/api/owner/staff'),
+        fetch('/api/owner/internal_messages?limit=500'),
+      ]);
+      const staffData = await staffRes.json();
+      const msgData = await msgRes.json();
+      const active = (staffData.active || []).filter(u =>
+        u.username !== (_teamMe?.username || ''));
+      // Compute unread counts + last-message previews per other user
+      const msgs = msgData.messages || [];
+      const meta = {};   // other_username → {unread, lastMsg, lastTs}
+      for (const m of msgs) {
+        const other = m.to === _teamMe?.username ? m.from : m.to;
+        if (!other || other === _teamMe?.username) continue;
+        if (!meta[other]) meta[other] = { unread: 0, lastMsg: '', lastTs: 0 };
+        if (m.created_at > meta[other].lastTs) {
+          meta[other].lastTs = m.created_at;
+          meta[other].lastMsg = m.body || '';
+        }
+        if (m.to === _teamMe?.username && !m.read_at) {
+          meta[other].unread += 1;
+        }
       }
-      const msgs = data.messages || [];
-      if (!msgs.length) {
-        list.innerHTML = '<div class="empty-state-small">No messages yet. Hit Compose, or just tell Orby in chat.</div>';
+      // Update tab badge with total unread
+      const totalUnread = Object.values(meta).reduce((s, v) => s + v.unread, 0);
+      const badge = document.getElementById('team-unread-badge');
+      if (badge) {
+        if (totalUnread > 0) { badge.textContent = totalUnread; badge.hidden = false; }
+        else { badge.hidden = true; }
+      }
+      if (!active.length) {
+        list.innerHTML = '<div class="muted" style="padding:12px;font-size:13px">No staff to chat with yet. Add some in Staff tab.</div>';
         return;
       }
+      // Sort by last-message time (most recent first), then by name
+      active.sort((a, b) => {
+        const ta = meta[a.username]?.lastTs || 0;
+        const tb = meta[b.username]?.lastTs || 0;
+        if (ta !== tb) return tb - ta;
+        return (a.display_name || a.username).localeCompare(b.display_name || b.username);
+      });
       let html = '';
-      for (const m of msgs.slice(0, 30)) {
-        const inbound = m.to === _imsgCurrentUsername;
-        const unread = inbound && !m.read_at;
-        const otherName = inbound ? m.from_name : m.to_name;
-        const arrow = inbound ? '←' : '→';
-        const dt = m.created_at ? new Date(m.created_at * 1000).toLocaleString() : '';
-        const via = m.via === 'orby' ? ' <span style="font-size:10px;color:#8b5cf6">via Orby</span>' : '';
+      for (const u of active) {
+        const name = u.display_name || u.username;
+        const m = meta[u.username] || { unread: 0, lastMsg: '', lastTs: 0 };
+        const preview = m.lastMsg ? m.lastMsg.slice(0, 50).replace(/\n/g, ' ')
+                                    : 'No messages yet';
+        const active_cls = u.username === _teamActiveOther
+          ? 'background:#2a3460' : 'background:transparent';
         html += `
-          <div data-msgid="${_esc(m.id)}" data-unread="${unread ? 1 : 0}"
-               style="padding:10px 12px;background:${unread ? '#1f2640' : '#1a2240'};border-radius:8px;border-left:3px solid ${unread ? '#8b5cf6' : 'transparent'}">
-            <div style="display:flex;justify-content:space-between;font-size:12px;color:#9aa4c0;margin-bottom:4px">
-              <span>${arrow} ${_esc(otherName)}${via}</span>
-              <span>${_esc(dt)}${unread ? ' <b style="color:#8b5cf6">●</b>' : ''}</span>
+          <div class="team-staff-row" data-other="${_esc(u.username)}"
+               style="padding:10px 12px;border-radius:8px;cursor:pointer;${active_cls};margin-bottom:4px">
+            <div style="display:flex;justify-content:space-between;align-items:center">
+              <div style="font-weight:600;font-size:14px">${_esc(name)}</div>
+              ${m.unread > 0 ? `<span style="background:#8b5cf6;color:white;font-size:11px;padding:2px 7px;border-radius:10px">${m.unread}</span>` : ''}
             </div>
-            <div style="white-space:pre-wrap;font-size:14px">${_esc(m.body)}</div>
+            <div style="font-size:12px;color:#9aa4c0;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${_esc(preview)}</div>
           </div>
         `;
       }
       list.innerHTML = html;
-      // Mark inbound-unread as read after rendering (slight delay for UX)
-      const unreadIds = msgs.filter(m => m.to === _imsgCurrentUsername && !m.read_at)
-                            .map(m => m.id);
-      if (unreadIds.length) {
-        setTimeout(() => {
-          fetch('/api/owner/internal_messages/mark_all_read', { method: 'POST' })
-            .catch(() => {});
-        }, 1500);
-      }
-    } catch (e) {
-      list.innerHTML = '<div style="color:#ff7a7a;font-size:13px">' + _esc(e.message) + '</div>';
-    }
-  }
-
-  async function _populateImsgRecipients() {
-    const sel = document.getElementById('imsg-to');
-    if (!sel) return;
-    try {
-      const r = await fetch('/api/owner/staff');
-      if (!r.ok) return;
-      const data = await r.json();
-      const active = data.active || [];
-      let html = '<option value="">— pick a staff member —</option>';
-      for (const u of active) {
-        if (u.username === _imsgCurrentUsername) continue;
-        const label = u.display_name ? `${u.display_name} (${u.username})` : u.username;
-        html += `<option value="${_esc(u.username)}">${_esc(label)}</option>`;
-      }
-      sel.innerHTML = html;
-    } catch {}
-  }
-
-  function _wireImsg() {
-    const composeBtn = document.getElementById('imsg-compose-btn');
-    const dlg = document.getElementById('imsg-dialog');
-    const form = document.getElementById('imsg-form');
-    if (composeBtn && dlg) {
-      composeBtn.addEventListener('click', async () => {
-        await _populateImsgRecipients();
-        document.getElementById('imsg-body').value = '';
-        dlg.showModal();
+      // Wire row clicks
+      list.querySelectorAll('.team-staff-row').forEach(row => {
+        row.addEventListener('click', () => {
+          _teamOpenThread(row.dataset.other,
+                           row.querySelector('div > div').textContent.trim());
+        });
       });
+    } catch (e) {
+      list.innerHTML = '<div style="color:#ff7a7a;padding:12px;font-size:13px">' + _esc(e.message) + '</div>';
     }
-    if (form) {
-      form.addEventListener('submit', async (e) => {
-        e.preventDefault();
-        const to = document.getElementById('imsg-to').value;
-        const body = document.getElementById('imsg-body').value.trim();
-        if (!to || !body) return;
-        const btn = document.getElementById('imsg-send-btn');
-        btn.disabled = true; btn.textContent = 'Sending…';
-        try {
-          const r = await fetch('/api/owner/internal_messages', {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ to, body })
-          });
-          const data = await r.json();
-          if (!r.ok) throw new Error(data.error || 'Failed');
-          dlg.close();
-          _loadImsgList();
-        } catch (e) {
-          alert('Send failed: ' + e.message);
-        } finally {
-          btn.disabled = false; btn.textContent = 'Send';
+  }
+
+  async function _teamOpenThread(otherUsername, otherDisplayName) {
+    _teamActiveOther = otherUsername;
+    const header = document.getElementById('team-chat-header');
+    const compose = document.getElementById('team-chat-compose');
+    if (header) header.textContent = otherDisplayName || otherUsername;
+    if (compose) compose.style.display = 'block';
+    await _teamLoadThread();
+    _teamRenderStaffList();   // refresh to show active row highlight
+    // Start polling every 5s while this thread is open
+    if (_teamPollHandle) clearInterval(_teamPollHandle);
+    _teamPollHandle = setInterval(() => {
+      if (document.getElementById('tab-team')?.classList.contains('active')
+          && _teamActiveOther === otherUsername) {
+        _teamLoadThread();
+      }
+    }, 5000);
+  }
+
+  async function _teamLoadThread() {
+    if (!_teamActiveOther) return;
+    const thread = document.getElementById('team-chat-thread');
+    if (!thread) return;
+    try {
+      await _teamLoadMe();
+      const r = await fetch(`/api/owner/internal_messages/thread/${encodeURIComponent(_teamActiveOther)}`);
+      if (!r.ok) throw new Error('Failed to load thread');
+      const data = await r.json();
+      const msgs = data.thread || [];
+      if (!msgs.length) {
+        thread.innerHTML = '<div class="muted" style="text-align:center;font-size:13px;margin:auto">No messages yet. Send the first one.</div>';
+        return;
+      }
+      let html = '';
+      for (const m of msgs) {
+        const mine = m.from === _teamMe?.username;
+        const via = m.via === 'orby' ? ' <span style="font-size:10px;opacity:0.7">via Orby</span>' : '';
+        const dt = m.created_at ? new Date(m.created_at * 1000).toLocaleString() : '';
+        const align = mine ? 'flex-end' : 'flex-start';
+        const bg = mine ? '#8b5cf6' : '#2a3460';
+        const color = mine ? 'white' : '#eaf0ff';
+        html += `
+          <div style="display:flex;justify-content:${align}">
+            <div style="max-width:75%;padding:10px 14px;background:${bg};color:${color};border-radius:14px;border-${mine ? 'bottom-right' : 'bottom-left'}-radius:4px">
+              <div style="white-space:pre-wrap;font-size:14px">${_esc(m.body)}</div>
+              <div style="font-size:10px;opacity:0.7;margin-top:4px">${_esc(dt)}${via}</div>
+            </div>
+          </div>
+        `;
+      }
+      thread.innerHTML = html;
+      thread.scrollTop = thread.scrollHeight;
+      // Mark inbound-unread as read (silently, after rendering)
+      setTimeout(() => {
+        fetch('/api/owner/internal_messages/mark_all_read', { method: 'POST' })
+          .catch(() => {});
+      }, 1000);
+    } catch (e) {
+      thread.innerHTML = '<div style="color:#ff7a7a;font-size:13px">' + _esc(e.message) + '</div>';
+    }
+  }
+
+  async function _teamSendMessage() {
+    const input = document.getElementById('team-chat-input');
+    if (!input || !_teamActiveOther) return;
+    const body = input.value.trim();
+    if (!body) return;
+    const btn = document.getElementById('team-chat-send');
+    btn.disabled = true;
+    try {
+      const r = await fetch('/api/owner/internal_messages', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ to: _teamActiveOther, body })
+      });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || 'Failed');
+      input.value = '';
+      await _teamLoadThread();
+      _teamRenderStaffList();
+    } catch (e) {
+      alert('Send failed: ' + e.message);
+    } finally {
+      btn.disabled = false;
+      input.focus();
+    }
+  }
+
+  function _wireTeamChat() {
+    const sendBtn = document.getElementById('team-chat-send');
+    const input = document.getElementById('team-chat-input');
+    if (sendBtn) sendBtn.addEventListener('click', _teamSendMessage);
+    if (input) {
+      input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && !e.shiftKey) {
+          e.preventDefault();
+          _teamSendMessage();
         }
       });
     }
-    // Auto-refresh inbox when People tab opens + every 60s while it's active
-    const peopleTab = document.querySelector('.tab[data-tab="people"]');
-    if (peopleTab) peopleTab.addEventListener('click', _loadImsgList);
-    if (document.getElementById('tab-people')?.classList.contains('active')) {
-      _loadImsgList();
+    // Refresh staff list when Team tab opens, plus every 30s while active
+    const teamTab = document.querySelector('.tab[data-tab="team"]');
+    if (teamTab) teamTab.addEventListener('click', () => _teamRenderStaffList());
+    if (document.getElementById('tab-team')?.classList.contains('active')) {
+      _teamRenderStaffList();
     }
+    // Also load the badge count on initial page load so user knows there's mail
+    _teamRenderStaffList();
     setInterval(() => {
-      if (document.getElementById('tab-people')?.classList.contains('active')) {
-        _loadImsgList();
+      if (document.getElementById('tab-team')?.classList.contains('active')) {
+        _teamRenderStaffList();
+      } else {
+        // Light refresh just for badge count even when tab inactive
+        _teamRenderStaffList();
       }
-    }, 60000);
+    }, 30000);
   }
-  document.addEventListener('DOMContentLoaded', _wireImsg);
+  document.addEventListener('DOMContentLoaded', _wireTeamChat);
 
 })();

@@ -48,6 +48,7 @@
     <button class="tab" data-tab="files">Files</button>
     <button class="tab" data-tab="business">Business</button>
     <button class="tab owner-only" data-tab="people" hidden>Staff</button>
+    <button class="tab" data-tab="team">Team Chat <span class="badge" id="team-unread-badge" hidden>0</span></button>
     <button class="tab" data-tab="settings">Settings</button>
     <button class="tab" data-tab="help" title="What can Orby do?">Help</button>
   </nav>
@@ -579,40 +580,6 @@
       <div id="people-active-list" class="people-list">
         <div class="empty-state-small">Loading staff…</div>
       </div>
-      <!-- Internal staff messaging — talk to your team -->
-      <div style="margin-top:28px;border-top:1px solid #2c3756;padding-top:20px">
-        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
-          <h2 style="margin:0">💬 Team messages</h2>
-          <button class="primary-btn" id="imsg-compose-btn">+ Compose</button>
-        </div>
-        <p class="muted" style="margin:4px 0 12px">
-          Quick messages between staff. Or just tell Orby in chat —
-          <em>"tell Cathi the meeting moved to 3pm"</em>.
-        </p>
-        <div id="imsg-list" style="display:flex;flex-direction:column;gap:8px">
-          <div class="empty-state-small">Loading messages…</div>
-        </div>
-        <!-- Compose dialog -->
-        <dialog id="imsg-dialog" style="background:#131a2e;color:#eaf0ff;border:1px solid #2c3756;border-radius:12px;padding:24px;max-width:480px;width:90%">
-          <form method="dialog" id="imsg-form">
-            <h2 style="margin:0 0 12px">New message</h2>
-            <label style="display:block;font-size:12px;color:#9aa4c0;margin-bottom:4px">To</label>
-            <select name="to" id="imsg-to" required
-                     style="width:100%;padding:8px;background:#1a2240;color:#dce3f6;border:1px solid #2c3756;border-radius:6px;margin-bottom:12px">
-              <option value="">— pick a staff member —</option>
-            </select>
-            <label style="display:block;font-size:12px;color:#9aa4c0;margin-bottom:4px">Message</label>
-            <textarea name="body" id="imsg-body" rows="4" required maxlength="4000"
-                       style="width:100%;padding:8px;background:#1a2240;color:#dce3f6;border:1px solid #2c3756;border-radius:6px;box-sizing:border-box;resize:vertical"
-                       placeholder="What do you want to say?"></textarea>
-            <div class="form-actions" style="margin-top:14px;display:flex;gap:8px;justify-content:flex-end">
-              <button type="button" class="secondary-btn" onclick="document.getElementById('imsg-dialog').close()">Cancel</button>
-              <button type="submit" class="primary-btn" id="imsg-send-btn">Send</button>
-            </div>
-          </form>
-        </dialog>
-      </div>
-
       <h2 style="margin-top:24px">Archived staff</h2>
       <p class="muted" style="margin:4px 0 12px">When someone leaves, their data is preserved for 90 days. Transfer anything you need (customer contacts, notes) before it auto-purges.</p>
       <div id="people-archived-list" class="people-list">
@@ -646,6 +613,36 @@
           </div>
         </form>
       </dialog>
+    </section>
+
+    <!-- TEAM CHAT TAB -->
+    <section class="tab-panel" id="tab-team">
+      <div id="team-chat-layout" style="display:flex;gap:14px;height:calc(100vh - 160px);min-height:480px">
+        <!-- Left: staff list -->
+        <div id="team-staff-list" style="width:260px;flex-shrink:0;background:#131a2e;border-radius:10px;padding:8px;overflow-y:auto">
+          <div class="muted" style="padding:12px;font-size:13px">Loading…</div>
+        </div>
+        <!-- Right: chat panel -->
+        <div id="team-chat-panel" style="flex:1;display:flex;flex-direction:column;background:#131a2e;border-radius:10px;overflow:hidden">
+          <div id="team-chat-header" style="padding:14px 18px;border-bottom:1px solid #2c3756;font-weight:600">
+            Pick a teammate on the left to start chatting
+          </div>
+          <div id="team-chat-thread" style="flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:8px">
+            <div class="muted" style="text-align:center;font-size:13px;margin:auto">
+              No conversation selected.<br>
+              <span style="font-size:12px">Tip: you can also tell Orby — <em>"tell Cathi the meeting moved to 3pm"</em></span>
+            </div>
+          </div>
+          <div id="team-chat-compose" style="padding:12px;border-top:1px solid #2c3756;display:none">
+            <div style="display:flex;gap:8px">
+              <textarea id="team-chat-input" rows="2" placeholder="Type a message…" maxlength="4000"
+                         style="flex:1;padding:10px;background:#1a2240;color:#dce3f6;border:1px solid #2c3756;border-radius:8px;resize:none;font-family:inherit;font-size:14px"></textarea>
+              <button type="button" class="primary-btn" id="team-chat-send" style="align-self:flex-end">Send</button>
+            </div>
+            <div style="font-size:11px;color:#6c7592;margin-top:4px">Enter to send · Shift+Enter for new line</div>
+          </div>
+        </div>
+      </div>
     </section>
 
     <!-- BUSINESS INFO TAB -->
