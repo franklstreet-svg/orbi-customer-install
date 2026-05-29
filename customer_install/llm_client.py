@@ -180,6 +180,80 @@ def generate(config: dict, system: str, messages: list[dict]) -> LLMResponse:
     return LLMResponse("", "none", 0, "all_tiers_failed")
 
 
+# ---------------------------------------------------------------------------
+# Multi-pass review (borrowed from Ultimate Bridge Brain module14)
+# ---------------------------------------------------------------------------
+# Two-pass generation: draft, then critique-and-revise. Use for high-stakes
+# outputs (marketing copy, ads, customer-facing emails, finished campaigns).
+# Costs ~2x the LLM time/tokens but the quality jump is dramatic.
+#
+# Don't use for casual chat — too slow, not worth the cost.
+
+REVIEWER_SYSTEM = (
+    "You are a senior editor reviewing an AI's draft. Your job is to "
+    "produce a REVISED version that is sharper, more specific, more honest, "
+    "and more punchy than the original.\n\n"
+    "REVIEW CRITERIA:\n"
+    "- SPECIFICITY: replace vague claims ('great service') with concrete ones\n"
+    "  ('Friday 2pm pickup', '$2 mimosas', 'within 10 miles'). If a draft "
+    "  has nothing concrete, leave the abstraction but tighten it.\n"
+    "- HONESTY: cut anything not defensible. Strip invented features, "
+    "  invented discounts, invented numbers, invented testimonials.\n"
+    "- PUNCH: cut filler ('we are excited to', 'it goes without saying'). "
+    "  Tighten sentences. Replace weak verbs with strong ones.\n"
+    "- VOICE: PRESERVE the original tone exactly. If the draft is casual, "
+    "  keep it casual. If formal, keep formal. Don't corporatize.\n"
+    "- ERRORS: fix factual mistakes, contradictions, broken JSON.\n\n"
+    "CRITICAL: PRESERVE the format and structure of the original exactly.\n"
+    "  - JSON in → JSON out (same schema, same keys)\n"
+    "  - prose in → prose out\n"
+    "  - list in → list out\n"
+    "  - bullets in → bullets out\n\n"
+    "Output ONLY the revised version. No commentary. No preamble. No "
+    "explanation of what you changed. Just the better version of the draft."
+)
+
+
+def generate_with_review(config: dict, system: str,
+                          messages: list[dict],
+                          enable_review: bool = True) -> LLMResponse:
+    """Two-pass: initial draft + critique-and-revise pass.
+
+    If enable_review=False or the review tier fails, returns the draft
+    unchanged. Tier on a successful review is suffixed with '+review' so
+    callers / logs can see the quality boost was applied.
+    """
+    draft = generate(config, system, messages)
+    if not draft or not draft.text:
+        return draft   # nothing to revise
+    if not enable_review:
+        return draft
+
+    # Pass 2: have the LLM critique + rewrite its own draft
+    original_brief = ""
+    for m in messages:
+        if m.get("role") == "user":
+            original_brief = m.get("content", "")
+    revise_user = (
+        f"ORIGINAL REQUEST:\n{original_brief}\n\n"
+        f"FIRST DRAFT (revise this):\n{draft.text}\n\n"
+        "Return ONLY the revised version."
+    )
+    try:
+        revised = generate(config, REVIEWER_SYSTEM,
+                            [{"role": "user", "content": revise_user}])
+    except Exception:
+        log.exception("review pass crashed; using draft")
+        return draft
+
+    if revised and revised.text and len(revised.text) >= 10:
+        revised.tier = f"{revised.tier}+review"
+        log.info(f"review pass applied: draft={len(draft.text)} → "
+                 f"revised={len(revised.text)} chars")
+        return revised
+    return draft
+
+
 def current_connection_state(config: dict) -> str:
     """Quick liveness check used by /api/owner/status. Returns 'online', 'degraded', 'offline'."""
     # Try brain first with a short timeout

@@ -175,6 +175,13 @@ AD_DESIGNER_SYSTEM = (
     "- If the business policy says no-trials / no-money-back, do NOT\n"
     "  promise either in the ad. Use 'cancel anytime, no penalties'\n"
     "  if applicable.\n"
+    "- NEVER use the phrase 'free trial' / 'free AI' / 'try free' unless\n"
+    "  the business profile EXPLICITLY lists a free offering. Defaulting\n"
+    "  to 'free' is a leading source of false-advertising complaints.\n"
+    "- NEVER use the phrase 'small business' / 'small businesses' /\n"
+    "  'small-business' in headlines, body, or CTAs. The product works for\n"
+    "  businesses of any size — use 'business', 'your business', 'business\n"
+    "  owners', or specific audience descriptors instead.\n"
     "- Keep claims defensible. 'Loved by hundreds of regulars' is fine if\n"
     "  plausible. '#1 in town' / 'voted best' require proof in the profile.\n"
     "- The headline must NOT repeat the business name (it goes in the\n"
@@ -274,8 +281,12 @@ def design_ad(config: dict, brief: str, business: dict | None = None,
     system = AD_DESIGNER_SYSTEM + ("\n\n" + exemplar_block if exemplar_block else "")
     user_msg = (f"{biz_ctx}PLATFORM: {platform}\n\n"
                 f"OWNER BRIEF: {brief.strip()}")
-    resp = llm_client.generate(config, system,
-                                [{"role": "user", "content": user_msg}])
+    # Use the two-pass review path — ads are high-stakes output and the
+    # quality jump is worth the ~2x LLM time. Reviewer preserves JSON
+    # format so the schema is intact.
+    resp = llm_client.generate_with_review(
+        config, system, [{"role": "user", "content": user_msg}],
+        enable_review=True)
     if not resp or not resp.text:
         raise RuntimeError("ad_designer LLM unavailable")
     raw = resp.text.strip()
