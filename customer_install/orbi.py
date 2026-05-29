@@ -1710,6 +1710,15 @@ def owner_chat():
     except Exception:
         log.exception("win mention capture failed")
 
+    # Client personal-detail capture — when owner mentions a fact ABOUT a
+    # contact ("Maxwell's daughter graduated", "Sarah loves jazz"), silently
+    # append it to that contact's personal_notes. Months of these = the
+    # owner remembers their clients' lives, which is irreplaceable.
+    try:
+        _capture_contact_facts(user_msg, user_dir)
+    except Exception:
+        log.exception("contact fact capture failed")
+
     # Update commands — "is there an update?" / "install update"
     upd = _try_update_command(user_msg, username)
     if upd is not None:
@@ -1801,6 +1810,17 @@ def owner_chat():
                 extras.append(wins_block)
         except Exception:
             log.exception("wins context_block failed")
+
+        # Client-context surfacing — if a known contact's name appears in
+        # the current message, surface what Orby knows about them. The
+        # owner mentioning "Maxwell" should remind Orby that Maxwell's
+        # daughter graduated last month, etc.
+        try:
+            cc = _contact_context_for_message(user_msg, user_dir)
+            if cc:
+                extras.append(cc)
+        except Exception:
+            log.exception("contact context lookup failed")
 
     # "What can you do?" / "Walk me through X" — pull from the shipped
     # capabilities doc so the answer is grounded in real features.
@@ -2298,6 +2318,188 @@ def _try_update_command(message: str, username: str) -> dict | None:
                 "source": "update_downloaded"}
 
     return None
+
+
+def _contact_context_for_message(message: str, user_dir: Path) -> str:
+    """If a known contact's name appears in the message, return a context
+    block with what we know about them. Multiple contacts → multiple
+    sub-blocks. Empty string when no match."""
+    from modules import contacts as mod_contacts
+
+    msg = (message or "").strip()
+    if not msg:
+        return ""
+    contacts = mod_contacts.list_all(user_dir)
+    if not contacts:
+        return ""
+
+    # Find contacts whose name appears in the message (full name or
+    # unambiguous first name)
+    msg_lower = msg.lower()
+    first_count: dict[str, list[str]] = {}
+    for c in contacts:
+        first = (c.get("name") or "").split()[:1]
+        if first:
+            first_count.setdefault(first[0].lower(), []).append(c["id"])
+
+    mentioned: list[dict] = []
+    seen_ids = set()
+    for c in contacts:
+        nm = (c.get("name") or "").strip()
+        if not nm:
+            continue
+        nm_lower = nm.lower()
+        first_lower = nm_lower.split()[0]
+        # Full name match always counts
+        if nm_lower in msg_lower:
+            if c["id"] not in seen_ids:
+                mentioned.append(c)
+                seen_ids.add(c["id"])
+            continue
+        # First name match only when unambiguous AND surrounded by word
+        # boundaries (don't match "Joe" inside "Joey")
+        if len(first_count.get(first_lower, [])) == 1:
+            if _re.search(r"\b" + _re.escape(first_lower) + r"\b",
+                          msg_lower):
+                if c["id"] not in seen_ids:
+                    mentioned.append(c)
+                    seen_ids.add(c["id"])
+
+    if not mentioned:
+        return ""
+
+    lines = ["WHAT YOU KNOW ABOUT THE PEOPLE THEY MENTIONED — weave in "
+             "naturally, especially anything personal:"]
+    for c in mentioned[:3]:
+        nm = c.get("name", "")
+        company = c.get("company", "")
+        phone = c.get("phone", "")
+        email = c.get("email", "")
+        last = c.get("last_contact", "")
+        lines.append(f"\n- {nm}" + (f" ({company})" if company else ""))
+        bits = []
+        if phone:
+            bits.append(f"phone {phone}")
+        if email:
+            bits.append(f"email {email}")
+        if last:
+            bits.append(f"last contact {last[:10]}")
+        if bits:
+            lines.append(f"  · {' · '.join(bits)}")
+        general_notes = (c.get("notes") or "").strip()
+        if general_notes:
+            lines.append(f"  · {general_notes[:200]}")
+        # Personal_notes — these are the gold (auto-captured personal facts)
+        personal = c.get("personal_notes") or []
+        if personal:
+            lines.append("  · Personal facts you've picked up:")
+            for n in personal[:6]:
+                txt = (n.get("note") or "").strip()
+                if txt:
+                    lines.append(f"      · {txt}")
+    return "\n".join(lines)
+
+
+def _capture_contact_facts(message: str, user_dir: Path) -> None:
+    """Scan the message for facts about known contacts. When a contact's
+    name appears with a personal-sounding clause, capture it as a
+    personal_note on that contact.
+
+    Patterns it catches:
+      "Maxwell's daughter Maria just graduated"
+      "Joe's wife is sick"
+      "Sarah loves jazz, especially Miles Davis"
+      "Tom's anniversary is May 15"
+      "Mike's son broke his arm last week"
+
+    Skipped — these are NOT personal facts:
+      "Send Joe the invoice"          (instruction)
+      "Did Sarah call back yet"       (question)
+      "Tom's the lead on Maxwell"     (work-only descriptor)
+    """
+    from modules import contacts as mod_contacts
+
+    msg = (message or "").strip()
+    if not msg or len(msg) > 600:
+        return
+    # Don't capture from imperatives / questions to Orby herself
+    if msg.endswith("?") or _re.match(
+            r"^\s*(?:send|email|call|text|remind|tell|ask|check|find|search|"
+            r"book|schedule|cancel|delete|update|set|add|remove)\b",
+            msg, _re.IGNORECASE):
+        return
+
+    contacts = mod_contacts.list_all(user_dir)
+    if not contacts:
+        return
+
+    # Build a lookup of names → contact id. Include first names only when
+    # unambiguous (so "Joe" matches Joe Smith if there's no other Joe).
+    by_full = {}
+    by_first = {}
+    first_count: dict[str, int] = {}
+    for c in contacts:
+        nm = (c.get("name") or "").strip()
+        if not nm:
+            continue
+        by_full[nm.lower()] = c["id"]
+        first = nm.split()[0].lower()
+        first_count[first] = first_count.get(first, 0) + 1
+        if first not in by_first:
+            by_first[first] = c["id"]
+    by_first = {k: v for k, v in by_first.items() if first_count[k] == 1}
+
+    # Personal-fact pattern: [Name][optional 's] + [verb/copula/possessive] +
+    # [personal noun or sentence]
+    PERSONAL_VERBS = (
+        r"is|was|are|were|has|have|had|loves|loved|hates|hated|prefers|"
+        r"got\s+(?:married|engaged|divorced)|graduated|started|stopped|quit|"
+        r"moved|bought|sold|inherited|adopted|broke|injured|sick|recovering|"
+        r"birthday|anniversary|wedding|baby|pregnant|"
+        r"likes|dislikes|favorite|hobby|collects|plays|watches|reads"
+    )
+    POSS_NOUNS = (
+        r"daughter|son|kid|child|wife|husband|spouse|partner|mom|dad|"
+        r"mother|father|brother|sister|sibling|family|parent|in[- ]?law|"
+        r"grandkid|grandchild|grandson|granddaughter|"
+        r"birthday|anniversary|hobby|favorite|pet|dog|cat|car|house|home|"
+        r"surgery|illness|business|company|job|new\s+(?:job|role|gig)"
+    )
+
+    pat_possessive = _re.compile(
+        r"\b(?P<name>[A-Z][a-zA-Z]{1,30})'s\s+"
+        r"(?P<rest>(?:" + POSS_NOUNS + r")\b[^.!?\n]{0,140})",
+    )
+    pat_verb = _re.compile(
+        r"\b(?P<name>[A-Z][a-zA-Z]{1,30})\s+"
+        r"(?P<rest>(?:" + PERSONAL_VERBS + r")\b[^.!?\n]{0,140})",
+    )
+
+    captured = 0
+    for pat in (pat_possessive, pat_verb):
+        for m in pat.finditer(msg):
+            name = m.group("name")
+            rest = m.group("rest").strip().rstrip(".,;:")
+            # Resolve name → contact id
+            cid = (by_full.get(name.lower())
+                    or by_first.get(name.lower()))
+            if not cid:
+                continue
+            # Skip pure work shorthand ("Joe's the lead", "Joe's behind")
+            if rest.lower().startswith(("the ", "behind", "ahead", "on it",
+                                          "doing", "working", "handling")):
+                continue
+            note = f"{name}'s {rest}" if pat is pat_possessive else f"{name} {rest}"
+            try:
+                result = mod_contacts.append_personal_note(
+                    user_dir, cid, note, source="chat")
+                if result:
+                    captured += 1
+                    log.info(f"contact fact auto-captured for {name}: {note[:80]}")
+            except Exception:
+                log.exception("append_personal_note failed")
+            if captured >= 3:    # cap per message
+                return
 
 
 def _capture_gift_mention(message: str, user_dir: Path) -> None:

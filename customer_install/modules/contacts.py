@@ -120,6 +120,76 @@ def touch_last_contact(user_dir: Path, contact_id: str) -> bool:
     return False
 
 
+def append_personal_note(user_dir: Path, contact_id: str,
+                          note: str, source: str = "chat") -> dict | None:
+    """Append a timestamped personal fact to a contact's record.
+
+    contact.personal_notes = [
+        {"note": "daughter Maria just graduated", "ts": 1780000000, "source": "chat"},
+        {"note": "loves jazz, especially Miles Davis", "ts": 1780100000, "source": "chat"},
+        ...
+    ]
+
+    Why: every fact you learn about a client is leverage for the next
+    interaction. CRMs have a 'notes' field nobody uses; this one fills
+    itself in from chat automatically.
+
+    Idempotency: skips if an identical note (case-insensitive) already
+    exists. Newest notes first; auto-prunes to 40 max per contact.
+    """
+    note = (note or "").strip()
+    if not note or len(note) < 5:
+        return None
+    note_lower = note.lower()
+    with _LOCK:
+        contacts = _load(user_dir)
+        for c in contacts:
+            if c.get("id") == contact_id:
+                existing = c.setdefault("personal_notes", [])
+                # Dedupe — don't store the same fact twice
+                if any((n.get("note", "").lower() == note_lower) for n in existing):
+                    return c
+                existing.insert(0, {
+                    "note":   note[:300],
+                    "ts":     int(time.time()),
+                    "source": source,
+                })
+                # Cap at 40 notes per contact — prevents runaway growth
+                c["personal_notes"] = existing[:40]
+                _save(user_dir, contacts)
+                return c
+    return None
+
+
+def find_by_name(user_dir: Path, name: str) -> dict | None:
+    """Find a contact by case-insensitive name match. First-name-only OK."""
+    if not name:
+        return None
+    name_lower = name.strip().lower()
+    contacts = list_all(user_dir)
+    # Exact full-name match first
+    for c in contacts:
+        if c.get("name", "").lower() == name_lower:
+            return c
+    # First-name match — only return if unambiguous
+    matches = [c for c in contacts
+               if c.get("name", "").lower().split()[:1] == name_lower.split()[:1]]
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def personal_notes_for(user_dir: Path, contact_id: str,
+                       limit: int = 8) -> list[dict]:
+    """Return the personal_notes for a contact, newest first."""
+    contacts = list_all(user_dir)
+    for c in contacts:
+        if c.get("id") == contact_id:
+            notes = c.get("personal_notes", []) or []
+            return notes[:limit]
+    return []
+
+
 def search(user_dir: Path, query: str) -> list[dict]:
     q = (query or "").lower().strip()
     if not q:
