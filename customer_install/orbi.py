@@ -2762,9 +2762,11 @@ _IMAGE_REFERENCED_RE = _re.compile(
     r"\b(?:those|these|the|that)\s+"
     r"(?:image|images|picture|pictures|pic|pics|graphic|graphics|"
     r"photo|photos|drawing|drawings|visual|visuals|one|ones)\s+"
-    r"(?:you|that\s+you)?\s*"
-    r"(?:were\s+)?(?:talking\s+about|mentioned|described|"
-    r"named|listed|just\s+(?:said|talked\s+about))",
+    r"(?:that\s+)?"
+    r"(?:you(?:'re|\s+are|\s+were)?|i)\s+"
+    r"(?:just\s+)?"
+    r"(?:talking\s+about|talked\s+about|mentioned|described|"
+    r"named|listed|said|referred\s+to|brought\s+up|came\s+up\s+with)",
     _re.IGNORECASE,
 )
 # Loose catch-all: a bare drawing verb without an explicit noun.
