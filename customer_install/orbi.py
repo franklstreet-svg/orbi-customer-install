@@ -4601,14 +4601,17 @@ def briefing_scheduler_loop():
                     continue
                 try:
                     prefs = briefing.get_preferences(user_dir)
-                    if not prefs.get("enabled", True):
-                        continue
-                    if now_hour < int(prefs.get("hour", 7)):
-                        continue
-                    if not briefing.should_send_today(user_dir):
-                        continue
-                    briefing.send_morning_brief(CONFIG, DATA_DIR, username)
-                    log.info(f"morning brief sent: {username}")
+                    if prefs.get("enabled", True):
+                        if (now_hour >= int(prefs.get("hour", 7))
+                                and briefing.should_send_today(user_dir)):
+                            briefing.send_morning_brief(CONFIG, DATA_DIR, username)
+                            log.info(f"morning brief sent: {username}")
+                    # End-of-day summary — separate trigger, separate state
+                    if prefs.get("eod_enabled", True):
+                        if (now_hour >= int(prefs.get("eod_hour", 18))
+                                and briefing.should_send_eod_today(user_dir)):
+                            briefing.send_eod_summary(CONFIG, DATA_DIR, username)
+                            log.info(f"eod summary sent: {username}")
                 except Exception as e:
                     log.warning(f"briefing schedule error for {username}: {e}")
         except Exception as e:
@@ -5642,6 +5645,23 @@ def main():
             CONFIG, DATA_DIR, biz, notify_callback=_friend_checkin_notify)
     except Exception as e:
         log.warning(f"friend check-in scheduler failed to start: {e}")
+
+    # Birthdays + anniversaries — daily sweep that schedules reminders
+    # ~3 days before each upcoming personal milestone. Idempotent per
+    # contact per year. Was previously only triggerable manually via
+    # /api/owner/birthdays/sweep_now.
+    def _birthdays_sweep_loop():
+        time.sleep(120)   # let app fully boot first
+        while True:
+            try:
+                created = birthdays.run_sweep(CONFIG, DATA_DIR)
+                if created:
+                    log.info(f"birthdays daily sweep: {created} reminder(s) scheduled")
+            except Exception:
+                log.exception("birthdays sweep crashed")
+            time.sleep(24 * 3600)
+    threading.Thread(target=_birthdays_sweep_loop, daemon=True,
+                      name="orbi-birthdays-sweep").start()
     server = CONFIG.get("server", {})
     host = server.get("host", "127.0.0.1")
     port = int(server.get("port", 5050))

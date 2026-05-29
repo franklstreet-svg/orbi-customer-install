@@ -180,6 +180,139 @@ def draft_card_text(config: dict, contact: dict, kind: str) -> str:
     return text
 
 
+# ── Public: gift suggestions ────────────────────────────────────────────
+
+
+def suggest_gift(config: dict, contact: dict, kind: str,
+                 budget_hint: str | None = None,
+                 occasion: str | None = None) -> dict:
+    """LLM-suggest 3 gift ideas for an upcoming birthday / anniversary /
+    milestone. Budget-aware, relationship-aware.
+
+    Returns:
+        {
+            "suggestions": [{"idea": "...", "rough_cost": "$X-Y", "why": "..."}, ...],
+            "needs_budget": True/False,   # True if we should ask the owner
+        }
+
+    `budget_hint` examples: "$25-50", "tight", "no limit", "around $100",
+                            None (then we may ask the owner via reminder text).
+    `occasion` overrides `kind` for things like "graduation", "promotion",
+              "first house" — non-birthday milestones.
+    """
+    name = (contact.get("name") or "").strip() or "them"
+    notes = (contact.get("notes") or "").strip()
+    relationship = (contact.get("relationship") or contact.get("relation")
+                     or contact.get("tags", [""])[0] if contact.get("tags") else "").strip()
+    company = (contact.get("company") or "").strip()
+    occasion = occasion or kind or "birthday"
+
+    biz = (config.get("business") or {})
+    tone_hint = (biz.get("tone") or "warm, casual").strip()
+
+    # If no budget hint, mark for asking the owner casually
+    needs_budget = not bool(budget_hint)
+    budget_line = (f"Budget: {budget_hint}." if budget_hint
+                    else "No budget set yet — give a small/mid/big tier each.")
+
+    system = (
+        "You suggest thoughtful, NOT-cheesy gift ideas. You're suggesting "
+        "to a friend (the owner) — speak like a friend who happens to "
+        "know what good gifts look like. NOT like a corporate sales bot.\n\n"
+        "Output STRICT JSON with this exact shape — no preamble, no fences:\n"
+        "  {\n"
+        "    \"suggestions\": [\n"
+        "      {\"idea\": \"3-12 words, concrete\", \"rough_cost\": \"$X-Y\", \"why\": \"1 short sentence — why THIS person would like it\"},\n"
+        "      ...3 total...\n"
+        "    ]\n"
+        "  }\n\n"
+        "RULES:\n"
+        "- Three suggestions. If budget is given, all three must respect it.\n"
+        "- If no budget, give one small-tier (under $25), one mid-tier "
+        "  ($25-100), one bigger-tier ($100+). Cover the range.\n"
+        "- 'why' must reference SOMETHING about the person — their notes, "
+        "  their relationship to the owner, the occasion. Never generic.\n"
+        "- Avoid gift cards unless the person is genuinely hard to shop "
+        "  for AND the notes show no specific interests.\n"
+        "- For spouses/partners: lean experiential or sentimental, not just "
+        "  material. For kids: age-appropriate. For coworkers: professional.\n"
+        "- Tone: " + tone_hint + ". Don't be cheesy.\n"
+    )
+
+    notes_bit = f" Notes about them: {notes[:200]}." if notes else ""
+    rel_bit = f" Relationship to the owner: {relationship}." if relationship else ""
+    company_bit = f" Works at {company}." if company else ""
+    user_msg = (
+        f"Suggest gift ideas for {name}'s upcoming {occasion}.{rel_bit}"
+        f"{company_bit}{notes_bit} {budget_line}"
+    )
+
+    import json as _json
+    try:
+        import llm_client  # lazy
+        resp = llm_client.generate(config, system, [
+            {"role": "user", "content": user_msg}
+        ])
+        raw = (resp.text or "").strip() if resp else ""
+    except Exception as e:
+        log.warning(f"suggest_gift LLM call failed: {e}")
+        raw = ""
+
+    # Parse the JSON — try to extract the {} block if there's filler
+    suggestions = []
+    if raw:
+        import re as _re
+        raw = _re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = _re.sub(r"\s*```\s*$", "", raw)
+        m = _re.search(r"\{.*\}", raw, _re.DOTALL)
+        if m:
+            try:
+                data = _json.loads(m.group(0))
+                sug = data.get("suggestions") or []
+                for s in sug[:3]:
+                    if isinstance(s, dict) and s.get("idea"):
+                        suggestions.append({
+                            "idea": str(s.get("idea", "")).strip(),
+                            "rough_cost": str(s.get("rough_cost", "")).strip(),
+                            "why": str(s.get("why", "")).strip(),
+                        })
+            except _json.JSONDecodeError:
+                pass
+
+    if not suggestions:
+        # Deterministic fallback so the reminder always has SOMETHING
+        suggestions = [
+            {"idea": f"A handwritten card with a small thoughtful gesture",
+             "rough_cost": "$5-20",
+             "why": f"Personal and never wrong, especially when you're unsure."},
+        ]
+
+    return {
+        "suggestions": suggestions,
+        "needs_budget": needs_budget,
+    }
+
+
+def format_gift_line(suggestions_result: dict,
+                     budget_unknown_addendum: str = "") -> str:
+    """One-line summary suitable for embedding in a reminder text.
+    Owner sees this in the push notification.
+
+    If budget was unknown, append a short 'how much you looking to spend?'
+    nudge so owner can answer back."""
+    sugs = suggestions_result.get("suggestions") or []
+    if not sugs:
+        return ""
+    lines = ["Gift ideas:"]
+    for s in sugs[:3]:
+        cost = f" ({s['rough_cost']})" if s.get("rough_cost") else ""
+        lines.append(f"  · {s['idea']}{cost}")
+    text = "\n".join(lines)
+    if suggestions_result.get("needs_budget"):
+        text += "\n\nWhat range you looking to spend? Tell me and I'll narrow it down."
+    return text
+
+
 # ── Public: scheduled sweep ─────────────────────────────────────────────
 
 

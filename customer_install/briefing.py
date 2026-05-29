@@ -38,9 +38,11 @@ PREFS_FILE = "briefing_prefs.json"
 STATE_FILE = "briefing_state.json"
 
 DEFAULT_PREFS = {
-    "enabled":  True,
-    "hour":     7,                    # local hour (24h) to send brief
-    "channels": ["push", "email"],    # subset of ["push", "email", "sms"]
+    "enabled":         True,
+    "hour":            7,             # local hour (24h) for MORNING brief
+    "channels":        ["push", "email"],   # subset of ["push", "email", "sms"]
+    "eod_enabled":     True,          # send the end-of-day summary too
+    "eod_hour":        18,            # local hour (24h) for END-OF-DAY summary (6pm)
 }
 
 _LOCK = threading.Lock()
@@ -329,6 +331,212 @@ def should_send_today(user_dir: Path) -> bool:
     last = state.get("last_sent_date", "")
     today = datetime.now(timezone.utc).date().isoformat()
     return last != today
+
+
+# ── End-of-day summary ──────────────────────────────────────────────────────
+# Reverse of the morning brief. Sent at user's `eod_hour` (default 6pm).
+# Pulls what got DONE today, what's still open, what's coming tomorrow.
+# The retention lever: if owner gets this every evening as their workday
+# closes out, the habit forms in ~30 days and it becomes part of their
+# daily ritual.
+
+
+def build_eod_summary(config: dict, data_dir: Path, username: str) -> dict:
+    """Assemble the end-of-day summary for one user.
+
+    Pulls:
+      - Tasks completed today (count + samples)
+      - Messages received today (count + still-unread)
+      - Calendar events that happened today
+      - Calendar events SCHEDULED FOR TOMORROW (so owner can mentally prep)
+      - Reminders/tasks pending for tomorrow
+      - Pending learning-loop questions
+      - Yesterday's Stripe revenue if available (closing the loop on morning)
+    Returns the same shape as build_briefing: {summary_text, stats, items}.
+    """
+    data_dir = Path(data_dir)
+    user_dir = _user_dir(data_dir, username)
+    display_name = _display_name(data_dir, username)
+    today_iso = _today_local_iso(config)
+    tomorrow_iso = (datetime.fromisoformat(today_iso)
+                     + timedelta(days=1)).date().isoformat()
+
+    stats: dict = {
+        "tasks_completed_today": 0,
+        "tasks_still_open":      0,
+        "messages_today":        0,
+        "unread_messages":       0,
+        "events_today_count":    0,
+        "events_tomorrow_count": 0,
+        "pending_questions":     0,
+        "errors":                [],
+    }
+    items: list[dict] = []
+
+    # Tasks completed today
+    try:
+        from modules import tasks as mod_tasks
+        all_tasks = mod_tasks.list_all(user_dir, include_done=True) or []
+        done_today = []
+        open_tasks = []
+        for t in all_tasks:
+            if t.get("done"):
+                done_ts = t.get("done_ts") or t.get("updated_ts")
+                if done_ts and str(done_ts)[:10] == today_iso:
+                    done_today.append(t)
+            else:
+                open_tasks.append(t)
+        stats["tasks_completed_today"] = len(done_today)
+        stats["tasks_still_open"] = len(open_tasks)
+        for t in done_today[:5]:
+            items.append({"kind": "task_done", "text": t.get("text", "")})
+        for t in open_tasks[:3]:
+            items.append({"kind": "task_open", "text": t.get("text", "")})
+    except Exception as exc:    # noqa: BLE001
+        log.warning("eod[%s] tasks failed: %s", username, exc)
+        stats["errors"].append(f"tasks: {exc}")
+
+    # Tomorrow's calendar events
+    try:
+        from modules import calendar as mod_calendar
+        try:
+            tomorrow_events = mod_calendar.on_date(user_dir, tomorrow_iso) or []
+        except AttributeError:
+            # Fallback if no on_date helper — pull a window
+            tomorrow_events = []
+        stats["events_tomorrow_count"] = len(tomorrow_events)
+        for e in tomorrow_events[:5]:
+            items.append({
+                "kind":     "tomorrow_event",
+                "title":    e.get("title", ""),
+                "when":     (e.get("start", "") or "")[:16].replace("T", " "),
+            })
+        today_events = mod_calendar.today(user_dir) or []
+        stats["events_today_count"] = len(today_events)
+    except Exception as exc:    # noqa: BLE001
+        log.warning("eod[%s] calendar failed: %s", username, exc)
+        stats["errors"].append(f"calendar: {exc}")
+
+    # Messages today + still unread
+    try:
+        from modules import messages as mod_messages
+        all_msgs = mod_messages.list_all(data_dir, limit=400) or []
+        today_msgs = [m for m in all_msgs
+                      if str(int(m.get("timestamp", 0)))[:10] != ""
+                      and datetime.fromtimestamp(m.get("timestamp", 0)).date().isoformat() == today_iso]
+        unread = [m for m in all_msgs if not m.get("read")]
+        stats["messages_today"] = len(today_msgs)
+        stats["unread_messages"] = len(unread)
+        for m in unread[:3]:
+            items.append({
+                "kind":    "unread_message",
+                "from":    m.get("from_name") or m.get("from_phone") or "Anonymous",
+                "snippet": (m.get("body") or "")[:120],
+            })
+    except Exception as exc:    # noqa: BLE001
+        log.warning("eod[%s] messages failed: %s", username, exc)
+        stats["errors"].append(f"messages: {exc}")
+
+    # Pending learning-loop questions
+    try:
+        from modules import learning_loop as mod_learning
+        pending = mod_learning.list_pending(data_dir) or []
+        stats["pending_questions"] = len(pending)
+        for p in pending[:2]:
+            items.append({
+                "kind":     "question",
+                "question": p.get("question", ""),
+                "asker":    (p.get("asker") or {}).get("name", "") or "anonymous visitor",
+                "token":    p.get("token", ""),
+            })
+    except Exception as exc:    # noqa: BLE001
+        log.warning("eod[%s] learning_loop failed: %s", username, exc)
+        stats["errors"].append(f"learning_loop: {exc}")
+
+    # Assemble a warm closing summary
+    summary = _format_eod_summary(display_name, stats, items)
+    return {"summary_text": summary, "stats": stats, "items": items}
+
+
+def _format_eod_summary(name: str, stats: dict, items: list[dict]) -> str:
+    """Friendly end-of-day text. Aims for ~3-5 sentences."""
+    parts = []
+    parts.append(f"Wrapping up your day, {name}.")
+    done = stats.get("tasks_completed_today", 0)
+    if done:
+        parts.append(f"You finished {done} task{'s' if done != 1 else ''} today.")
+    open_t = stats.get("tasks_still_open", 0)
+    msgs_today = stats.get("messages_today", 0)
+    if msgs_today:
+        unread = stats.get("unread_messages", 0)
+        if unread:
+            parts.append(f"{msgs_today} message{'s' if msgs_today != 1 else ''} came in "
+                         f"today, {unread} still unread.")
+        else:
+            parts.append(f"All {msgs_today} message{'s' if msgs_today != 1 else ''} "
+                         "from today are handled.")
+    tomorrow_count = stats.get("events_tomorrow_count", 0)
+    if tomorrow_count:
+        first_tom = next((i for i in items if i["kind"] == "tomorrow_event"), None)
+        if first_tom:
+            parts.append(f"Tomorrow you have {tomorrow_count} on the calendar, starting "
+                         f"with \"{first_tom.get('title', '')}\" at "
+                         f"{first_tom.get('when', '')}.")
+    if open_t:
+        parts.append(f"{open_t} task{'s' if open_t != 1 else ''} still on your plate.")
+    pending_q = stats.get("pending_questions", 0)
+    if pending_q:
+        parts.append(f"{pending_q} customer question{'s' if pending_q != 1 else ''} "
+                     "waiting on your answer.")
+    parts.append("Get some rest. I'll see you in the morning.")
+    return " ".join(parts)
+
+
+def send_eod_summary(config: dict, data_dir: Path, username: str) -> dict:
+    """Build + dispatch the end-of-day summary. Records the send so
+    should_send_eod_today returns False for the rest of the day."""
+    import notifications as notify
+    summary = build_eod_summary(config, data_dir, username)
+    user_dir = _user_dir(data_dir, username)
+    title = "End of day"
+    body = summary.get("summary_text") or "End of day."
+    try:
+        result = notify.send(
+            config, Path(data_dir),
+            event="new_message",
+            title=title,
+            body=body,
+            url="/owner#briefing",
+        )
+    except Exception as exc:    # noqa: BLE001
+        log.warning("eod[%s] notify.send failed: %s", username, exc)
+        result = {"queued": False, "error": str(exc)}
+    summary["delivery"] = result
+    _record_eod_sent(user_dir, summary)
+    return summary
+
+
+def should_send_eod_today(user_dir: Path) -> bool:
+    state = _read_state(user_dir)
+    last = state.get("last_eod_date", "")
+    today = datetime.now(timezone.utc).date().isoformat()
+    return last != today
+
+
+def _record_eod_sent(user_dir: Path, summary: dict) -> None:
+    """Mirror _record_sent but for EOD."""
+    user_dir = Path(user_dir)
+    user_dir.mkdir(parents=True, exist_ok=True)
+    state_path = user_dir / STATE_FILE
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else {}
+    except (json.JSONDecodeError, OSError):
+        state = {}
+    state["last_eod_date"] = datetime.now(timezone.utc).date().isoformat()
+    state["last_eod_summary"] = (summary.get("summary_text") or "")[:1000]
+    tmp = state_path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    tmp.replace(state_path)
 
 
 def get_preferences(user_dir: Path) -> dict:
