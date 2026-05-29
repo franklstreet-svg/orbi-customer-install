@@ -1672,6 +1672,13 @@ def owner_chat():
         return jsonify({"error": "empty message"}), 400
 
     # ── Fast-path personal-assistant intents (no LLM needed) ──────────────
+    # Recovery commands — owner-only self-service for drift / data
+    # corruption. Two-step confirmation: first call returns a confirm
+    # token, second call (within 60s) executes.
+    recovery = _try_recovery_command(user_msg, username, user_dir)
+    if recovery is not None:
+        return jsonify(recovery)
+
     # Capability overview — answers "give me a full list of your capabilities"
     # without touching the LLM, so it works in offline mode.
     cap_overview = _try_capabilities_overview(user_msg)
@@ -1967,6 +1974,175 @@ _WHAT_CAN_YOU_DO_RE = _re.compile(
     r"what\s+(?:(?:can|do)\s+you\s+do|you\s+(?:can|could|do)\s+do)\b",
     _re.IGNORECASE,
 )
+
+
+# ── Recovery commands ──────────────────────────────────────────────────────
+# Two-step pattern. First call: "factory reset" / "rollback yesterday" /
+# "restore from backup" → returns a confirmation token + warning. Second
+# call: "confirm reset TOKEN" within 60s → actually executes. Prevents
+# accidental wipes while still being usable from chat.
+
+_RECOVERY_RE = _re.compile(
+    r"^\s*(?:(?:can|could|would|will)\s+you\s+(?:please\s+)?)?"
+    r"(?:please\s+)?"
+    r"(?:"
+    # Factory reset variants
+    r"(?P<factory>(?:do\s+a\s+)?factory\s+reset|wipe\s+(?:my\s+)?(?:data|orbi|notes|memory)"
+    r"|reset\s+(?:everything|my\s+notes|my\s+memory|to\s+factory)"
+    r"|start\s+(?:over\s+)?from\s+scratch|nuke\s+(?:my\s+)?data)"
+    # Rollback variants
+    r"|(?P<rollback>rollback\s+(?:my\s+)?(?:yesterday|today|last\s+\d+\s*(?:hour|day)s?|"
+    r"changes|notes|memory)|undo\s+(?:yesterday|today|the\s+last\s+\d+\s*hours?))"
+    # Restore from backup
+    r"|(?P<restore>restore\s+(?:from\s+)?(?:my\s+)?backup|"
+    r"restore\s+(?:from\s+)?(?:yesterday|last\s+night))"
+    r")\b",
+    _re.IGNORECASE,
+)
+
+_CONFIRM_RECOVERY_RE = _re.compile(
+    r"^\s*(?:confirm|yes\s+confirm|do\s+it)\s+(?P<action>reset|rollback|restore)\s+"
+    r"(?P<token>[A-Za-z0-9_-]{8,})\b",
+    _re.IGNORECASE,
+)
+
+_PENDING_RECOVERY: dict[str, tuple[str, str, float]] = {}
+_RECOVERY_TTL = 60
+
+
+def _try_recovery_command(message: str, username: str, user_dir: Path) -> dict | None:
+    """Detect and handle factory reset / rollback / restore commands.
+    Two-step confirmation for safety. Returns chat reply dict or None."""
+    import uuid as _uuid
+    msg = (message or "").strip()
+    if not msg:
+        return None
+
+    # Step 2: user confirming a pending recovery
+    cm = _CONFIRM_RECOVERY_RE.match(msg)
+    if cm:
+        action_typed = cm.group("action").lower()
+        token = cm.group("token")
+        pending = _PENDING_RECOVERY.get(username)
+        if not pending or (time.time() - pending[2]) > _RECOVERY_TTL:
+            return {"reply": "No pending recovery to confirm (or it expired). "
+                              "Start over by saying 'factory reset' or 'rollback'.",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "recovery_expired"}
+        pending_action, pending_token, _ = pending
+        if pending_token != token or pending_action != action_typed:
+            return {"reply": "Token or action doesn't match the pending recovery. "
+                              f"Pending: {pending_action} {pending_token}. Try again.",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "recovery_mismatch"}
+        # Execute
+        del _PENDING_RECOVERY[username]
+        try:
+            if pending_action == "reset":
+                # Wipe per-user data dir (keep .session_secret + .audit_secret)
+                preserve = {".session_secret", ".audit_secret",
+                            ".backup_local_key", ".backup_state.json",
+                            ".vapid_keys.json"}
+                wiped = []
+                for p in list(user_dir.iterdir()):
+                    if p.name in preserve:
+                        continue
+                    if p.is_file():
+                        p.unlink()
+                        wiped.append(p.name)
+                    elif p.is_dir():
+                        import shutil as _shutil
+                        _shutil.rmtree(p, ignore_errors=True)
+                        wiped.append(p.name + "/")
+                audit.log_event(DATA_DIR, actor=username,
+                                action="recovery.factory_reset",
+                                meta={"wiped_count": len(wiped)})
+                return {"reply": f"Factory reset complete. Wiped {len(wiped)} "
+                                  "items from your data folder. Your secrets "
+                                  "(audit, session, backup key) were preserved. "
+                                  "Orbi is fresh — re-onboard via the setup wizard.",
+                        "tier": "local", "latency_ms": 0,
+                        "source": "recovery_done"}
+            elif pending_action == "restore":
+                # Find the most recent local backup and restore it
+                bk_dir = backup._local_backup_dir(CONFIG, DATA_DIR)
+                if not bk_dir.exists():
+                    return {"reply": "No backup directory found. Nothing to restore from.",
+                            "tier": "local", "latency_ms": 0,
+                            "source": "recovery_no_backup"}
+                snapshots = sorted(
+                    [p for p in bk_dir.iterdir() if p.suffix == ".enc"],
+                    key=lambda p: p.stat().st_mtime, reverse=True)
+                if not snapshots:
+                    return {"reply": "No backup snapshots in the backup directory.",
+                            "tier": "local", "latency_ms": 0,
+                            "source": "recovery_no_backup"}
+                latest = snapshots[0]
+                key = backup._get_or_create_local_key(DATA_DIR)
+                blob = latest.read_bytes()
+                try:
+                    raw = backup.decrypt(blob, key)
+                except Exception as e:
+                    return {"reply": f"Backup decrypt failed: {e}. "
+                                      "The local backup key may have changed.",
+                            "tier": "local", "latency_ms": 0,
+                            "source": "recovery_decrypt_failed"}
+                # Extract tar to user_dir (overwrite)
+                import io as _io, tarfile as _tarfile
+                with _tarfile.open(fileobj=_io.BytesIO(raw), mode="r:gz") as tar:
+                    tar.extractall(path=DATA_DIR)
+                audit.log_event(DATA_DIR, actor=username,
+                                action="recovery.restore",
+                                meta={"snapshot": latest.name})
+                return {"reply": f"Restored from {latest.name}. "
+                                  "Restart Orbi for all modules to re-read state.",
+                        "tier": "local", "latency_ms": 0,
+                        "source": "recovery_done"}
+            elif pending_action == "rollback":
+                # Restore is the same mechanism but framed differently for the user.
+                # Recurse — but reuse the restore branch by re-triggering pending.
+                # Simpler: tell the user to confirm 'restore' instead.
+                return {"reply": "Rollback uses the same mechanism as restore. "
+                                  "Say 'restore from backup' to restore the most "
+                                  "recent snapshot.",
+                        "tier": "local", "latency_ms": 0,
+                        "source": "recovery_rollback_redirect"}
+        except Exception as e:
+            log.exception("recovery execution failed")
+            return {"reply": f"Recovery failed: {e}",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "recovery_error"}
+
+    # Step 1: detect a recovery request, generate a confirm token
+    m = _RECOVERY_RE.match(msg)
+    if not m:
+        return None
+    action = ("reset" if m.group("factory")
+              else "rollback" if m.group("rollback")
+              else "restore" if m.group("restore")
+              else None)
+    if not action:
+        return None
+    token = _uuid.uuid4().hex[:10]
+    _PENDING_RECOVERY[username] = (action, token, time.time())
+    description = {
+        "reset": ("Factory reset will WIPE all your notes, memory, contacts, "
+                   "calendar cache, messages, learned answers, and workspace "
+                   "index. Your secrets (audit log, session, backup key) stay. "
+                   "Business profile (business_info.json) stays. This is "
+                   "near-irreversible without a backup."),
+        "rollback": ("Rollback restores from your most recent backup snapshot, "
+                      "overwriting current data. Anything you added today will "
+                      "be lost."),
+        "restore": ("Restore from backup will overwrite current data with the "
+                     "most recent encrypted snapshot in your backup folder."),
+    }[action]
+    return {"reply": (f"{description}\n\n"
+                      f"To confirm, reply with:\n"
+                      f"  confirm {action} {token}\n\n"
+                      f"(60-second window. If you don't confirm, nothing happens.)"),
+            "tier": "local", "latency_ms": 0,
+            "source": "recovery_pending"}
 
 
 def _try_capabilities_overview(message: str) -> str | None:

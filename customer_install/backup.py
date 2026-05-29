@@ -193,22 +193,110 @@ def download_from_url(url: str) -> bytes | None:
 # High-level: run_backup() / run_restore()
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Local-backup mode (no cloud, no R2, works out of the box)
+# ---------------------------------------------------------------------------
+
+def _local_key_path(data_dir: Path) -> Path:
+    return data_dir / ".backup_local_key"
+
+
+def _get_or_create_local_key(data_dir: Path) -> bytes:
+    """Per-install random 32-byte key kept in a chmod 600 file. Used when
+    backup.mode='local' so backups work out of the box without the owner
+    setting a passphrase. Owners who want extra security can switch to
+    passphrase mode in Settings."""
+    p = _local_key_path(data_dir)
+    if p.exists():
+        try:
+            return base64.b64decode(p.read_text(encoding="ascii").strip())
+        except Exception:    # noqa: BLE001
+            pass
+    p.parent.mkdir(parents=True, exist_ok=True)
+    key = secrets.token_bytes(32)
+    p.write_text(base64.b64encode(key).decode("ascii"), encoding="ascii")
+    try:
+        os.chmod(p, 0o600)
+    except (OSError, NotImplementedError):
+        pass
+    return key
+
+
+def _local_backup_dir(config: dict, data_dir: Path) -> Path:
+    """Where local backup snapshots are written. Default: <data_dir>/../backups/.
+    Owner can override via config.backup.local_dir."""
+    bk_cfg = config.get("backup", {})
+    override = bk_cfg.get("local_dir")
+    if override:
+        return Path(override).expanduser()
+    return data_dir.parent / "backups"
+
+
+def _prune_local_backups(backup_dir: Path, retention: int = 14) -> int:
+    """Keep newest N .enc files, delete the rest. Returns count deleted."""
+    if not backup_dir.exists():
+        return 0
+    files = sorted(
+        [p for p in backup_dir.iterdir() if p.suffix == ".enc"],
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    deleted = 0
+    for old in files[retention:]:
+        try:
+            old.unlink()
+            deleted += 1
+        except OSError:
+            pass
+    return deleted
+
+
 def run_backup(config: dict, data_dir: Path) -> dict:
-    """Bundle, encrypt, upload. Returns summary."""
+    """Bundle, encrypt, write. Returns summary.
+
+    Two modes:
+      mode='local' (default for new installs) — writes encrypted snapshot
+        to <data_dir>/../backups/. No cloud, no upload URL needed. Uses a
+        per-install random key file (chmod 600). 14-day rotation default.
+      mode='cloud' — passphrase + presigned URL flow (legacy / opt-in).
+    """
     if not HAS_CRYPTO:
         return {"status": "error", "reason": "cryptography_missing"}
     bk_cfg = config.get("backup", {})
     if not bk_cfg.get("enabled"):
         return {"status": "skipped", "reason": "disabled"}
 
+    mode = bk_cfg.get("mode", "local")    # default LOCAL — works out of box
+
+    raw = bundle(data_dir)
+    name = f"orbi-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}.tar.gz.enc"
+
+    if mode == "local":
+        key = _get_or_create_local_key(data_dir)
+        encrypted = encrypt(raw, key)
+        backup_dir = _local_backup_dir(config, data_dir)
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        dest = backup_dir / name
+        tmp = dest.with_suffix(".enc.tmp")
+        tmp.write_bytes(encrypted)
+        tmp.replace(dest)
+        pruned = _prune_local_backups(
+            backup_dir, retention=int(bk_cfg.get("retention", 14)))
+        state = _load_state(data_dir)
+        state["last_backup_ts"] = int(time.time())
+        state["last_backup_name"] = name
+        state["last_backup_bytes"] = len(encrypted)
+        state["last_backup_mode"] = "local"
+        state["last_backup_path"] = str(dest)
+        _save_state(data_dir, state)
+        log.info(f"local backup ok: {dest} ({len(encrypted)} bytes, pruned {pruned})")
+        return {"status": "ok", "mode": "local", "name": name,
+                "bytes": len(encrypted), "path": str(dest), "pruned": pruned}
+
+    # mode == "cloud" — original passphrase+upload flow
     state = _load_state(data_dir)
     if not state.get("salt"):
         return {"status": "error", "reason": "passphrase_not_set"}
-
-    # Get key. For automated daily backups we need the passphrase cached
-    # somewhere reachable — owner sets this in dashboard, we keep an in-memory
-    # ref and persist an encrypted-at-rest copy using the OS keyring or a
-    # config-time encrypted blob. For Phase 1: read from env var as fallback.
     key_b64 = bk_cfg.get("_runtime_key_b64") or os.environ.get("ORBI_BACKUP_KEY")
     if not key_b64:
         return {"status": "error", "reason": "no_runtime_key"}
@@ -216,32 +304,22 @@ def run_backup(config: dict, data_dir: Path) -> dict:
         key = base64.b64decode(key_b64)
     except Exception:
         return {"status": "error", "reason": "invalid_runtime_key"}
-
-    # Get upload URL from brain machine (where Frank manages R2 credentials)
     upload_url = bk_cfg.get("upload_url")
     if not upload_url:
         return {"status": "error", "reason": "no_upload_url"}
-
-    # Build + encrypt
-    raw = bundle(data_dir)
     encrypted = encrypt(raw, key)
-
-    # Filename gets a timestamp; the brain decides retention via R2 lifecycle
-    name = f"orbi-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}.tar.gz.enc"
-    # Allow {filename} placeholder in the URL
     final_url = upload_url.replace("{filename}", name)
-
     ok = upload_to_presigned_url(encrypted, final_url)
     if not ok:
         return {"status": "error", "reason": "upload_failed",
                 "name": name, "bytes": len(encrypted)}
-
     state["last_backup_ts"] = int(time.time())
     state["last_backup_name"] = name
     state["last_backup_bytes"] = len(encrypted)
+    state["last_backup_mode"] = "cloud"
     _save_state(data_dir, state)
-    log.info(f"backup ok: {name} ({len(encrypted)} bytes)")
-    return {"status": "ok", "name": name, "bytes": len(encrypted)}
+    log.info(f"cloud backup ok: {name} ({len(encrypted)} bytes)")
+    return {"status": "ok", "mode": "cloud", "name": name, "bytes": len(encrypted)}
 
 
 def run_restore(config: dict, data_dir: Path,
