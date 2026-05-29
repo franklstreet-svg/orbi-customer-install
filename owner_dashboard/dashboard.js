@@ -1533,36 +1533,25 @@
     // reliably enough that we don't need a forced finish. The complexity
     // was causing timing conflicts with the rebuild logic.)
 
-    // iOS PWA strategy: reuse the persistent Audio element that was
-    // unlocked by the speaker-toggle click. iOS treats new Audio() as
-    // a fresh autoplay attempt and blocks it; reusing the unlocked
-    // element preserves the gesture grant.
+    // Use fresh Audio() every time — this is the same path the Test
+    // button uses, and the Test button works on Chrome iPhone. The
+    // first-gesture unlock has already opened the iOS audio session;
+    // we don't need to reuse a persistent element. (Reusing one was
+    // sometimes leaving the player on the silent unlock WAV instead
+    // of the real /tts source, and we'd miss onended → mic never
+    // restarted → user stuck toggling manually.)
     const url = '/tts?text=' + encodeURIComponent(cleanText);
-    const useExistingUnlocked = !!_persistentAudio;
     try {
-      if (useExistingUnlocked) {
-        // Reuse — keeps iOS happy. .load() is REQUIRED after changing
-        // src on an already-played Audio element, otherwise the browser
-        // ignores the new source and stays on the silent unlock WAV.
-        _persistentAudio.onended = finish;
-        _persistentAudio.onerror = finish;
-        _persistentAudio.src = url;
-        _persistentAudio.load();
-        currentAudio = _persistentAudio;
-      } else {
-        // Fresh Audio (desktop / non-iOS where this works fine)
-        currentAudio = new Audio(url);
-        currentAudio.preload = 'auto';
-        currentAudio.playsInline = true;
-        currentAudio.setAttribute('playsinline', '');
-        currentAudio.onended = finish;
-        currentAudio.onerror = finish;
-      }
+      currentAudio = new Audio(url);
+      currentAudio.preload = 'auto';
+      currentAudio.playsInline = true;
+      currentAudio.setAttribute('playsinline', '');
+      currentAudio.onended = finish;
+      currentAudio.onerror = finish;
       const playPromise = currentAudio.play();
       if (playPromise && typeof playPromise.catch === 'function') {
         playPromise.catch((err) => {
-          // iOS PWA blocked it OR /tts failed. Try speechSynthesis as the
-          // safety net — iOS's built-in voices work in PWAs.
+          // /tts blocked or failed. Fall back to iOS built-in voice.
           console.warn('[Orbi] Audio() blocked or failed:', err);
           _speakViaSpeechSynthesis(cleanText, finish);
         });
