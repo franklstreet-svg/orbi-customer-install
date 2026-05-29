@@ -161,9 +161,15 @@ def main(argv=None):
         code, body = get(f"{base}/api/admin/customers",
                          headers={"X-Admin-Token": args.admin_token})
         try:
-            customers = json.loads(body)
+            payload = json.loads(body)
+            if isinstance(payload, dict) and "customers" in payload:
+                customers = payload["customers"]
+            elif isinstance(payload, list):
+                customers = payload
+            else:
+                customers = []
             for c in customers:
-                if c.get("stripe_customer_id") == fake_customer_id:
+                if isinstance(c, dict) and c.get("stripe_customer_id") == fake_customer_id:
                     api_key = c.get("api_key")
                     break
         except json.JSONDecodeError:

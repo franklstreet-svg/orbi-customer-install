@@ -192,6 +192,27 @@ def event_already_seen(stripe_event_id: str) -> bool:
 
 def record_event(stripe_event: dict) -> None:
     with db() as conn:
+        # Stripe SDK returns nested StripeObject instances whose .get() behavior
+        # differs from a dict in some SDK versions. Use bracket access wrapped
+        # in defensive try/except to extract the customer id without exploding
+        # on synthetic-test events that may lack the field.
+        cust_id: str | None = None
+        try:
+            data_obj = stripe_event["data"]["object"]
+            try:
+                cust_id = data_obj["customer"]
+            except (KeyError, TypeError):
+                cust_id = None
+        except (KeyError, TypeError):
+            cust_id = None
+        try:
+            payload_json = json.dumps(stripe_event)[:50000]
+        except TypeError:
+            # StripeObject may not be JSON-serializable in older SDK versions.
+            try:
+                payload_json = json.dumps(stripe_event.to_dict_recursive())[:50000]
+            except Exception:    # noqa: BLE001
+                payload_json = str(stripe_event)[:50000]
         conn.execute(
             "INSERT OR IGNORE INTO events "
             "(stripe_event, event_type, customer_id, payload, received_at) "
@@ -199,8 +220,8 @@ def record_event(stripe_event: dict) -> None:
             (
                 stripe_event["id"],
                 stripe_event["type"],
-                (stripe_event.get("data", {}).get("object") or {}).get("customer"),
-                json.dumps(stripe_event)[:50000],
+                cust_id,
+                payload_json,
                 now(),
             ),
         )
@@ -721,13 +742,35 @@ def webhook():
         return jsonify({"status": "duplicate"}), 200
 
     record_event(event)
+    # Convert StripeObject → plain dict so handlers can safely .get(...)
+    # everywhere. Newer Stripe SDK versions removed dict inheritance from
+    # StripeObject, breaking attribute-style .get() chains in older code.
+    # Fall back through several method names that have existed across SDK
+    # versions, finally to json round-trip if nothing else works.
+    event_dict = event
+    for method in ("to_dict_recursive", "to_dict"):
+        fn = getattr(event, method, None)
+        if callable(fn):
+            try:
+                event_dict = fn()
+                break
+            except Exception:
+                continue
+    else:
+        try:
+            event_dict = json.loads(json.dumps(event, default=str))
+        except Exception:
+            pass
     handler = EVENT_HANDLERS.get(event["type"])
     if handler:
         try:
-            handler(event)
+            handler(event_dict)
         except Exception as e:
-            print(f"[error] handling {event['type']}: {e}")
-            return jsonify({"status": "error", "message": str(e)}), 500
+            import traceback
+            tb = traceback.format_exc()
+            print(f"[error] handling {event['type']}: {e}\n{tb}", flush=True)
+            return jsonify({"status": "error", "message": str(e),
+                            "type": type(e).__name__}), 500
     else:
         print(f"[ignored] {event['type']}")
     return jsonify({"status": "ok"}), 200
@@ -769,9 +812,9 @@ def admin_list():
         abort(403)
     with db() as conn:
         cur = conn.execute(
-            "SELECT api_key, email, business_name, tier, active, "
-            "period_end, grace_until, created_at FROM customers "
-            "ORDER BY created_at DESC"
+            "SELECT api_key, stripe_customer_id, email, business_name, tier, "
+            "active, period_end, grace_until, created_at "
+            "FROM customers ORDER BY created_at DESC"
         )
         rows = [dict(r) for r in cur.fetchall()]
     return jsonify({"customers": rows, "count": len(rows)})
