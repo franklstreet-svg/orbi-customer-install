@@ -2944,8 +2944,8 @@ def _try_office_gen(message: str, username: str) -> dict | None:
 
         # ── Refinement-after-image shortcut ─────────────────────────────────
         # "more humanoid" / "make it bigger" / "different style" / "(for
-        # instagram)" — these don't have a drawing verb, but the user is
-        # following up on the last image. Cached prompt + refinement text
+        # instagram)" / "draw it again but full body" — these are all
+        # follow-ups on the last image. Cached prompt + refinement text
         # → re-fire image_gen.
         refine_now = time.time()
         cached = _LAST_IMAGE_PROMPT.get(username)
@@ -2955,30 +2955,76 @@ def _try_office_gen(message: str, username: str) -> dict | None:
             and bool(_re.match(r"^\s*(?:for\s+)?", msg_for_check, _re.IGNORECASE))
             and any(rx.search(msg_for_check) for rx, _ in _IMAGE_KIND_RES)
         )
+        # Explicit "do this again" language. STRONGER signal than the
+        # generic drawing trigger — "draw it again" / "redo" / "one more"
+        # always means "refine the previous", never "fresh draw of new
+        # subject", even though the message contains a drawing verb.
+        is_explicit_refinement = bool(_re.search(
+            r"\b(?:again|one\s+more(?:\s+time)?|once\s+(?:more|again)|"
+            r"another\s+(?:version|one|try|round|time)|"
+            r"redo|retry|do\s+(?:it|that)\s+(?:over|again)|"
+            r"same\s+(?:thing|image|one)\s+but)\b",
+            msg, _re.IGNORECASE))
         is_refinement = (
             cached
             and (refine_now - cached[1]) < _IMAGE_REFINE_TTL_SECONDS
             and len(msg) < 200
-            and (_IMAGE_REFINE_RE.search(msg) or looks_like_platform_only)
-            and not _IMAGE_TRIGGER_RE.match(msg)
-            and not _IMAGE_LOOSE_RE.match(msg)
+            and (
+                is_explicit_refinement
+                or _IMAGE_REFINE_RE.search(msg)
+                or looks_like_platform_only
+            )
+            and (
+                # Explicit refinement language overrides the trigger; otherwise
+                # require trigger absence so genuine fresh draws don't get
+                # mis-routed.
+                is_explicit_refinement
+                or (not _IMAGE_TRIGGER_RE.match(msg)
+                    and not _IMAGE_LOOSE_RE.match(msg))
+            )
         )
         if cached and not is_refinement:
             log.info("office_gen refinement skipped: msg=%r cache_age=%.0fs "
-                     "refine_kw=%s platform_only=%s",
+                     "refine_kw=%s platform_only=%s explicit=%s",
                      msg[:80], refine_now - cached[1],
                      bool(_IMAGE_REFINE_RE.search(msg)),
-                     looks_like_platform_only)
+                     looks_like_platform_only,
+                     is_explicit_refinement)
         elif is_refinement:
-            log.info("office_gen refinement HIT: msg=%r cache_age=%.0fs mode=%s",
-                     msg[:80], refine_now - cached[1], cached[2])
+            log.info("office_gen refinement HIT: msg=%r cache_age=%.0fs mode=%s "
+                     "explicit=%s",
+                     msg[:80], refine_now - cached[1], cached[2],
+                     is_explicit_refinement)
         if is_refinement:
             base_prompt, _, mode = cached
             refinement = msg.strip().rstrip(".?!")
-            # For self-portrait refinements, swap to a humanoid-friendly
-            # Orby base so "more humanoid" stops conflicting with the
-            # orb-prompt's "no human figures" negative tokens.
-            base = _ORBY_SELF_BASE if (mode == "self") else base_prompt
+            # Strip away "draw it again" / "redo" / "another version" filler
+            # from the refinement text so we don't pass FLUX literal phrases
+            # like "draw it again but X" — we just want the "X" part.
+            refinement = _re.sub(
+                r"^\s*(?:(?:can|could|would|will)\s+you\s+)?"
+                r"(?:please\s+)?"
+                r"(?:draw|paint|sketch|render|make|create|generate|do|try)\s+"
+                r"(?:it|that|this|one|another\s+(?:one|version))?\s*"
+                r"(?:again|one\s+more\s+time|once\s+more)?\s*"
+                r"(?:but|except|with|in|as)?\s*",
+                "", refinement, flags=_re.IGNORECASE).strip()
+            # If stripping nuked everything, fall back to original
+            if not refinement:
+                refinement = msg.strip().rstrip(".?!")
+            # For SELF-portrait refinements, keep the cached prompt as-is
+            # (it already includes prior descriptors like "humanoid robot")
+            # UNLESS the cached prompt is the bare orb template (which has
+            # "no human figures" negatives that conflict with most
+            # refinements). In that case swap to the humanoid base.
+            if mode == "self":
+                if ("no human figures" in base_prompt
+                    or "no faces" in base_prompt):
+                    base = _ORBY_SELF_BASE
+                else:
+                    base = base_prompt
+            else:
+                base = base_prompt
             prompt = f"{base}, {refinement}"
             kind = _detect_image_kind(msg) if _detect_image_kind(msg) != "instagram_square" else _detect_image_kind(base_prompt)
             try:
