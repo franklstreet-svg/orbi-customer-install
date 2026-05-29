@@ -2753,6 +2753,20 @@ _IMAGE_TRIGGER_RE = _re.compile(
     + r")\b",
     _re.IGNORECASE,
 )
+# "the images you mentioned / those pictures / the ones you described" —
+# referring back to images named in a prior LLM response (e.g. inside a
+# marketing campaign brief). The fast-path can't draw a meaningful image
+# because the subject is in the LLM's prior turn, not in the user's
+# message. We catch this and prompt the user to pick one.
+_IMAGE_REFERENCED_RE = _re.compile(
+    r"\b(?:those|these|the|that)\s+"
+    r"(?:image|images|picture|pictures|pic|pics|graphic|graphics|"
+    r"photo|photos|drawing|drawings|visual|visuals|one|ones)\s+"
+    r"(?:you|that\s+you)?\s*"
+    r"(?:were\s+)?(?:talking\s+about|mentioned|described|"
+    r"named|listed|just\s+(?:said|talked\s+about))",
+    _re.IGNORECASE,
+)
 # Loose catch-all: a bare drawing verb without an explicit noun.
 # "can you draw what an Orby user would look like" doesn't say "picture" —
 # still fire image gen because the verb is clearly visual.
@@ -3067,6 +3081,26 @@ def _try_office_gen(message: str, username: str) -> dict | None:
             return {"reply": f"Here's a new version — {short}. Also saved to your Files tab.",
                     "tier": "local", "latency_ms": 0,
                     "source": "image_gen", "download_url": url}
+
+        # ── Referenced-image disambiguation ─────────────────────────────────
+        # "show me the images you were talking about" / "draw those pictures
+        # you mentioned" — the user is referring to image briefs the LLM
+        # described in a prior turn (often inside a marketing campaign).
+        # We have NO way to know which one without context, and sending the
+        # literal phrase to FLUX produces a stock-photo woman.  Respond
+        # with a coaching prompt instead.
+        if _IMAGE_REFERENCED_RE.search(msg):
+            log.info("office_gen referenced-image disambiguation: msg=%r", msg[:80])
+            return {
+                "reply": ("I can draw each of those for you, one at a time — "
+                          "just tell me which one you want and I'll generate it. "
+                          "For example: \"draw the futuristic Orbi interface image\" "
+                          "or \"draw the busy small-business storefront image\". "
+                          "I can also do them all in a series if you say "
+                          "\"draw all the campaign images\"."),
+                "tier": "local", "latency_ms": 0,
+                "source": "image_disambiguation",
+            }
 
         image_match = (_IMAGE_TRIGGER_RE.match(msg)
                        or _IMAGE_LOOSE_RE.match(msg)
