@@ -1880,6 +1880,81 @@ def owner_reset_password():
 #   change_password, list_users (active), list_archived,
 #   set_purge_hold (owner can prevent purge), transfer_items
 
+# ── Internal messaging (staff-to-staff within one install) ────────────────
+
+from modules import internal_messages as mod_imsg
+
+
+@app.route("/api/owner/internal_messages", methods=["GET"])
+def internal_messages_list():
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    only_unread = request.args.get("unread") == "1"
+    limit = int(request.args.get("limit", "200"))
+    return jsonify({
+        "messages": mod_imsg.list_for_user(DATA_DIR, user["username"],
+                                            limit=limit, only_unread=only_unread),
+        "unread_count": mod_imsg.unread_count(DATA_DIR, user["username"]),
+    })
+
+
+@app.route("/api/owner/internal_messages/thread/<other>", methods=["GET"])
+def internal_messages_thread(other):
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    return jsonify({
+        "thread": mod_imsg.thread_with(DATA_DIR, user["username"], other,
+                                        limit=200),
+    })
+
+
+@app.route("/api/owner/internal_messages", methods=["POST"])
+def internal_messages_send():
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    data = request.get_json(silent=True) or {}
+    to_user = (data.get("to") or "").strip().lower()
+    body = data.get("body") or ""
+    if not to_user or not body:
+        return jsonify({"error": "to + body required"}), 400
+    # Verify recipient exists + is active
+    recipient = users_mod.get_user(DATA_DIR, to_user)
+    if not recipient or recipient.get("status") != "active":
+        return jsonify({"error": "recipient not found or inactive"}), 404
+    try:
+        entry = mod_imsg.send(
+            DATA_DIR,
+            from_user=user["username"],
+            from_name=user.get("display_name", user["username"]),
+            to_user=to_user,
+            to_name=recipient.get("display_name", to_user),
+            body=body, via="manual")
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    # Notify recipient via push
+    try:
+        notify.send(CONFIG, DATA_DIR, event="new_message",
+                     title=f"Message from {entry['from_name']}",
+                     body=body[:140], url="/owner#messages")
+    except Exception:
+        log.exception("internal msg notify failed")
+    audit.log_event(DATA_DIR, actor=user["username"],
+                    action="internal_msg.sent",
+                    meta={"to": to_user, "via": "manual"})
+    return jsonify({"status": "ok", "message": entry})
+
+
+@app.route("/api/owner/internal_messages/<msg_id>/read", methods=["POST"])
+def internal_messages_mark_read(msg_id):
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    ok = mod_imsg.mark_read(DATA_DIR, msg_id, by_user=user["username"])
+    return jsonify({"status": "ok" if ok else "not_found"}), 200 if ok else 404
+
+
+@app.route("/api/owner/internal_messages/mark_all_read", methods=["POST"])
+def internal_messages_mark_all_read():
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    n = mod_imsg.mark_all_read(DATA_DIR, user["username"])
+    return jsonify({"status": "ok", "marked": n})
+
+
 @app.route("/api/owner/staff", methods=["GET"])
 def owner_staff_list():
     auth.require_owner(ORBI_DIR)
@@ -2186,6 +2261,11 @@ def owner_chat():
     upd = _try_update_command(user_msg, username)
     if upd is not None:
         return jsonify(upd)
+
+    # "Tell Cathi X" / "Send Joe a message: Y" — internal staff messaging
+    im = _try_send_internal_message(user_msg, user_rec)
+    if im is not None:
+        return jsonify(im)
 
     # Capability overview — answers "give me a full list of your capabilities"
     # without touching the LLM, so it works in offline mode.
@@ -2709,6 +2789,86 @@ _UPDATE_INSTALL_RE = _re.compile(
     r"upgrade\s+(?:orbi|yourself|now))",
     _re.IGNORECASE,
 )
+
+
+def _try_send_internal_message(message: str, user_rec: dict) -> dict | None:
+    """Detect 'tell X', 'send X a message', 'let X know', 'message X about Y'
+    and route to internal staff messaging. Returns chat reply dict or None
+    to fall through.
+
+    Recipient resolution: tries exact username, then display_name
+    case-insensitive, then unambiguous first-name match. If multiple
+    matches OR no matches, asks the owner to specify.
+    """
+    intent = mod_imsg.detect_send_intent(message)
+    if not intent:
+        return None
+    recipient_name = intent["recipient_name"]
+    body = intent["body"]
+    sender_username = user_rec["username"]
+
+    # Resolve recipient to a known active user
+    all_users = users_mod.list_users(DATA_DIR, include_archived=False)
+    name_lower = recipient_name.lower()
+    candidates = []
+    for u in all_users:
+        uname = (u.get("username") or "").lower()
+        dname = (u.get("display_name") or "").lower()
+        if uname == name_lower:
+            candidates = [u]
+            break
+        if dname == name_lower or dname.split()[0:1] == [name_lower]:
+            candidates.append(u)
+        elif uname.startswith(name_lower) and len(name_lower) >= 3:
+            candidates.append(u)
+    candidates = [c for c in candidates
+                  if (c.get("username") or "").lower() != sender_username.lower()]
+
+    if not candidates:
+        active_names = [u.get("display_name") or u.get("username")
+                        for u in all_users
+                        if (u.get("username") or "").lower() != sender_username.lower()]
+        return {"reply": (f"I don't see a staff member named \"{recipient_name}\". "
+                          f"Active staff: {', '.join(active_names) or '(none)'}. "
+                          "Add them in Settings → Staff first, then try again."),
+                "tier": "local", "latency_ms": 0,
+                "source": "internal_msg_no_recipient"}
+
+    if len(candidates) > 1:
+        names = ", ".join(c.get("display_name") or c.get("username") for c in candidates)
+        return {"reply": (f"More than one match for \"{recipient_name}\": {names}. "
+                          "Try the full name or username."),
+                "tier": "local", "latency_ms": 0,
+                "source": "internal_msg_ambiguous"}
+
+    recipient = candidates[0]
+    to_user = recipient["username"]
+    try:
+        entry = mod_imsg.send(
+            DATA_DIR,
+            from_user=sender_username,
+            from_name=user_rec.get("display_name") or sender_username,
+            to_user=to_user,
+            to_name=recipient.get("display_name") or to_user,
+            body=body,
+            via="orby")
+    except ValueError as e:
+        return {"reply": f"Couldn't send: {e}",
+                "tier": "local", "latency_ms": 0,
+                "source": "internal_msg_error"}
+    try:
+        notify.send(CONFIG, DATA_DIR, event="new_message",
+                     title=f"Message from {entry['from_name']}",
+                     body=body[:140], url="/owner#messages")
+    except Exception:
+        log.exception("internal msg notify failed")
+    audit.log_event(DATA_DIR, actor=sender_username,
+                    action="internal_msg.sent",
+                    meta={"to": to_user, "via": "orby"})
+    return {"reply": (f"Sent — \"{body[:80]}{'...' if len(body) > 80 else ''}\" "
+                      f"to {recipient.get('display_name') or to_user}."),
+            "tier": "local", "latency_ms": 0,
+            "source": "internal_msg_sent"}
 
 
 def _try_update_command(message: str, username: str) -> dict | None:
