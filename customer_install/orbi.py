@@ -63,6 +63,7 @@ import gcal
 import image_gen
 import ad_gen
 import updater
+import friend_checkin
 import ocr as ocr_mod
 import review_responder
 import safe_send
@@ -1672,6 +1673,13 @@ def owner_chat():
     if not user_msg:
         return jsonify({"error": "empty message"}), 400
 
+    # Mark owner as active so the friend-checkin scheduler doesn't ping them
+    # mid-conversation.
+    try:
+        friend_checkin.mark_owner_active(DATA_DIR)
+    except Exception:
+        log.exception("friend_checkin.mark_owner_active failed")
+
     # ── Fast-path personal-assistant intents (no LLM needed) ──────────────
     # Recovery commands — owner-only self-service for drift / data
     # corruption. Two-step confirmation: first call returns a confirm
@@ -1746,20 +1754,34 @@ def owner_chat():
 
     business = mod_business.load(DATA_DIR)
     system = prompts.build_owner_prompt(business)
+    tone = ((business.get("personality") or {}).get("tone") or "friend").lower()
 
     # Owner mode gets memory + notes + workspace + per-user PA as extra context
     extras = []
+
+    # ── FRIEND-MODE personal context block (top priority) ──────────────
+    # When tone == "friend", combine notes + long-term memory + owner
+    # business info into ONE high-prominence block labeled as "what you
+    # know about this person." Pushes the friend prompt's "weave naturally"
+    # instruction onto real personal data instead of generic memory pulls.
+    if tone == "friend":
+        personal = _friend_personal_context(business, user_dir)
+        if personal:
+            extras.append(personal)
+
     # "What can you do?" / "Walk me through X" — pull from the shipped
     # capabilities doc so the answer is grounded in real features.
     cap_ctx = _capabilities_context_block(user_msg)
     if cap_ctx:
         extras.append(cap_ctx)
-    notes_ctx = mod_notes.context_block(DATA_DIR)
-    if notes_ctx:
-        extras.append(notes_ctx)
-    memory_ctx = mod_memory.context_block(DATA_DIR)
-    if memory_ctx:
-        extras.append(memory_ctx)
+    # Skip the generic notes/memory blocks when friend-mode already pulled them
+    if tone != "friend":
+        notes_ctx = mod_notes.context_block(DATA_DIR)
+        if notes_ctx:
+            extras.append(notes_ctx)
+        memory_ctx = mod_memory.context_block(DATA_DIR)
+        if memory_ctx:
+            extras.append(memory_ctx)
     # Per-user personal-assistant context blocks
     for module_ctx in (mod_calendar.context_block(user_dir),
                        mod_reminders.context_block(user_dir),
@@ -2243,6 +2265,67 @@ def _try_update_command(message: str, username: str) -> dict | None:
                 "source": "update_downloaded"}
 
     return None
+
+
+def _friend_personal_context(business: dict, user_dir: Path) -> str:
+    """Single combined 'what you know about this person' block for friend
+    mode. Pulls from business profile (name, role), long-term memory
+    (lasting facts), notes (owner-authored), and any 'personal' field
+    in the business profile. Framed so the LLM uses it conversationally
+    instead of reciting it like a database lookup."""
+    personality = business.get("personality") or {}
+    owner_full = personality.get("owner_name") or business.get("owner_name") or ""
+    owner_first = owner_full.split()[0] if owner_full else "the owner"
+    owner_role = personality.get("owner_role") or "owner"
+    biz_name = business.get("name") or ""
+
+    lines = [f"WHO YOU'RE TALKING TO — use this naturally, don't recite "
+             "it like trivia or a database lookup:"]
+    if owner_full:
+        if biz_name:
+            lines.append(f"- Name: {owner_full} ({owner_role} of {biz_name})")
+        else:
+            lines.append(f"- Name: {owner_full} ({owner_role})")
+    # Owner's freeform personal context (a dedicated field they can fill
+    # in via Settings or by saying "remember that I [...]")
+    personal_text = (business.get("owner_personal")
+                      or personality.get("personal_context") or "").strip()
+    if personal_text:
+        lines.append(f"- Personal context: {personal_text}")
+
+    # Long-term memory entries (lasting facts about the owner)
+    try:
+        mem_data = mod_memory._load_raw(DATA_DIR)
+        lt = [e.get("content", "") for e in (mem_data.get("long_term") or [])][-12:]
+        if lt:
+            lines.append("- Things you remember about them (long-term):")
+            for item in lt:
+                if item:
+                    lines.append(f"  · {item}")
+    except Exception:
+        pass
+
+    # Recent notes (owner-authored, freeform)
+    try:
+        notes = mod_notes.list_all(DATA_DIR)
+        notes = sorted(notes, key=lambda n: n.get("ts", 0), reverse=True)[:10]
+        if notes:
+            lines.append("- Notes they've added for you to keep in mind:")
+            for n in notes:
+                c = (n.get("content") or "").strip()
+                if c:
+                    lines.append(f"  · {c}")
+    except Exception:
+        pass
+
+    # If we only got the header line, return empty (nothing useful to share)
+    if len(lines) <= 1:
+        return ""
+    lines.append("\nWeave this in naturally when context invites it — "
+                 "asking about a partner by name, referencing a struggle "
+                 "they mentioned last week, celebrating a win you remember. "
+                 "Don't dump it back at them.")
+    return "\n".join(lines)
 
 
 def _try_capabilities_overview(message: str) -> str | None:
@@ -5546,6 +5629,19 @@ def main():
                                               notify_callback=_update_notify)
     except Exception as e:
         log.warning(f"updater scheduler failed to start: {e}")
+    try:
+        biz = mod_business.load(DATA_DIR)
+        def _friend_checkin_notify(title: str, body: str) -> None:
+            try:
+                notify.send(CONFIG, DATA_DIR,
+                             event="friend_checkin",
+                             title=title, body=body, url="/owner")
+            except Exception:
+                log.exception("friend check-in push failed")
+        friend_checkin.start_checkin_scheduler(
+            CONFIG, DATA_DIR, biz, notify_callback=_friend_checkin_notify)
+    except Exception as e:
+        log.warning(f"friend check-in scheduler failed to start: {e}")
     server = CONFIG.get("server", {})
     host = server.get("host", "127.0.0.1")
     port = int(server.get("port", 5050))
