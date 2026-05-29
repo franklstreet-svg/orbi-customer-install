@@ -1697,6 +1697,19 @@ def owner_chat():
     except Exception:
         log.exception("gift mention capture failed")
 
+    # Win logging — when the owner shares a win in chat ("closed the
+    # Maxwell deal", "best month ever"), silently store it. Later when
+    # they sound stressed, Orby pulls these back to remind them they've
+    # been here before and came out the other side.
+    try:
+        from modules import wins as mod_wins
+        win_text = mod_wins.detect_win_mention(user_msg)
+        if win_text:
+            mod_wins.record_win(user_dir, win_text, source="auto")
+            log.info(f"win auto-logged: {win_text[:60]}")
+    except Exception:
+        log.exception("win mention capture failed")
+
     # Update commands — "is there an update?" / "install update"
     upd = _try_update_command(user_msg, username)
     if upd is not None:
@@ -1777,6 +1790,17 @@ def owner_chat():
         personal = _friend_personal_context(business, user_dir)
         if personal:
             extras.append(personal)
+        # Past-wins recall — if the current message has stress cues, pull
+        # a relevant past win for the LLM to weave in naturally. Real
+        # friend behavior: remind you that you've been here before and
+        # came out the other side.
+        try:
+            from modules import wins as mod_wins
+            wins_block = mod_wins.context_block(user_dir, user_msg)
+            if wins_block:
+                extras.append(wins_block)
+        except Exception:
+            log.exception("wins context_block failed")
 
     # "What can you do?" / "Walk me through X" — pull from the shipped
     # capabilities doc so the answer is grounded in real features.
