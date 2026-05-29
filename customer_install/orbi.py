@@ -2764,14 +2764,16 @@ _AD_TRIGGER_RE = _re.compile(
     r"(?:make|build|create|generate|design|put\s+together|whip\s+up|do)"
     r"\s+(?:me\s+|us\s+)?(?:a\s+|an\s+|the\s+)?"
     r"(?:complete\s+|full\s+|finished\s+|actual\s+|real\s+|whole\s+)?"
-    r"(?:facebook|instagram|twitter|linkedin|tiktok|youtube|pinterest|"
-    r"social\s+media\s+)?\s*"
+    r"(?:facebook|fb|instagram|ig|twitter|x|linkedin|tiktok|youtube|yt|"
+    r"pinterest|social\s+media)?\s*"
+    r"(?:story|stories|post|feed|cover|reels?|carousel|video|photo)?\s*"
     r"(?:ad|advert|advertisement|ad\s+creative|finished\s+ad|"
     r"complete\s+ad|whole\s+ad|full\s+ad|actual\s+ad)\b"
     r"|" + _ACTION_PREFIX +
     r"(?:a\s+|an\s+|the\s+)?(?:complete\s+|full\s+|finished\s+|actual\s+|real\s+)?"
-    r"(?:facebook|instagram|twitter|linkedin|tiktok|youtube|pinterest|"
-    r"social\s+media\s+)?\s*"
+    r"(?:facebook|fb|instagram|ig|twitter|x|linkedin|tiktok|youtube|yt|"
+    r"pinterest|social\s+media)?\s*"
+    r"(?:story|stories|post|feed|cover|reels?|carousel|video|photo)?\s*"
     r"(?:ad|advert|advertisement|ad\s+creative|finished\s+ad|"
     r"complete\s+ad|whole\s+ad|full\s+ad|actual\s+ad)\b"
     r")",
@@ -2980,11 +2982,21 @@ def _try_office_gen(message: str, username: str) -> dict | None:
     msg = (message or "").strip()
     if not msg:
         return None
+    # Strip leading wrapper punctuation that users often type when pasting
+    # back a quoted example or example list (— • " ' " " etc.). Without
+    # this, "\"create me a complete facebook ad...\"" silently fails every
+    # trigger regex because '^\s*' doesn't span past the leading quote.
+    msg = msg.lstrip("\"'`“”‘’*-•—> \t")
+    # Multi-line pastes (bullet lists, explanations) — match only the first
+    # line for the trigger. Otherwise "create me a facebook ad\n- another\n
+    # - third" tries to use the whole paste as the brief.
+    first_line = msg.split("\n", 1)[0].strip()
     # Visibility for diagnosing "wrong thing got drawn" / "she didn't draw" reports.
-    log.info("office_gen entry msg=%r", msg[:200])
+    log.info("office_gen entry msg=%r first_line=%r",
+             msg[:120], first_line[:80])
 
     try:
-        if _CHART_TRIGGER_RE.match(msg):
+        if _CHART_TRIGGER_RE.match(first_line):
             parsed = chart_gen.parse_chart_request(CONFIG, msg)
             png = chart_gen.generate_chart(
                 CONFIG,
@@ -3001,7 +3013,7 @@ def _try_office_gen(message: str, username: str) -> dict | None:
                     "tier": "local", "latency_ms": 0,
                     "source": "chart_gen", "download_url": saved.get("download_url")}
 
-        if _DECK_TRIGGER_RE.match(msg):
+        if _DECK_TRIGGER_RE.match(first_line):
             # Extract topic — everything after "deck about/on/for" or after the word "deck"
             topic_match = _re.search(
                 r"(?:about|on|for|titled)\s+(.+)$", msg, _re.IGNORECASE)
@@ -3163,19 +3175,20 @@ def _try_office_gen(message: str, username: str) -> dict | None:
         # "create me a complete facebook ad for our weekend brunch" →
         # ad_gen designs the ad (LLM), generates the background image,
         # composites text + CTA button → one finished PNG ready to upload.
-        if _AD_TRIGGER_RE.match(msg):
-            log.info("office_gen ad branch fired msg=%r", msg[:120])
+        # Match against first_line so multi-line / quoted pastes still fire.
+        if _AD_TRIGGER_RE.match(first_line):
+            log.info("office_gen ad branch fired first_line=%r", first_line[:120])
             # Extract platform from the message — same kind-detector as images
-            platform = _detect_image_kind(msg)
+            platform = _detect_image_kind(first_line)
             # Strip the trigger phrase so the brief sent to ad_gen is just
             # the user's intent (e.g. "for our weekend brunch")
             brief = _re.sub(
                 _AD_TRIGGER_RE.pattern,
                 "",
-                msg,
+                first_line,
                 count=1,
                 flags=_re.IGNORECASE,
-            ).strip(" ,.:;-—")
+            ).strip(" ,.:;-—\"'")
             # Remove leading "for" / "about" so brief reads naturally
             brief = _re.sub(r"^(?:for|about|on|to\s+promote)\s+",
                             "", brief, flags=_re.IGNORECASE).strip()
@@ -3228,9 +3241,9 @@ def _try_office_gen(message: str, username: str) -> dict | None:
         # We have NO way to know which one without context, and sending the
         # literal phrase to FLUX produces a stock-photo woman.  Respond
         # with a coaching prompt instead.
-        if _IMAGE_REFERENCED_RE.search(msg):
-            log.info("office_gen referenced-image disambiguation: msg=%r", msg[:80])
-            is_all = bool(_re.search(r"\ball\b", msg, _re.IGNORECASE))
+        if _IMAGE_REFERENCED_RE.search(first_line):
+            log.info("office_gen referenced-image disambiguation: msg=%r", first_line[:80])
+            is_all = bool(_re.search(r"\ball\b", first_line, _re.IGNORECASE))
             if is_all:
                 reply = ("I have to draw the campaign images one at a time — "
                          "if I send a single batch prompt like \"all the campaign "
@@ -3253,9 +3266,9 @@ def _try_office_gen(message: str, username: str) -> dict | None:
                 "source": "image_disambiguation",
             }
 
-        image_match = (_IMAGE_TRIGGER_RE.match(msg)
-                       or _IMAGE_LOOSE_RE.match(msg)
-                       or _IMAGE_SUBJECT_LED_RE.match(msg))
+        image_match = (_IMAGE_TRIGGER_RE.match(first_line)
+                       or _IMAGE_LOOSE_RE.match(first_line)
+                       or _IMAGE_SUBJECT_LED_RE.match(first_line))
         if image_match:
             # ── Self-portrait shortcut ──────────────────────────────────────
             # "draw yourself" / "what you look like" / "what you imagine you
