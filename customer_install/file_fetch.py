@@ -585,13 +585,31 @@ def extract_file_request(message: str) -> dict | None:
         "give you a", "give you the",
     )):
         return None
-    # COMPOSITION verbs — "draft an email to X", "write a letter for Y",
-    # "compose a reply". These ARE NOT file searches. The owner wants
-    # Orby to WRITE something, not search for an existing file.
+    # COMPOSITION requests — owner wants Orby to WRITE something, not
+    # search for an existing file. Two patterns to catch:
+    #   1) Message starts with a writing verb: draft/write/compose/reply/respond
+    #   2) Message contains a writing-verb + writing-object pair anywhere:
+    #      "can you CREATE a follow-up EMAIL for Joe Maxwell"
+    #      "put together a LETTER for the landlord"
+    #      "help me MAKE a REPLY to Sarah"
     if re.match(
         r"^\s*(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?"
         r"(?:draft|write|compose|reply|respond|put\s+together|"
         r"help\s+me\s+(?:draft|write|compose|reply|respond))\s+",
+        text, re.IGNORECASE):
+        return None
+    # Verb + writing-object pair — "create/make/build/put-together/draft/
+    # write/compose A/AN/THE email/letter/message/reply/note/memo/response/post"
+    if re.search(
+        r"\b(?:create|make|build|draft|write|compose|put\s+together|do|"
+        r"help\s+me\s+(?:with|make|create|build|write|draft))\s+"
+        r"(?:me\s+|us\s+|him\s+|her\s+|them\s+)?"
+        r"(?:a\s+|an\s+|the\s+|some\s+|another\s+)?"
+        r"(?:short\s+|quick\s+|brief\s+|long\s+|detailed\s+|"
+        r"polite\s+|warm\s+|friendly\s+|professional\s+|follow[- ]?up\s+)?"
+        r"(?:email|letter|message|reply|response|note|memo|"
+        r"text|sms|dm|comment|post|caption|tweet|reply|"
+        r"thank[- ]?you|apology|invoice\s+message|response)\b",
         text, re.IGNORECASE):
         return None
     # If the message contains a URL, that's definitively a url-fetch case
