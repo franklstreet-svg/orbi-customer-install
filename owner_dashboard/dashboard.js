@@ -1218,6 +1218,21 @@
   function _isMobile() {
     return /iPhone|iPad|iPod|Android/.test(navigator.userAgent || '');
   }
+  // Universal audio unlock — the FIRST tap or touch ANYWHERE on the
+  // page unlocks audio playback for the whole session. iOS/Android
+  // browsers require an active user gesture before any audio plays;
+  // this guarantees that gesture happens early no matter what the
+  // user actually clicks.
+  function _unlockOnFirstGesture() {
+    const handler = () => {
+      _unlockAudio();
+      document.removeEventListener('click', handler, { capture: true });
+      document.removeEventListener('touchstart', handler, { capture: true });
+    };
+    document.addEventListener('click', handler, { capture: true });
+    document.addEventListener('touchstart', handler, { capture: true });
+  }
+  _unlockOnFirstGesture();
   // Mobile browsers (iOS Safari AND iOS Chrome AND Android Chrome) all
   // require a user gesture to unlock audio playback for the session.
   // Without the unlock, the first Audio().play() in a fetch callback
