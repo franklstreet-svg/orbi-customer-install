@@ -1114,6 +1114,42 @@
     try { return localStorage.getItem('orbi_speak_replies') === '1'; }
     catch { return false; }
   })();
+  // One-time banner suggesting Chrome on iOS Safari users. Apple's
+  // standalone PWA audio sandbox blocks Orby's voice; Chrome's shortcut
+  // opens as a regular tab and works fully. Banner dismissible.
+  function _showIosChromeBanner() {
+    try {
+      const ua = navigator.userAgent || '';
+      const isIos = /iPad|iPhone|iPod/.test(ua) || (/Mac/.test(ua) && 'ontouchend' in document);
+      const isSafari = isIos && /Safari/.test(ua) && !/CriOS|FxiOS|EdgiOS/.test(ua);
+      const isStandalone = window.matchMedia('(display-mode: standalone)').matches
+        || window.navigator.standalone === true;
+      const dismissed = localStorage.getItem('orbi_ios_chrome_dismissed') === '1';
+      if (!isIos || !isSafari || dismissed) return;
+      const banner = document.createElement('div');
+      banner.style.cssText = 'position:fixed;bottom:12px;left:12px;right:12px;'
+        + 'background:#8b5cf6;color:white;padding:12px 14px;border-radius:10px;'
+        + 'z-index:9999;font-size:13px;line-height:1.4;'
+        + 'box-shadow:0 6px 24px rgba(0,0,0,0.4)';
+      banner.innerHTML =
+        '<div style="display:flex;gap:10px;align-items:flex-start">'
+        + '<div style="flex:1">'
+          + '<b>Heads up:</b> for voice on iPhone, use Orby in <b>Chrome</b>'
+          + ' (not Safari). Apple restricts audio in Safari home-screen apps.'
+        + '</div>'
+        + '<button type="button" style="background:rgba(0,0,0,0.2);color:white;'
+          + 'border:none;border-radius:6px;padding:4px 8px;cursor:pointer"'
+          + ' id="_orbi-iossafari-dismiss">Got it</button>'
+        + '</div>';
+      document.body.appendChild(banner);
+      banner.querySelector('#_orbi-iossafari-dismiss').addEventListener('click', () => {
+        banner.remove();
+        try { localStorage.setItem('orbi_ios_chrome_dismissed', '1'); } catch {}
+      });
+    } catch {}
+  }
+  document.addEventListener('DOMContentLoaded', _showIosChromeBanner);
+
   // iOS PWAs need a "user gesture" context to play audio. Once we play
   // ANY audio inside a click handler, the persistent Audio element is
   // "unlocked" for subsequent .play() calls without further gestures.

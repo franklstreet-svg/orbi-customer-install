@@ -744,22 +744,45 @@
                     style="margin-top:6px">Refresh QR</button>
           </div>
         </div>
-        <!-- iOS install modal — Safari doesn't allow auto-prompts -->
-        <dialog id="ios-install-modal" style="background:#131a2e;color:#eaf0ff;border:1px solid #2c3756;border-radius:14px;padding:24px;max-width:380px;width:90%">
-          <h2 style="margin:0 0 12px;font-size:18px">📱 Add Orby to your home screen</h2>
-          <p class="muted" style="margin:0 0 14px;font-size:13px">
-            iPhone doesn't allow apps to add themselves automatically — Apple makes
-            you do it manually in Safari. Takes 5 seconds:
+        <!-- iOS install modal — recommend Chrome (works with voice) -->
+        <dialog id="ios-install-modal" style="background:#131a2e;color:#eaf0ff;border:1px solid #2c3756;border-radius:14px;padding:24px;max-width:420px;width:90%">
+          <h2 style="margin:0 0 8px;font-size:18px">📱 Add Orby to your iPhone</h2>
+          <div style="background:#1f2640;border-left:3px solid #8b5cf6;padding:10px 12px;border-radius:6px;margin-bottom:14px;font-size:13px">
+            <b>Important:</b> Use <b>Chrome</b> (not Safari) on iPhone — Safari's
+            home-screen install blocks Orby's voice. Chrome's shortcut works fully.
+          </div>
+          <p class="muted" style="margin:0 0 10px;font-size:13px">
+            <b>Step 1 — get Chrome if you don't have it:</b><br>
+            Open the App Store, search "Google Chrome", install (free).
           </p>
-          <ol style="margin:0;padding-left:22px;line-height:1.8;font-size:14px">
-            <li>Tap the <b>Share</b> button at the bottom of Safari
-                <span style="font-size:11px;color:#9aa4c0">(square with arrow up)</span></li>
+          <p class="muted" style="margin:0 0 8px;font-size:13px">
+            <b>Step 2 — open this page in Chrome:</b>
+          </p>
+          <p style="margin:0 0 14px;font-size:12px;color:#9aa4c0">
+            Copy the URL from the Settings → Install on Phone section,
+            open Chrome, paste in the address bar, sign in.
+          </p>
+          <p class="muted" style="margin:0 0 8px;font-size:13px">
+            <b>Step 3 — add to home screen FROM Chrome:</b>
+          </p>
+          <ol style="margin:0 0 14px;padding-left:22px;line-height:1.8;font-size:14px">
+            <li>Tap the <b>⋯</b> menu (three dots, bottom-right of Chrome)</li>
             <li>Scroll down, tap <b>Add to Home Screen</b></li>
-            <li>Tap <b>Add</b> in the top right</li>
+            <li>Tap <b>Add</b></li>
           </ol>
-          <p class="muted" style="margin:16px 0 0;font-size:12px">
-            Orby will appear as an app icon — tap it to open full-screen, like a real app.
+          <p style="margin:0;font-size:12px;color:#4ade80">
+            ✓ Orby icon appears on your home screen — tap it any time, voice
+            and chat both work.
           </p>
+          <details style="margin-top:14px;font-size:12px;color:#9aa4c0">
+            <summary style="cursor:pointer">Why not Safari?</summary>
+            <p style="margin:8px 0 0;line-height:1.5">
+              Apple restricts audio in installed Safari PWAs — Orby can't speak
+              her replies reliably. Chrome's shortcut opens Orby as a browser
+              tab (not a standalone PWA) which has full audio access. Same Orby,
+              just opens in Chrome.
+            </p>
+          </details>
           <button type="button" class="primary-btn" style="width:100%;margin-top:16px"
                   onclick="document.getElementById('ios-install-modal').close()">Got it</button>
         </dialog>

@@ -9,29 +9,37 @@ You only have to do this once per device.
 
 ---
 
-## On iPhone or iPad (Safari)
+## On iPhone or iPad — USE CHROME (not Safari)
 
-1. Open **Safari** and go to your Orbi dashboard URL
-   (your installer told you what it is — usually something like
-   `http://orbi.local/owner` on your home Wi-Fi, or a secure tunnel link
-   if you're away from home).
+**Important:** Add Orbi to your home screen from **Chrome on iPhone**,
+not Safari. Apple restricts audio in installed Safari PWAs, so Orbi can't
+speak her replies reliably when installed from Safari. Chrome's shortcut
+works fully — voice + chat both functional.
 
-2. Sign in if you haven't already.
+### Steps:
 
-3. Tap the **Share** button at the bottom-center of Safari.
-   It looks like a square with an arrow pointing up out of it.
+1. **Get Chrome if you don't already have it.** Open the App Store,
+   search "Google Chrome", install (free).
 
-   *(If you don't see the bottom bar, scroll down a tiny bit and it
-   re-appears.)*
+2. **Open Chrome** and go to your Orbi dashboard URL.
 
-4. In the menu that pops up, scroll down and tap **Add to Home Screen**.
+3. **Sign in** with your username and password.
 
-5. You'll see a preview with the Orbi icon and the name "Orbi".
-   Leave the name as-is (or shorten it if you want) and tap **Add**
-   in the top right.
+4. Tap the **⋯ menu** (three dots, usually bottom-right of Chrome).
 
-6. Done. Orbi is now on your home screen like any other app. Tap her
-   icon any time to open the dashboard.
+5. Scroll down and tap **Add to Home Screen**.
+
+6. Tap **Add** to confirm.
+
+Done. Orbi appears on your home screen as a Chrome-branded shortcut.
+Tap it any time — both voice and chat work normally.
+
+### What if I already added it from Safari?
+
+If you used Safari and the voice isn't working, just delete that icon
+(hold the icon → Remove App → Delete from Home Screen) and re-do the
+install steps above using Chrome. Everything else still works in the
+Safari one — only audio is restricted.
 
 **Heads up:** Safari is the only browser on iPhone that can install web
 apps. Chrome on iPhone can't do it (Apple's rule, not ours).
