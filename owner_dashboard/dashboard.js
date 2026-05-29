@@ -3870,4 +3870,193 @@
   }
   document.addEventListener('DOMContentLoaded', wireImap);
 
+
+  // ====================================================================
+  // STAFF MANAGEMENT (Settings tab)
+  // ====================================================================
+  function _esc(s) { return String(s ?? '').replace(/[&<>"']/g, c =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
+
+  async function _loadStaff() {
+    const list = document.getElementById('staff-list');
+    if (!list) return;
+    try {
+      const r = await fetch('/api/owner/staff');
+      if (!r.ok) throw new Error('Failed to load staff');
+      const data = await r.json();
+      const active = data.active || [];
+      const archived = data.archived || [];
+      if (!active.length && !archived.length) {
+        list.innerHTML = '<div class="muted" style="font-size:13px">No staff users yet. Add one below.</div>';
+        return;
+      }
+      let html = '';
+      if (active.length) {
+        html += '<div style="font-size:12px;color:#9aa4c0;margin-bottom:6px">Active staff</div>';
+        for (const u of active) {
+          html += _renderStaffRow(u, false);
+        }
+      }
+      if (archived.length) {
+        html += '<div style="font-size:12px;color:#9aa4c0;margin:14px 0 6px">Archived (auto-purges in 90 days)</div>';
+        for (const u of archived) {
+          html += _renderStaffRow(u, true);
+        }
+      }
+      list.innerHTML = html;
+      _wireStaffRowActions();
+    } catch (e) {
+      list.innerHTML = '<div style="color:#ff7a7a;font-size:13px">' + _esc(e.message) + '</div>';
+    }
+  }
+
+  function _renderStaffRow(u, archived) {
+    const name = u.username || '(no name)';
+    const email = u.email || '';
+    const role = u.role || 'staff';
+    const created = u.created_at ? new Date(u.created_at * 1000).toLocaleDateString() : '';
+    const archivedAt = u.archived_at ? new Date(u.archived_at * 1000).toLocaleDateString() : '';
+    const hold = u.purge_hold ? ' · 🔒 hold' : '';
+    return `
+      <div class="staff-row" data-username="${_esc(name)}" data-archived="${archived ? 1 : 0}"
+           style="display:flex;gap:12px;align-items:center;padding:10px;background:#1a2240;
+                  border-radius:8px;margin-bottom:6px;flex-wrap:wrap">
+        <div style="flex:1;min-width:160px">
+          <div style="font-weight:600">${_esc(name)} <span style="font-weight:400;font-size:12px;color:#9aa4c0">· ${_esc(role)}</span></div>
+          ${email ? `<div style="font-size:12px;color:#9aa4c0">${_esc(email)}</div>` : ''}
+          <div style="font-size:11px;color:#6c7592">
+            ${archived ? `archived ${_esc(archivedAt)}${hold}` : (created ? `added ${_esc(created)}` : '')}
+          </div>
+        </div>
+        <div style="display:flex;gap:6px">
+          ${!archived ? `
+            <button class="secondary-btn staff-reset-btn" type="button">Reset password</button>
+            <button class="secondary-btn staff-deactivate-btn" type="button" style="color:#ff7a7a">Deactivate</button>
+          ` : `
+            <button class="secondary-btn staff-hold-btn" type="button">${u.purge_hold ? 'Release hold' : 'Hold from purge'}</button>
+          `}
+        </div>
+      </div>
+    `;
+  }
+
+  function _wireStaffRowActions() {
+    document.querySelectorAll('.staff-row').forEach(row => {
+      const username = row.dataset.username;
+      row.querySelector('.staff-reset-btn')?.addEventListener('click', async () => {
+        if (!confirm(`Generate a password reset link for ${username}? (24h expiry; you'll share the URL with them.)`)) return;
+        try {
+          const r = await fetch(`/api/owner/staff/${encodeURIComponent(username)}/reset_link`, { method: 'POST' });
+          const data = await r.json();
+          if (!r.ok) throw new Error(data.error || 'Failed');
+          prompt(`Reset link for ${username} (expires in 24h):\n\nCopy and share via text/email:`, data.reset_url);
+        } catch (e) { alert('Error: ' + e.message); }
+      });
+      row.querySelector('.staff-deactivate-btn')?.addEventListener('click', async () => {
+        const reason = prompt(`Deactivate ${username}? Their data archives for 90 days then auto-purges. Reason (optional):`);
+        if (reason === null) return;
+        try {
+          const r = await fetch(`/api/owner/staff/${encodeURIComponent(username)}/deactivate`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ reason })
+          });
+          const data = await r.json();
+          if (!r.ok) throw new Error(data.error || 'Failed');
+          _loadStaff();
+        } catch (e) { alert('Error: ' + e.message); }
+      });
+      row.querySelector('.staff-hold-btn')?.addEventListener('click', async () => {
+        const current = row.querySelector('.staff-hold-btn').textContent.includes('Release');
+        try {
+          const r = await fetch(`/api/owner/staff/${encodeURIComponent(username)}/purge_hold`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ hold: !current })
+          });
+          if (!r.ok) throw new Error('Failed');
+          _loadStaff();
+        } catch (e) { alert('Error: ' + e.message); }
+      });
+    });
+  }
+
+  function _wireStaffForm() {
+    const addBtn = document.getElementById('add-staff-btn');
+    if (!addBtn) return;
+    addBtn.addEventListener('click', async () => {
+      const username = document.getElementById('new-staff-username').value.trim();
+      const email = document.getElementById('new-staff-email').value.trim();
+      const password = document.getElementById('new-staff-password').value;
+      const msg = document.getElementById('add-staff-msg');
+      if (!username || username.length < 2) {
+        msg.style.color = '#ff7a7a'; msg.textContent = 'Username required (2+ chars)'; return;
+      }
+      if (!password || password.length < 8) {
+        msg.style.color = '#ff7a7a'; msg.textContent = 'Password must be 8+ characters'; return;
+      }
+      msg.style.color = '#9aa4c0'; msg.textContent = 'Adding...';
+      try {
+        const r = await fetch('/api/owner/staff', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username, email, password, role: 'staff' })
+        });
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.error || 'Failed');
+        msg.style.color = '#4ade80'; msg.textContent = 'Added ✓';
+        document.getElementById('new-staff-username').value = '';
+        document.getElementById('new-staff-email').value = '';
+        document.getElementById('new-staff-password').value = '';
+        _loadStaff();
+      } catch (e) {
+        msg.style.color = '#ff7a7a'; msg.textContent = e.message;
+      }
+    });
+  }
+
+  function wireStaff() {
+    _wireStaffForm();
+    const settingsTab = document.querySelector('.tab[data-tab="settings"]');
+    if (settingsTab) settingsTab.addEventListener('click', _loadStaff);
+    if (document.getElementById('tab-settings')?.classList.contains('active')) {
+      _loadStaff();
+    }
+  }
+  document.addEventListener('DOMContentLoaded', wireStaff);
+
+  // QR install URL — populate the URL textbox + Copy button on Settings load
+  function _wireInstallQr() {
+    const refresh = async () => {
+      const img = document.getElementById('install-qr-img');
+      const input = document.getElementById('install-url-input');
+      const hint = document.getElementById('install-url-hint');
+      if (!input || !hint) return;
+      try {
+        const r = await fetch('/api/owner/install_url');
+        const data = await r.json();
+        input.value = data.url || '';
+        hint.textContent = data.hint || '';
+        hint.style.color = data.stable ? '#9aa4c0' : '#fbbf24';
+        if (img) img.src = '/api/owner/install_qr.png?ts=' + Date.now();
+      } catch (e) {
+        hint.textContent = 'Could not load install URL.';
+        hint.style.color = '#ff7a7a';
+      }
+    };
+    const copyBtn = document.getElementById('install-copy-btn');
+    const refreshBtn = document.getElementById('install-refresh-btn');
+    if (copyBtn) copyBtn.addEventListener('click', () => {
+      const input = document.getElementById('install-url-input');
+      input.select();
+      navigator.clipboard?.writeText(input.value);
+      copyBtn.textContent = 'Copied ✓';
+      setTimeout(() => copyBtn.textContent = 'Copy', 1500);
+    });
+    if (refreshBtn) refreshBtn.addEventListener('click', refresh);
+    const settingsTab = document.querySelector('.tab[data-tab="settings"]');
+    if (settingsTab) settingsTab.addEventListener('click', refresh);
+    if (document.getElementById('tab-settings')?.classList.contains('active')) {
+      refresh();
+    }
+  }
+  document.addEventListener('DOMContentLoaded', _wireInstallQr);
+
 })();

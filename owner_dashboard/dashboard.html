@@ -717,6 +717,41 @@
       </div>
 
       <div class="form-section">
+        <h2>👥 Staff & access</h2>
+        <p class="muted" style="margin:4px 0 10px;font-size:13px">
+          Add staff users so each person gets their own login + per-user data folder
+          (their own calendar, tasks, contacts, etc.). When someone leaves, deactivate
+          them — their data archives for 90 days then auto-purges, in case you need
+          to reference it.
+        </p>
+        <div id="staff-list" style="margin-top:12px">
+          <div class="muted" style="font-size:13px">Loading...</div>
+        </div>
+        <div style="margin-top:14px;border-top:1px solid #2c3756;padding-top:14px">
+          <h3 style="margin:0 0 8px;font-size:14px">Add a new staff user</h3>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end">
+            <div style="flex:1;min-width:140px">
+              <label style="display:block;font-size:12px;color:#9aa4c0;margin-bottom:4px">Username</label>
+              <input id="new-staff-username" type="text" placeholder="sarah"
+                      style="width:100%;padding:8px;background:#1a2240;color:#dce3f6;border:1px solid #2c3756;border-radius:6px;box-sizing:border-box">
+            </div>
+            <div style="flex:1;min-width:160px">
+              <label style="display:block;font-size:12px;color:#9aa4c0;margin-bottom:4px">Email (for password reset)</label>
+              <input id="new-staff-email" type="email" placeholder="sarah@example.com"
+                      style="width:100%;padding:8px;background:#1a2240;color:#dce3f6;border:1px solid #2c3756;border-radius:6px;box-sizing:border-box">
+            </div>
+            <div style="flex:1;min-width:140px">
+              <label style="display:block;font-size:12px;color:#9aa4c0;margin-bottom:4px">Temp password (8+ chars)</label>
+              <input id="new-staff-password" type="text" placeholder="they'll change it"
+                      style="width:100%;padding:8px;background:#1a2240;color:#dce3f6;border:1px solid #2c3756;border-radius:6px;box-sizing:border-box">
+            </div>
+            <button type="button" class="primary-btn" id="add-staff-btn">Add staff</button>
+          </div>
+          <div id="add-staff-msg" style="margin-top:8px;font-size:13px"></div>
+        </div>
+      </div>
+
+      <div class="form-section">
         <h2>Orby's Personality</h2>
         <label>How should Orby sound?
           <select name="tone" id="tone-select">
