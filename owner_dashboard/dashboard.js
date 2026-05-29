@@ -1294,10 +1294,13 @@
     const useExistingUnlocked = !!_persistentAudio;
     try {
       if (useExistingUnlocked) {
-        // Reuse — keeps iOS happy
+        // Reuse — keeps iOS happy. .load() is REQUIRED after changing
+        // src on an already-played Audio element, otherwise the browser
+        // ignores the new source and stays on the silent unlock WAV.
         _persistentAudio.onended = finish;
         _persistentAudio.onerror = finish;
         _persistentAudio.src = url;
+        _persistentAudio.load();
         currentAudio = _persistentAudio;
       } else {
         // Fresh Audio (desktop / non-iOS where this works fine)
