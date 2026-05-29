@@ -668,6 +668,55 @@
       </div>
 
       <div class="form-section">
+        <h2>📱 Install Orby on your phone</h2>
+        <p class="muted" style="margin:4px 0 10px;font-size:13px">
+          Open your phone camera, point it at the QR code below, and tap the link.
+          You'll sign in with your username + password, then add Orby to your home
+          screen. Each staff member does this on their own phone with their own
+          credentials.
+        </p>
+        <div id="install-qr-block" style="display:flex;gap:24px;align-items:flex-start;flex-wrap:wrap;margin-top:12px">
+          <div style="background:white;padding:12px;border-radius:8px;display:inline-block">
+            <img id="install-qr-img" alt="Orby install QR"
+                  src="/api/owner/install_qr.png"
+                  style="width:220px;height:220px;display:block">
+          </div>
+          <div style="flex:1;min-width:260px">
+            <label style="display:block;font-size:12px;color:#9aa4c0;margin-bottom:4px">
+              Install URL (also typeable):
+            </label>
+            <div style="display:flex;gap:8px;align-items:center">
+              <input id="install-url-input" type="text" readonly
+                      style="flex:1;font-family:monospace;font-size:13px;padding:8px 10px;background:#1a2240;border:1px solid #2c3756;color:#dce3f6;border-radius:6px"
+                      value="Loading...">
+              <button type="button" class="secondary-btn" id="install-copy-btn">Copy</button>
+            </div>
+            <p id="install-url-hint" class="muted"
+                style="margin-top:8px;font-size:12px;line-height:1.5">Loading...</p>
+            <button type="button" class="secondary-btn" id="install-refresh-btn"
+                    style="margin-top:6px">Refresh QR</button>
+          </div>
+        </div>
+        <details style="margin-top:14px;font-size:13px">
+          <summary style="cursor:pointer;color:#9aa4c0">Step-by-step (iPhone & Android)</summary>
+          <div style="margin-top:8px;padding-left:8px;line-height:1.6">
+            <strong>iPhone (Safari only):</strong>
+            <ol style="margin:6px 0 12px 20px;padding:0">
+              <li>Scan the QR with your camera, tap the link</li>
+              <li>Sign in with your email + password</li>
+              <li>Tap <b>Share</b> (square with arrow up) → <b>Add to Home Screen</b> → <b>Add</b></li>
+            </ol>
+            <strong>Android (Chrome / Edge):</strong>
+            <ol style="margin:6px 0 0 20px;padding:0">
+              <li>Scan the QR, tap the link</li>
+              <li>Sign in</li>
+              <li>Tap the <b>Install Orby</b> banner that pops up (or ⋮ menu → <b>Install app</b>)</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <div class="form-section">
         <h2>Orby's Personality</h2>
         <label>How should Orby sound?
           <select name="tone" id="tone-select">

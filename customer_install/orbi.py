@@ -1640,6 +1640,85 @@ def owner_backup_status():
         "enabled": bool((CONFIG.get("backup") or {}).get("enabled")),
     })
 
+# ── Mobile install QR ────────────────────────────────────────────────────
+# Owner / staff opens Settings → "Install on phone", scans the QR with
+# their phone camera, lands on /owner/login on their phone, signs in with
+# their username/password, taps "Add to Home Screen". Done.
+#
+# The QR encodes the publicly-reachable URL — preferably the cloudflared
+# tunnel (config.server.tunnel_url) OR config.server.public_url if the
+# owner manually set one. Falls back to the request's Host header (works
+# for local LAN testing).
+
+def _resolve_install_base() -> tuple[str, str]:
+    """Pick the best URL to advertise for mobile install.
+    Returns (base_url, source_tag)."""
+    server = CONFIG.get("server") or {}
+    public_url = (server.get("public_url") or "").rstrip("/")
+    config_tunnel = (server.get("tunnel_url") or "").rstrip("/")
+    live_tunnel = (_CURRENT_TUNNEL_URL[0] or "").rstrip("/") if _CURRENT_TUNNEL_URL else ""
+    if public_url:
+        return public_url, "configured"
+    if live_tunnel:
+        return live_tunnel, "tunnel"
+    if config_tunnel:
+        return config_tunnel, "tunnel"
+    return request.host_url.rstrip("/"), "host_header"
+
+
+@app.route("/api/owner/install_url", methods=["GET"])
+def owner_install_url():
+    """Returns the URL to put in the QR code + a human-readable label
+    indicating how stable it is (named tunnel / random tunnel / local IP)."""
+    auth.require_owner(ORBI_DIR)
+    chosen, source = _resolve_install_base()
+
+    full = f"{chosen}/owner/login"
+    is_stable = source == "configured"
+    return jsonify({
+        "url":       full,
+        "base":      chosen,
+        "source":    source,
+        "stable":    is_stable,
+        "hint":      ("Stable URL — safe to print + share." if is_stable
+                       else "TEMPORARY URL — changes when you restart Orby. "
+                            "For a permanent URL, set up a named cloudflared "
+                            "tunnel on your domain."),
+    })
+
+
+@app.route("/api/owner/install_qr.png", methods=["GET"])
+def owner_install_qr():
+    """Returns a QR code PNG that encodes the install URL. Scan with
+    phone camera → opens /owner/login on the phone → log in → Add to
+    Home Screen → done."""
+    auth.require_owner(ORBI_DIR)
+    try:
+        import qrcode
+        import qrcode.image.pil   # ensure PIL factory is registered
+    except ImportError:
+        return jsonify({"error": "qrcode_lib_missing",
+                        "message": "Install python-qrcode + Pillow."}), 503
+
+    base, _ = _resolve_install_base()
+    url = f"{base}/owner/login"
+
+    qr = qrcode.QRCode(
+        version=None,
+        error_correction=qrcode.constants.ERROR_CORRECT_M,
+        box_size=12,
+        border=2,
+    )
+    qr.add_data(url)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="#8b5cf6", back_color="white")
+    import io as _io
+    buf = _io.BytesIO()
+    img.save(buf, format="PNG")
+    return Response(buf.getvalue(), mimetype="image/png",
+                     headers={"Cache-Control": "no-store, max-age=0"})
+
+
 @app.route("/api/owner/audit", methods=["GET"])
 def owner_audit_view():
     owner_session = auth.require_owner(ORBI_DIR)
