@@ -4079,8 +4079,60 @@
       setTimeout(() => copyBtn.textContent = 'Copy', 1500);
     });
     if (refreshBtn) refreshBtn.addEventListener('click', refresh);
+
+    // "Add Orby to this device's home screen" button — visible only when
+    // it makes sense (not when running standalone, not when there's no
+    // way to install). Uses orbiInstallPrompt / orbiInstallState helpers
+    // exposed by /pwa/register-sw.js.
+    const installBtn = document.getElementById('install-on-device-btn');
+    const alreadyHint = document.getElementById('install-already');
+    function refreshInstallButtonState() {
+      if (!installBtn) return;
+      const state = (typeof window.orbiInstallState === 'function')
+        ? window.orbiInstallState()
+        : { installed: false, ios: false, promptReady: false };
+      if (state.installed) {
+        installBtn.style.display = 'none';
+        if (alreadyHint) alreadyHint.style.display = 'block';
+        return;
+      }
+      if (alreadyHint) alreadyHint.style.display = 'none';
+      // Show on iOS (manual steps modal) OR when Chrome's prompt is ready
+      if (state.ios || state.promptReady) {
+        installBtn.style.display = 'block';
+      } else {
+        // No install API + not iOS — desktop browser without install support.
+        // Still show the button — clicking will show a fallback message.
+        installBtn.style.display = 'block';
+        installBtn.textContent = '📱 How to install Orby on your phone';
+      }
+    }
+    if (installBtn) {
+      installBtn.addEventListener('click', () => {
+        const state = (typeof window.orbiInstallState === 'function')
+          ? window.orbiInstallState()
+          : { installed: false, ios: false, promptReady: false };
+        if (state.ios) {
+          const modal = document.getElementById('ios-install-modal');
+          if (modal && typeof modal.showModal === 'function') {
+            modal.showModal();
+          } else if (typeof window.orbiInstallPrompt === 'function') {
+            window.orbiInstallPrompt();
+          }
+        } else if (typeof window.orbiInstallPrompt === 'function') {
+          window.orbiInstallPrompt();
+        }
+      });
+    }
+    refreshInstallButtonState();
+    window.addEventListener('orbi:install-available', refreshInstallButtonState);
+    window.addEventListener('orbi:installed', refreshInstallButtonState);
+
     const settingsTab = document.querySelector('.tab[data-tab="settings"]');
-    if (settingsTab) settingsTab.addEventListener('click', refresh);
+    if (settingsTab) settingsTab.addEventListener('click', () => {
+      refresh();
+      refreshInstallButtonState();
+    });
     if (document.getElementById('tab-settings')?.classList.contains('active')) {
       refresh();
     }

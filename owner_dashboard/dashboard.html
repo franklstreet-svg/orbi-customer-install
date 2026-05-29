@@ -713,6 +713,15 @@
                   style="width:220px;height:220px;display:block">
           </div>
           <div style="flex:1;min-width:260px">
+            <!-- Primary install action — visible right at the top -->
+            <button type="button" class="primary-btn" id="install-on-device-btn"
+                    style="width:100%;padding:12px;font-size:14px;display:none">
+              📱 Add Orby to this device's home screen
+            </button>
+            <div id="install-already" class="muted"
+                  style="font-size:12px;color:#4ade80;margin-bottom:10px;display:none">
+              ✓ Already installed on this device — you can use the app icon to open it.
+            </div>
             <label style="display:block;font-size:12px;color:#9aa4c0;margin-bottom:4px">
               Install URL (also typeable):
             </label>
@@ -728,6 +737,26 @@
                     style="margin-top:6px">Refresh QR</button>
           </div>
         </div>
+        <!-- iOS install modal — Safari doesn't allow auto-prompts -->
+        <dialog id="ios-install-modal" style="background:#131a2e;color:#eaf0ff;border:1px solid #2c3756;border-radius:14px;padding:24px;max-width:380px;width:90%">
+          <h2 style="margin:0 0 12px;font-size:18px">📱 Add Orby to your home screen</h2>
+          <p class="muted" style="margin:0 0 14px;font-size:13px">
+            iPhone doesn't allow apps to add themselves automatically — Apple makes
+            you do it manually in Safari. Takes 5 seconds:
+          </p>
+          <ol style="margin:0;padding-left:22px;line-height:1.8;font-size:14px">
+            <li>Tap the <b>Share</b> button at the bottom of Safari
+                <span style="font-size:11px;color:#9aa4c0">(square with arrow up)</span></li>
+            <li>Scroll down, tap <b>Add to Home Screen</b></li>
+            <li>Tap <b>Add</b> in the top right</li>
+          </ol>
+          <p class="muted" style="margin:16px 0 0;font-size:12px">
+            Orby will appear as an app icon — tap it to open full-screen, like a real app.
+          </p>
+          <button type="button" class="primary-btn" style="width:100%;margin-top:16px"
+                  onclick="document.getElementById('ios-install-modal').close()">Got it</button>
+        </dialog>
+
         <details style="margin-top:14px;font-size:13px">
           <summary style="cursor:pointer;color:#9aa4c0">Step-by-step (iPhone & Android)</summary>
           <div style="margin-top:8px;padding-left:8px;line-height:1.6">
