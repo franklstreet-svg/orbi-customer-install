@@ -1599,6 +1599,373 @@ def owner_change_password():
                     action="owner.password_changed")
     return jsonify({"status": "ok"})
 
+# ── Password reset (email-based) ────────────────────────────────────────
+# Standard SaaS flow:
+#   1. User clicks "Forgot password" on /owner/login
+#   2. POSTs email to /api/owner/forgot_password
+#   3. We generate a one-time token (24-hour expiry), store it, email the
+#      reset link to the user's address via their own connected email
+#      account (or, for owner, the configured owner email)
+#   4. User clicks link → /owner/reset_password?token=X → enters new pw
+#   5. /api/owner/reset_password verifies token, sets new password
+#
+# Tokens stored in data/password_reset_tokens.json. Single-use, expire
+# after 24 hours. Cryptographically random (secrets.token_urlsafe).
+
+_RESET_TOKEN_FILE = "password_reset_tokens.json"
+_RESET_TOKEN_TTL = 24 * 3600
+
+
+def _reset_tokens_path():
+    return DATA_DIR / _RESET_TOKEN_FILE
+
+
+def _load_reset_tokens() -> dict:
+    p = _reset_tokens_path()
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_reset_tokens(tokens: dict) -> None:
+    p = _reset_tokens_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(tokens, indent=2), encoding="utf-8")
+    tmp.replace(p)
+
+
+def _create_reset_token(target_user: str, email: str) -> str:
+    """Generate a one-time reset token for a username. Returns the token."""
+    import secrets
+    tokens = _load_reset_tokens()
+    # Cleanup expired
+    now = int(time.time())
+    tokens = {k: v for k, v in tokens.items()
+              if int(v.get("expires_at", 0)) > now}
+    token = secrets.token_urlsafe(32)
+    tokens[token] = {
+        "username":   target_user,
+        "email":      email,
+        "created_at": now,
+        "expires_at": now + _RESET_TOKEN_TTL,
+    }
+    _save_reset_tokens(tokens)
+    return token
+
+
+def _consume_reset_token(token: str) -> dict | None:
+    """Validate a token and remove it from the store. Returns the token
+    record (with username + email) or None if invalid/expired."""
+    tokens = _load_reset_tokens()
+    rec = tokens.get(token)
+    if not rec:
+        return None
+    if int(rec.get("expires_at", 0)) < int(time.time()):
+        del tokens[token]
+        _save_reset_tokens(tokens)
+        return None
+    del tokens[token]
+    _save_reset_tokens(tokens)
+    return rec
+
+
+def _send_reset_email(to_addr: str, reset_url: str, name: str = "") -> dict:
+    """Send a password reset email. Tries owner's first connected email
+    account; falls back to SMTP env vars (ORBI_SMTP_HOST etc.) if any."""
+    # Try owner's configured email accounts (Gmail/Outlook/generic SMTP)
+    try:
+        # Owner's mailbox = whichever user folder belongs to the owner.
+        # For the owner herself, that's the owner user. For staff resets,
+        # the owner still sends FROM their own account.
+        owner_user = (CONFIG.get("owner") or {}).get("name", "owner")
+        from pathlib import Path as _P
+        owner_dir = users_mod.get_user_dir(DATA_DIR, owner_user)
+        accounts = imap_smtp.list_accounts(owner_dir)
+        for a in accounts:
+            if a.get("smtp_host"):
+                subj = "Reset your Orby password"
+                body = (
+                    f"{('Hi ' + name + ',') if name else 'Hi,'}\n\n"
+                    "You (or someone) requested a password reset for your "
+                    "Orby login. Click the link below to set a new password. "
+                    "The link expires in 24 hours.\n\n"
+                    f"{reset_url}\n\n"
+                    "If you didn't request this, you can ignore this email — "
+                    "your current password still works.\n\n"
+                    "— Orby"
+                )
+                result = imap_smtp.send_email(
+                    owner_dir, a["id"], to=to_addr,
+                    subject=subj, body=body)
+                if result.get("ok"):
+                    return {"ok": True, "via": "owner_account"}
+    except Exception as e:
+        log.warning(f"reset email via owner account failed: {e}")
+
+    # Fallback: SMTP env vars (rare, but available)
+    smtp_host = os.environ.get("ORBI_SMTP_HOST")
+    if smtp_host:
+        try:
+            import smtplib
+            from email.mime.text import MIMEText
+            msg = MIMEText(
+                f"Reset link (24h): {reset_url}\n\n"
+                "If you didn't request this, ignore — your password still works.")
+            msg["Subject"] = "Reset your Orby password"
+            msg["From"] = os.environ.get("ORBI_SMTP_FROM", smtp_host)
+            msg["To"] = to_addr
+            port = int(os.environ.get("ORBI_SMTP_PORT", "587"))
+            with smtplib.SMTP(smtp_host, port, timeout=20) as s:
+                if os.environ.get("ORBI_SMTP_STARTTLS", "1") == "1":
+                    s.ehlo(); s.starttls(); s.ehlo()
+                user = os.environ.get("ORBI_SMTP_USER")
+                if user:
+                    s.login(user, os.environ.get("ORBI_SMTP_PASS", ""))
+                s.send_message(msg)
+            return {"ok": True, "via": "smtp_env"}
+        except Exception as e:
+            log.warning(f"reset email via SMTP env failed: {e}")
+
+    return {"ok": False, "error": "no_email_configured"}
+
+
+@app.route("/api/owner/forgot_password", methods=["POST"])
+def owner_forgot_password():
+    """Public — no auth. Triggers a reset email if the address matches
+    a known user. Always returns 'ok' to avoid leaking which addresses
+    have accounts."""
+    data = request.get_json(silent=True) or {}
+    email_addr = (data.get("email") or "").strip().lower()
+    if not email_addr or "@" not in email_addr:
+        return jsonify({"error": "valid email required"}), 400
+
+    # Find the user by email — check owner config first, then user registry
+    target_user = None
+    owner = CONFIG.get("owner", {})
+    if (owner.get("email") or "").strip().lower() == email_addr:
+        target_user = owner.get("name", "owner")
+    else:
+        for u in users_mod.list_users(DATA_DIR):
+            if (u.get("email") or "").strip().lower() == email_addr:
+                target_user = u["username"]
+                break
+
+    if not target_user:
+        # Don't leak which emails are registered. Return ok anyway.
+        log.info(f"forgot_password: no user for {email_addr!r}")
+        return jsonify({"status": "ok",
+                        "message": "If that email is on file, a reset link has been sent."})
+
+    token = _create_reset_token(target_user, email_addr)
+    base, _ = _resolve_install_base()
+    reset_url = f"{base}/owner/reset_password?token={token}"
+    send_result = _send_reset_email(email_addr, reset_url, name=target_user)
+    audit.log_event(DATA_DIR, actor=email_addr,
+                    action="owner.forgot_password.sent",
+                    meta={"username": target_user,
+                          "sent": send_result.get("ok", False)})
+    return jsonify({"status": "ok",
+                    "message": "If that email is on file, a reset link has been sent.",
+                    "email_sent": send_result.get("ok", False)})
+
+
+@app.route("/owner/reset_password", methods=["GET"])
+def owner_reset_password_page():
+    """Public reset form. Token in query string. Renders inline HTML."""
+    token = request.args.get("token", "")
+    # We don't validate here (consume on submit) — just render the form
+    safe_token = (token or "")[:200]   # cap size for the hidden field
+    return Response(f"""<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reset Orby password</title>
+<style>
+  body {{ font-family: system-ui, -apple-system, sans-serif; background: #0b0f1a;
+          color: #eaf0ff; min-height: 100vh; display: flex; align-items: center;
+          justify-content: center; padding: 24px; margin: 0; }}
+  .card {{ background: #131a2e; padding: 28px 24px; border-radius: 14px;
+           max-width: 380px; width: 100%; }}
+  h1 {{ margin: 0 0 8px; font-size: 22px; }}
+  p {{ color: #9aa4c0; font-size: 13px; margin: 0 0 16px; }}
+  input {{ width: 100%; padding: 10px; background: #1a2240; color: #eaf0ff;
+           border: 1px solid #2c3756; border-radius: 6px; font-size: 14px;
+           box-sizing: border-box; }}
+  label {{ display: block; font-size: 12px; color: #9aa4c0; margin: 12px 0 4px; }}
+  button {{ width: 100%; padding: 12px; background: #8b5cf6; color: white;
+            border: none; border-radius: 6px; font-size: 14px; font-weight: 600;
+            margin-top: 16px; cursor: pointer; }}
+  button:disabled {{ opacity: 0.5; cursor: not-allowed; }}
+  #msg {{ margin-top: 12px; font-size: 13px; }}
+  .ok {{ color: #4ade80; }}
+  .err {{ color: #ff7a7a; }}
+</style></head><body>
+<div class="card">
+  <h1>Reset your password</h1>
+  <p>Enter a new password below. Minimum 8 characters.</p>
+  <form id="resetForm">
+    <input type="hidden" name="token" value="{safe_token}">
+    <label for="pw">New password</label>
+    <input type="password" id="pw" name="password" required minlength="8" autofocus>
+    <label for="pw2">Confirm new password</label>
+    <input type="password" id="pw2" name="confirm" required minlength="8">
+    <button type="submit">Set new password</button>
+    <div id="msg"></div>
+  </form>
+</div>
+<script>
+  document.getElementById("resetForm").addEventListener("submit", async (e) => {{
+    e.preventDefault();
+    const pw = document.getElementById("pw").value;
+    const pw2 = document.getElementById("pw2").value;
+    const msg = document.getElementById("msg");
+    if (pw !== pw2) {{ msg.className = "err"; msg.textContent = "Passwords don't match."; return; }}
+    const tok = e.target.elements.token.value;
+    const r = await fetch("/api/owner/reset_password", {{
+      method: "POST", headers: {{"Content-Type": "application/json"}},
+      body: JSON.stringify({{token: tok, password: pw}})
+    }});
+    const data = await r.json();
+    if (r.ok) {{
+      msg.className = "ok"; msg.textContent = "Password set. Redirecting to login…";
+      setTimeout(() => window.location.href = "/owner/login", 1500);
+    }} else {{
+      msg.className = "err"; msg.textContent = data.error || "Reset failed.";
+    }}
+  }});
+</script>
+</body></html>""", mimetype="text/html")
+
+
+@app.route("/api/owner/reset_password", methods=["POST"])
+def owner_reset_password():
+    """Verify token + set new password. Public — no auth (the token IS
+    the auth)."""
+    data = request.get_json(silent=True) or {}
+    token = (data.get("token") or "").strip()
+    new_pw = data.get("password", "")
+    if not token:
+        return jsonify({"error": "token required"}), 400
+    if len(new_pw) < 8:
+        return jsonify({"error": "Password must be at least 8 characters"}), 400
+    rec = _consume_reset_token(token)
+    if not rec:
+        return jsonify({"error": "Reset link expired or already used"}), 401
+
+    target_user = rec.get("username")
+    # Owner reset (target_user matches owner.name) vs staff reset
+    owner = CONFIG.get("owner", {})
+    if target_user == owner.get("name", "owner"):
+        owner["_password_hash"] = auth.hash_password(new_pw)
+        CONFIG["owner"] = owner
+        save_config(CONFIG)
+        audit.log_event(DATA_DIR, actor=rec.get("email"),
+                        action="owner.password_reset_via_email")
+    else:
+        ok = users_mod.change_password(DATA_DIR, target_user, new_pw)
+        if not ok:
+            return jsonify({"error": "User no longer exists"}), 404
+        audit.log_event(DATA_DIR, actor=rec.get("email"),
+                        action="staff.password_reset_via_email",
+                        meta={"username": target_user})
+    return jsonify({"status": "ok"})
+
+
+# ── Staff CRUD ──────────────────────────────────────────────────────────
+# Owner-only. List / add / deactivate / generate-reset-link for staff users.
+# Backed by users.py which already has:
+#   add_user, deactivate_user (archive-not-delete with 90-day purge),
+#   change_password, list_users (active), list_archived,
+#   set_purge_hold (owner can prevent purge), transfer_items
+
+@app.route("/api/owner/staff", methods=["GET"])
+def owner_staff_list():
+    auth.require_owner(ORBI_DIR)
+    return jsonify({
+        "active":   users_mod.list_users(DATA_DIR, include_archived=False),
+        "archived": users_mod.list_archived(DATA_DIR),
+    })
+
+
+@app.route("/api/owner/staff", methods=["POST"])
+def owner_staff_add():
+    owner_session = auth.require_owner(ORBI_DIR)
+    data = request.get_json(silent=True) or {}
+    username = (data.get("username") or "").strip().lower()
+    password = data.get("password") or ""
+    email_addr = (data.get("email") or "").strip().lower()
+    role = (data.get("role") or "staff").strip()
+    if not username or len(username) < 2:
+        return jsonify({"error": "username required (2+ chars)"}), 400
+    if len(password) < 8:
+        return jsonify({"error": "password must be 8+ characters"}), 400
+    try:
+        user = users_mod.add_user(DATA_DIR, username=username,
+                                   password=password, email=email_addr,
+                                   role=role)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    audit.log_event(DATA_DIR, actor=owner_session.get("email", "?"),
+                    action="staff.added",
+                    meta={"username": username, "role": role})
+    return jsonify({"status": "ok", "user": user})
+
+
+@app.route("/api/owner/staff/<username>/deactivate", methods=["POST"])
+def owner_staff_deactivate(username: str):
+    """Archive a staff user. Data moved to data/_archive/<username>/ and
+    auto-purged after 90 days unless owner sets a hold."""
+    owner_session = auth.require_owner(ORBI_DIR)
+    data = request.get_json(silent=True) or {}
+    reason = data.get("reason", "")
+    try:
+        result = users_mod.deactivate_user(DATA_DIR, username,
+                                            reason=reason)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 404
+    audit.log_event(DATA_DIR, actor=owner_session.get("email", "?"),
+                    action="staff.deactivated",
+                    meta={"username": username, "reason": reason[:120]})
+    return jsonify({"status": "ok", "archive": result})
+
+
+@app.route("/api/owner/staff/<username>/reset_link", methods=["POST"])
+def owner_staff_reset_link(username: str):
+    """Owner generates a one-time reset link for a staff member. Owner
+    shares the link (text/email/in-person). Staff opens it, sets a new
+    password. The link expires in 24h."""
+    owner_session = auth.require_owner(ORBI_DIR)
+    user = users_mod.get_user(DATA_DIR, username)
+    if not user:
+        return jsonify({"error": "user not found"}), 404
+    token = _create_reset_token(username, user.get("email", ""))
+    base, _ = _resolve_install_base()
+    reset_url = f"{base}/owner/reset_password?token={token}"
+    audit.log_event(DATA_DIR, actor=owner_session.get("email", "?"),
+                    action="staff.reset_link_created",
+                    meta={"username": username})
+    return jsonify({"status": "ok", "reset_url": reset_url,
+                    "expires_in_hours": 24})
+
+
+@app.route("/api/owner/staff/<username>/purge_hold", methods=["POST"])
+def owner_staff_purge_hold(username: str):
+    """Toggle the purge-hold flag on an archived user. When held=true,
+    their data won't be auto-purged at 90 days."""
+    owner_session = auth.require_owner(ORBI_DIR)
+    data = request.get_json(silent=True) or {}
+    hold = bool(data.get("hold"))
+    ok = users_mod.set_purge_hold(DATA_DIR, username, hold)
+    if not ok:
+        return jsonify({"error": "user not found in archive"}), 404
+    audit.log_event(DATA_DIR, actor=owner_session.get("email", "?"),
+                    action="staff.purge_hold_set",
+                    meta={"username": username, "hold": hold})
+    return jsonify({"status": "ok", "hold": hold})
+
+
 @app.route("/api/owner/backup/set_passphrase", methods=["POST"])
 def owner_backup_set_pw():
     owner_session = auth.require_owner(ORBI_DIR)
