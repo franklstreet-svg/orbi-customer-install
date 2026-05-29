@@ -1406,7 +1406,10 @@
 
     const cleanText = stripForSpeech(text);
 
+    let _finishCalled = false;
     const finish = () => {
+      if (_finishCalled) return;
+      _finishCalled = true;
       isSpeaking = false;
       if (currentAudioUrl) {
         URL.revokeObjectURL(currentAudioUrl);
@@ -1431,6 +1434,22 @@
         }, 300);
       }
     };
+
+    // SAFETY NET: if neither onended nor onerror nor the play() rejection
+    // fires within the expected playback time, force-call finish() so
+    // isSpeaking gets reset and the mic can restart. Without this, a
+    // silently-failed audio leaves the system stuck on isSpeaking=true
+    // forever and the mic never re-arms.
+    // Estimate: ~15 chars/sec speech + 3s buffer for network/startup,
+    // capped between 5s and 60s.
+    const estimatedSec = Math.min(60, Math.max(5,
+      Math.ceil(cleanText.length / 15) + 3));
+    setTimeout(() => {
+      if (!_finishCalled) {
+        console.warn('[Orbi] audio safety timeout fired — forcing finish()');
+        finish();
+      }
+    }, estimatedSec * 1000);
 
     // iOS PWA strategy: reuse the persistent Audio element that was
     // unlocked by the speaker-toggle click. iOS treats new Audio() as
