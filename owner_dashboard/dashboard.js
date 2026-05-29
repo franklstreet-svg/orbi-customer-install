@@ -1370,12 +1370,10 @@
     }
   }
 
-  // Watchdog — every 3s, if voice mode is on but mic isn't actively
+  // Watchdog — every 1.5s, if voice mode is on but mic isn't actively
   // listening AND Orby isn't speaking, REBUILD recognition + restart.
-  // Rebuilding is required because iOS Safari often refuses .start()
-  // on a recognition instance that's been stopped after audio playback.
-  // After two consecutive stalls we always rebuild; on the first stall
-  // we try a plain restart first (cheaper).
+  // Catches iOS Safari's silent recognition death so owner doesn't
+  // wait 3+ seconds wondering why the mic isn't responding.
   let _watchdogStalls = 0;
   setInterval(() => {
     if (voiceOn && wantsListening && !isListening && !isSpeaking) {
@@ -1387,7 +1385,7 @@
     } else if (isListening) {
       _watchdogStalls = 0;   // healthy — reset
     }
-  }, 3000);
+  }, 1500);
 
   // Uses server-side /tts endpoint (edge_tts, en-US-AvaNeural by default
   // — same voice as orbi_test on twickell.com). Falls back to browser
@@ -1417,9 +1415,9 @@
       currentAudio = null;
       document.getElementById('owner-stop-speaking').hidden = true;
       setVoiceState(null);
-      // Echo guard — wait 600ms before re-arming the mic so the audio
-      // element's buffer fully drains and the tail of Ava's last word
-      // doesn't get picked up by the microphone and treated as user input.
+      // Echo guard — short wait so the audio element's tail doesn't get
+      // picked up by the mic. Chrome on iOS has decent built-in echo
+      // cancellation so 300ms is plenty.
       // Also REBUILD the recognition object — iOS Safari often refuses
       // .start() on the same instance once audio has played in the
       // session. Rebuilding gives us a fresh engine.
@@ -1430,7 +1428,7 @@
             if (window._orbiRebuildRecognition) window._orbiRebuildRecognition();
           } catch {}
           safeStartMic();
-        }, 600);
+        }, 300);
       }
     };
 
