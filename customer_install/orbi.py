@@ -2865,6 +2865,22 @@ _IMAGE_REFINE_RE = _re.compile(
 _LAST_IMAGE_PROMPT: dict[str, tuple[str, float, str]] = {}
 _IMAGE_REFINE_TTL_SECONDS = 600  # 10 minutes
 
+# Per-user lock so a second image request while one is in flight doesn't
+# blow the Pollinations 1-concurrent-request-per-IP limit. The second
+# request waits behind the first instead of racing it (and getting an
+# HTTP 402 "queue full" rejection).
+import threading as _threading
+_IMAGE_USER_LOCKS: dict[str, "_threading.Lock"] = {}
+_IMAGE_LOCKS_GUARD = _threading.Lock()
+
+def _user_image_lock(username: str) -> "_threading.Lock":
+    with _IMAGE_LOCKS_GUARD:
+        lk = _IMAGE_USER_LOCKS.get(username)
+        if lk is None:
+            lk = _threading.Lock()
+            _IMAGE_USER_LOCKS[username] = lk
+        return lk
+
 # Platform/format detection — pick the right canvas size from natural
 # language. Order matters: more specific patterns first (instagram_story
 # before instagram_square, facebook_cover before facebook_post).
@@ -3076,7 +3092,8 @@ def _try_office_gen(message: str, username: str) -> dict | None:
             prompt = f"{base}, {refinement}"
             kind = _detect_image_kind(msg) if _detect_image_kind(msg) != "instagram_square" else _detect_image_kind(base_prompt)
             try:
-                png = image_gen.generate(CONFIG, prompt, kind=kind)
+                with _user_image_lock(username):
+                    png = image_gen.generate(CONFIG, prompt, kind=kind)
             except RuntimeError as e:
                 if "image_service_unavailable" in str(e):
                     return {"reply": ("The image service is busy — your refinement "
@@ -3211,7 +3228,8 @@ def _try_office_gen(message: str, username: str) -> dict | None:
             # right canvas size. Falls back to instagram_square if no hint.
             kind = _detect_image_kind(msg)
             try:
-                png = image_gen.generate(CONFIG, prompt, kind=kind)
+                with _user_image_lock(username):
+                    png = image_gen.generate(CONFIG, prompt, kind=kind)
             except RuntimeError as e:
                 if "image_service_unavailable" in str(e):
                     return {"reply": ("The image service is busy right now — "

@@ -102,7 +102,8 @@ HF_TIMEOUT_SECONDS = 60
 # the customer has to do. Their FLUX model is the same family as HF's.
 POLLINATIONS_BASE = "https://image.pollinations.ai/prompt/"
 POLLINATIONS_TIMEOUT_SECONDS = 90        # FLUX backend can be slow under load
-POLLINATIONS_MAX_RETRIES = 2             # transient timeouts are very common
+POLLINATIONS_MAX_RETRIES = 4             # 402 "queue full" needs a wait + retry
+POLLINATIONS_QUEUE_WAIT_SECONDS = 15     # how long to wait when 402 says queue is full
 
 # System prompt for the LLM-based image-prompt enhancer. The user's casual
 # request ("draw a robot") is converted into a detailed FLUX-friendly prompt
@@ -480,6 +481,16 @@ def _generate_pollinations(prompt: str, kind: str, img_cfg: dict,
             err_body = exc.read().decode("utf-8", errors="ignore")
         except Exception:    # noqa: BLE001
             err_body = ""
+        # HTTP 402 = "Queue full for IP" — Pollinations' free tier only
+        # allows 1 in-flight request per IP. Wait for the existing request
+        # to finish then retry. This is the COMMON failure when the user
+        # fires multiple draw requests in a short window.
+        if exc.code == 402 and _attempt < POLLINATIONS_MAX_RETRIES:
+            wait = POLLINATIONS_QUEUE_WAIT_SECONDS * (1 + _attempt)
+            log.warning("pollinations 402 queue full on attempt %d — "
+                        "waiting %ds then retrying", _attempt + 1, wait)
+            time.sleep(wait)
+            return _generate_pollinations(prompt, kind, img_cfg, seed=None, _attempt=_attempt + 1)
         # 5xx are transient — retry with a fresh seed (rerolls the queue)
         if exc.code in (500, 502, 503, 504) and _attempt < POLLINATIONS_MAX_RETRIES:
             log.warning("pollinations HTTP %d on attempt %d, retrying", exc.code, _attempt + 1)
