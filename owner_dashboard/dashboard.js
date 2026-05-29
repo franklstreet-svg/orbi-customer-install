@@ -1253,6 +1253,54 @@
       btn.addEventListener('click', () => setSpeakReplies(!speakRepliesOn));
       setSpeakReplies(speakRepliesOn);   // apply initial state styling
     }
+    // Voice diagnostic test button — bypasses chat flow, plays a fixed
+    // greeting directly. If this works, audio path is fine and the chat
+    // wiring is the issue. If it doesn't, browser is blocking audio.
+    const testBtn = document.getElementById('voice-test-btn');
+    const debugEl = document.getElementById('voice-debug');
+    function debug(msg, kind) {
+      if (!debugEl) return;
+      debugEl.style.display = 'block';
+      debugEl.style.color = kind === 'err' ? '#ff7a7a' : (kind === 'ok' ? '#4ade80' : '#9aa4c0');
+      debugEl.textContent = msg;
+    }
+    if (testBtn) {
+      testBtn.addEventListener('click', async () => {
+        const ua = navigator.userAgent || '';
+        const standalone = window.matchMedia('(display-mode: standalone)').matches
+          || window.navigator.standalone === true;
+        debug(`Testing audio... UA: ${(/iPhone/.test(ua) ? 'iPhone' : /Android/.test(ua) ? 'Android' : 'Desktop')}, standalone PWA: ${standalone}`, 'info');
+        // Try server /tts first
+        const url = '/tts?text=' + encodeURIComponent("Hi Frank, this is Orby. Can you hear me?");
+        try {
+          const a = new Audio(url);
+          a.playsInline = true;
+          a.setAttribute('playsinline', '');
+          a.onerror = () => debug('❌ Audio() error event fired — /tts may have failed', 'err');
+          a.onended = () => debug('✓ Audio played end-to-end. Voice path works.', 'ok');
+          const p = a.play();
+          if (p && typeof p.then === 'function') {
+            p.then(() => debug('▶ Server audio started playing — you should hear Orby now', 'ok'))
+              .catch((err) => {
+                debug(`❌ Server audio rejected: ${err.name} — trying iOS built-in voice...`, 'err');
+                // Fallback to speechSynthesis
+                if (window.speechSynthesis) {
+                  const u = new SpeechSynthesisUtterance("Hi Frank, this is Orby. Can you hear me?");
+                  u.lang = 'en-US';
+                  u.onend = () => debug('✓ Built-in iOS voice played. Server /tts is blocked.', 'ok');
+                  u.onerror = () => debug('❌ Both server AND iOS voice failed. Check phone volume/silent switch.', 'err');
+                  window.speechSynthesis.cancel();
+                  window.speechSynthesis.speak(u);
+                } else {
+                  debug('❌ No speechSynthesis available either', 'err');
+                }
+              });
+          }
+        } catch (e) {
+          debug(`❌ Audio() throw: ${e.message}`, 'err');
+        }
+      });
+    }
   });
   let recognition = null;
   let isListening = false;

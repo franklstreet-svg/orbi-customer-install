@@ -119,7 +119,14 @@
 
         <div class="owner-chat-state-bar" id="owner-chat-state-bar" hidden></div>
 
+        <!-- Voice diagnostic banner — shows what's happening on the audio
+             path so we can see WHY her voice isn't playing -->
+        <div id="voice-debug" style="display:none;font-size:11px;color:#9aa4c0;padding:6px 8px;background:#1a2240;border-radius:6px;margin-bottom:6px;font-family:monospace"></div>
+
         <div class="owner-chat-composer">
+          <button type="button" id="voice-test-btn"
+                  style="margin-right:6px;padding:8px 12px;background:#8b5cf6;border:none;color:white;border-radius:8px;cursor:pointer;font-weight:600;font-size:13px"
+                  title="Tap to test if Orby's voice plays on this device">🔊 Test</button>
           <button class="voice-btn" id="owner-speaker-toggle" aria-pressed="false"
                   title="Read Orby's replies out loud (off)"
                   style="margin-right:6px;padding:8px;background:transparent;border:1px solid #2c3756;border-radius:8px;color:#9aa4c0;cursor:pointer">
