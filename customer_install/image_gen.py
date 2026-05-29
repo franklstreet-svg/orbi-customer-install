@@ -101,9 +101,9 @@ HF_TIMEOUT_SECONDS = 60
 # returns PNG bytes. Default tier 1 since it Just Works without any setup
 # the customer has to do. Their FLUX model is the same family as HF's.
 POLLINATIONS_BASE = "https://image.pollinations.ai/prompt/"
-POLLINATIONS_TIMEOUT_SECONDS = 90        # FLUX backend can be slow under load
-POLLINATIONS_MAX_RETRIES = 4             # 402 "queue full" needs a wait + retry
-POLLINATIONS_QUEUE_WAIT_SECONDS = 15     # how long to wait when 402 says queue is full
+POLLINATIONS_TIMEOUT_SECONDS = 120       # detailed prompts can take 60-90s
+POLLINATIONS_MAX_RETRIES = 6             # 402 "queue full" needs many waits
+POLLINATIONS_QUEUE_WAIT_SECONDS = 20     # base wait — scales up per attempt
 
 # System prompt for the LLM-based image-prompt enhancer. The user's casual
 # request ("draw a robot") is converted into a detailed FLUX-friendly prompt

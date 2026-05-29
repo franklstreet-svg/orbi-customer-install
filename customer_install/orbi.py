@@ -3014,6 +3014,18 @@ def _try_office_gen(message: str, username: str) -> dict | None:
         refine_now = time.time()
         cached = _LAST_IMAGE_PROMPT.get(username)
         msg_for_check = msg.strip("() ")
+        # GUARD: detect when the user pasted an LLM response back in (often
+        # by accident or to show it to me). These should NEVER trigger
+        # refinement — they're not user instructions, they're the previous
+        # assistant turn. Signals: starts with a typical assistant opener,
+        # contains "I drew" / "I'll try" / etc., or has quoted phrases.
+        looks_like_llm_paste = bool(_re.match(
+            r"^\s*(?:here'?s\s+(?:what|the|a)|sure[,!]|i'?ll\s+try|"
+            r"i'd\s+be\s+happy|got\s+it[,!]|i\s+(?:drew|generated|created|"
+            r"made|designed|rendered)|i'?m\s+(?:going\s+to|gonna)|"
+            r"let\s+me|absolutely[,!]|of\s+course[,!])",
+            msg, _re.IGNORECASE
+        ))
         looks_like_platform_only = (
             len(msg_for_check) < 60
             and bool(_re.match(r"^\s*(?:for\s+)?", msg_for_check, _re.IGNORECASE))
@@ -3033,6 +3045,7 @@ def _try_office_gen(message: str, username: str) -> dict | None:
             cached
             and (refine_now - cached[1]) < _IMAGE_REFINE_TTL_SECONDS
             and len(msg) < 200
+            and not looks_like_llm_paste   # never refine on a pasted assistant reply
             and (
                 is_explicit_refinement
                 or _IMAGE_REFINE_RE.search(msg)
