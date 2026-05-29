@@ -585,6 +585,15 @@ def extract_file_request(message: str) -> dict | None:
         "give you a", "give you the",
     )):
         return None
+    # COMPOSITION verbs — "draft an email to X", "write a letter for Y",
+    # "compose a reply". These ARE NOT file searches. The owner wants
+    # Orby to WRITE something, not search for an existing file.
+    if re.match(
+        r"^\s*(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?"
+        r"(?:draft|write|compose|reply|respond|put\s+together|"
+        r"help\s+me\s+(?:draft|write|compose|reply|respond))\s+",
+        text, re.IGNORECASE):
+        return None
     # If the message contains a URL, that's definitively a url-fetch case
     if re.search(r"https?://", text, re.IGNORECASE):
         return None

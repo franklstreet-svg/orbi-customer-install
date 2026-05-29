@@ -3788,6 +3788,14 @@ def _try_office_gen(message: str, username: str) -> dict | None:
             r"redo|retry|do\s+(?:it|that)\s+(?:over|again)|"
             r"same\s+(?:thing|image|one)\s+but)\b",
             msg, _re.IGNORECASE))
+        # _IMAGE_REFINE_RE has loose words like 'with' / 'more' / 'less' that
+        # appear in plenty of NON-refinement messages ("remember I run Orbi
+        # with no developer background"). Require the refinement word to
+        # appear near the START of the message OR for the whole message to
+        # be very short — otherwise it's not really a refinement.
+        refine_kw_match = _IMAGE_REFINE_RE.search(msg)
+        refine_at_start = bool(refine_kw_match) and (
+            refine_kw_match.start() < 12 or len(msg) < 40)
         is_refinement = (
             cached
             and (refine_now - cached[1]) < _IMAGE_REFINE_TTL_SECONDS
@@ -3795,7 +3803,7 @@ def _try_office_gen(message: str, username: str) -> dict | None:
             and not looks_like_llm_paste   # never refine on a pasted assistant reply
             and (
                 is_explicit_refinement
-                or _IMAGE_REFINE_RE.search(msg)
+                or refine_at_start
                 or looks_like_platform_only
             )
             and (
@@ -3804,7 +3812,12 @@ def _try_office_gen(message: str, username: str) -> dict | None:
                 # mis-routed.
                 is_explicit_refinement
                 or (not _IMAGE_TRIGGER_RE.match(msg)
-                    and not _IMAGE_LOOSE_RE.match(msg))
+                    and not _IMAGE_LOOSE_RE.match(msg)
+                    and not _AD_TRIGGER_RE.match(first_line)
+                    and not _AD_LEARN_TRIGGER_RE.match(first_line)
+                    and not _re.match(
+                        r"^\s*(?:remember|note|save|long[- ]?term\s+memory)",
+                        msg, _re.IGNORECASE))
             )
         )
         if cached and not is_refinement:
