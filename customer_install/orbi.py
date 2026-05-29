@@ -61,6 +61,7 @@ import file_fetch
 import follow_up
 import gcal
 import image_gen
+import ad_gen
 import ocr as ocr_mod
 import review_responder
 import safe_send
@@ -2753,6 +2754,30 @@ _IMAGE_TRIGGER_RE = _re.compile(
     + r")\b",
     _re.IGNORECASE,
 )
+# Detect "create/build/design me an ad" — the user wants a FINISHED
+# composited ad (background image + headline + body + CTA button) not
+# just a picture or just copy. This routes to ad_gen.build_ad which
+# orchestrates the LLM (designs the ad) + image_gen (background) + PIL
+# (composite).
+_AD_TRIGGER_RE = _re.compile(
+    r"^\s*(?:" + _POLITE_PREFIX +
+    r"(?:make|build|create|generate|design|put\s+together|whip\s+up|do)"
+    r"\s+(?:me\s+|us\s+)?(?:a\s+|an\s+|the\s+)?"
+    r"(?:complete\s+|full\s+|finished\s+|actual\s+|real\s+|whole\s+)?"
+    r"(?:facebook|instagram|twitter|linkedin|tiktok|youtube|pinterest|"
+    r"social\s+media\s+)?\s*"
+    r"(?:ad|advert|advertisement|ad\s+creative|finished\s+ad|"
+    r"complete\s+ad|whole\s+ad|full\s+ad|actual\s+ad)\b"
+    r"|" + _ACTION_PREFIX +
+    r"(?:a\s+|an\s+|the\s+)?(?:complete\s+|full\s+|finished\s+|actual\s+|real\s+)?"
+    r"(?:facebook|instagram|twitter|linkedin|tiktok|youtube|pinterest|"
+    r"social\s+media\s+)?\s*"
+    r"(?:ad|advert|advertisement|ad\s+creative|finished\s+ad|"
+    r"complete\s+ad|whole\s+ad|full\s+ad|actual\s+ad)\b"
+    r")",
+    _re.IGNORECASE,
+)
+
 # "the images you mentioned / those pictures / the ones you described" —
 # referring back to images named in a prior LLM response (e.g. inside a
 # marketing campaign brief). The fast-path can't draw a meaningful image
@@ -3133,6 +3158,68 @@ def _try_office_gen(message: str, username: str) -> dict | None:
             return {"reply": f"Here's a new version — {short}. Also saved to your Files tab.",
                     "tier": "local", "latency_ms": 0,
                     "source": "image_gen", "download_url": url}
+
+        # ── FINISHED AD (image + headline + body + CTA composite) ──────────
+        # "create me a complete facebook ad for our weekend brunch" →
+        # ad_gen designs the ad (LLM), generates the background image,
+        # composites text + CTA button → one finished PNG ready to upload.
+        if _AD_TRIGGER_RE.match(msg):
+            log.info("office_gen ad branch fired msg=%r", msg[:120])
+            # Extract platform from the message — same kind-detector as images
+            platform = _detect_image_kind(msg)
+            # Strip the trigger phrase so the brief sent to ad_gen is just
+            # the user's intent (e.g. "for our weekend brunch")
+            brief = _re.sub(
+                _AD_TRIGGER_RE.pattern,
+                "",
+                msg,
+                count=1,
+                flags=_re.IGNORECASE,
+            ).strip(" ,.:;-—")
+            # Remove leading "for" / "about" so brief reads naturally
+            brief = _re.sub(r"^(?:for|about|on|to\s+promote)\s+",
+                            "", brief, flags=_re.IGNORECASE).strip()
+            if not brief:
+                brief = "a general brand ad for the business"
+            biz = mod_business.load(DATA_DIR)
+            try:
+                with _user_image_lock(username):
+                    png, components = ad_gen.build_ad(
+                        CONFIG, brief, business=biz, platform=platform)
+            except RuntimeError as e:
+                if "image_service_unavailable" in str(e):
+                    return {"reply": ("The image service is busy — couldn't "
+                                       "render the ad background. Try again in "
+                                       "a few seconds."),
+                            "tier": "local", "latency_ms": 0,
+                            "source": "image_gen_busy"}
+                log.exception("ad_gen failed")
+                return {"reply": (f"I couldn't build the ad: {e}. "
+                                   "Try simplifying the brief or asking again."),
+                        "tier": "local", "latency_ms": 0,
+                        "source": "ad_gen_error"}
+            ws = mod_workspace.workspace_path(CONFIG)
+            saved_path = ad_gen.save_ad_to_workspace(png, brief, ws)
+            try:
+                token = file_fetch.mint_download_token(
+                    DATA_DIR, str(saved_path), ttl_minutes=30,
+                    extra_allowed_roots=[ws])
+                url = f"/download/{token}"
+            except Exception:
+                url = None
+            audit.log_event(DATA_DIR, actor=username, action="ad.via_chat",
+                            meta={"brief": brief[:120],
+                                  "headline": components["headline"][:80]})
+            # Cache the image_brief so refinements ("make it brighter") still work
+            _LAST_IMAGE_PROMPT[username] = (
+                components["image_brief"], time.time(), "free")
+            reply = (f"Built a {platform.replace('_', ' ')} ad — "
+                     f"headline: \"{components['headline']}\" · "
+                     f"CTA: \"{components['cta']}\". "
+                     "Composited image + copy + button, saved to your Files tab.")
+            return {"reply": reply,
+                    "tier": "local", "latency_ms": 0,
+                    "source": "ad_gen", "download_url": url}
 
         # ── Referenced-image disambiguation ─────────────────────────────────
         # "show me the images you were talking about" / "draw those pictures

@@ -612,7 +612,7 @@
     // Inline preview for PNG-producing tools (image_gen / chart_gen).
     // Owner asked "draw me a picture" — they expect to SEE it in the chat,
     // not click a download link. Decks (pptx_gen) stay as link-only.
-    if (opts.download_url && (opts.source === 'image_gen' || opts.source === 'chart_gen')) {
+    if (opts.download_url && (opts.source === 'image_gen' || opts.source === 'chart_gen' || opts.source === 'ad_gen')) {
       const wrap = document.createElement('div');
       wrap.className = 'owner-chat-image-wrap';
       wrap.style.cssText = 'margin-top:8px;';
