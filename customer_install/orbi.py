@@ -3658,8 +3658,23 @@ def _try_office_gen(message: str, username: str) -> dict | None:
     # this turn's message is the answers. Combine with the original partial
     # brief and route straight to ad_gen.build_ad (skip the clarification
     # check that triggered the questions in the first place).
+    #
+    # BAIL-OUT: if the new message clearly isn't an answer (it's a fresh
+    # command/question/composition request), CLEAR the pending state and
+    # let the message route normally. Otherwise we'd hijack unrelated
+    # follow-ups as ad answers.
     pending = _PENDING_AD_BRIEF.get(username)
-    if pending and (time.time() - pending[2]) < _PENDING_AD_TTL_SECONDS:
+    looks_like_fresh_intent = bool(_re.match(
+        r"^\s*(?:(?:can|could|would|will)\s+you\s+|please\s+)?"
+        r"(?:create|build|make|design|draft|write|compose|put\s+together|"
+        r"show|find|search|send|email|text|call|book|schedule|cancel|"
+        r"add|remove|delete|update|remember|note|save|"
+        r"what|how|when|where|why|who|which|"
+        r"factory\s+reset|rollback|restore|"
+        r"is\s+there|check\s+for|tell\s+me|list)\b",
+        first_line, _re.IGNORECASE))
+    if pending and (time.time() - pending[2]) < _PENDING_AD_TTL_SECONDS \
+            and not looks_like_fresh_intent:
         original_brief, platform, _ = pending
         del _PENDING_AD_BRIEF[username]
         combined_brief = (f"{original_brief}. {msg}" if original_brief else msg).strip()
