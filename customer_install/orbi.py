@@ -1688,6 +1688,15 @@ def owner_chat():
     if recovery is not None:
         return jsonify(recovery)
 
+    # Gift logging — when owner mentions a gift they gave OR how a
+    # previous gift was received, silently store it in their gifts
+    # history. Doesn't intercept the chat — just enriches the memory
+    # so future suggest_gift calls get smarter over time.
+    try:
+        _capture_gift_mention(user_msg, user_dir)
+    except Exception:
+        log.exception("gift mention capture failed")
+
     # Update commands — "is there an update?" / "install update"
     upd = _try_update_command(user_msg, username)
     if upd is not None:
@@ -2265,6 +2274,45 @@ def _try_update_command(message: str, username: str) -> dict | None:
                 "source": "update_downloaded"}
 
     return None
+
+
+def _capture_gift_mention(message: str, user_dir: Path) -> None:
+    """Background gift-history enrichment. When the owner says something
+    like 'I got Kathy a necklace for her birthday', silently log it so
+    suggest_gift learns the owner's taste over time. Same for outcome
+    mentions ('Kathy loved the necklace')."""
+    from modules import gifts as mod_gifts
+
+    # Detect a NEW gift mention
+    g = mod_gifts.detect_logged_gift(message)
+    if g:
+        try:
+            mod_gifts.record_gift(
+                user_dir,
+                recipient=g["recipient"],
+                occasion=g["occasion"],
+                item=g["item"],
+                rough_cost=g.get("rough_cost", ""),
+            )
+            log.info(f"gift auto-logged: {g['item']} → {g['recipient']} "
+                     f"({g['occasion']})")
+        except Exception:
+            log.exception("record_gift failed")
+        return
+
+    # Detect an OUTCOME mention — match to most recent gift to that person
+    out = mod_gifts.detect_outcome_mention(message)
+    if out:
+        try:
+            past = mod_gifts.list_for_recipient(user_dir, out["recipient"], limit=1)
+            if past:
+                # Update the most recent gift to this recipient with the outcome
+                mod_gifts.record_outcome(user_dir, past[0]["id"],
+                                          out["outcome"], note=message[:120])
+                log.info(f"gift outcome auto-logged: {out['recipient']} "
+                         f"{out['outcome']} → gift {past[0]['id']}")
+        except Exception:
+            log.exception("record_outcome failed")
 
 
 def _friend_personal_context(business: dict, user_dir: Path) -> str:

@@ -185,7 +185,8 @@ def draft_card_text(config: dict, contact: dict, kind: str) -> str:
 
 def suggest_gift(config: dict, contact: dict, kind: str,
                  budget_hint: str | None = None,
-                 occasion: str | None = None) -> dict:
+                 occasion: str | None = None,
+                 user_dir: Path | None = None) -> dict:
     """LLM-suggest 3 gift ideas for an upcoming birthday / anniversary /
     milestone. Budget-aware, relationship-aware.
 
@@ -215,6 +216,28 @@ def suggest_gift(config: dict, contact: dict, kind: str,
     budget_line = (f"Budget: {budget_hint}." if budget_hint
                     else "No budget set yet — give a small/mid/big tier each.")
 
+    # Pull the owner's gift TASTE history if user_dir was given so the
+    # LLM can lean toward styles that have worked before.
+    taste_block = ""
+    past_for_this_person = []
+    if user_dir is not None:
+        try:
+            from modules import gifts as mod_gifts
+            taste_block = mod_gifts.taste_summary(user_dir)
+            past_for_this_person = mod_gifts.list_for_recipient(user_dir, name, limit=5)
+        except Exception as e:    # noqa: BLE001
+            log.warning(f"gift taste lookup failed: {e}")
+
+    history_lines = []
+    if past_for_this_person:
+        history_lines.append(
+            f"PAST GIFTS TO {name.upper()} (don't repeat exactly; can build on themes):")
+        for g in past_for_this_person:
+            cost = f" ({g['rough_cost']})" if g.get("rough_cost") else ""
+            outcome = f" — they {g['outcome']} it" if g.get("outcome") else ""
+            history_lines.append(f"  · {g.get('year', '')}: {g['item']}{cost}{outcome}")
+    history_block = "\n".join(history_lines)
+
     system = (
         "You suggest thoughtful, NOT-cheesy gift ideas. You're suggesting "
         "to a friend (the owner) — speak like a friend who happens to "
@@ -242,7 +265,16 @@ def suggest_gift(config: dict, contact: dict, kind: str,
     notes_bit = f" Notes about them: {notes[:200]}." if notes else ""
     rel_bit = f" Relationship to the owner: {relationship}." if relationship else ""
     company_bit = f" Works at {company}." if company else ""
+    # Build the full user message — include taste + history blocks first
+    # so the LLM sees them in context.
+    prefix_blocks = []
+    if taste_block:
+        prefix_blocks.append(taste_block)
+    if history_block:
+        prefix_blocks.append(history_block)
+    prefix = ("\n\n".join(prefix_blocks) + "\n\n") if prefix_blocks else ""
     user_msg = (
+        f"{prefix}"
         f"Suggest gift ideas for {name}'s upcoming {occasion}.{rel_bit}"
         f"{company_bit}{notes_bit} {budget_line}"
     )
