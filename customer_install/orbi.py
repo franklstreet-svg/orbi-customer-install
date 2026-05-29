@@ -4944,11 +4944,33 @@ def users_route():
 @app.route("/api/owner/users/<username>/deactivate", methods=["POST"])
 def user_deactivate(username):
     owner = auth.require_role(ORBI_DIR, DATA_DIR, "owner")
+    data = request.get_json(silent=True) or {}
+    reason = (data.get("reason") or "").strip()
     try:
         meta = users_mod.deactivate_user(DATA_DIR, username)
+        # Capture the reason in audit so owner can see WHY later (leave of
+        # absence vs departed vs other)
+        log_meta = dict(meta)
+        if reason:
+            log_meta["reason"] = reason[:200]
         audit.log_event(DATA_DIR, actor=owner["username"],
-                        action="users.deactivate", resource=username, meta=meta)
-        return jsonify({"status": "ok", "archive": meta})
+                        action="users.deactivate", resource=username, meta=log_meta)
+        return jsonify({"status": "ok", "archive": meta, "reason": reason})
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/owner/users/<username>/reactivate", methods=["POST"])
+def user_reactivate(username):
+    """People-tab consistent path for reactivation. Same function as
+    /api/owner/staff/<username>/reactivate — kept for namespace symmetry
+    with /deactivate, /hold, /transfer."""
+    owner = auth.require_role(ORBI_DIR, DATA_DIR, "owner")
+    try:
+        rec = users_mod.reactivate_user(DATA_DIR, username)
+        audit.log_event(DATA_DIR, actor=owner["username"],
+                        action="users.reactivate", resource=username)
+        return jsonify({"status": "ok", "user": rec})
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
 

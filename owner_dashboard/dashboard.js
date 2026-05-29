@@ -955,9 +955,16 @@
     list.querySelectorAll('[data-action="deactivate"]').forEach(btn => {
       btn.addEventListener('click', async (e) => {
         const u = e.target.closest('[data-username]').dataset.username;
-        if (!confirm(`Deactivate ${u}? Their data goes to archive for 90 days. You can transfer their contacts/notes/calendar/tasks to yourself before it purges.`)) return;
+        const reason = prompt(
+          `Deactivate ${u}? Their data archives for 90 days then auto-purges.\n\n` +
+          `Reason (optional — e.g. "leave of absence", "departed company"):`
+        );
+        if (reason === null) return;   // owner clicked Cancel
         try {
-          await api(`/api/owner/users/${u}/deactivate`, { method: 'POST' });
+          await api(`/api/owner/users/${u}/deactivate`, {
+            method: 'POST',
+            body: JSON.stringify({ reason })
+          });
           loadPeople();
         } catch (err) { alert(err.message); }
       });
@@ -984,11 +991,22 @@
           </div>
         </div>
         <div class="person-actions">
+          <button class="primary-btn" data-action="reactivate">Reactivate</button>
           <button class="secondary-btn" data-action="transfer">Transfer</button>
           <button class="secondary-btn" data-action="hold-${a.hold ? 'off' : 'on'}">${a.hold ? 'Release Hold' : 'Hold'}</button>
         </div>
       </div>
     `).join('');
+    list.querySelectorAll('[data-action="reactivate"]').forEach(btn => {
+      btn.addEventListener('click', async (e) => {
+        const u = e.target.closest('[data-username]').dataset.username;
+        if (!confirm(`Reactivate ${u}? Their archived data will be restored and they'll be able to log in again with their existing password.`)) return;
+        try {
+          await api(`/api/owner/users/${encodeURIComponent(u)}/reactivate`, { method: 'POST' });
+          loadPeople();
+        } catch (err) { alert(err.message); }
+      });
+    });
     list.querySelectorAll('[data-action^="hold"]').forEach(btn => {
       btn.addEventListener('click', async (e) => {
         const u = e.target.closest('[data-username]').dataset.username;
