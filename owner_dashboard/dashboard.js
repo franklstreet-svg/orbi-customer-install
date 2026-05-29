@@ -1114,6 +1114,25 @@
     try { return localStorage.getItem('orbi_speak_replies') === '1'; }
     catch { return false; }
   })();
+  // iOS PWAs need a "user gesture" context to play audio. Once we play
+  // ANY audio inside a click handler, the persistent Audio element is
+  // "unlocked" for subsequent .play() calls without further gestures.
+  let _persistentAudio = null;
+  function _unlockAudio() {
+    if (_persistentAudio) return;
+    _persistentAudio = new Audio();
+    _persistentAudio.preload = 'auto';
+    _persistentAudio.playsInline = true;
+    _persistentAudio.setAttribute('playsinline', '');
+    // 1-frame silent WAV — triggers the iOS gesture-grant without actually
+    // playing anything audible. Subsequent src updates + play() work.
+    _persistentAudio.src =
+      'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=';
+    _persistentAudio.play()
+      .then(() => { /* unlocked */ })
+      .catch(() => { /* silent fail — fall through to speechSynthesis */ });
+  }
+
   function setSpeakReplies(on) {
     speakRepliesOn = !!on;
     try { localStorage.setItem('orbi_speak_replies', on ? '1' : '0'); } catch {}
@@ -1127,6 +1146,8 @@
       btn.style.color      = on ? 'white'    : '#9aa4c0';
       btn.style.borderColor = on ? '#8b5cf6' : '#2c3756';
     }
+    // Unlock iOS audio on the user gesture (this click event)
+    if (on) _unlockAudio();
   }
   document.addEventListener('DOMContentLoaded', () => {
     const btn = document.getElementById('owner-speaker-toggle');
@@ -1265,22 +1286,58 @@
       }
     };
 
+    // iOS PWA strategy: reuse the persistent Audio element that was
+    // unlocked by the speaker-toggle click. iOS treats new Audio() as
+    // a fresh autoplay attempt and blocks it; reusing the unlocked
+    // element preserves the gesture grant.
+    const url = '/tts?text=' + encodeURIComponent(cleanText);
+    const useExistingUnlocked = !!_persistentAudio;
     try {
-      // Use GET so the browser does PROGRESSIVE playback — audio starts within
-      // ~300ms as the first MP3 frames arrive, instead of waiting for the whole
-      // file (which was the 2-3 sec gap Frank saw).
-      const url = '/tts?text=' + encodeURIComponent(cleanText);
-      currentAudio = new Audio(url);
-      currentAudio.preload = 'auto';
-      currentAudio.onended = finish;
-      currentAudio.onerror = finish;
-      await currentAudio.play();
+      if (useExistingUnlocked) {
+        // Reuse — keeps iOS happy
+        _persistentAudio.onended = finish;
+        _persistentAudio.onerror = finish;
+        _persistentAudio.src = url;
+        currentAudio = _persistentAudio;
+      } else {
+        // Fresh Audio (desktop / non-iOS where this works fine)
+        currentAudio = new Audio(url);
+        currentAudio.preload = 'auto';
+        currentAudio.playsInline = true;
+        currentAudio.setAttribute('playsinline', '');
+        currentAudio.onended = finish;
+        currentAudio.onerror = finish;
+      }
+      const playPromise = currentAudio.play();
+      if (playPromise && typeof playPromise.catch === 'function') {
+        playPromise.catch((err) => {
+          // iOS PWA blocked it OR /tts failed. Try speechSynthesis as the
+          // safety net — iOS's built-in voices work in PWAs.
+          console.warn('[Orbi] Audio() blocked or failed:', err);
+          if (window.speechSynthesis && window.SpeechSynthesisUtterance) {
+            try {
+              const u = new SpeechSynthesisUtterance(cleanText);
+              u.rate = 1.05;
+              u.pitch = 1.0;
+              // Prefer a female voice if available (matches Ava on the server)
+              const voices = window.speechSynthesis.getVoices();
+              const female = voices.find(v =>
+                /female|samantha|karen|moira|tessa|ava/i.test(v.name) &&
+                /^en/i.test(v.lang));
+              if (female) u.voice = female;
+              u.onend = finish;
+              u.onerror = finish;
+              window.speechSynthesis.cancel();
+              window.speechSynthesis.speak(u);
+              return;
+            } catch (e) { /* fall through to error message */ }
+          }
+          setVoiceState('Voice playback unavailable — text reply still works.', 'error');
+          setTimeout(() => { try { setVoiceState(null); } catch {} }, 5000);
+          finish();
+        });
+      }
     } catch (err) {
-      // PREVIOUSLY: silently fell back to window.speechSynthesis, which on
-      // Linux/Chrome picks a robotic default male voice — Frank reported
-      // "she lost her voice now it's a robotic man's voice". That fallback
-      // was misleading because the user couldn't tell TTS had failed.
-      // Now we log + show a visible status instead of swapping voices.
       console.warn('[Orbi] /tts failed:', err);
       setVoiceState('Voice playback unavailable — text reply still works.', 'error');
       setTimeout(() => { try { setVoiceState(null); } catch {} }, 5000);
