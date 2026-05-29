@@ -3933,6 +3933,7 @@
             <button class="secondary-btn staff-reset-btn" type="button">Reset password</button>
             <button class="secondary-btn staff-deactivate-btn" type="button" style="color:#ff7a7a">Deactivate</button>
           ` : `
+            <button class="primary-btn staff-reactivate-btn" type="button">Reactivate</button>
             <button class="secondary-btn staff-hold-btn" type="button">${u.purge_hold ? 'Release hold' : 'Hold from purge'}</button>
           `}
         </div>
@@ -3960,6 +3961,15 @@
             method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ reason })
           });
+          const data = await r.json();
+          if (!r.ok) throw new Error(data.error || 'Failed');
+          _loadStaff();
+        } catch (e) { alert('Error: ' + e.message); }
+      });
+      row.querySelector('.staff-reactivate-btn')?.addEventListener('click', async () => {
+        if (!confirm(`Reactivate ${username}? Their archived data will be restored and they'll be able to log in again with their existing password.`)) return;
+        try {
+          const r = await fetch(`/api/owner/staff/${encodeURIComponent(username)}/reactivate`, { method: 'POST' });
           const data = await r.json();
           if (!r.ok) throw new Error(data.error || 'Failed');
           _loadStaff();

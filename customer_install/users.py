@@ -230,6 +230,49 @@ def deactivate_user(data_dir: Path, username: str,
         return meta
 
 
+def reactivate_user(data_dir: Path, username: str) -> dict:
+    """Reverse of deactivate_user:
+      1. Move data/_archived/<username>/ back to data/users/<username>/
+      2. Flip status=active in users.json
+      3. Drop the _meta.json + purge fields
+    Returns the restored user record. Raises ValueError if no archive
+    exists OR an active user folder is already in the way.
+    """
+    key = username.strip().lower()
+    with _LOCK:
+        users = load_users(data_dir)
+        rec = users.get(key)
+        if not rec:
+            raise ValueError(f"user {key!r} not found")
+        if rec.get("status") == "active":
+            raise ValueError(f"user {key!r} is already active")
+
+        user_dir = get_user_dir(data_dir, key)
+        archive_dir = get_archive_dir(data_dir, key)
+        if not archive_dir.exists():
+            raise ValueError(f"no archive folder for {key!r}")
+        if user_dir.exists():
+            raise ValueError(
+                f"user folder for {key!r} already exists — "
+                "won't overwrite. Move or delete it first.")
+
+        shutil.move(str(archive_dir), str(user_dir))
+        meta_path = user_dir / "_meta.json"
+        if meta_path.exists():
+            try:
+                meta_path.unlink()
+            except OSError:
+                pass
+
+        rec["status"] = "active"
+        rec.pop("archived_at", None)
+        rec.pop("purge_hold", None)
+        users[key] = rec
+        save_users(data_dir, users)
+        log.info(f"user reactivated: {key}")
+        return rec
+
+
 def list_archived(data_dir: Path) -> list[dict]:
     """Owner-dashboard helper. Returns archived users with their meta and a
     folder-summary count of items per source."""

@@ -1931,6 +1931,23 @@ def owner_staff_deactivate(username: str):
     return jsonify({"status": "ok", "archive": result})
 
 
+@app.route("/api/owner/staff/<username>/reactivate", methods=["POST"])
+def owner_staff_reactivate(username: str):
+    """Restore an archived user. Moves their _archived folder back to
+    active. Fails if their old user folder already exists (someone
+    re-added that username after archiving — owner needs to resolve
+    the collision manually)."""
+    owner_session = auth.require_owner(ORBI_DIR)
+    try:
+        rec = users_mod.reactivate_user(DATA_DIR, username)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    audit.log_event(DATA_DIR, actor=owner_session.get("email", "?"),
+                    action="staff.reactivated",
+                    meta={"username": username})
+    return jsonify({"status": "ok", "user": rec})
+
+
 @app.route("/api/owner/staff/<username>/reset_link", methods=["POST"])
 def owner_staff_reset_link(username: str):
     """Owner generates a one-time reset link for a staff member. Owner
