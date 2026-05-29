@@ -32,6 +32,78 @@ import llm_client
 log = logging.getLogger("orbi.ad_gen")
 
 
+# ---------------------------------------------------------------------------
+# Exemplar corpus — the owner pastes ads they like, we store them, and use
+# them as few-shot examples on every future ad build.
+# ---------------------------------------------------------------------------
+
+_EXEMPLAR_FILE = "ad_exemplars.json"
+_EXEMPLAR_MAX = 50   # keep newest N; older ones drop off so prompts stay sane
+
+
+def save_exemplar(data_dir: Path, raw_text: str,
+                  source: str = "owner_paste",
+                  tags: list[str] | None = None) -> dict:
+    """Append an exemplar ad to the corpus.  Returns the stored entry."""
+    import time
+    import uuid
+    raw_text = (raw_text or "").strip()
+    if not raw_text:
+        raise ValueError("exemplar text required")
+    p = Path(data_dir) / _EXEMPLAR_FILE
+    p.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or "exemplars" not in data:
+            data = {"exemplars": []}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        data = {"exemplars": []}
+    entry = {
+        "id": uuid.uuid4().hex[:12],
+        "saved_at": time.time(),
+        "source": source,
+        "tags": tags or [],
+        "text": raw_text[:4000],   # cap individual size
+    }
+    data["exemplars"].append(entry)
+    # Cap total count, newest first
+    data["exemplars"] = sorted(
+        data["exemplars"], key=lambda x: x.get("saved_at", 0),
+        reverse=True)[:_EXEMPLAR_MAX]
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    tmp.replace(p)
+    log.info("saved ad exemplar (%d chars) → %s", len(raw_text), p)
+    return entry
+
+
+def load_exemplars(data_dir: Path, limit: int = 4) -> list[dict]:
+    """Load the newest `limit` exemplars. Most recent are most relevant
+    because tastes drift; an older paste might be outdated."""
+    p = Path(data_dir) / _EXEMPLAR_FILE
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        exs = data.get("exemplars", []) if isinstance(data, dict) else []
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return []
+    exs = sorted(exs, key=lambda x: x.get("saved_at", 0), reverse=True)
+    return exs[:limit]
+
+
+def _exemplar_prompt_block(exemplars: list[dict]) -> str:
+    """Format exemplars as a few-shot examples block for the LLM."""
+    if not exemplars:
+        return ""
+    parts = ["EXAMPLES OF ADS THE OWNER LIKES — match this voice, tone, "
+             "rhythm, and level of detail. Do NOT copy the words; copy "
+             "the STYLE (headline punch, sentence length, vocabulary, "
+             "emotional register, CTA flavor):\n"]
+    for i, ex in enumerate(exemplars, 1):
+        parts.append(f"\n--- EXAMPLE {i} ---\n{ex['text']}\n")
+    parts.append("\n--- END EXAMPLES ---\n")
+    return "".join(parts)
+
+
 # Platform → (canvas size, design tweaks). These mirror image_gen.SIZES but
 # the ad layout is tuned per platform (a story has more vertical room for
 # text than a square Facebook post).
@@ -163,9 +235,15 @@ def brief_needs_clarification(brief: str) -> list[str]:
 
 
 def design_ad(config: dict, brief: str, business: dict | None = None,
-              platform: str = "instagram_square") -> dict:
+              platform: str = "instagram_square",
+              data_dir: Path | None = None) -> dict:
     """LLM-design the ad. Returns {'headline', 'body', 'cta', 'image_brief'}.
-    Raises RuntimeError if the LLM is unreachable or returns invalid JSON."""
+    Raises RuntimeError if the LLM is unreachable or returns invalid JSON.
+
+    If `data_dir` is provided, pulls the most recent ad exemplars from
+    the corpus and uses them as few-shot examples so the output matches
+    the owner's preferred style.
+    """
     biz_ctx = ""
     if business:
         # Compact summary the LLM can chew on
@@ -181,9 +259,21 @@ def design_ad(config: dict, brief: str, business: dict | None = None,
         biz_ctx = ("BUSINESS PROFILE (use these facts, don't invent others):\n"
                    + "\n".join(parts) + "\n\n")
 
+    # Few-shot exemplars — ads the owner pasted as "do more like this"
+    exemplar_block = ""
+    if data_dir:
+        try:
+            exemplars = load_exemplars(data_dir, limit=4)
+            exemplar_block = _exemplar_prompt_block(exemplars)
+            if exemplars:
+                log.info("ad_design using %d exemplars", len(exemplars))
+        except Exception as exc:    # noqa: BLE001
+            log.warning("exemplar load failed: %s", exc)
+
+    system = AD_DESIGNER_SYSTEM + ("\n\n" + exemplar_block if exemplar_block else "")
     user_msg = (f"{biz_ctx}PLATFORM: {platform}\n\n"
                 f"OWNER BRIEF: {brief.strip()}")
-    resp = llm_client.generate(config, AD_DESIGNER_SYSTEM,
+    resp = llm_client.generate(config, system,
                                 [{"role": "user", "content": user_msg}])
     if not resp or not resp.text:
         raise RuntimeError("ad_designer LLM unavailable")
@@ -210,11 +300,13 @@ def design_ad(config: dict, brief: str, business: dict | None = None,
 
 def build_ad(config: dict, brief: str, business: dict | None = None,
              platform: str = "instagram_square",
-             accent: tuple[int, int, int] = DEFAULT_ACCENT) -> tuple[bytes, dict]:
+             accent: tuple[int, int, int] = DEFAULT_ACCENT,
+             data_dir: Path | None = None) -> tuple[bytes, dict]:
     """End-to-end: design the ad, generate the background image, composite
     everything. Returns (png_bytes, components_dict)."""
     platform = platform if platform in AD_PLATFORM_SIZES else "instagram_square"
-    components = design_ad(config, brief, business=business, platform=platform)
+    components = design_ad(config, brief, business=business, platform=platform,
+                            data_dir=data_dir)
 
     log.info("ad design: headline=%r cta=%r", components["headline"][:40],
              components["cta"])

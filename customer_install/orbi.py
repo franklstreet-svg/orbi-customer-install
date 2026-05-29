@@ -2754,6 +2754,25 @@ _IMAGE_TRIGGER_RE = _re.compile(
     + r")\b",
     _re.IGNORECASE,
 )
+# "save this ad as a style example" / "learn from this ad" / "remember this
+# ad style" / "I like this ad" + a paste of the actual ad text. Stores in
+# ad_gen's exemplar corpus so future build_ad calls use it as a few-shot.
+_AD_LEARN_TRIGGER_RE = _re.compile(
+    r"^\s*(?:" + _POLITE_PREFIX +
+    r"(?:save|remember|learn\s+from|use|study|file\s+away|keep)"
+    r"\s+(?:this|the\s+following|the\s+next)?\s*"
+    r"(?:ad|advert|advertisement|copy|example|style|sample|one)"
+    r"|" +
+    r"i\s+(?:like|love|want\s+more\s+like)\s+(?:this|the\s+following)\s+"
+    r"(?:ad|advert|advertisement|style|copy|sample|one)"
+    r"|" +
+    r"(?:here'?s|this\s+is)\s+(?:a\s+|an\s+|the\s+)?"
+    r"(?:ad|advert|advertisement|example|style|sample)\s+"
+    r"(?:i\s+(?:like|want\s+more\s+like)|to\s+(?:save|remember|learn\s+from))"
+    r")",
+    _re.IGNORECASE,
+)
+
 # Detect "create/build/design me an ad" — the user wants a FINISHED
 # composited ad (background image + headline + body + CTA button) not
 # just a picture or just copy. This routes to ad_gen.build_ad which
@@ -3017,7 +3036,8 @@ def _try_office_gen(message: str, username: str) -> dict | None:
         try:
             with _user_image_lock(username):
                 png, components = ad_gen.build_ad(
-                    CONFIG, combined_brief, business=biz, platform=platform)
+                    CONFIG, combined_brief, business=biz, platform=platform,
+                    data_dir=DATA_DIR)
         except RuntimeError as e:
             if "image_service_unavailable" in str(e):
                 return {"reply": ("Image service is busy — try saying \"redo\" "
@@ -3228,6 +3248,62 @@ def _try_office_gen(message: str, username: str) -> dict | None:
                     "tier": "local", "latency_ms": 0,
                     "source": "image_gen", "download_url": url}
 
+        # ── SAVE-AD-EXEMPLAR ("learn from this ad: [paste]") ──────────────
+        # Match against first_line so we can store the rest of the multi-line
+        # paste as the exemplar. "save this ad: <newline> [pasted ad text]"
+        if _AD_LEARN_TRIGGER_RE.match(first_line):
+            log.info("office_gen ad-learn branch fired first_line=%r",
+                     first_line[:120])
+            # Exemplar text = everything AFTER the trigger phrase. If multi-
+            # line, lines 2+ are almost always the pasted ad. If single-line,
+            # take the part after a ":" if there is one.
+            after_trigger = _re.sub(
+                _AD_LEARN_TRIGGER_RE.pattern,
+                "",
+                first_line,
+                count=1,
+                flags=_re.IGNORECASE,
+            ).strip(" :,.-—")
+            rest_of_msg = (msg.split("\n", 1)[1].strip()
+                            if "\n" in msg else "")
+            exemplar_text = (rest_of_msg or after_trigger).strip()
+            if not exemplar_text or len(exemplar_text) < 20:
+                return {
+                    "reply": ("Paste the ad text on the next line and try "
+                              "again — I need at least a headline and body "
+                              "to store as a style example. Like:\n\n"
+                              "  save this ad:\n"
+                              "  Tired of missed calls?\n"
+                              "  Our AI receptionist answers 24/7, books "
+                              "appointments, and follows up — so you can "
+                              "focus on the work.\n"
+                              "  Try it free for 14 days."),
+                    "tier": "local", "latency_ms": 0,
+                    "source": "ad_learn_empty",
+                }
+            try:
+                entry = ad_gen.save_exemplar(
+                    DATA_DIR, exemplar_text, source="owner_paste")
+            except Exception as e:
+                log.exception("save_exemplar failed")
+                return {"reply": f"Couldn't save the exemplar: {e}",
+                        "tier": "local", "latency_ms": 0,
+                        "source": "ad_learn_error"}
+            audit.log_event(DATA_DIR, actor=username,
+                             action="ad.exemplar_saved",
+                             meta={"chars": len(exemplar_text),
+                                   "id": entry["id"]})
+            count = len(ad_gen.load_exemplars(DATA_DIR, limit=999))
+            return {
+                "reply": (f"Saved that as a style example. I'll match its "
+                          f"tone and structure on future ads. ({count} "
+                          f"example{'s' if count != 1 else ''} on file now.) "
+                          "Build an ad with \"create me a facebook ad for "
+                          "...\" and you'll see the style come through."),
+                "tier": "local", "latency_ms": 0,
+                "source": "ad_learn_saved",
+            }
+
         # ── FINISHED AD (image + headline + body + CTA composite) ──────────
         # "create me a complete facebook ad for our weekend brunch" →
         # ad_gen designs the ad (LLM), generates the background image,
@@ -3271,7 +3347,8 @@ def _try_office_gen(message: str, username: str) -> dict | None:
             try:
                 with _user_image_lock(username):
                     png, components = ad_gen.build_ad(
-                        CONFIG, brief, business=biz, platform=platform)
+                        CONFIG, brief, business=biz, platform=platform,
+                        data_dir=DATA_DIR)
             except RuntimeError as e:
                 if "image_service_unavailable" in str(e):
                     return {"reply": ("The image service is busy — couldn't "
