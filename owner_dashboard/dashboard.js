@@ -1202,7 +1202,21 @@
       onDone && onDone();
     }
   }
+  // Persistent unlock element is only needed in iOS standalone PWA mode
+  // (Safari "Add to Home Screen" — Apple's strictest sandbox). For Chrome
+  // on iPhone, Chrome shortcut on iPhone, Android Chrome, desktop, and
+  // Safari browser tabs, fresh new Audio() per reply works fine and is
+  // the documented happy path. Using the persistent element on those
+  // platforms caused subsequent plays to fail silently.
+  function _isIosStandalonePwa() {
+    const ua = navigator.userAgent || '';
+    const isIos = /iPad|iPhone|iPod/.test(ua) || (/Mac/.test(ua) && 'ontouchend' in document);
+    const standalone = window.matchMedia('(display-mode: standalone)').matches
+      || window.navigator.standalone === true;
+    return isIos && standalone;
+  }
   function _unlockAudio() {
+    if (!_isIosStandalonePwa()) return;
     if (_persistentAudio) return;
     _persistentAudio = new Audio();
     _persistentAudio.preload = 'auto';
