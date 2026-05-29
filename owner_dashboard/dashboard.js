@@ -1215,20 +1215,41 @@
       || window.navigator.standalone === true;
     return isIos && standalone;
   }
+  function _isMobile() {
+    return /iPhone|iPad|iPod|Android/.test(navigator.userAgent || '');
+  }
+  // Mobile browsers (iOS Safari AND iOS Chrome AND Android Chrome) all
+  // require a user gesture to unlock audio playback for the session.
+  // Without the unlock, the first Audio().play() in a fetch callback
+  // (i.e. inside speakReply triggered by an LLM response) gets blocked.
+  // We unlock by playing a silent WAV inside the user's tap on either
+  // toggle button — that "primes" the audio session. Subsequent fresh
+  // Audio() plays work without further gestures.
+  let _audioUnlocked = false;
   function _unlockAudio() {
-    if (!_isIosStandalonePwa()) return;
-    if (_persistentAudio) return;
-    _persistentAudio = new Audio();
-    _persistentAudio.preload = 'auto';
-    _persistentAudio.playsInline = true;
-    _persistentAudio.setAttribute('playsinline', '');
-    // 1-frame silent WAV — triggers the iOS gesture-grant without actually
-    // playing anything audible. Subsequent src updates + play() work.
-    _persistentAudio.src =
-      'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=';
-    _persistentAudio.play()
-      .then(() => { /* unlocked */ })
-      .catch(() => { /* silent fail — fall through to speechSynthesis */ });
+    if (_audioUnlocked) return;
+    if (!_isMobile()) { _audioUnlocked = true; return; }
+    try {
+      const a = new Audio();
+      a.preload = 'auto';
+      a.playsInline = true;
+      a.setAttribute('playsinline', '');
+      a.src = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=';
+      a.play()
+        .then(() => { _audioUnlocked = true; })
+        .catch(() => { /* unlock failed — speechSynthesis fallback */ });
+    } catch {}
+    // iOS standalone PWA still wants a PERSISTENT element for reliability;
+    // every other mobile case uses fresh Audio() per reply.
+    if (_isIosStandalonePwa() && !_persistentAudio) {
+      _persistentAudio = new Audio();
+      _persistentAudio.preload = 'auto';
+      _persistentAudio.playsInline = true;
+      _persistentAudio.setAttribute('playsinline', '');
+      _persistentAudio.src =
+        'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=';
+      _persistentAudio.play().then(() => {}).catch(() => {});
+    }
   }
 
   function setSpeakReplies(on) {
