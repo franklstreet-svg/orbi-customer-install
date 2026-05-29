@@ -101,7 +101,8 @@ HF_TIMEOUT_SECONDS = 60
 # returns PNG bytes. Default tier 1 since it Just Works without any setup
 # the customer has to do. Their FLUX model is the same family as HF's.
 POLLINATIONS_BASE = "https://image.pollinations.ai/prompt/"
-POLLINATIONS_TIMEOUT_SECONDS = 45
+POLLINATIONS_TIMEOUT_SECONDS = 90        # FLUX backend can be slow under load
+POLLINATIONS_MAX_RETRIES = 2             # transient timeouts are very common
 
 
 # ---------------------------------------------------------------------------
@@ -149,14 +150,14 @@ def generate(config: dict, prompt: str, kind: str = DEFAULT_KIND,
             log.warning("hf generation failed (%s), falling back to template",
                         exc)
 
-    # ── Path C: PIL template fallback ─────────────────────────────────────
-    try:
-        png = templated_post(prompt, kind)
-        log.info("template generated %d bytes for kind=%s", len(png), kind)
-        return png
-    except Exception as exc:
-        log.exception("template fallback crashed — image_gen is broken")
-        raise RuntimeError(f"image_gen totally failed: {exc}") from exc
+    # No usable AI tier reachable. We INTENTIONALLY do NOT return the
+    # PIL "purple gradient with prompt text" template here — that was
+    # being mistaken for a real image and the LLM kept apologizing for
+    # producing garbage. Better UX: throw a clean "service busy" so the
+    # chat handler can show "image service is busy, please try again."
+    raise RuntimeError(
+        "image_service_unavailable: All image-gen tiers are unreachable. "
+        "Pollinations may be queued — retry in a few seconds.")
 
 
 def overlay_caption(png_bytes: bytes, caption: str,
@@ -345,7 +346,8 @@ def templated_post(text: str, kind: str = DEFAULT_KIND,
 
 
 def _generate_pollinations(prompt: str, kind: str, img_cfg: dict,
-                            seed: int | None = None) -> bytes:
+                            seed: int | None = None,
+                            _attempt: int = 0) -> bytes:
     """
     Generate a PNG via Pollinations.ai. No API key required. The whole
     request is a single GET against an encoded URL — they generate the image
@@ -394,9 +396,20 @@ def _generate_pollinations(prompt: str, kind: str, img_cfg: dict,
             err_body = exc.read().decode("utf-8", errors="ignore")
         except Exception:    # noqa: BLE001
             err_body = ""
+        # 5xx are transient — retry with a fresh seed (rerolls the queue)
+        if exc.code in (500, 502, 503, 504) and _attempt < POLLINATIONS_MAX_RETRIES:
+            log.warning("pollinations HTTP %d on attempt %d, retrying", exc.code, _attempt + 1)
+            return _generate_pollinations(prompt, kind, img_cfg, seed=None, _attempt=_attempt + 1)
         raise RuntimeError(f"pollinations HTTP {exc.code}: {err_body[:300]}") from exc
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        raise RuntimeError(f"pollinations network error: {exc}") from exc
+        # Timeouts are the most common failure mode — Pollinations' FLUX
+        # backend gets queued under load. Retry once with a longer-feeling
+        # seed before giving up.
+        if _attempt < POLLINATIONS_MAX_RETRIES:
+            log.warning("pollinations %s on attempt %d, retrying",
+                        type(exc).__name__, _attempt + 1)
+            return _generate_pollinations(prompt, kind, img_cfg, seed=None, _attempt=_attempt + 1)
+        raise RuntimeError(f"pollinations network error after {POLLINATIONS_MAX_RETRIES + 1} attempts: {exc}") from exc
 
     elapsed_ms = int((time.time() - start) * 1000)
     log.info("pollinations GET took %dms (%d bytes, ctype=%s)",

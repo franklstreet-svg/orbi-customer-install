@@ -2956,7 +2956,15 @@ def _try_office_gen(message: str, username: str) -> dict | None:
             base = _ORBY_SELF_BASE if (mode == "self") else base_prompt
             prompt = f"{base}, {refinement}"
             kind = _detect_image_kind(msg) if _detect_image_kind(msg) != "instagram_square" else _detect_image_kind(base_prompt)
-            png = image_gen.generate(CONFIG, prompt, kind=kind)
+            try:
+                png = image_gen.generate(CONFIG, prompt, kind=kind)
+            except RuntimeError as e:
+                if "image_service_unavailable" in str(e):
+                    return {"reply": ("The image service is busy — your refinement "
+                                       "didn't go through. Try again in a few seconds."),
+                            "tier": "local", "latency_ms": 0,
+                            "source": "image_gen_busy"}
+                raise
             caption = _extract_caption(msg)
             if caption:
                 png = image_gen.overlay_caption(png, caption)
@@ -3048,7 +3056,16 @@ def _try_office_gen(message: str, username: str) -> dict | None:
             # "wide", "tall", "flyer", "youtube thumbnail") and pick the
             # right canvas size. Falls back to instagram_square if no hint.
             kind = _detect_image_kind(msg)
-            png = image_gen.generate(CONFIG, prompt, kind=kind)
+            try:
+                png = image_gen.generate(CONFIG, prompt, kind=kind)
+            except RuntimeError as e:
+                if "image_service_unavailable" in str(e):
+                    return {"reply": ("The image service is busy right now — "
+                                       "Pollinations queues up under load. "
+                                       "Try the same prompt again in a few seconds."),
+                            "tier": "local", "latency_ms": 0,
+                            "source": "image_gen_busy"}
+                raise
             # If the owner asked for caption text ("with text X" / "saying X"),
             # PIL-overlay it on top — FLUX can't render readable text itself.
             caption = _extract_caption(msg)
