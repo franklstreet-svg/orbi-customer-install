@@ -2759,14 +2759,34 @@ _IMAGE_TRIGGER_RE = _re.compile(
 # because the subject is in the LLM's prior turn, not in the user's
 # message. We catch this and prompt the user to pick one.
 _IMAGE_REFERENCED_RE = _re.compile(
-    r"\b(?:those|these|the|that)\s+"
+    r"\b(?:"
+    # PATTERN A: "those/the/these/that [image words] you mentioned/described"
+    r"(?:those|these|the|that)\s+"
     r"(?:image|images|picture|pictures|pic|pics|graphic|graphics|"
     r"photo|photos|drawing|drawings|visual|visuals|one|ones)\s+"
     r"(?:that\s+)?"
     r"(?:you(?:'re|\s+are|\s+were)?|i)\s+"
     r"(?:just\s+)?"
     r"(?:talking\s+about|talked\s+about|mentioned|described|"
-    r"named|listed|said|referred\s+to|brought\s+up|came\s+up\s+with)",
+    r"named|listed|said|referred\s+to|brought\s+up|came\s+up\s+with)"
+    # PATTERN B: "all (of) the (campaign/marketing/ad/social) images" — refers
+    # to a set Orby described in a prior turn, usually inside a marketing
+    # campaign brief. "campaign images" sent to FLUX triggers the military
+    # association → produced a battle scene of 8 soldiers. Never do that.
+    r"|all\s+(?:of\s+)?(?:the\s+|those\s+|these\s+|that\s+)?"
+    r"(?:campaign\s+|marketing\s+|ad\s+|ads\s+|post\s+|posts\s+|"
+    r"social\s+(?:media\s+)?|facebook\s+|instagram\s+|tiktok\s+|"
+    r"linkedin\s+|brief\s+|briefs\s+|suggested\s+|proposed\s+|"
+    r"recommended\s+)*"
+    r"(?:image|images|picture|pictures|pic|pics|graphic|graphics|"
+    r"photo|photos|visual|visuals|post|posts|ad|ads|creative|creatives)"
+    # PATTERN C: "the (campaign/marketing) [image-words]" without "all"
+    r"|(?:the|these|those|that)\s+"
+    r"(?:campaign|marketing|ad|ads|social\s+(?:media)?|brief|briefs|"
+    r"suggested|proposed|recommended)\s+"
+    r"(?:image|images|picture|pictures|graphic|graphics|"
+    r"photo|photos|visual|visuals|post|posts|creative|creatives)"
+    r")\b",
     _re.IGNORECASE,
 )
 # Loose catch-all: a bare drawing verb without an explicit noun.
@@ -3093,13 +3113,25 @@ def _try_office_gen(message: str, username: str) -> dict | None:
         # with a coaching prompt instead.
         if _IMAGE_REFERENCED_RE.search(msg):
             log.info("office_gen referenced-image disambiguation: msg=%r", msg[:80])
+            is_all = bool(_re.search(r"\ball\b", msg, _re.IGNORECASE))
+            if is_all:
+                reply = ("I have to draw the campaign images one at a time — "
+                         "if I send a single batch prompt like \"all the campaign "
+                         "images\" the model tries to fit everything into ONE "
+                         "image and you get a mess (the word \"campaign\" alone "
+                         "also makes it produce military scenes). "
+                         "Tell me which one to draw first, in your own words. "
+                         "For example: \"draw the futuristic Orbi interface\" "
+                         "or \"draw the busy small-business storefront\". "
+                         "After that one's done, just say \"next one\" and "
+                         "we'll keep going.")
+            else:
+                reply = ("I can draw each of those for you, one at a time — "
+                         "just tell me which one you want and I'll generate it. "
+                         "For example: \"draw the futuristic Orbi interface image\" "
+                         "or \"draw the busy small-business storefront image\".")
             return {
-                "reply": ("I can draw each of those for you, one at a time — "
-                          "just tell me which one you want and I'll generate it. "
-                          "For example: \"draw the futuristic Orbi interface image\" "
-                          "or \"draw the busy small-business storefront image\". "
-                          "I can also do them all in a series if you say "
-                          "\"draw all the campaign images\"."),
+                "reply": reply,
                 "tier": "local", "latency_ms": 0,
                 "source": "image_disambiguation",
             }

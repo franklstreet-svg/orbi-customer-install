@@ -104,14 +104,92 @@ POLLINATIONS_BASE = "https://image.pollinations.ai/prompt/"
 POLLINATIONS_TIMEOUT_SECONDS = 90        # FLUX backend can be slow under load
 POLLINATIONS_MAX_RETRIES = 2             # transient timeouts are very common
 
+# System prompt for the LLM-based image-prompt enhancer. The user's casual
+# request ("draw a robot") is converted into a detailed FLUX-friendly prompt
+# ("a detailed photograph of a humanoid robot, sleek metallic body, glowing
+# blue eyes, modern laboratory setting, dramatic lighting, sharp focus,
+# 8k, professional photography"). Without this step FLUX often produces
+# vague / off-topic / military-coded images because its training data
+# associates short prompts with whatever was most common in that domain.
+ENHANCER_SYSTEM = (
+    "You are an expert image-generation prompt engineer working with the "
+    "FLUX text-to-image model. Given a user's casual request, rewrite it "
+    "as a detailed, specific FLUX prompt that will produce a high-quality "
+    "image clearly matching the user's intent.\n\n"
+    "RULES:\n"
+    "- Output ONLY the rewritten prompt. No preamble, no quotes, no "
+    "  explanations, no markdown.\n"
+    "- Be CONCRETE about the subject: what it is, what it looks like, "
+    "  its pose / action / state.\n"
+    "- Add: lighting, composition, style, mood, setting, detail level.\n"
+    "- Avoid loaded political/military words unless the user explicitly "
+    "  asked. The word 'campaign' alone makes FLUX produce battle scenes — "
+    "  if the user said 'campaign image', interpret as 'marketing campaign "
+    "  visual' and rewrite to something like 'professional commercial "
+    "  photograph of [actual subject]'.\n"
+    "- Keep it under 80 words. FLUX gets confused by very long prompts.\n"
+    "- Preserve the user's specific subject choices — don't substitute.\n"
+)
+
 
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
 
+def enhance_prompt(config: dict, raw_prompt: str) -> str:
+    """LLM-rewrite a casual user request into a detailed FLUX-friendly
+    prompt. Returns the rewritten string, or the original if the LLM
+    is unavailable (better to ship the user's words than to block on
+    enhancement).
+
+    Cached in-process — same input string returns the same enhanced
+    output for ~10 minutes so refinements don't pay the LLM cost twice.
+    """
+    raw = (raw_prompt or "").strip()
+    if not raw:
+        return raw
+    # If the prompt already looks detailed (long enough, has style cues),
+    # don't waste an LLM call. The self-portrait templates and refinement
+    # composites are already rich.
+    if (len(raw) > 180
+        or "digital art" in raw.lower()
+        or "photograph" in raw.lower()
+        or "no human figures" in raw.lower()):
+        return raw
+
+    cached = _ENHANCE_CACHE.get(raw)
+    if cached and (time.time() - cached[1]) < _ENHANCE_TTL:
+        return cached[0]
+
+    try:
+        # Lazy import to avoid circular dep (llm_client imports nothing
+        # from image_gen but better safe than sorry)
+        import llm_client
+        resp = llm_client.generate(
+            config, ENHANCER_SYSTEM,
+            [{"role": "user", "content": raw}])
+        if resp and resp.text:
+            enhanced = resp.text.strip().strip('"').strip("'")
+            # Sanity — keep within FLUX-friendly length
+            if 10 <= len(enhanced) <= 800:
+                _ENHANCE_CACHE[raw] = (enhanced, time.time())
+                log.info("prompt enhanced: %r → %r", raw[:60], enhanced[:80])
+                return enhanced
+    except Exception as exc:    # noqa: BLE001
+        log.warning("prompt enhancement failed (%s); using raw", exc)
+
+    return raw
+
+
+# Tiny in-process cache; cleared on restart. Plenty for single-customer install.
+_ENHANCE_CACHE: dict[str, tuple[str, float]] = {}
+_ENHANCE_TTL = 600
+
+
 def generate(config: dict, prompt: str, kind: str = DEFAULT_KIND,
-             seed: int | None = None) -> bytes:
+             seed: int | None = None,
+             enhance: bool = True) -> bytes:
     """
     Generate a PNG for `prompt` at the size matching `kind`. Tries
     HuggingFace first if a key is configured, falls back to the PIL template
@@ -126,6 +204,12 @@ def generate(config: dict, prompt: str, kind: str = DEFAULT_KIND,
     if kind not in SIZES:
         log.info("unknown kind=%r, defaulting to %s", kind, DEFAULT_KIND)
         kind = DEFAULT_KIND
+
+    # LLM-rewrite casual prompts into FLUX-friendly detail. Skip when
+    # caller explicitly disabled (e.g. when re-firing a known-good prompt)
+    # or when the prompt is already detailed.
+    if enhance:
+        prompt = enhance_prompt(config, prompt)
 
     # ── Path A: Pollinations.ai (keyless, free, default) ─────────────────
     img_cfg = (config or {}).get("image_gen") or {}
