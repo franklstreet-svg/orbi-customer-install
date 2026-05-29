@@ -1245,8 +1245,32 @@
 
   function safeStartMic() {
     if (!recognition || isListening || isSpeaking) return;
-    try { recognition.start(); } catch {}
+    try { recognition.start(); }
+    catch (e) {
+      // InvalidStateError happens when recognition "thinks" it's already
+      // started. Force-stop and retry once after a short pause.
+      if (e && e.name === 'InvalidStateError') {
+        try { recognition.stop(); } catch {}
+        setTimeout(() => {
+          if (wantsListening && !isSpeaking && !isListening) {
+            try { recognition.start(); } catch {}
+          }
+        }, 500);
+      }
+    }
   }
+
+  // Watchdog — every 3s, if voice mode is on but mic isn't actively
+  // listening AND Orby isn't speaking, restart it. This catches iOS
+  // Safari pausing recognition silently after a long quiet stretch,
+  // and Chrome's similar behavior. Without this, the mic can quietly
+  // die mid-conversation and the owner has to manually toggle it
+  // off/on to get it going again.
+  setInterval(() => {
+    if (voiceOn && wantsListening && !isListening && !isSpeaking) {
+      safeStartMic();
+    }
+  }, 3000);
 
   // Uses server-side /tts endpoint (edge_tts, en-US-AvaNeural by default
   // — same voice as orbi_test on twickell.com). Falls back to browser
