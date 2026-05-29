@@ -190,11 +190,11 @@ _INTENT_PATTERNS = [
                  r"let\s+(?P<name>[A-Za-z][a-zA-Z]{1,30})\s+know\s+"
                  r"(?:that\s+)?(?P<body>.+)",
                  _re.IGNORECASE),
-    # "send <name> a message (that/about/saying) <body>"
+    # "send <name> a message (that/about/saying/:) <body>"
     _re.compile(r"^\s*(?:please\s+|can\s+you\s+(?:please\s+)?)?"
                  r"send\s+(?P<name>[A-Za-z][a-zA-Z]{1,30})\s+(?:a\s+)?"
-                 r"(?:message|note|text|dm|im)\s+"
-                 r"(?:that\s+|about\s+|saying\s+|:\s*)?(?P<body>.+)",
+                 r"(?:message|note|text|dm|im)\s*"
+                 r"(?:that\s+|about\s+|saying\s+|[:\-—]\s*)?(?P<body>.+)",
                  _re.IGNORECASE),
     # "message <name> (that/about) <body>"  /  "ping <name> — body"
     _re.compile(r"^\s*(?:please\s+|can\s+you\s+(?:please\s+)?)?"

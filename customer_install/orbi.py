@@ -1885,6 +1885,19 @@ def owner_reset_password():
 from modules import internal_messages as mod_imsg
 
 
+@app.route("/api/owner/whoami", methods=["GET"])
+def owner_whoami():
+    """Returns the logged-in user's identity. Used by the dashboard JS
+    to know who 'me' is for filtering inbound vs outbound messages."""
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    return jsonify({
+        "username":     user.get("username"),
+        "display_name": user.get("display_name"),
+        "role":         user.get("role"),
+        "email":        user.get("email"),
+    })
+
+
 @app.route("/api/owner/internal_messages", methods=["GET"])
 def internal_messages_list():
     user = auth.require_user(ORBI_DIR, DATA_DIR)

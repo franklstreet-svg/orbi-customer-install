@@ -4087,4 +4087,134 @@
   }
   document.addEventListener('DOMContentLoaded', _wireInstallQr);
 
+
+  // ====================================================================
+  // INTERNAL STAFF MESSAGES (Team messages panel inside People tab)
+  // ====================================================================
+  let _imsgCurrentUsername = null;
+
+  async function _loadImsgList() {
+    const list = document.getElementById('imsg-list');
+    if (!list) return;
+    try {
+      const r = await fetch('/api/owner/internal_messages?limit=50');
+      if (!r.ok) throw new Error('Failed to load');
+      const data = await r.json();
+      // Remember who "me" is by checking the dashboard's known user
+      // Falls back to the first message's "to" if both ends are present.
+      if (!_imsgCurrentUsername) {
+        try {
+          const meRes = await fetch('/api/owner/whoami');
+          if (meRes.ok) {
+            const me = await meRes.json();
+            _imsgCurrentUsername = me.username;
+          }
+        } catch {}
+      }
+      const msgs = data.messages || [];
+      if (!msgs.length) {
+        list.innerHTML = '<div class="empty-state-small">No messages yet. Hit Compose, or just tell Orby in chat.</div>';
+        return;
+      }
+      let html = '';
+      for (const m of msgs.slice(0, 30)) {
+        const inbound = m.to === _imsgCurrentUsername;
+        const unread = inbound && !m.read_at;
+        const otherName = inbound ? m.from_name : m.to_name;
+        const arrow = inbound ? '←' : '→';
+        const dt = m.created_at ? new Date(m.created_at * 1000).toLocaleString() : '';
+        const via = m.via === 'orby' ? ' <span style="font-size:10px;color:#8b5cf6">via Orby</span>' : '';
+        html += `
+          <div data-msgid="${_esc(m.id)}" data-unread="${unread ? 1 : 0}"
+               style="padding:10px 12px;background:${unread ? '#1f2640' : '#1a2240'};border-radius:8px;border-left:3px solid ${unread ? '#8b5cf6' : 'transparent'}">
+            <div style="display:flex;justify-content:space-between;font-size:12px;color:#9aa4c0;margin-bottom:4px">
+              <span>${arrow} ${_esc(otherName)}${via}</span>
+              <span>${_esc(dt)}${unread ? ' <b style="color:#8b5cf6">●</b>' : ''}</span>
+            </div>
+            <div style="white-space:pre-wrap;font-size:14px">${_esc(m.body)}</div>
+          </div>
+        `;
+      }
+      list.innerHTML = html;
+      // Mark inbound-unread as read after rendering (slight delay for UX)
+      const unreadIds = msgs.filter(m => m.to === _imsgCurrentUsername && !m.read_at)
+                            .map(m => m.id);
+      if (unreadIds.length) {
+        setTimeout(() => {
+          fetch('/api/owner/internal_messages/mark_all_read', { method: 'POST' })
+            .catch(() => {});
+        }, 1500);
+      }
+    } catch (e) {
+      list.innerHTML = '<div style="color:#ff7a7a;font-size:13px">' + _esc(e.message) + '</div>';
+    }
+  }
+
+  async function _populateImsgRecipients() {
+    const sel = document.getElementById('imsg-to');
+    if (!sel) return;
+    try {
+      const r = await fetch('/api/owner/staff');
+      if (!r.ok) return;
+      const data = await r.json();
+      const active = data.active || [];
+      let html = '<option value="">— pick a staff member —</option>';
+      for (const u of active) {
+        if (u.username === _imsgCurrentUsername) continue;
+        const label = u.display_name ? `${u.display_name} (${u.username})` : u.username;
+        html += `<option value="${_esc(u.username)}">${_esc(label)}</option>`;
+      }
+      sel.innerHTML = html;
+    } catch {}
+  }
+
+  function _wireImsg() {
+    const composeBtn = document.getElementById('imsg-compose-btn');
+    const dlg = document.getElementById('imsg-dialog');
+    const form = document.getElementById('imsg-form');
+    if (composeBtn && dlg) {
+      composeBtn.addEventListener('click', async () => {
+        await _populateImsgRecipients();
+        document.getElementById('imsg-body').value = '';
+        dlg.showModal();
+      });
+    }
+    if (form) {
+      form.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const to = document.getElementById('imsg-to').value;
+        const body = document.getElementById('imsg-body').value.trim();
+        if (!to || !body) return;
+        const btn = document.getElementById('imsg-send-btn');
+        btn.disabled = true; btn.textContent = 'Sending…';
+        try {
+          const r = await fetch('/api/owner/internal_messages', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ to, body })
+          });
+          const data = await r.json();
+          if (!r.ok) throw new Error(data.error || 'Failed');
+          dlg.close();
+          _loadImsgList();
+        } catch (e) {
+          alert('Send failed: ' + e.message);
+        } finally {
+          btn.disabled = false; btn.textContent = 'Send';
+        }
+      });
+    }
+    // Auto-refresh inbox when People tab opens + every 60s while it's active
+    const peopleTab = document.querySelector('.tab[data-tab="people"]');
+    if (peopleTab) peopleTab.addEventListener('click', _loadImsgList);
+    if (document.getElementById('tab-people')?.classList.contains('active')) {
+      _loadImsgList();
+    }
+    setInterval(() => {
+      if (document.getElementById('tab-people')?.classList.contains('active')) {
+        _loadImsgList();
+      }
+    }, 60000);
+  }
+  document.addEventListener('DOMContentLoaded', _wireImsg);
+
 })();
