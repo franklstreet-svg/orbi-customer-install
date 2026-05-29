@@ -62,6 +62,7 @@ import follow_up
 import gcal
 import image_gen
 import ad_gen
+import updater
 import ocr as ocr_mod
 import review_responder
 import safe_send
@@ -1679,6 +1680,11 @@ def owner_chat():
     if recovery is not None:
         return jsonify(recovery)
 
+    # Update commands — "is there an update?" / "install update"
+    upd = _try_update_command(user_msg, username)
+    if upd is not None:
+        return jsonify(upd)
+
     # Capability overview — answers "give me a full list of your capabilities"
     # without touching the LLM, so it works in offline mode.
     cap_overview = _try_capabilities_overview(user_msg)
@@ -1991,7 +1997,7 @@ _RECOVERY_RE = _re.compile(
     r"|reset\s+(?:everything|my\s+notes|my\s+memory|to\s+factory)"
     r"|start\s+(?:over\s+)?from\s+scratch|nuke\s+(?:my\s+)?data)"
     # Rollback variants
-    r"|(?P<rollback>rollback\s+(?:my\s+)?(?:yesterday|today|last\s+\d+\s*(?:hour|day)s?|"
+    r"|(?P<rollback>rollback\s+(?:my\s+|the\s+)?(?:yesterday|today|last\s+\d+\s*(?:hour|day)s?|"
     r"changes|notes|memory)|undo\s+(?:yesterday|today|the\s+last\s+\d+\s*hours?))"
     # Restore from backup
     r"|(?P<restore>restore\s+(?:from\s+)?(?:my\s+)?backup|"
@@ -2143,6 +2149,100 @@ def _try_recovery_command(message: str, username: str, user_dir: Path) -> dict |
                       f"(60-second window. If you don't confirm, nothing happens.)"),
             "tier": "local", "latency_ms": 0,
             "source": "recovery_pending"}
+
+
+# ── Update commands ────────────────────────────────────────────────────────
+# "is there an update?" / "check for updates" → quick answer from cached state
+# (or live check if last_check > 24h ago).
+# "install update" / "apply update" / "update orbi" → download to staging,
+# tell owner where to run the install (root permissions needed for binary swap).
+
+_UPDATE_CHECK_RE = _re.compile(
+    r"^\s*(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?"
+    r"(?:is\s+there\s+(?:an?\s+)?update|check\s+for\s+(?:an?\s+)?updates?|"
+    r"any\s+updates?\s+available|are\s+you\s+up\s+to\s+date|"
+    r"what\s+version\s+(?:are\s+you|is\s+this))",
+    _re.IGNORECASE,
+)
+_UPDATE_INSTALL_RE = _re.compile(
+    r"^\s*(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?"
+    r"(?:install\s+(?:the\s+)?update|apply\s+(?:the\s+)?update|"
+    r"update\s+(?:orbi|yourself|now)|do\s+the\s+update|"
+    r"upgrade\s+(?:orbi|yourself|now))",
+    _re.IGNORECASE,
+)
+
+
+def _try_update_command(message: str, username: str) -> dict | None:
+    msg = (message or "").strip()
+    if not msg:
+        return None
+
+    # "Is there an update?" — check + report
+    if _UPDATE_CHECK_RE.match(msg):
+        current = (CONFIG or {}).get("version", "0.0.0")
+        # Use cached state if recent (last check < 24h), else live check
+        state = updater._load_state(DATA_DIR)
+        last_check = state.get("last_check", 0)
+        info = state.get("available")
+        if time.time() - last_check > 3600 or not last_check:
+            info = updater.check_for_update(CONFIG, DATA_DIR) or info
+        if not info:
+            return {"reply": (f"You're on version {current} and that's the "
+                              "latest. Last checked just now."),
+                    "tier": "local", "latency_ms": 0,
+                    "source": "update_current"}
+        size_mb = round((info.get("asset_size", 0) or 0) / 1e6, 1)
+        notes = (info.get("body") or "")[:300].strip()
+        notes_line = f"\n\nRelease notes:\n{notes}" if notes else ""
+        return {"reply": (f"Update available: {current} → {info['tag']} "
+                          f"({size_mb} MB). Say \"install update\" to "
+                          f"download + apply it.{notes_line}"),
+                "tier": "local", "latency_ms": 0,
+                "source": "update_available"}
+
+    # "Install update"
+    if _UPDATE_INSTALL_RE.match(msg):
+        info = updater.get_pending_update(DATA_DIR)
+        if not info:
+            return {"reply": ("No update is pending. Say \"check for updates\" "
+                              "first to see if a new version exists."),
+                    "tier": "local", "latency_ms": 0,
+                    "source": "update_none_pending"}
+
+        install_root = Path(__file__).resolve().parent
+        if updater.is_git_checkout(install_root):
+            result = updater.git_pull_update(install_root)
+            audit.log_event(DATA_DIR, actor=username, action="update.git_pull",
+                            meta={"tag": info.get("tag"), "ok": result.get("ok")})
+            if result.get("ok"):
+                return {"reply": (f"Pulled latest code (git). Restart Orbi to "
+                                   f"activate the changes.\n\n{result.get('stdout','')}"),
+                        "tier": "local", "latency_ms": 0,
+                        "source": "update_git_done"}
+            return {"reply": (f"git pull failed: {result.get('stderr') or result.get('error')}"),
+                    "tier": "local", "latency_ms": 0,
+                    "source": "update_git_failed"}
+
+        # Binary install — download to staging
+        staging = DATA_DIR / "_updates" / info["tag"]
+        dest = updater.download_update(info, staging)
+        if not dest:
+            return {"reply": ("Couldn't download the update. Check internet + "
+                              "try again later."),
+                    "tier": "local", "latency_ms": 0,
+                    "source": "update_download_failed"}
+        audit.log_event(DATA_DIR, actor=username, action="update.downloaded",
+                        meta={"tag": info.get("tag"), "path": str(dest)})
+        return {"reply": (f"Downloaded {info['tag']} to {dest}. "
+                          "To install it, run (as administrator/root):\n\n"
+                          f"  {dest}\n\n"
+                          "Orbi will restart automatically after the swap. "
+                          "Your data is safe — only the program files change."),
+                "tier": "local", "latency_ms": 0,
+                "source": "update_downloaded"}
+
+    return None
 
 
 def _try_capabilities_overview(message: str) -> str | None:
@@ -5430,6 +5530,22 @@ def main():
         backup.start_daily_backup(CONFIG, DATA_DIR)
     except Exception as e:
         log.warning(f"backup scheduler failed to start: {e}")
+    try:
+        def _update_notify(info: dict) -> None:
+            """When the updater finds a new release, push to the owner."""
+            try:
+                notify.send(CONFIG, DATA_DIR,
+                             event="update_available",
+                             title=f"Orbi {info.get('tag')} is available",
+                             body=("Say \"install update\" in chat or open "
+                                    "Settings → Updates to apply it."),
+                             url="/owner")
+            except Exception:    # noqa: BLE001
+                log.exception("update notify push failed")
+        updater.start_update_check_scheduler(CONFIG, DATA_DIR,
+                                              notify_callback=_update_notify)
+    except Exception as e:
+        log.warning(f"updater scheduler failed to start: {e}")
     server = CONFIG.get("server", {})
     host = server.get("host", "127.0.0.1")
     port = int(server.get("port", 5050))
