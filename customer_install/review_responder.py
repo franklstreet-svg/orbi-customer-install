@@ -53,7 +53,7 @@ REVIEW_CONNECTORS = ("google_reviews", "yelp")
 # friendly_professional.
 TONE_GUIDANCE = {
     "friendly_professional": (
-        "Warm but professional. Sound like a competent small-business owner "
+        "Warm but professional. Sound like a competent business owner "
         "who genuinely appreciates feedback. No slang."
     ),
     "warm_casual": (

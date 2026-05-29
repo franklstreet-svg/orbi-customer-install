@@ -208,7 +208,8 @@ def brief_needs_clarification(brief: str) -> list[str]:
     has_audience = any(w in b for w in (
         "for ", "people who", "anyone", "moms", "dads", "parents", "kids",
         "families", "couples", "locals", "tourists", "professionals",
-        "students", "small business", "homeowners", "fans"))
+        "students", "business owners", "small business", "homeowners",
+        "fans", "executives", "managers", "enterprises"))
     has_format_hint = any(w in b for w in (
         "facebook", "instagram", "story", "post", "tiktok", "linkedin",
         "youtube", "reels", "carousel", "flyer", "poster"))

@@ -148,7 +148,7 @@ def _heuristic_fallback(text: str, hints: dict) -> list[str]:
 # ── LLM classification (the smart path) ────────────────────────────────
 
 
-_SYSTEM_PROMPT = """You are a message-classifier for a small business inbox.
+_SYSTEM_PROMPT = """You are a message-classifier for a business inbox.
 
 Classify the message into 1 to 3 tags from this EXACT list (do not invent new ones):
   urgent     - needs reply within a few hours

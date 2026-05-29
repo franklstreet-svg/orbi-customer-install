@@ -357,7 +357,7 @@ def _draft_proposal_email(name: str, email: str, duration_minutes: int,
         config = json.loads(config_path.read_text(encoding="utf-8"))
 
         system = (
-            "You write short, warm meeting-proposal emails for a small-business "
+            "You write short, warm meeting-proposal emails for a business "
             "owner. Output ONLY the email body — no subject, no signature, no "
             "preamble like 'Sure, here is the email'. Keep it 3-5 short "
             "sentences. Friendly, plain English, no marketing-speak. "

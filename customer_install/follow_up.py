@@ -64,7 +64,7 @@ def draft_nudge(config: dict, item: dict) -> str:
     try:
         import llm_client
         system = (
-            "You write short, warm follow-up nudges for a small-business owner. "
+            "You write short, warm follow-up nudges for a business owner. "
             "Output ONLY the nudge text, no preamble, no signature line, no "
             "subject — just the body of the message. Keep it 2-4 sentences. "
             "Sound human and friendly. Reference what they originally asked or "

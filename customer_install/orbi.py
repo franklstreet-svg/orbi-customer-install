@@ -3681,14 +3681,14 @@ def _try_office_gen(message: str, username: str) -> dict | None:
                          "also makes it produce military scenes). "
                          "Tell me which one to draw first, in your own words. "
                          "For example: \"draw the futuristic Orbi interface\" "
-                         "or \"draw the busy small-business storefront\". "
+                         "or \"draw the busy business storefront\". "
                          "After that one's done, just say \"next one\" and "
                          "we'll keep going.")
             else:
                 reply = ("I can draw each of those for you, one at a time — "
                          "just tell me which one you want and I'll generate it. "
                          "For example: \"draw the futuristic Orbi interface image\" "
-                         "or \"draw the busy small-business storefront image\".")
+                         "or \"draw the busy business storefront image\".")
             return {
                 "reply": reply,
                 "tier": "local", "latency_ms": 0,

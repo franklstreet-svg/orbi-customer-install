@@ -6,7 +6,7 @@ source (messages, calendar, notes, Stripe, Gmail, Outlook) and returns a
 single newest-first list of events plus a one-line human summary.
 
 This is the "tap on Joe Smith, see everything you've ever done together"
-view — the small-business equivalent of opening a CRM card.
+view — equivalent of opening a CRM card without the per-seat enterprise cost.
 
 DESIGN NOTES
 ------------
