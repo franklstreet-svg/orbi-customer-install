@@ -4498,8 +4498,15 @@
   // TEAM CHAT — dedicated tab with iMessage-style per-staff threads
   // ====================================================================
   let _teamMe = null;             // logged-in user's identity (cached)
-  let _teamActiveOther = null;    // currently-open thread (other user)
+  // Active selection: { type: 'person' | 'group',
+  //                     id:   username  | group_id,
+  //                     name: display name,
+  //                     members?: [usernames]  (group only),
+  //                     member_names?: [display names] (group only) }
+  let _teamActive = null;
   let _teamPollHandle = null;     // setInterval handle for thread polling
+  let _teamGroupsCache = [];      // last-loaded groups (for sidebar render)
+  let _teamStaffCache = [];       // last-loaded active staff
 
   async function _teamLoadMe() {
     if (_teamMe) return _teamMe;
@@ -4510,139 +4517,273 @@
     return _teamMe;
   }
 
-  async function _teamRenderStaffList() {
-    const list = document.getElementById('team-staff-list');
-    if (!list) return;
+  async function _teamRefreshSidebar() {
+    await _teamLoadMe();
     try {
-      await _teamLoadMe();
-      const [staffRes, msgRes] = await Promise.all([
+      const [staffRes, msgRes, groupsRes] = await Promise.all([
         fetch('/api/owner/staff'),
         fetch('/api/owner/internal_messages?limit=500'),
+        fetch('/api/owner/groups'),
       ]);
       const staffData = await staffRes.json();
-      const msgData = await msgRes.json();
-      const active = (staffData.active || []).filter(u =>
-        u.username !== (_teamMe?.username || ''));
-      // Compute unread counts + last-message previews per other user
-      const msgs = msgData.messages || [];
-      const meta = {};   // other_username → {unread, lastMsg, lastTs}
-      for (const m of msgs) {
-        const other = m.to === _teamMe?.username ? m.from : m.to;
-        if (!other || other === _teamMe?.username) continue;
-        if (!meta[other]) meta[other] = { unread: 0, lastMsg: '', lastTs: 0 };
-        if (m.created_at > meta[other].lastTs) {
-          meta[other].lastTs = m.created_at;
-          meta[other].lastMsg = m.body || '';
-        }
-        if (m.to === _teamMe?.username && !m.read_at) {
-          meta[other].unread += 1;
-        }
-      }
-      // Update tab badge with total unread
-      const totalUnread = Object.values(meta).reduce((s, v) => s + v.unread, 0);
-      const badge = document.getElementById('team-unread-badge');
-      if (badge) {
-        if (totalUnread > 0) { badge.textContent = totalUnread; badge.hidden = false; }
-        else { badge.hidden = true; }
-      }
-      if (!active.length) {
-        list.innerHTML = '<div class="muted" style="padding:12px;font-size:13px">No staff to chat with yet. Add some in Staff tab.</div>';
-        return;
-      }
-      // Sort by last-message time (most recent first), then by name
-      active.sort((a, b) => {
-        const ta = meta[a.username]?.lastTs || 0;
-        const tb = meta[b.username]?.lastTs || 0;
-        if (ta !== tb) return tb - ta;
-        return (a.display_name || a.username).localeCompare(b.display_name || b.username);
-      });
-      let html = '';
-      for (const u of active) {
-        const name = u.display_name || u.username;
-        const m = meta[u.username] || { unread: 0, lastMsg: '', lastTs: 0 };
-        const preview = m.lastMsg ? m.lastMsg.slice(0, 50).replace(/\n/g, ' ')
-                                    : 'No messages yet';
-        const active_cls = u.username === _teamActiveOther
-          ? 'background:#2a3460' : 'background:transparent';
-        html += `
-          <div class="team-staff-row" data-other="${_esc(u.username)}"
-               style="padding:10px 12px;border-radius:8px;cursor:pointer;${active_cls};margin-bottom:4px">
-            <div style="display:flex;justify-content:space-between;align-items:center">
-              <div style="font-weight:600;font-size:14px">${_esc(name)}</div>
-              ${m.unread > 0 ? `<span style="background:#8b5cf6;color:white;font-size:11px;padding:2px 7px;border-radius:10px">${m.unread}</span>` : ''}
-            </div>
-            <div style="font-size:12px;color:#9aa4c0;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${_esc(preview)}</div>
-          </div>
-        `;
-      }
-      list.innerHTML = html;
-      // Wire row clicks
-      list.querySelectorAll('.team-staff-row').forEach(row => {
-        row.addEventListener('click', () => {
-          _teamOpenThread(row.dataset.other,
-                           row.querySelector('div > div').textContent.trim());
-        });
-      });
+      const msgData   = await msgRes.json();
+      const groupsData = await groupsRes.json();
+      _teamStaffCache  = staffData.active || [];
+      _teamGroupsCache = groupsData.groups || [];
+      const allMsgs = msgData.messages || [];
+      _teamRenderGroups(allMsgs);
+      _teamRenderStaffList(allMsgs);
+      _teamRefreshBadge(msgData.unread_count);
     } catch (e) {
-      list.innerHTML = '<div style="color:#ff7a7a;padding:12px;font-size:13px">' + _esc(e.message) + '</div>';
+      const list = document.getElementById('team-staff-list');
+      if (list) list.innerHTML = '<div style="color:#ff7a7a;padding:12px;font-size:13px">' + _esc(e.message) + '</div>';
     }
   }
 
-  async function _teamOpenThread(otherUsername, otherDisplayName) {
-    _teamActiveOther = otherUsername;
+  function _teamRefreshBadge(serverUnreadCount) {
+    const badge = document.getElementById('team-unread-badge');
+    if (!badge) return;
+    if (serverUnreadCount > 0) {
+      badge.textContent = serverUnreadCount;
+      badge.hidden = false;
+    } else {
+      badge.hidden = true;
+    }
+  }
+
+  function _teamRenderGroups(allMsgs) {
+    const wrap = document.getElementById('team-groups-list');
+    if (!wrap) return;
+    const me = _teamMe?.username || '';
+    // For each group, compute unread + last-message preview from the message
+    // stream we already loaded.
+    const meta = {};   // group_id → { unread, lastMsg, lastTs, lastFromName }
+    for (const m of allMsgs) {
+      if (!m.group_id) continue;
+      const id = m.group_id;
+      if (!meta[id]) meta[id] = { unread: 0, lastMsg: '', lastTs: 0, lastFromName: '' };
+      if (m.created_at > meta[id].lastTs) {
+        meta[id].lastTs = m.created_at;
+        meta[id].lastMsg = m.body || '';
+        meta[id].lastFromName = m.from_name || m.from || '';
+      }
+      if (!(m.read_by || []).includes(me)) {
+        meta[id].unread += 1;
+      }
+    }
+    if (!_teamGroupsCache.length) {
+      wrap.innerHTML = '<div class="muted" style="padding:8px 12px;font-size:12px">No groups yet.</div>';
+      return;
+    }
+    // Sort: Whole Team always first, then by last-message-time, then by name
+    const sorted = [..._teamGroupsCache].sort((a, b) => {
+      if (a.id === '__all__') return -1;
+      if (b.id === '__all__') return 1;
+      const ta = meta[a.id]?.lastTs || 0;
+      const tb = meta[b.id]?.lastTs || 0;
+      if (ta !== tb) return tb - ta;
+      return (a.name || '').localeCompare(b.name || '');
+    });
+    let html = '';
+    for (const g of sorted) {
+      const mm = meta[g.id] || { unread: 0, lastMsg: '', lastFromName: '' };
+      const memberCount = (g.members || []).length;
+      const preview = mm.lastMsg
+        ? `${mm.lastFromName ? mm.lastFromName + ': ' : ''}${mm.lastMsg.slice(0, 40).replace(/\n/g, ' ')}`
+        : `${memberCount} ${memberCount === 1 ? 'person' : 'people'}`;
+      const isActive = _teamActive && _teamActive.type === 'group' && _teamActive.id === g.id;
+      const bg = isActive ? 'background:#2a3460' : 'background:transparent';
+      const icon = g.id === '__all__' ? '🌐' : '👥';
+      html += `
+        <div class="team-group-row" data-group-id="${_esc(g.id)}"
+              style="padding:10px 12px;border-radius:8px;cursor:pointer;${bg};margin-bottom:4px">
+          <div style="display:flex;justify-content:space-between;align-items:center">
+            <div style="font-weight:600;font-size:14px">${icon} ${_esc(g.name)}</div>
+            ${mm.unread > 0 ? `<span style="background:#8b5cf6;color:white;font-size:11px;padding:2px 7px;border-radius:10px">${mm.unread}</span>` : ''}
+          </div>
+          <div style="font-size:12px;color:#9aa4c0;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${_esc(preview)}</div>
+        </div>
+      `;
+    }
+    wrap.innerHTML = html;
+    wrap.querySelectorAll('.team-group-row').forEach(row => {
+      row.addEventListener('click', () => {
+        const id = row.dataset.groupId;
+        const g = _teamGroupsCache.find(x => x.id === id);
+        if (g) _teamOpenGroup(g);
+      });
+    });
+  }
+
+  function _teamRenderStaffList(allMsgs) {
+    const list = document.getElementById('team-staff-list');
+    if (!list) return;
+    const me = _teamMe?.username || '';
+    const active = _teamStaffCache.filter(u => u.username !== me);
+    // Compute per-person unread / last-msg meta from 1-on-1 messages only
+    const meta = {};
+    for (const m of allMsgs) {
+      if (m.group_id) continue;
+      const other = m.to === me ? m.from : m.to;
+      if (!other || other === me) continue;
+      if (!meta[other]) meta[other] = { unread: 0, lastMsg: '', lastTs: 0 };
+      if (m.created_at > meta[other].lastTs) {
+        meta[other].lastTs = m.created_at;
+        meta[other].lastMsg = m.body || '';
+      }
+      if (m.to === me && !m.read_at) meta[other].unread += 1;
+    }
+    if (!active.length) {
+      list.innerHTML = '<div class="muted" style="padding:8px 12px;font-size:12px">No staff to chat with yet.</div>';
+      return;
+    }
+    active.sort((a, b) => {
+      const ta = meta[a.username]?.lastTs || 0;
+      const tb = meta[b.username]?.lastTs || 0;
+      if (ta !== tb) return tb - ta;
+      return (a.display_name || a.username).localeCompare(b.display_name || b.username);
+    });
+    let html = '';
+    for (const u of active) {
+      const name = u.display_name || u.username;
+      const m = meta[u.username] || { unread: 0, lastMsg: '', lastTs: 0 };
+      const preview = m.lastMsg ? m.lastMsg.slice(0, 50).replace(/\n/g, ' ')
+                                  : 'No messages yet';
+      const isActive = _teamActive && _teamActive.type === 'person'
+                        && _teamActive.id === u.username;
+      const bg = isActive ? 'background:#2a3460' : 'background:transparent';
+      html += `
+        <div class="team-staff-row" data-other="${_esc(u.username)}"
+              data-name="${_esc(name)}"
+              style="padding:10px 12px;border-radius:8px;cursor:pointer;${bg};margin-bottom:4px">
+          <div style="display:flex;justify-content:space-between;align-items:center">
+            <div style="font-weight:600;font-size:14px">${_esc(name)}</div>
+            ${m.unread > 0 ? `<span style="background:#8b5cf6;color:white;font-size:11px;padding:2px 7px;border-radius:10px">${m.unread}</span>` : ''}
+          </div>
+          <div style="font-size:12px;color:#9aa4c0;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${_esc(preview)}</div>
+        </div>
+      `;
+    }
+    list.innerHTML = html;
+    list.querySelectorAll('.team-staff-row').forEach(row => {
+      row.addEventListener('click', () => {
+        _teamOpenPerson(row.dataset.other, row.dataset.name);
+      });
+    });
+  }
+
+  async function _teamOpenPerson(username, displayName) {
+    _teamActive = { type: 'person', id: username, name: displayName || username };
     const header = document.getElementById('team-chat-header');
     const compose = document.getElementById('team-chat-compose');
-    if (header) header.textContent = otherDisplayName || otherUsername;
+    if (header) header.textContent = displayName || username;
     if (compose) compose.style.display = 'block';
     await _teamLoadThread();
-    _teamRenderStaffList();   // refresh to show active row highlight
-    // Start polling every 5s while this thread is open
+    _teamRefreshSidebar();   // refresh highlights + unread counts
+    _teamRestartPolling();
+  }
+
+  async function _teamOpenGroup(group) {
+    _teamActive = {
+      type: 'group',
+      id: group.id,
+      name: group.name,
+      members: group.members || [],
+      member_names: group.member_names || [],
+      virtual: !!group.virtual,
+    };
+    const header = document.getElementById('team-chat-header');
+    const compose = document.getElementById('team-chat-compose');
+    if (header) {
+      const count = (group.members || []).length;
+      const icon = group.id === '__all__' ? '🌐' : '👥';
+      const editBtn = (group.id === '__all__')
+        ? ''
+        : `<button type="button" id="team-group-edit-btn"
+                    style="background:transparent;border:1px solid #2c3756;color:#9aa4c0;font-size:11px;padding:3px 10px;border-radius:6px;cursor:pointer;margin-left:8px">Edit</button>`;
+      header.innerHTML = `
+        <div style="display:flex;align-items:center;flex-wrap:wrap;gap:6px">
+          <div>${icon} ${_esc(group.name)}</div>
+          <div style="font-weight:400;font-size:12px;color:#9aa4c0">${count} ${count === 1 ? 'member' : 'members'}</div>
+          ${editBtn}
+        </div>
+        <div style="font-weight:400;font-size:11px;color:#9aa4c0;margin-top:4px">
+          ${(group.member_names || []).slice(0, 8).map(_esc).join(' · ')}${(group.member_names || []).length > 8 ? ' …' : ''}
+        </div>
+      `;
+      const eb = document.getElementById('team-group-edit-btn');
+      if (eb) eb.addEventListener('click', () => _teamOpenGroupEditor(group));
+    }
+    if (compose) compose.style.display = 'block';
+    await _teamLoadThread();
+    _teamRefreshSidebar();
+    _teamRestartPolling();
+  }
+
+  function _teamRestartPolling() {
     if (_teamPollHandle) clearInterval(_teamPollHandle);
+    const activeAtStart = _teamActive ? `${_teamActive.type}:${_teamActive.id}` : null;
     _teamPollHandle = setInterval(() => {
-      if (document.getElementById('tab-team')?.classList.contains('active')
-          && _teamActiveOther === otherUsername) {
-        _teamLoadThread();
-      }
+      if (!document.getElementById('tab-team')?.classList.contains('active')) return;
+      const nowActive = _teamActive ? `${_teamActive.type}:${_teamActive.id}` : null;
+      if (nowActive === activeAtStart) _teamLoadThread();
     }, 5000);
   }
 
   async function _teamLoadThread() {
-    if (!_teamActiveOther) return;
+    if (!_teamActive) return;
     const thread = document.getElementById('team-chat-thread');
     if (!thread) return;
     try {
       await _teamLoadMe();
-      const r = await fetch(`/api/owner/internal_messages/thread/${encodeURIComponent(_teamActiveOther)}`);
+      const url = _teamActive.type === 'group'
+        ? `/api/owner/internal_messages/group_thread/${encodeURIComponent(_teamActive.id)}`
+        : `/api/owner/internal_messages/thread/${encodeURIComponent(_teamActive.id)}`;
+      const r = await fetch(url);
       if (!r.ok) throw new Error('Failed to load thread');
       const data = await r.json();
       const msgs = data.thread || [];
       if (!msgs.length) {
-        thread.innerHTML = '<div class="muted" style="text-align:center;font-size:13px;margin:auto">No messages yet. Send the first one.</div>';
+        const hint = _teamActive.type === 'group'
+          ? `No messages yet. Send the first one — everyone in <b>${_esc(_teamActive.name)}</b> will see it.`
+          : 'No messages yet. Send the first one.';
+        thread.innerHTML = `<div class="muted" style="text-align:center;font-size:13px;margin:auto">${hint}</div>`;
         return;
       }
+      const me = _teamMe?.username || '';
       let html = '';
+      let lastFrom = null;
       for (const m of msgs) {
-        const mine = m.from === _teamMe?.username;
+        const mine = m.from === me;
         const via = m.via === 'orby' ? ' <span style="font-size:10px;opacity:0.7">via Orby</span>' : '';
         const dt = m.created_at ? new Date(m.created_at * 1000).toLocaleString() : '';
         const align = mine ? 'flex-end' : 'flex-start';
         const bg = mine ? '#8b5cf6' : '#2a3460';
         const color = mine ? 'white' : '#eaf0ff';
+        const showSender = _teamActive.type === 'group' && !mine
+                            && m.from !== lastFrom;
+        const senderLine = showSender
+          ? `<div style="font-size:11px;color:#9aa4c0;margin-bottom:3px;margin-left:4px">${_esc(m.from_name || m.from)}</div>`
+          : '';
         html += `
-          <div style="display:flex;justify-content:${align}">
+          <div style="display:flex;flex-direction:column;align-items:${mine ? 'flex-end' : 'flex-start'}">
+            ${senderLine}
             <div style="max-width:75%;padding:10px 14px;background:${bg};color:${color};border-radius:14px;border-${mine ? 'bottom-right' : 'bottom-left'}-radius:4px">
               <div style="white-space:pre-wrap;font-size:14px">${_esc(m.body)}</div>
               <div style="font-size:10px;opacity:0.7;margin-top:4px">${_esc(dt)}${via}</div>
             </div>
           </div>
         `;
+        lastFrom = m.from;
       }
       thread.innerHTML = html;
       thread.scrollTop = thread.scrollHeight;
-      // Mark inbound-unread as read (silently, after rendering)
+      // Mark unread as read (silently, after rendering)
       setTimeout(() => {
-        fetch('/api/owner/internal_messages/mark_all_read', { method: 'POST' })
-          .catch(() => {});
+        const markUrl = _teamActive.type === 'group'
+          ? `/api/owner/internal_messages/group_thread/${encodeURIComponent(_teamActive.id)}/mark_read`
+          : '/api/owner/internal_messages/mark_all_read';
+        fetch(markUrl, { method: 'POST' }).catch(() => {});
       }, 1000);
     } catch (e) {
       thread.innerHTML = '<div style="color:#ff7a7a;font-size:13px">' + _esc(e.message) + '</div>';
@@ -4651,26 +4792,154 @@
 
   async function _teamSendMessage() {
     const input = document.getElementById('team-chat-input');
-    if (!input || !_teamActiveOther) return;
+    if (!input || !_teamActive) return;
     const body = input.value.trim();
     if (!body) return;
     const btn = document.getElementById('team-chat-send');
     btn.disabled = true;
     try {
-      const r = await fetch('/api/owner/internal_messages', {
+      const url = _teamActive.type === 'group'
+        ? `/api/owner/internal_messages/group/${encodeURIComponent(_teamActive.id)}`
+        : '/api/owner/internal_messages';
+      const payload = _teamActive.type === 'group'
+        ? { body }
+        : { to: _teamActive.id, body };
+      const r = await fetch(url, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ to: _teamActiveOther, body })
+        body: JSON.stringify(payload)
       });
       const data = await r.json();
       if (!r.ok) throw new Error(data.error || 'Failed');
       input.value = '';
       await _teamLoadThread();
-      _teamRenderStaffList();
+      _teamRefreshSidebar();
     } catch (e) {
       alert('Send failed: ' + e.message);
     } finally {
       btn.disabled = false;
       input.focus();
+    }
+  }
+
+  // ── Group create / edit modal ───────────────────────────────────────────
+  let _teamGroupModalMode = 'create';   // 'create' or 'edit'
+  let _teamGroupModalEditingId = null;
+
+  function _teamOpenGroupCreator() {
+    _teamGroupModalMode = 'create';
+    _teamGroupModalEditingId = null;
+    document.getElementById('team-group-modal-title').textContent = 'New group';
+    document.getElementById('team-group-name').value = '';
+    document.getElementById('team-group-msg').textContent = '';
+    _teamRenderGroupMemberChecks([]);
+    const modal = document.getElementById('team-group-modal');
+    modal.style.display = 'flex';
+    setTimeout(() => document.getElementById('team-group-name').focus(), 50);
+  }
+
+  function _teamOpenGroupEditor(group) {
+    _teamGroupModalMode = 'edit';
+    _teamGroupModalEditingId = group.id;
+    document.getElementById('team-group-modal-title').textContent = 'Edit group';
+    document.getElementById('team-group-name').value = group.name || '';
+    document.getElementById('team-group-msg').textContent = '';
+    _teamRenderGroupMemberChecks(group.members || []);
+    const modal = document.getElementById('team-group-modal');
+    modal.style.display = 'flex';
+    // Inject a Delete button on edit (rebuilt each open so we don't dup it)
+    let saveBtn = document.getElementById('team-group-save');
+    let delBtn = document.getElementById('team-group-delete');
+    if (!delBtn) {
+      delBtn = document.createElement('button');
+      delBtn.type = 'button';
+      delBtn.id = 'team-group-delete';
+      delBtn.textContent = 'Delete';
+      delBtn.style.cssText = 'flex:1;padding:10px;background:transparent;border:1px solid #6b2a3a;color:#ff7a7a;border-radius:6px;cursor:pointer;font-weight:600';
+      saveBtn.parentNode.insertBefore(delBtn, saveBtn);
+      delBtn.addEventListener('click', _teamDeleteGroup);
+    }
+    delBtn.style.display = '';
+  }
+
+  function _teamRenderGroupMemberChecks(preselected) {
+    const wrap = document.getElementById('team-group-member-checks');
+    const sel = new Set((preselected || []).map(x => x.toLowerCase()));
+    const me = _teamMe?.username || '';
+    if (!_teamStaffCache.length) {
+      wrap.innerHTML = '<div class="muted" style="padding:8px;font-size:12px">No active staff. Add some in the Staff tab first.</div>';
+      return;
+    }
+    let html = '';
+    for (const u of _teamStaffCache) {
+      const name = u.display_name || u.username;
+      const checked = sel.has(u.username) || u.username === me;
+      const isSelf = u.username === me;
+      html += `
+        <label style="display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:6px;cursor:pointer;font-size:14px">
+          <input type="checkbox" class="team-group-member-cb" value="${_esc(u.username)}"
+                  ${checked ? 'checked' : ''}>
+          <span>${_esc(name)}${isSelf ? ' <span style="color:#9aa4c0;font-size:11px">(you)</span>' : ''}</span>
+        </label>
+      `;
+    }
+    wrap.innerHTML = html;
+  }
+
+  async function _teamSaveGroup() {
+    const name = document.getElementById('team-group-name').value.trim();
+    const msg = document.getElementById('team-group-msg');
+    const members = Array.from(document.querySelectorAll('.team-group-member-cb'))
+      .filter(cb => cb.checked).map(cb => cb.value);
+    msg.style.color = '#9aa4c0';
+    if (!name) { msg.style.color = '#ff7a7a'; msg.textContent = 'Name required.'; return; }
+    if (members.length < 2) { msg.style.color = '#ff7a7a'; msg.textContent = 'Pick at least 2 members.'; return; }
+    msg.textContent = 'Saving…';
+    const btn = document.getElementById('team-group-save');
+    btn.disabled = true;
+    try {
+      const r = _teamGroupModalMode === 'edit'
+        ? await fetch(`/api/owner/groups/${encodeURIComponent(_teamGroupModalEditingId)}`, {
+            method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name, members })
+          })
+        : await fetch('/api/owner/groups', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name, members })
+          });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || 'Save failed');
+      document.getElementById('team-group-modal').style.display = 'none';
+      await _teamRefreshSidebar();
+      if (data.group) _teamOpenGroup(data.group);
+    } catch (e) {
+      msg.style.color = '#ff7a7a';
+      msg.textContent = e.message;
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  async function _teamDeleteGroup() {
+    if (!_teamGroupModalEditingId) return;
+    if (!confirm('Delete this group? Message history stays for audit but the group disappears from your sidebar.')) return;
+    try {
+      const r = await fetch(`/api/owner/groups/${encodeURIComponent(_teamGroupModalEditingId)}`,
+                             { method: 'DELETE' });
+      if (!r.ok) {
+        const data = await r.json().catch(() => ({}));
+        throw new Error(data.error || 'Delete failed');
+      }
+      document.getElementById('team-group-modal').style.display = 'none';
+      _teamActive = null;
+      const header = document.getElementById('team-chat-header');
+      const compose = document.getElementById('team-chat-compose');
+      if (header) header.textContent = 'Pick a teammate or group on the left to start chatting';
+      if (compose) compose.style.display = 'none';
+      document.getElementById('team-chat-thread').innerHTML =
+        '<div class="muted" style="text-align:center;font-size:13px;margin:auto">No conversation selected.</div>';
+      await _teamRefreshSidebar();
+    } catch (e) {
+      alert(e.message);
     }
   }
 
@@ -4686,22 +4955,24 @@
         }
       });
     }
-    // Refresh staff list when Team tab opens, plus every 30s while active
+    // New-group modal wiring
+    const newBtn = document.getElementById('team-new-group-btn');
+    if (newBtn) newBtn.addEventListener('click', _teamOpenGroupCreator);
+    const cancelBtn = document.getElementById('team-group-cancel');
+    if (cancelBtn) cancelBtn.addEventListener('click', () => {
+      document.getElementById('team-group-modal').style.display = 'none';
+    });
+    const saveBtn = document.getElementById('team-group-save');
+    if (saveBtn) saveBtn.addEventListener('click', _teamSaveGroup);
+    const modal = document.getElementById('team-group-modal');
+    if (modal) modal.addEventListener('click', (e) => {
+      if (e.target === modal) modal.style.display = 'none';
+    });
+    // Tab + interval refresh
     const teamTab = document.querySelector('.tab[data-tab="team"]');
-    if (teamTab) teamTab.addEventListener('click', () => _teamRenderStaffList());
-    if (document.getElementById('tab-team')?.classList.contains('active')) {
-      _teamRenderStaffList();
-    }
-    // Also load the badge count on initial page load so user knows there's mail
-    _teamRenderStaffList();
-    setInterval(() => {
-      if (document.getElementById('tab-team')?.classList.contains('active')) {
-        _teamRenderStaffList();
-      } else {
-        // Light refresh just for badge count even when tab inactive
-        _teamRenderStaffList();
-      }
-    }, 30000);
+    if (teamTab) teamTab.addEventListener('click', _teamRefreshSidebar);
+    _teamRefreshSidebar();
+    setInterval(_teamRefreshSidebar, 30000);
   }
   document.addEventListener('DOMContentLoaded', _wireTeamChat);
 

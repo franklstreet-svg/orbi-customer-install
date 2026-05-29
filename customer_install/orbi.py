@@ -1903,10 +1903,13 @@ def internal_messages_list():
     user = auth.require_user(ORBI_DIR, DATA_DIR)
     only_unread = request.args.get("unread") == "1"
     limit = int(request.args.get("limit", "200"))
+    active = [u.get("username") for u in users_mod.list_users(DATA_DIR)]
     return jsonify({
         "messages": mod_imsg.list_for_user(DATA_DIR, user["username"],
-                                            limit=limit, only_unread=only_unread),
-        "unread_count": mod_imsg.unread_count(DATA_DIR, user["username"]),
+                                            limit=limit, only_unread=only_unread,
+                                            active_usernames=active),
+        "unread_count": mod_imsg.unread_count(DATA_DIR, user["username"],
+                                                active_usernames=active),
     })
 
 
@@ -1964,7 +1967,197 @@ def internal_messages_mark_read(msg_id):
 @app.route("/api/owner/internal_messages/mark_all_read", methods=["POST"])
 def internal_messages_mark_all_read():
     user = auth.require_user(ORBI_DIR, DATA_DIR)
-    n = mod_imsg.mark_all_read(DATA_DIR, user["username"])
+    active = [u.get("username") for u in users_mod.list_users(DATA_DIR)]
+    n = mod_imsg.mark_all_read(DATA_DIR, user["username"],
+                                active_usernames=active)
+    return jsonify({"status": "ok", "marked": n})
+
+
+# ── Internal Groups (multi-recipient threads) ──────────────────────────────
+
+def _group_members_or_400(data, key="members"):
+    raw = data.get(key) or []
+    if not isinstance(raw, list):
+        return None, ("members must be a list", 400)
+    members = [(m or "").strip().lower() for m in raw if (m or "").strip()]
+    return members, None
+
+
+@app.route("/api/owner/groups", methods=["GET"])
+def groups_list():
+    """List groups the current user can see. Owner sees all stored groups
+    plus the virtual Whole Team. Staff see only groups they belong to plus
+    Whole Team."""
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    is_owner = user.get("role") == "owner"
+    groups = mod_imsg.list_groups(DATA_DIR,
+                                    for_user=None if is_owner else user["username"])
+    active = users_mod.list_users(DATA_DIR)
+    # Enrich members with display names for the UI
+    by_uname = {u["username"]: u.get("display_name", u["username"])
+                 for u in active}
+    for g in groups:
+        g["member_names"] = [by_uname.get(m, m) for m in g.get("members", [])]
+    # Virtual "Whole Team" — always available, members resolved live
+    all_members = [u["username"] for u in active]
+    all_member_names = [u.get("display_name", u["username"]) for u in active]
+    virtual_all = {
+        "id":           mod_imsg.ALL_GROUP_ID,
+        "name":         mod_imsg.ALL_GROUP_NAME,
+        "members":      all_members,
+        "member_names": all_member_names,
+        "virtual":      True,
+    }
+    return jsonify({"groups": [virtual_all] + groups})
+
+
+@app.route("/api/owner/groups", methods=["POST"])
+def groups_create():
+    """Create a new group. Owner only — they curate groups."""
+    owner_session = auth.require_owner(ORBI_DIR)
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    data = request.get_json(silent=True) or {}
+    name = (data.get("name") or "").strip()
+    members, err = _group_members_or_400(data)
+    if err:
+        return jsonify({"error": err[0]}), err[1]
+    if not name:
+        return jsonify({"error": "name required"}), 400
+    # Ensure all members exist and are active
+    active = {u["username"] for u in users_mod.list_users(DATA_DIR)}
+    bad = [m for m in members if m not in active]
+    if bad:
+        return jsonify({"error": f"unknown or inactive users: {', '.join(bad)}"}), 400
+    try:
+        entry = mod_imsg.create_group(DATA_DIR, name=name, members=members,
+                                       created_by=user["username"])
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    audit.log_event(DATA_DIR, actor=user["username"],
+                    action="group.created",
+                    meta={"group_id": entry["id"], "name": name,
+                          "members": members})
+    return jsonify({"status": "ok", "group": entry})
+
+
+@app.route("/api/owner/groups/<group_id>", methods=["PATCH"])
+def groups_update(group_id: str):
+    """Rename and/or update members. Owner only."""
+    if group_id == mod_imsg.ALL_GROUP_ID:
+        return jsonify({"error": "Whole Team is built-in and can't be edited"}), 400
+    auth.require_owner(ORBI_DIR)
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    data = request.get_json(silent=True) or {}
+    kw = {}
+    if "name" in data:
+        kw["name"] = data["name"]
+    if "members" in data:
+        members, err = _group_members_or_400(data)
+        if err:
+            return jsonify({"error": err[0]}), err[1]
+        kw["members"] = members
+    g = mod_imsg.update_group(DATA_DIR, group_id, **kw)
+    if not g:
+        return jsonify({"error": "group not found"}), 404
+    audit.log_event(DATA_DIR, actor=user["username"],
+                    action="group.updated",
+                    meta={"group_id": group_id, **{k: kw[k] for k in kw}})
+    return jsonify({"status": "ok", "group": g})
+
+
+@app.route("/api/owner/groups/<group_id>", methods=["DELETE"])
+def groups_delete(group_id: str):
+    if group_id == mod_imsg.ALL_GROUP_ID:
+        return jsonify({"error": "Whole Team is built-in and can't be deleted"}), 400
+    auth.require_owner(ORBI_DIR)
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    ok = mod_imsg.delete_group(DATA_DIR, group_id)
+    if ok:
+        audit.log_event(DATA_DIR, actor=user["username"],
+                        action="group.deleted",
+                        meta={"group_id": group_id})
+    return jsonify({"status": "ok" if ok else "not_found"}), 200 if ok else 404
+
+
+@app.route("/api/owner/internal_messages/group_thread/<group_id>",
+            methods=["GET"])
+def internal_messages_group_thread(group_id: str):
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    # Access check
+    if group_id == mod_imsg.ALL_GROUP_ID:
+        active = {u["username"] for u in users_mod.list_users(DATA_DIR)}
+        if user["username"] not in active:
+            return jsonify({"error": "not in group"}), 403
+    else:
+        g = mod_imsg.get_group(DATA_DIR, group_id)
+        if not g:
+            return jsonify({"error": "group not found"}), 404
+        if user["username"] not in set(g.get("members", [])) \
+                and user.get("role") != "owner":
+            return jsonify({"error": "not in group"}), 403
+    return jsonify({
+        "thread": mod_imsg.group_thread(DATA_DIR, group_id, limit=200),
+    })
+
+
+@app.route("/api/owner/internal_messages/group/<group_id>", methods=["POST"])
+def internal_messages_group_send(group_id: str):
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    data = request.get_json(silent=True) or {}
+    body = data.get("body") or ""
+    if not body.strip():
+        return jsonify({"error": "body required"}), 400
+    # Resolve group + permission + member list
+    if group_id == mod_imsg.ALL_GROUP_ID:
+        active = users_mod.list_users(DATA_DIR)
+        if user["username"] not in {u["username"] for u in active}:
+            return jsonify({"error": "not in group"}), 403
+        members = [u["username"] for u in active]
+        group_name = mod_imsg.ALL_GROUP_NAME
+    else:
+        g = mod_imsg.get_group(DATA_DIR, group_id)
+        if not g:
+            return jsonify({"error": "group not found"}), 404
+        members = list(g.get("members", []))
+        if user["username"] not in members and user.get("role") != "owner":
+            return jsonify({"error": "not in group"}), 403
+        # If owner is sending and not a member, still let it through; they
+        # see all groups anyway.
+        if user["username"] not in members:
+            members = members + [user["username"]]
+        group_name = g.get("name") or "Group"
+    try:
+        entry = mod_imsg.send_to_group(
+            DATA_DIR,
+            group_id=group_id, group_name=group_name,
+            member_usernames=members,
+            from_user=user["username"],
+            from_name=user.get("display_name", user["username"]),
+            body=body, via="manual")
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    # Push-notify each member except sender
+    for m in members:
+        if m == user["username"]:
+            continue
+        try:
+            notify.send(CONFIG, DATA_DIR, event="new_message",
+                         title=f"{group_name}: {entry['from_name']}",
+                         body=body[:140], url="/owner#messages")
+        except Exception:
+            pass
+    audit.log_event(DATA_DIR, actor=user["username"],
+                    action="group_msg.sent",
+                    meta={"group_id": group_id, "name": group_name,
+                          "members": len(members)})
+    return jsonify({"status": "ok", "message": entry})
+
+
+@app.route("/api/owner/internal_messages/group_thread/<group_id>/mark_read",
+            methods=["POST"])
+def internal_messages_group_mark_read(group_id: str):
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    n = mod_imsg.mark_group_read(DATA_DIR, group_id, by_user=user["username"])
     return jsonify({"status": "ok", "marked": n})
 
 
