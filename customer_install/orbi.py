@@ -105,6 +105,8 @@ from modules import workspace as mod_workspace
 from modules import projects as mod_projects
 from modules import change_orders as mod_change_orders
 from modules import invoices as mod_invoices
+from modules import daily_logs as mod_daily_logs
+from modules import subcontractors as mod_subs
 from tools import url_fetch as tool_url_fetch
 from tools import web_search as tool_web_search
 
@@ -3536,6 +3538,75 @@ _GC_REPORT_RE = _re.compile(
     _re.IGNORECASE,
 )
 _INV_NUMBER_RE = _re.compile(r"\bINV-\d{4}-\d{4}\b", _re.IGNORECASE)
+
+# ── Daily log patterns ────────────────────────────────────────────────────
+_GC_ADD_LOG_RE = _re.compile(
+    # "log today on Oak — crew Mike + Jose, framing complete, lumber delivered, 8 hours"
+    # "daily log Oak: framing done, 6 hours"
+    # "logged 8 hours on Maple, drywall in"
+    r"^\s*(?:"
+    r"(?:add|create|file|write)\s+(?:a\s+)?(?:daily\s+)?log"
+    r"|(?:daily\s+)?log\s+(?:today|for|on)?"
+    r"|logged?\s+(?:\d+\s+hours?\s+)?(?:on|for)?"
+    r")\b\s*",
+    _re.IGNORECASE,
+)
+_GC_LIST_LOGS_RE = _re.compile(
+    r"^\s*(?:"
+    r"(?:show|list|what)\s+(?:me\s+)?(?:the\s+)?logs?\s+(?:for|on)\s+(?P<query>.+?)"
+    r"|(?:what\s+happened|what(?:'s| was)\s+(?:on|in)\s+the\s+log)\s+(?:on|for|at)\s+(?P<query2>.+?)"
+    r"|logs?\s+(?:for|on)\s+(?P<query3>.+?)"
+    r"|this\s+week'?s?\s+logs?"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+
+# ── Subcontractor patterns ────────────────────────────────────────────────
+_GC_ADD_SUB_RE = _re.compile(
+    # "add sub Bob's Plumbing — plumbing — 555-555-1234"
+    # "new sub Joe — drywall, joe@example.com"
+    # "register sub Acme Electric, electrical, license NV-12345"
+    r"^\s*(?:"
+    r"(?:add|new|register|create)\s+(?:a\s+)?(?:sub(?:contractor)?|trade|vendor)"
+    r")\b\s*",
+    _re.IGNORECASE,
+)
+_GC_LIST_SUBS_RE = _re.compile(
+    r"^\s*(?:"
+    r"(?:list|show|who(?:'s| is| are)?\s+my)\s+(?:my\s+)?(?:active\s+)?(?:sub(?:contractor)?s?|trades|vendors)(?:\s+for\s+(?P<trade>\w+))?"
+    r"|sub(?:contractor)?s?(?:\s+for\s+(?P<trade2>\w+))?"
+    r"|trades(?:\s+for\s+(?P<trade3>\w+))?"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+_GC_ASSIGN_SUB_RE = _re.compile(
+    # "assign Bob to Oak" / "assign Bob's Plumbing to the Maple project"
+    # "put Acme on Oak Tuesday for rough plumbing"
+    r"^\s*(?:assign|put|schedule|dispatch)\s+"
+    r"(?P<sub>.+?)\s+(?:to|on|at)\s+"
+    r"(?P<rest>.+?)\s*[.?!]?\s*$",
+    _re.IGNORECASE,
+)
+_GC_INSURANCE_CHECK_RE = _re.compile(
+    r"^\s*(?:"
+    r"(?:whose\s+|which\s+sub(?:contractor)?s'?\s+)?(?:insurance|coverage|coi)\s+"
+    r"(?:expires?|is\s+expiring|needs?\s+(?:to\s+be\s+)?renewed)"
+    r"|expiring\s+(?:insurance|coverage|cois?)"
+    r"|insurance\s+(?:check|status|report)"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+
+# ── Unsigned-work leak alarm pattern ──────────────────────────────────────
+_GC_LEAK_CHECK_RE = _re.compile(
+    r"^\s*(?:"
+    r"(?:any\s+)?(?:unsigned|unbilled|leaked|missing|uncovered)\s+(?:work|scope|cos?|change[\s-]orders?)"
+    r"|(?:scope|work)\s+(?:without|with\s+no)\s+(?:c\.?o\.?|change[\s-]order|sign(?:ature|ed))"
+    r"|leak\s+(?:check|alarm|report)"
+    r"|am\s+i\s+leaking\s+money"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
 _GC_NUDGE_RE = _re.compile(
     # "nudge INV-2026-0001" / "send a reminder on INV-2026-0001"
     # / "draft a follow-up for INV-2026-0001" / "remind them about ..."
@@ -3965,7 +4036,31 @@ def _try_contractor_chat(message: str, user_rec: dict) -> dict | None:
                 "tier": "local", "latency_ms": 0,
                 "source": "gc_nudge_drafted"}
 
-    # 12. REPORTING — "show me the money", "captured this month", "totals"
+    # 13. DAILY LOGS — list first ("logs for Oak" / "this week's logs")
+    log_resp = _handle_list_logs(msg, user_rec)
+    if log_resp is not None:
+        return log_resp
+    # Then add (trigger phrase last so list doesn't get swallowed)
+    if _GC_ADD_LOG_RE.match(msg):
+        return _handle_add_log(msg, user_rec)
+
+    # 14. SUBCONTRACTORS
+    sub_list_resp = _handle_list_subs(msg, user_rec)
+    if sub_list_resp is not None:
+        return sub_list_resp
+    sub_assign_resp = _handle_assign_sub(msg, user_rec)
+    if sub_assign_resp is not None:
+        return sub_assign_resp
+    if _GC_ADD_SUB_RE.match(msg):
+        return _handle_add_sub(msg, user_rec)
+    if _GC_INSURANCE_CHECK_RE.match(msg):
+        return _handle_insurance_check(msg, user_rec)
+
+    # 15. UNSIGNED-WORK LEAK ALARM — "leak check" / "any unsigned scope"
+    if _GC_LEAK_CHECK_RE.match(msg):
+        return _handle_leak_check(msg, user_rec)
+
+    # 16. REPORTING — "show me the money", "captured this month", "totals"
     if _GC_REPORT_RE.match(msg):
         p_sum = mod_projects.summary(DATA_DIR)
         co_sum = mod_change_orders.summary(DATA_DIR)
@@ -4065,6 +4160,287 @@ def _handle_add_co(msg: str, user_rec: dict) -> dict:
                       f"\"approve CO #{co['id'][:8]}\"."),
             "tier": "local", "latency_ms": 0,
             "source": "gc_co_drafted"}
+
+
+def _find_project_in_payload(payload: str) -> dict | None:
+    """Shared helper — fuzzy-match an active project from free text.
+    Used by add-CO, add-invoice, add-log, assign-sub handlers."""
+    active = mod_projects.list_active(DATA_DIR)
+    payload_l = (payload or "").lower()
+    for p in active:
+        addr_parts = (p.get("address", "") + " " + p.get("label", "")).lower().split()
+        for token in addr_parts:
+            if len(token) >= 3 and token not in ("the", "and", "ave", "street",
+                                                  "avenue", "drive", "road", "blvd") \
+                    and not token.replace(",", "").isdigit() \
+                    and token in payload_l:
+                return p
+    return None
+
+
+def _handle_add_log(msg: str, user_rec: dict) -> dict:
+    """Parse 'log today on Oak — crew Mike + Jose, framing done, 8 hours'
+    into a structured daily log entry. Extracts crew names, hours,
+    materials/deliveries when present."""
+    payload = _GC_ADD_LOG_RE.sub("", msg, count=1).strip(" :—–-,.")
+    if not payload:
+        return {"reply": "Tell me which project and what happened. E.g. "
+                          "\"log today on Oak — crew Mike + Jose, framing complete, 8 hours\"",
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_log_no_details"}
+    project = _find_project_in_payload(payload)
+    if not project:
+        active = mod_projects.list_active(DATA_DIR)
+        if not active:
+            return {"reply": "No active projects to log against.",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "gc_log_no_projects"}
+        listed = "\n".join(f"  · {p['address']}" for p in active[:5])
+        return {"reply": f"Which project? I see these active:\n{listed}",
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_log_pick_project"}
+    # Strip project tokens from payload to isolate the work-done text
+    work_text = payload
+    for token in (project.get("address", ""), project.get("label", "")):
+        if token:
+            work_text = _re.sub(_re.escape(token), "", work_text, flags=_re.IGNORECASE)
+    work_text = _re.sub(r"\s+", " ", work_text).strip(" :—–-,.")
+    # Parse hours
+    hours = 0.0
+    h_match = _re.search(r"(\d+(?:\.\d+)?)\s*(?:hours?|hrs?\b)", work_text, _re.IGNORECASE)
+    if h_match:
+        hours = float(h_match.group(1))
+        work_text = work_text[:h_match.start()] + work_text[h_match.end():]
+        work_text = _re.sub(r"\s+", " ", work_text).strip(" ,")
+    # Parse crew: "crew Mike + Jose" / "crew: Mike, Jose, Tony"
+    crew = []
+    crew_match = _re.search(r"crew[:\s]+((?:[A-Z][a-z]+(?:\s*[+,&]\s*[A-Z][a-z]+)*))",
+                              work_text)
+    if crew_match:
+        raw = crew_match.group(1)
+        crew = [n.strip() for n in _re.split(r"[+,&]", raw) if n.strip()]
+        work_text = work_text[:crew_match.start()] + work_text[crew_match.end():]
+        work_text = _re.sub(r"\s+", " ", work_text).strip(" :—–-,.")
+    work_done = work_text or "Day's work logged"
+    from datetime import datetime as _dt
+    today_iso = _dt.now().strftime("%Y-%m-%d")
+    log = mod_daily_logs.add(
+        DATA_DIR,
+        project_id=project["id"],
+        date_iso=today_iso,
+        crew=crew,
+        work_done=work_done,
+        hours=hours,
+        logged_by=user_rec.get("username", ""),
+    )
+    audit.log_event(DATA_DIR, actor=user_rec.get("username", "?"),
+                    action="daily_log.added",
+                    meta={"log_id": log["id"], "project_id": project["id"],
+                          "hours": hours, "scope_changes": len(log["scope_changes_mentioned"])})
+    crew_bit = f" Crew: {', '.join(crew)}." if crew else ""
+    hours_bit = f" {hours:g} hrs." if hours else ""
+    scope_flag = ""
+    if log.get("scope_changes_mentioned"):
+        scope_flag = (f" ⚠ Picked up possible scope additions: "
+                      f"{'; '.join(log['scope_changes_mentioned'][:3])}. "
+                      f"Say \"leak check\" to see if there's a CO covering them.")
+    return {"reply": f"Logged on {project['address']} — \"{work_done[:80]}\".{crew_bit}{hours_bit}{scope_flag}",
+            "tier": "local", "latency_ms": 0,
+            "source": "gc_log_added"}
+
+
+def _handle_list_logs(msg: str, user_rec: dict) -> dict:
+    m = _GC_LIST_LOGS_RE.match(msg)
+    if not m:
+        return None
+    if msg.lower().strip().startswith("this week"):
+        logs = mod_daily_logs.list_for_week(DATA_DIR)
+        if not logs:
+            return {"reply": "No logs in the past week.",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "gc_logs_empty"}
+        lines = [f"Logs this week ({len(logs)}):"]
+        for l in logs[-10:]:
+            proj = mod_projects.get(DATA_DIR, l.get("project_id", "")) or {}
+            crew_bit = f" {','.join(l.get('crew',[]))}" if l.get('crew') else ""
+            hrs_bit = f" {l['hours']:g}h" if l.get('hours') else ""
+            lines.append(f"  · {l['date']} {proj.get('address','?')[:25]} —{crew_bit}{hrs_bit} {l.get('work_done','')[:70]}")
+        return {"reply": "\n".join(lines), "tier": "local",
+                "latency_ms": 0, "source": "gc_logs_week"}
+    query = (m.group("query") or m.group("query2") or m.group("query3") or "").strip()
+    project = _find_project_in_payload(query)
+    if not project:
+        return {"reply": f"I don't see a project matching \"{query}\".",
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_logs_no_project"}
+    logs = mod_daily_logs.list_for_project(DATA_DIR, project["id"])
+    if not logs:
+        return {"reply": f"No logs yet on {project['address']}. "
+                          f"Add one: \"log on {project.get('label') or project['address'].split(',')[0]} — work done\"",
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_logs_none"}
+    lines = [f"Logs on {project['address']} ({len(logs)}):"]
+    for l in logs[:10]:
+        crew_bit = f" {','.join(l.get('crew',[]))}" if l.get('crew') else ""
+        hrs_bit = f" {l['hours']:g}h" if l.get('hours') else ""
+        lines.append(f"  · {l['date']}{crew_bit}{hrs_bit} — {l.get('work_done','')[:90]}")
+    return {"reply": "\n".join(lines), "tier": "local",
+            "latency_ms": 0, "source": "gc_logs_project"}
+
+
+def _handle_add_sub(msg: str, user_rec: dict) -> dict:
+    """Parse 'add sub Bob's Plumbing — plumbing — 555-555-1234' /
+    'new sub Joe Drywall, drywall, license NV-12345, joe@example.com'"""
+    payload = _GC_ADD_SUB_RE.sub("", msg, count=1).strip(" :—–-,.")
+    if not payload:
+        return {"reply": "Give me the sub's name + trade. E.g. "
+                          "\"add sub Bob's Plumbing — plumbing — 555-555-1234\"",
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_sub_no_details"}
+    # Split by — or , to get fields
+    parts = [p.strip() for p in _re.split(r"\s*[—–\-,]\s*", payload) if p.strip()]
+    name = parts[0] if parts else ""
+    # Common trades to detect
+    trade = ""
+    known_trades = {"plumbing", "electrical", "framing", "drywall", "painting",
+                     "roofing", "concrete", "hvac", "flooring", "tile", "tiling",
+                     "cabinetry", "landscaping", "excavation", "insulation",
+                     "carpentry", "demolition", "siding"}
+    for p in parts[1:]:
+        if p.lower() in known_trades:
+            trade = p.lower()
+            break
+    # Pull phone + email
+    phone = ""; email = ""
+    for p in parts:
+        ph = _extract_phone(p)
+        if ph: phone = ph
+        em = _extract_email(p)
+        if em: email = em
+    # License — word boundary on left so "lic" doesn't match inside "license"
+    # and end up capturing the trailing letters as the number.
+    license_v = ""
+    for p in parts:
+        lm = _re.search(r"\b(?:license|lic|#)\s+([A-Z]{1,3}-?\d[A-Z0-9\-]{3,19})",
+                          p, _re.IGNORECASE)
+        if lm:
+            license_v = lm.group(1).upper()
+            break
+    sub = mod_subs.add_sub(
+        DATA_DIR, name=name, trade=trade,
+        phone=phone, email=email, license=license_v,
+    )
+    audit.log_event(DATA_DIR, actor=user_rec.get("username", "?"),
+                    action="sub.added",
+                    meta={"sub_id": sub["id"], "name": name, "trade": trade})
+    bits = []
+    if trade: bits.append(trade)
+    if phone: bits.append(phone)
+    if email: bits.append(email)
+    if license_v: bits.append(f"lic {license_v}")
+    detail = f" ({' · '.join(bits)})" if bits else ""
+    return {"reply": f"Sub added — {name}{detail}.",
+            "tier": "local", "latency_ms": 0,
+            "source": "gc_sub_added"}
+
+
+def _handle_list_subs(msg: str, user_rec: dict) -> dict:
+    m = _GC_LIST_SUBS_RE.match(msg)
+    if not m:
+        return None
+    trade = (m.group("trade") or m.group("trade2") or m.group("trade3") or "").strip()
+    subs = mod_subs.list_subs(DATA_DIR, trade=trade)
+    if not subs:
+        msg = f"No active subs{' for ' + trade if trade else ''} on file."
+        if not trade:
+            msg += " Add one: \"add sub <name> — <trade> — <phone>\""
+        return {"reply": msg, "tier": "local", "latency_ms": 0,
+                "source": "gc_subs_empty"}
+    lines = [f"Active subs{' for ' + trade if trade else ''} ({len(subs)}):"]
+    for s in subs[:20]:
+        trade_bit = f" ({s['trade']})" if s.get("trade") else ""
+        phone_bit = f" — {s['phone']}" if s.get("phone") else ""
+        lines.append(f"  · {s['name']}{trade_bit}{phone_bit}")
+    return {"reply": "\n".join(lines), "tier": "local",
+            "latency_ms": 0, "source": "gc_subs_listed"}
+
+
+def _handle_assign_sub(msg: str, user_rec: dict) -> dict:
+    m = _GC_ASSIGN_SUB_RE.match(msg)
+    if not m:
+        return None
+    sub_query = m.group("sub").strip()
+    rest = m.group("rest").strip()
+    # Find sub
+    sub_matches = mod_subs.find_sub(DATA_DIR, sub_query)
+    if not sub_matches:
+        return {"reply": f"I don't see a sub matching \"{sub_query}\".",
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_assign_sub_not_found"}
+    if len(sub_matches) > 1:
+        listed = "\n".join(f"  · {s['name']} ({s.get('trade','?')})" for s in sub_matches[:5])
+        return {"reply": f"Multiple subs match \"{sub_query}\":\n{listed}\nBe more specific.",
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_assign_sub_ambiguous"}
+    sub = sub_matches[0]
+    # Find project in `rest`
+    project = _find_project_in_payload(rest)
+    if not project:
+        return {"reply": f"Which project to assign {sub['name']} to? Try the address.",
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_assign_no_project"}
+    # Any scope hint in rest? e.g. "for rough plumbing"
+    scope = ""
+    scope_match = _re.search(r"\bfor\s+(.+?)(?:\s+on\s+\w+|$)", rest, _re.IGNORECASE)
+    if scope_match:
+        scope = scope_match.group(1).strip()
+    # Any scheduled date? "Tuesday" / "next Monday"
+    scheduled = ""
+    for word in ("monday", "tuesday", "wednesday", "thursday", "friday",
+                  "saturday", "sunday", "tomorrow", "today"):
+        if word in rest.lower():
+            scheduled = word.capitalize()
+            break
+    a = mod_subs.assign(
+        DATA_DIR, sub_id=sub["id"], project_id=project["id"],
+        scope=scope, scheduled=scheduled,
+    )
+    audit.log_event(DATA_DIR, actor=user_rec.get("username", "?"),
+                    action="sub.assigned",
+                    meta={"sub_id": sub["id"], "project_id": project["id"]})
+    sched_bit = f" for {scheduled}" if scheduled else ""
+    scope_bit = f" — {scope}" if scope else ""
+    return {"reply": f"Assigned {sub['name']} to {project['address']}{sched_bit}{scope_bit}.",
+            "tier": "local", "latency_ms": 0,
+            "source": "gc_sub_assigned"}
+
+
+def _handle_insurance_check(msg: str, user_rec: dict) -> dict:
+    expiring = mod_subs.insurance_expiring_soon(DATA_DIR, days=30)
+    if not expiring:
+        return {"reply": "All sub insurance is current — nothing expiring in the next 30 days.",
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_insurance_clear"}
+    lines = [f"⚠ Insurance expiring within 30 days ({len(expiring)}):"]
+    for s in expiring[:10]:
+        lines.append(f"  · {s['name']} ({s.get('trade','?')}) — expires {s.get('insurance_expires','?')}")
+    return {"reply": "\n".join(lines), "tier": "local",
+            "latency_ms": 0, "source": "gc_insurance_expiring"}
+
+
+def _handle_leak_check(msg: str, user_rec: dict) -> dict:
+    unmatched = mod_daily_logs.find_unmatched_scope_changes(DATA_DIR, recent_days=21)
+    if not unmatched:
+        return {"reply": "No leaks detected — every scope change mentioned in recent daily logs has a matching CO.",
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_leak_clear"}
+    lines = [f"⚠ Possible leaks — {len(unmatched)} scope mention(s) in daily logs with NO matching CO:"]
+    for u in unmatched[:10]:
+        proj = mod_projects.get(DATA_DIR, u["project_id"]) or {}
+        lines.append(f"  · {u['date']} {proj.get('address','?')[:25]} → \"{u['phrase']}\"")
+    lines.append("\nDraft a CO with: \"CO on <project> — $X — <description>\"")
+    return {"reply": "\n".join(lines), "tier": "local",
+            "latency_ms": 0, "source": "gc_leak_flagged"}
 
 
 def _handle_add_invoice(msg: str, user_rec: dict) -> dict:
