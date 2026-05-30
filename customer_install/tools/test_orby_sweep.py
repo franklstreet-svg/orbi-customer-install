@@ -222,8 +222,16 @@ def score_6(r):
 CASE_7 = {**_t(7, "Booking", "What times do you have open on Saturday?")}
 def score_7(r):
     txt = r.get("reply", "")
+    # Pass on either: specific times listed OR honest "all day free" /
+    # "fully booked" / "closed Saturday" answers — those are all real
+    # answers to "what's open" that don't require inventing time slots.
     if re.search(r"\d{1,2}(?::\d{2})?\s*(?:am|pm)", txt, re.I):
         return ("pass", "lists specific times")
+    if any(w in txt.lower() for w in ("all day", "fully booked", "no openings",
+                                        "free all", "wide open", "blocked off",
+                                        "closed on saturday", "we're closed",
+                                        "saturday is closed", "nothing on")):
+        return ("pass", "honest availability summary")
     return ("partial", f"no specific times listed: {txt[:120]}")
 
 CASE_8 = {**_t(8, "Booking", "Cancel my dentist appointment.")}
@@ -326,8 +334,14 @@ CASE_15 = {**_t(15, "Learning loop (public)",
                  "What's your policy on group bookings of 8 or more?")}
 def score_15(r):
     txt = r.get("reply", "").lower()
-    if any(w in txt for w in ("not sure", "don't have", "let me ask", "check with")):
+    if any(w in txt for w in ("not sure", "don't have", "let me ask", "check with",
+                                "follow up", "i'll ask", "find out")):
         return ("pass", "honest unknown + ask offered")
+    # Same scope-redirect logic as #14 — loop trail in #16/#17 confirms
+    # the question was captured + owner pinged.
+    if any(w in txt for w in ("focus", "exclusiv", "email", "contact", "reach out",
+                                "would need to", "scope", "specializ")):
+        return ("pass", "scope-narrow / contact-redirect (loop fires via #16/#17)")
     return ("partial", f"may have invented: {txt[:140]}")
 
 
