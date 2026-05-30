@@ -4720,6 +4720,15 @@ _GC_NUDGE_ALL_RE = _re.compile(
     r")\s*[?.!]?\s*$",
     _re.IGNORECASE,
 )
+_GC_HELP_RE = _re.compile(
+    r"^\s*(?:"
+    r"(?:help|commands?|what\s+can\s+(?:you|i)\s+do)"
+    r"|(?:what|which|list)\s+(?:the\s+)?(?:contractor\s+)?commands?"
+    r"|(?:contractor|gc)\s+(?:help|commands?|cheat[\s-]sheet)"
+    r"|cheat[\s-]sheet"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
 _GC_RUN_SWEEP_RE = _re.compile(
     r"^\s*(?:"
     r"(?:run|trigger|do)\s+(?:the\s+)?(?:receivables?|nudge|followup|follow[\s-]up)\s+(?:sweep|check|scan)"
@@ -5145,6 +5154,12 @@ def _try_contractor_chat(message: str, user_rec: dict) -> dict | None:
     # 11. RECORD PAYMENT — "Sarah paid $3000 on INV-2026-0001"
     if _GC_RECORD_PAYMENT_RE.match(msg):
         return _handle_record_payment(msg, user_rec)
+
+    # HELP — discoverability of the 40+ contractor chat intents
+    if _GC_HELP_RE.match(msg):
+        return {"reply": _gc_help_text(),
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_help"}
 
     # 11. RUN SWEEP MANUALLY (mostly for demos; the daemon runs every 6h)
     if _GC_RUN_SWEEP_RE.match(msg):
@@ -5870,6 +5885,71 @@ def _handle_project_full_report(msg: str, user_rec: dict) -> dict | None:
             lines.append(f"  · {l['date']}{crew_bit}{hrs_bit} {l.get('work_done','')[:70]}")
     return {"reply": "\n".join(lines), "tier": "local",
             "latency_ms": 0, "source": "gc_project_report"}
+
+
+def _gc_help_text() -> str:
+    """Single source of truth for the contractor module command list.
+    Update here when you add a new intent. Grouped by what the GC is
+    trying to do, not by code layout."""
+    return """Contractor Orby — commands cheat sheet
+
+📋 PROJECTS
+  · new project at 555 Oak — $24k bathroom remodel
+  · what jobs are open
+  · status of the Oak project
+  · full report on Oak  (the deep dive: money + COs + invoices + subs + logs)
+  · mark Oak complete
+
+📝 CHANGE ORDERS
+  · CO on the Oak project — $1200 extra trim work
+  · pending COs                       (queue + things awaiting signature)
+  · approve CO #abcd1234
+  · send CO #abcd1234 to client       (mints signing URL for the homeowner)
+  · leak check                        (work in daily logs with no covering CO)
+
+🧾 INVOICING & PAYMENTS
+  · send invoice for Oak — $5000 progress draw 1
+  · who owes me money / receivables
+  · aging report
+  · received $3000 on INV-2026-0001
+  · PDF INV-2026-0001                 (downloadable PDF invoice)
+
+💰 RECEIVABLES NUDGES
+  · nudge INV-2026-0001               (draft polite reminder)
+  · draft all overdue reminders
+  · show queued reminders / send queued reminders
+                                       (daemon also auto-drafts every 6h)
+
+📊 BIDS & WIN/LOSS
+  · sent bid for Sarah Johnson at 123 Maple — $48,500 kitchen remodel
+  · open bids
+  · Sarah won the kitchen bid          (auto-creates the project!)
+  · Jennifer passed on the bathroom — went with someone cheaper
+  · win rate / bid report
+
+🎯 CLIENT-FACING
+  · share Oak with the client          (permanent portal URL)
+  · review link for Birch              (1-click rating after closeout)
+  · my rating / review summary
+  · closeout for Birch                 (PDF package + auto review link)
+
+📓 FIELD OPS
+  · log today on Oak — crew Mike + Jose, framing complete, 8 hours
+  · logs for Oak / this week's logs
+
+👷 SUBCONTRACTORS
+  · add sub Bob's Plumbing — plumbing — 555-555-1234
+  · subs / subs for plumbing
+  · assign Bob to Oak Tuesday for rough plumbing
+  · what's Bob working on
+  · whose insurance is expiring
+
+📈 REPORTING
+  · morning brief                     (real-time daily picture)
+  · weekly recap                      (Friday afternoon debrief)
+  · show me the money                 (full money report)
+
+💡 Type "help" any time to see this list again."""
 
 
 def _handle_review_link(msg: str, user_rec: dict) -> dict | None:
