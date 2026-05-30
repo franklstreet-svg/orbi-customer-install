@@ -109,6 +109,7 @@ from modules import daily_logs as mod_daily_logs
 from modules import subcontractors as mod_subs
 from modules import invoice_pdf as mod_invoice_pdf
 from modules import closeout_pdf as mod_closeout_pdf
+from modules import bids as mod_bids
 from tools import url_fetch as tool_url_fetch
 from tools import web_search as tool_web_search
 
@@ -334,16 +335,90 @@ def _save_pending_followups(items: list[dict]) -> None:
 
 
 def receivables_followup_loop():
-    """Sleep, then run a sweep every RECEIVABLES_FOLLOWUP_CHECK_INTERVAL.
-    The sweep itself is cheap (handful of file reads, only fires for
-    enabled installs)."""
+    """Sleep, then run both sweeps (invoices + bids) every
+    RECEIVABLES_FOLLOWUP_CHECK_INTERVAL. The sweeps themselves are
+    cheap (handful of file reads, only fire for enabled installs)."""
     time.sleep(45)   # wait for app to settle
     while True:
         try:
             _receivables_followup_sweep()
         except Exception as e:
             log.warning(f"receivables follow-up sweep error: {e}")
+        try:
+            _bid_followup_sweep()
+        except Exception as e:
+            log.warning(f"bid follow-up sweep error: {e}")
         time.sleep(RECEIVABLES_FOLLOWUP_CHECK_INTERVAL)
+
+
+def _bid_followup_sweep() -> int:
+    """Sister of _receivables_followup_sweep — drafts polite check-in
+    nudges for bids that have been quiet 7+ days. Returns count drafted.
+    Same pattern: queue in pending_followups.json, GC reviews + sends."""
+    if not is_module_enabled("contractor"):
+        return 0
+    stale = mod_bids.open_needing_follow_up(DATA_DIR, days=7)
+    if not stale:
+        return 0
+    now_ts = int(time.time())
+    pending = _load_pending_followups()
+    pending_bid_ids = {p.get("bid_id") for p in pending
+                        if not p.get("sent_at") and p.get("bid_id")}
+    drafted = 0
+    biz_name = (CONFIG.get("business") or {}).get("name", "your contractor")
+    for b in stale:
+        if b["id"] in pending_bid_ids:
+            continue
+        count = int(b.get("follow_up_count", 0))
+        # Tone tiers: 1 friendly check-in, 2 firmer ask, 3+ "last call"
+        tier = min(3, count + 1)
+        if tier == 1:
+            text = (f"Hi {b['customer_name']},\n\n"
+                     f"Just checking in on the bid I sent for "
+                     f"{b.get('project_type') or 'your project'}"
+                     f"{(' at ' + b['project_address']) if b.get('project_address') else ''}. "
+                     f"No rush — just want to make sure it didn't get lost. "
+                     f"If you have questions, I'm happy to walk through anything.\n\n"
+                     f"Thanks,\n{biz_name}")
+        elif tier == 2:
+            text = (f"Hi {b['customer_name']},\n\n"
+                     f"Following up on the {b.get('project_type') or 'project'} "
+                     f"bid I sent. Could you let me know either way? If you're "
+                     f"leaning a different direction I get it — would just love "
+                     f"to free up the calendar slot if it's not us.\n\n"
+                     f"Either way, thanks for the chance to bid.\n{biz_name}")
+        else:
+            text = (f"{b['customer_name']},\n\n"
+                     f"Closing out my files — should I keep your bid open or "
+                     f"mark it as gone elsewhere? Either way is fine; "
+                     f"I just want to clean up the pipeline.\n\n"
+                     f"{biz_name}")
+        pending.append({
+            "id":              uuid.uuid4().hex[:10],
+            "bid_id":          b["id"],
+            "customer_name":   b["customer_name"],
+            "customer_email":  b.get("customer_email", ""),
+            "customer_phone":  b.get("customer_phone", ""),
+            "amount":          float(b.get("amount") or 0),
+            "tier":            tier,
+            "kind":            "bid_followup",
+            "drafted_text":    text,
+            "drafted_at":      now_ts,
+            "sent_at":         None,
+            "sent_via":        "",
+        })
+        mod_bids.mark_followed_up(DATA_DIR, b["id"])
+        try:
+            audit.log_event(DATA_DIR, actor="scheduler",
+                            action="bid.nudge_auto_drafted",
+                            meta={"bid_id": b["id"], "tier": tier})
+        except Exception:
+            pass
+        drafted += 1
+    if drafted:
+        _save_pending_followups(pending)
+        log.info(f"bid sweep drafted {drafted} nudge(s)")
+    return drafted
 
 
 def _receivables_followup_sweep() -> int:
@@ -4125,6 +4200,44 @@ _GC_INSURANCE_CHECK_RE = _re.compile(
 )
 
 # ── Unsigned-work leak alarm pattern ──────────────────────────────────────
+_GC_ADD_BID_RE = _re.compile(
+    # "sent bid for Sarah Johnson at 123 Maple — $48,500 kitchen remodel"
+    # "logged bid $24k Tom Anderson deck Sparks"
+    # "bid sent Maria Garcia $8,800 whole-home repaint"
+    r"^\s*(?:"
+    r"(?:sent|logged|recorded|new)\s+(?:a\s+)?bid"
+    r"|bid\s+(?:sent|added|recorded)"
+    r")\b\s*",
+    _re.IGNORECASE,
+)
+_GC_LIST_BIDS_RE = _re.compile(
+    r"^\s*(?:"
+    r"(?:what|list|show)\s+(?:me\s+)?(?:my\s+)?(?:open|outstanding|pending|active)\s+bids?"
+    r"|(?:open|outstanding|pending)\s+bids?"
+    r"|bids?\s+(?:open|outstanding|out|pending)"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+_GC_BID_WON_RE = _re.compile(
+    r"^\s*(?P<who>.+?)\s+(?:won|signed|accepted|took|chose|hired)\s+(?:the\s+|us\s+(?:on\s+)?(?:the\s+)?)?"
+    r"(?P<what>.+?)?\s*(?:bid|estimate|proposal|job)?\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+_GC_BID_LOST_RE = _re.compile(
+    r"^\s*(?:"
+    r"(?P<who>.+?)\s+(?:lost|passed\s+on|declined|went\s+with|hired\s+someone\s+else)\s+(?:on\s+)?(?:the\s+)?(?P<what>.+?)?"
+    r"|lost\s+(?:the\s+)?(?P<who2>.+?)\s+bid"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+_GC_BID_REPORT_RE = _re.compile(
+    r"^\s*(?:"
+    r"(?:bid|win[/\s]*loss|win[/\s]*rate)\s+(?:report|stats?|summary)"
+    r"|what'?s?\s+my\s+(?:win[/\s]*rate|conversion)"
+    r"|how\s+(?:many\s+)?bids?\s+(?:have\s+i\s+)?won"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
 _GC_CLOSEOUT_RE = _re.compile(
     r"^\s*(?:"
     r"(?:generate|create|build|make|send)\s+(?:the\s+)?closeout"
@@ -4807,6 +4920,23 @@ def _try_contractor_chat(message: str, user_rec: dict) -> dict | None:
     if close_resp is not None:
         return close_resp
 
+    # 15g. BIDS — list / report first (specific patterns), then won/lost,
+    # then add (trigger phrase last so it doesn't shadow list/report).
+    bid_list_resp = _handle_list_bids(msg, user_rec)
+    if bid_list_resp is not None:
+        return bid_list_resp
+    bid_report_resp = _handle_bid_report(msg, user_rec)
+    if bid_report_resp is not None:
+        return bid_report_resp
+    bid_won_resp = _handle_bid_won(msg, user_rec)
+    if bid_won_resp is not None:
+        return bid_won_resp
+    bid_lost_resp = _handle_bid_lost(msg, user_rec)
+    if bid_lost_resp is not None:
+        return bid_lost_resp
+    if _GC_ADD_BID_RE.match(msg):
+        return _handle_add_bid(msg, user_rec)
+
     # 16. REPORTING — "show me the money", "captured this month", "totals"
     if _GC_REPORT_RE.match(msg):
         p_sum = mod_projects.summary(DATA_DIR)
@@ -5332,6 +5462,201 @@ def _handle_project_full_report(msg: str, user_rec: dict) -> dict | None:
             lines.append(f"  · {l['date']}{crew_bit}{hrs_bit} {l.get('work_done','')[:70]}")
     return {"reply": "\n".join(lines), "tier": "local",
             "latency_ms": 0, "source": "gc_project_report"}
+
+
+def _handle_add_bid(msg: str, user_rec: dict) -> dict:
+    """Parse 'sent bid for Sarah Johnson at 123 Maple — $48,500 kitchen
+    remodel'. Loose parsing — looks for a person name, dollar amount,
+    optional project type + address."""
+    payload = _GC_ADD_BID_RE.sub("", msg, count=1).strip(" :—–,.")
+    if not payload:
+        return {"reply": "Tell me who, what, how much. E.g. \"sent bid for "
+                          "Sarah Johnson at 123 Maple — $48,500 kitchen remodel\".",
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_bid_no_details"}
+    amount = _parse_money(payload)
+    if not amount:
+        return {"reply": "I need a dollar amount. E.g. \"$48,500\".",
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_bid_no_amount"}
+    # Customer name = first capitalized 1-3 word run we find (excluding
+    # the dollar amount + addresses with numbers).
+    cust_match = _re.search(
+        r"(?:for|to)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})",
+        payload)
+    customer_name = cust_match.group(1) if cust_match else ""
+    if not customer_name:
+        # Fallback: first capitalized phrase
+        nm = _re.search(r"\b([A-Z][a-z]{1,15}(?:\s+[A-Z][a-z]{1,15}){0,2})\b",
+                         payload)
+        if nm:
+            candidate = nm.group(1)
+            if candidate.lower() not in {"kitchen", "bathroom", "deck",
+                                          "garage", "whole", "house",
+                                          "addition", "remodel"}:
+                customer_name = candidate
+    if not customer_name:
+        return {"reply": "I couldn't pick up the customer's name. Try "
+                          "\"sent bid for FirstName LastName ...\".",
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_bid_no_name"}
+    # Project address — look for street-number patterns
+    addr_match = _re.search(
+        r"\b(\d{1,5}\s+[A-Za-z][A-Za-z\s\.]{2,40}"
+        r"(?:Street|St|Avenue|Ave|Drive|Dr|Road|Rd|Lane|Ln|Court|Ct|Blvd|Way))",
+        payload)
+    project_address = addr_match.group(1).strip() if addr_match else ""
+    # Project type — common keywords
+    type_match = _re.search(
+        r"\b(kitchen|bathroom|bath|deck|garage|whole[\s-]home|addition|"
+        r"basement|attic|patio|fence|pool|driveway|roof(?:ing)?|"
+        r"siding|painting?|remodel|renovation)\b\s*(?:remodel|renovation|build|repaint|conversion)?",
+        payload, _re.IGNORECASE)
+    project_type = ""
+    if type_match:
+        project_type = type_match.group(0).title()
+    # Phone + email
+    phone = _extract_phone(payload) or ""
+    email = _extract_email(payload) or ""
+    bid = mod_bids.add(
+        DATA_DIR,
+        customer_name=customer_name,
+        customer_phone=phone,
+        customer_email=email,
+        project_address=project_address,
+        project_type=project_type,
+        amount=amount,
+        status="sent",
+    )
+    audit.log_event(DATA_DIR, actor=user_rec.get("username", "?"),
+                    action="bid.created",
+                    meta={"bid_id": bid["id"], "customer": customer_name,
+                          "amount": amount})
+    bits = []
+    if project_type: bits.append(project_type)
+    if project_address: bits.append(project_address)
+    detail = f" ({' · '.join(bits)})" if bits else ""
+    return {"reply": f"Bid logged — {customer_name}{detail}: ${amount:,.0f}. "
+                      f"I'll surface a follow-up nudge if it goes silent for "
+                      f"7+ days.",
+            "tier": "local", "latency_ms": 0,
+            "source": "gc_bid_added"}
+
+
+def _handle_list_bids(msg: str, user_rec: dict) -> dict | None:
+    if not _GC_LIST_BIDS_RE.match(msg):
+        return None
+    open_bids = mod_bids.list_open(DATA_DIR)
+    if not open_bids:
+        return {"reply": "No open bids on the books. Log one with "
+                          "\"sent bid for [Name] — $[amount] [project type]\".",
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_bids_empty"}
+    open_bids.sort(key=lambda b: b.get("sent_at") or b.get("created_at", 0))
+    total = sum(float(b.get("amount") or 0) for b in open_bids)
+    lines = [f"Open bids ({len(open_bids)}, total ${total:,.0f}):"]
+    from datetime import datetime as _dt
+    now_ts = int(time.time())
+    for b in open_bids[:15]:
+        age_days = (now_ts - int(b.get("sent_at") or b.get("created_at", now_ts))) // 86400
+        age_str = f"{age_days}d ago" if age_days > 0 else "today"
+        last_nudge = b.get("last_followup_at")
+        nudge_bit = ""
+        if last_nudge:
+            since_nudge = (now_ts - int(last_nudge)) // 86400
+            nudge_bit = f" [nudged {since_nudge}d ago]"
+        elif age_days >= 7:
+            nudge_bit = " ⏰ overdue for follow-up"
+        type_bit = f" {b.get('project_type','')}" if b.get("project_type") else ""
+        lines.append(f"  · {b['customer_name']}{type_bit} ${b.get('amount',0):,.0f} ({age_str}){nudge_bit}")
+    return {"reply": "\n".join(lines), "tier": "local",
+            "latency_ms": 0, "source": "gc_bids_listed"}
+
+
+def _handle_bid_won(msg: str, user_rec: dict) -> dict | None:
+    m = _GC_BID_WON_RE.match(msg)
+    if not m:
+        return None
+    who = (m.group("who") or "").strip()
+    if not who or who.lower() in {"i", "we", "they"}:
+        return None
+    matches = mod_bids.find_by_customer(DATA_DIR, who)
+    open_matches = [b for b in matches if b.get("status") == "sent"]
+    if not open_matches:
+        return None  # Let LLM handle — might not be a bid event at all
+    if len(open_matches) > 1:
+        listed = "\n".join(f"  · {b['customer_name']} — {b.get('project_type','')} ${b.get('amount',0):,.0f}"
+                            for b in open_matches[:5])
+        return {"reply": f"Multiple open bids match \"{who}\":\n{listed}\nBe more specific.",
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_bid_won_ambiguous"}
+    b = open_matches[0]
+    mod_bids.mark_won(DATA_DIR, b["id"])
+    audit.log_event(DATA_DIR, actor=user_rec.get("username", "?"),
+                    action="bid.won",
+                    meta={"bid_id": b["id"], "amount": b.get("amount")})
+    return {"reply": (f"🎉 Marked bid as WON — {b['customer_name']} "
+                      f"({b.get('project_type','')}) ${b.get('amount',0):,.0f}. "
+                      f"Add the project with \"new project at {b.get('project_address') or '<address>'} "
+                      f"— ${b.get('amount',0):,.0f} {b.get('project_type','')}\""),
+            "tier": "local", "latency_ms": 0,
+            "source": "gc_bid_won"}
+
+
+def _handle_bid_lost(msg: str, user_rec: dict) -> dict | None:
+    m = _GC_BID_LOST_RE.match(msg)
+    if not m:
+        return None
+    who = (m.group("who") or m.group("who2") or "").strip()
+    if not who:
+        return None
+    matches = mod_bids.find_by_customer(DATA_DIR, who)
+    open_matches = [b for b in matches if b.get("status") == "sent"]
+    if not open_matches:
+        return None
+    if len(open_matches) > 1:
+        return {"reply": f"Multiple open bids match \"{who}\" — say more.",
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_bid_lost_ambiguous"}
+    b = open_matches[0]
+    # Try to extract reason from the message tail
+    reason = ""
+    reason_match = _re.search(r"(?:went\s+with|hired\s+someone\s+else|because)\s+(.+)",
+                                msg, _re.IGNORECASE)
+    if reason_match:
+        reason = reason_match.group(1).strip().rstrip(".")
+    mod_bids.mark_lost(DATA_DIR, b["id"], reason=reason)
+    audit.log_event(DATA_DIR, actor=user_rec.get("username", "?"),
+                    action="bid.lost",
+                    meta={"bid_id": b["id"], "amount": b.get("amount"),
+                          "reason": reason})
+    reason_bit = f" — \"{reason}\"" if reason else ""
+    return {"reply": f"Marked bid as lost — {b['customer_name']} "
+                      f"${b.get('amount',0):,.0f}{reason_bit}. Win/loss recorded.",
+            "tier": "local", "latency_ms": 0,
+            "source": "gc_bid_lost"}
+
+
+def _handle_bid_report(msg: str, user_rec: dict) -> dict | None:
+    if not _GC_BID_REPORT_RE.match(msg):
+        return None
+    s = mod_bids.summary(DATA_DIR)
+    if not (s["open_count"] or s["won_count"] or s["lost_count"]):
+        return {"reply": "No bid history yet. Log your first with "
+                          "\"sent bid for [Name] — $[amount] [project type]\".",
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_bid_report_empty"}
+    lines = [
+        "📊 Bid pipeline:",
+        f"  Open:   {s['open_count']:>3} bids  ${s['open_value']:,.0f} potential",
+        f"  Won:    {s['won_count']:>3} bids  ${s['won_value']:,.0f} captured",
+        f"  Lost:   {s['lost_count']:>3} bids  ${s['lost_value']:,.0f} missed",
+        "",
+        f"  Win rate: {s['win_rate_pct']:.1f}%",
+        f"  Avg won:  ${s['avg_won_amount']:,.0f}",
+    ]
+    return {"reply": "\n".join(lines), "tier": "local",
+            "latency_ms": 0, "source": "gc_bid_report"}
 
 
 def _handle_closeout_pdf(msg: str, user_rec: dict) -> dict | None:
