@@ -4270,11 +4270,16 @@ def _try_onboarding(message: str, user_rec: dict) -> dict | None:
     state = _load_onboarding_state()
     if state.get("complete"):
         return None
-    step_idx = int(state.get("step", 0))
+    step_idx = int(state.get("step", -1))
     collected = state.get("collected") or {}
-    # If this is the very first message, ignore content + ask first question
-    if step_idx == 0 and not collected:
-        first_key, first_q = ONBOARDING_STEPS[0]
+    # First-ever message: greet + ask question #0, bump state to "waiting
+    # for answer to step 0". Next call sees step 0 + waiting → saves the
+    # answer there + advances.
+    if step_idx < 0:
+        state["step"] = 0
+        state["collected"] = {}
+        _save_onboarding_state(state)
+        first_q = ONBOARDING_STEPS[0][1]
         return {"reply": ("👋 Welcome! Quick setup before we take any calls — "
                           "5 questions, 60 seconds.\n\n"
                           f"{first_q}"),
