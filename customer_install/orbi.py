@@ -699,6 +699,181 @@ def list_voices():
         ],
     })
 
+def _esc(s) -> str:
+    """HTML-escape for the few inline templates we render server-side
+    (CO signing page, etc.). Returns empty string for None."""
+    import html as _html
+    return _html.escape("" if s is None else str(s), quote=True)
+
+
+# ── Public Change-Order signing flow ──────────────────────────────────────
+# A client receives a link like /co/sign/<token> in an email. Clicking it
+# shows the CO document; signing posts the typed-name signature back here.
+# On signature, the CO status becomes "signed", the project total
+# updates, and the office is notified.
+
+def _load_co_sign_tokens() -> dict:
+    p = DATA_DIR / "co_sign_tokens.json"
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_co_sign_tokens(tokens: dict) -> None:
+    p = DATA_DIR / "co_sign_tokens.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(tokens, indent=2), encoding="utf-8")
+    tmp.replace(p)
+
+
+def _validate_co_token(token: str) -> tuple[dict | None, str]:
+    """Returns (co, reason). co is None if invalid; reason explains why."""
+    if not token:
+        return None, "missing token"
+    tokens = _load_co_sign_tokens()
+    rec = tokens.get(token)
+    if not rec:
+        return None, "this signing link is not valid or has been retired"
+    if rec.get("used_at"):
+        return None, "this signing link has already been used"
+    if int(time.time()) > int(rec.get("expires_at", 0)):
+        return None, "this signing link has expired"
+    co = mod_change_orders.get(DATA_DIR, rec.get("co_id", ""))
+    if not co:
+        return None, "the change order linked to this signature is no longer available"
+    return co, ""
+
+
+@app.route("/co/sign/<token>", methods=["GET"])
+def co_sign_view(token):
+    """Public-facing signing page. Renders the CO text + a signature
+    field. No auth — token is the credential."""
+    co, err = _validate_co_token(token)
+    if not co:
+        return _render_co_sign_error(err), 410 if "expired" in err else 404
+    project = mod_projects.get(DATA_DIR, co.get("project_id", "")) or {}
+    return _render_co_sign_page(token, co, project)
+
+
+@app.route("/co/sign/<token>", methods=["POST"])
+def co_sign_submit(token):
+    """The signer typed their name + clicked Sign. Validate, record,
+    mark the CO signed, notify the office, retire the token."""
+    co, err = _validate_co_token(token)
+    if not co:
+        return _render_co_sign_error(err), 410 if "expired" in err else 404
+    typed_name = (request.form.get("typed_name") or "").strip()
+    if not typed_name or len(typed_name) < 3:
+        project = mod_projects.get(DATA_DIR, co.get("project_id", "")) or {}
+        return _render_co_sign_page(token, co, project,
+                                       error="Please type your full name to sign."), 400
+    # Record the signature on the CO
+    mod_change_orders.mark_signed(DATA_DIR, co["id"], signer_name=typed_name)
+    # Retire the token (single-use)
+    tokens = _load_co_sign_tokens()
+    if token in tokens:
+        tokens[token]["used_at"] = int(time.time())
+        tokens[token]["signed_by"] = typed_name
+        tokens[token]["signer_ip"] = request.headers.get("X-Forwarded-For",
+                                                           request.remote_addr or "")
+        _save_co_sign_tokens(tokens)
+    # Notify the GC's office
+    project = mod_projects.get(DATA_DIR, co.get("project_id", "")) or {}
+    try:
+        amount = float(co.get("amount") or 0)
+        sign = "+" if amount >= 0 else ""
+        notify.send(CONFIG, DATA_DIR, event="co_signed",
+                     title=f"CO signed — {project.get('address', '?')}",
+                     body=f"{typed_name} signed CO #{co['id'][:8]} ({sign}${amount:,.0f}). "
+                          f"{co.get('description','')[:80]}",
+                     url="/owner#projects")
+    except Exception:
+        log.exception("co_signed notify failed")
+    audit.log_event(DATA_DIR, actor=typed_name,
+                    action="co.signed",
+                    meta={"co_id": co["id"], "project_id": co.get("project_id"),
+                          "amount": co.get("amount"), "signer_ip": request.headers.get("X-Forwarded-For", request.remote_addr or "")})
+    return _render_co_sign_thanks(co, project, typed_name)
+
+
+def _render_co_sign_page(token: str, co: dict, project: dict,
+                          error: str = "") -> str:
+    biz_name = (CONFIG.get("business") or {}).get("name", "Your contractor")
+    draft = co.get("draft_text") or ""
+    err_block = f'<div style="background:#5a1f1f;color:#ffcfcf;padding:10px 12px;border-radius:6px;margin-bottom:14px">{_esc(error)}</div>' if error else ""
+    return f"""<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign Change Order — {_esc(biz_name)}</title>
+<style>
+body {{ font-family: -apple-system, system-ui, sans-serif; background: #0e1422; color: #eaf0ff; margin: 0; padding: 20px; }}
+.card {{ max-width: 720px; margin: 24px auto; background: #1a2240; border-radius: 14px; padding: 28px; }}
+h1 {{ margin: 0 0 4px; font-size: 22px; }}
+.from {{ color: #9aa4c0; font-size: 14px; margin-bottom: 18px; }}
+.doc {{ background: #0e1730; padding: 18px; border-radius: 8px; font-family: ui-monospace, "SF Mono", monospace; font-size: 13px; white-space: pre-wrap; line-height: 1.5; margin-bottom: 18px; max-height: 460px; overflow-y: auto; }}
+label {{ display: block; font-weight: 600; margin-bottom: 6px; }}
+input[type="text"] {{ width: 100%; padding: 12px 14px; background: #0e1730; border: 1px solid #2c3756; color: #eaf0ff; border-radius: 8px; font-size: 18px; font-family: 'Brush Script MT', cursive; box-sizing: border-box; }}
+button {{ width: 100%; padding: 14px; background: #8b5cf6; color: white; border: none; border-radius: 8px; font-size: 16px; font-weight: 700; cursor: pointer; margin-top: 14px; }}
+button:hover {{ background: #7c4ef0; }}
+.fine {{ color: #6c7592; font-size: 12px; margin-top: 16px; line-height: 1.5; }}
+</style></head><body>
+<div class="card">
+  <h1>Change Order — Sign Here</h1>
+  <div class="from">From {_esc(biz_name)} • Project: {_esc(project.get('address',''))}</div>
+  {err_block}
+  <div class="doc">{_esc(draft)}</div>
+  <form method="POST">
+    <label for="typed_name">Type your full name to sign:</label>
+    <input type="text" id="typed_name" name="typed_name" autocomplete="name"
+            placeholder="Your full name" required minlength="3">
+    <button type="submit">I Agree &amp; Sign</button>
+    <div class="fine">By typing your name and clicking the button, you are signing this change order electronically and agreeing to its terms. We record your name, the time you signed, and your IP address as proof.</div>
+  </form>
+</div>
+</body></html>"""
+
+
+def _render_co_sign_thanks(co: dict, project: dict, signer: str) -> str:
+    biz_name = (CONFIG.get("business") or {}).get("name", "Your contractor")
+    amount = float(co.get("amount") or 0)
+    return f"""<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Signed — Thank you</title>
+<style>
+body {{ font-family: -apple-system, system-ui, sans-serif; background: #0e1422; color: #eaf0ff; margin: 0; padding: 20px; }}
+.card {{ max-width: 560px; margin: 60px auto; background: #1a2240; border-radius: 14px; padding: 32px; text-align: center; }}
+h1 {{ color: #4ade80; margin: 0 0 16px; }}
+p {{ color: #c8d0e8; line-height: 1.5; }}
+.amount {{ font-size: 24px; color: #eaf0ff; font-weight: 700; margin: 18px 0; }}
+</style></head><body>
+<div class="card">
+  <h1>✓ Signed</h1>
+  <p>Thank you, {_esc(signer)}. Your change order on {_esc(project.get('address','this project'))} has been signed and sent to {_esc(biz_name)}.</p>
+  <div class="amount">${abs(amount):,.2f}</div>
+  <p>You'll get a copy by email. If you have questions, just reply to the email or call.</p>
+</div>
+</body></html>"""
+
+
+def _render_co_sign_error(reason: str) -> str:
+    return f"""<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Link unavailable</title>
+<style>
+body {{ font-family: -apple-system, system-ui, sans-serif; background: #0e1422; color: #eaf0ff; margin: 0; padding: 20px; }}
+.card {{ max-width: 540px; margin: 60px auto; background: #1a2240; border-radius: 14px; padding: 32px; text-align: center; }}
+h1 {{ color: #ff7a7a; margin: 0 0 16px; }}
+p {{ color: #c8d0e8; line-height: 1.5; }}
+</style></head><body>
+<div class="card">
+  <h1>Link unavailable</h1>
+  <p>{_esc(reason)}</p>
+  <p>If you need a fresh signing link, please reach out to the contractor who sent you this.</p>
+</div>
+</body></html>"""
+
+
 @app.route("/health")
 def health():
     business = mod_business.load(DATA_DIR)
@@ -3262,6 +3437,93 @@ def _parse_money(text: str) -> float:
     return n
 
 
+# ── Change-order chat patterns ────────────────────────────────────────────
+# The hero feature. Foreman/owner triggers a CO by chat, Orbi drafts
+# it from a template, queues for GC approval, then sends a one-time
+# signing link to the client. On signature, logs to the project ledger.
+
+_GC_ADD_CO_RE = _re.compile(
+    # Forms:
+    #   "add CO on [project] — $X — description"
+    #   "change order on [project] — $X for description"
+    #   "CO on the Maple project: client agreed extra $1200 for trim"
+    #   "client just approved $1200 extra trim work at 555 Oak"
+    r"^\s*(?:"
+    r"(?:add|new|create|raise|log)\s+(?:a\s+)?(?:c\.?o\.?|change[\s-]order)"
+    r"|(?:c\.?o\.?|change[\s-]order)"
+    r"|client\s+(?:just\s+)?(?:approved|agreed\s+to|signed\s+off\s+on|okayed?)"
+    r")\b\s*",
+    _re.IGNORECASE,
+)
+_GC_LIST_PENDING_CO_RE = _re.compile(
+    r"^\s*(?:"
+    r"(?:what|which)\s+(?:c\.?o\.?s?|change[\s-]orders?)\s+(?:are\s+)?"
+    r"(?:pending|waiting|open|in\s+(?:my\s+)?queue|need\s+(?:my\s+)?approval)"
+    r"|pending\s+(?:c\.?o\.?s?|change[\s-]orders?)"
+    r"|list\s+(?:pending\s+)?(?:c\.?o\.?s?|change[\s-]orders?)"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+_GC_APPROVE_CO_RE = _re.compile(
+    r"^\s*(?:"
+    r"approve\s+(?:c\.?o\.?|change[\s-]order)\s*#?(?P<co_id>\S+)"
+    r"|(?:c\.?o\.?|change[\s-]order)\s*#?(?P<co_id2>\S+)\s+(?:is\s+)?approved"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+_GC_SEND_CO_RE = _re.compile(
+    r"^\s*(?:"
+    r"send\s+(?:c\.?o\.?|change[\s-]order)\s*#?(?P<co_id>\S+)\s+(?:to\s+(?:the\s+)?client|out|for\s+signature)?"
+    r"|email\s+(?:c\.?o\.?|change[\s-]order)\s*#?(?P<co_id2>\S+)\s+(?:to\s+(?:the\s+)?client)?"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+
+
+def _draft_change_order_text(project: dict, description: str, amount: float,
+                              scope_detail: str = "") -> str:
+    """Build the CO document body from a placeholder template. Frank can
+    swap in real legal language by editing this function (or by putting
+    a template file alongside config.json and reading from it later)."""
+    from datetime import datetime as _dt
+    contract = project.get("contract_amount") or 0
+    biz = (CONFIG.get("business") or {})
+    biz_name = biz.get("name") or "Contractor"
+    customer = project.get("customer_name") or "Client"
+    address = project.get("address") or "(project address)"
+    label = project.get("label") or ""
+    date = _dt.now().strftime("%B %d, %Y")
+    sign_str = "increase" if amount >= 0 else "decrease"
+    abs_amount = abs(float(amount))
+    return f"""CHANGE ORDER
+
+Date: {date}
+Contractor: {biz_name}
+Customer: {customer}
+Project: {address}{(' — ' + label) if label else ''}
+
+Original Contract Amount: ${contract:,.2f}
+
+CHANGE REQUESTED:
+{description}
+
+{('Scope Detail: ' + scope_detail) if scope_detail else ''}
+
+Contract {sign_str.upper()}: ${abs_amount:,.2f}
+
+By signing below, the Customer authorizes the Contractor to perform
+the work described above for the amount stated, and agrees that this
+change order modifies the original contract accordingly. All other
+terms of the original contract remain in effect.
+
+________________________________________
+Customer Signature: {customer}
+
+________________________________________
+Date Signed:
+"""
+
+
 def _try_contractor_chat(message: str, user_rec: dict) -> dict | None:
     """Detect contractor-module intents and act. Returns chat reply or
     None to fall through. Gated by is_module_enabled('contractor') —
@@ -3352,7 +3614,244 @@ def _try_contractor_chat(message: str, user_rec: dict) -> dict | None:
             return {"reply": "\n".join(lines), "tier": "local",
                     "latency_ms": 0, "source": "gc_project_status"}
 
+    # 4. LIST PENDING COs (GC's approval queue)
+    if _GC_LIST_PENDING_CO_RE.match(msg):
+        pending = mod_change_orders.list_pending_approval(DATA_DIR)
+        awaiting_sig = mod_change_orders.list_awaiting_signature(DATA_DIR)
+        if not pending and not awaiting_sig:
+            return {"reply": "Nothing waiting on you. No COs in the queue and none out for client signature.",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "gc_no_pending_cos"}
+        lines = []
+        if pending:
+            lines.append(f"Waiting for your approval ({len(pending)}):")
+            for c in pending[:10]:
+                proj = mod_projects.get(DATA_DIR, c.get("project_id", ""))
+                proj_label = proj.get("address", "?") if proj else "?"
+                amt = float(c.get("amount") or 0)
+                sign = "+" if amt >= 0 else ""
+                lines.append(f"  · #{c['id'][:8]} {proj_label} — {c.get('description','')} ({sign}${amt:,.0f})")
+            lines.append("  Approve with: \"approve CO #<id>\"")
+        if awaiting_sig:
+            if lines: lines.append("")
+            lines.append(f"Out for client signature ({len(awaiting_sig)}):")
+            for c in awaiting_sig[:10]:
+                proj = mod_projects.get(DATA_DIR, c.get("project_id", ""))
+                proj_label = proj.get("address", "?") if proj else "?"
+                amt = float(c.get("amount") or 0)
+                sign = "+" if amt >= 0 else ""
+                lines.append(f"  · #{c['id'][:8]} {proj_label} — {c.get('description','')} ({sign}${amt:,.0f})")
+        return {"reply": "\n".join(lines), "tier": "local",
+                "latency_ms": 0, "source": "gc_pending_cos_listed"}
+
+    # 5. APPROVE A CO
+    m = _GC_APPROVE_CO_RE.match(msg)
+    if m:
+        co_id_in = (m.group("co_id") or m.group("co_id2") or "").strip().lstrip("#")
+        # Accept short IDs (first 8 chars) — match by prefix.
+        all_cos = mod_change_orders._load(DATA_DIR)
+        matches = [c for c in all_cos
+                    if c.get("id", "").startswith(co_id_in)]
+        if not matches:
+            return {"reply": f"No CO matching #{co_id_in}. Say \"pending COs\" to see the queue.",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "gc_co_not_found"}
+        if len(matches) > 1:
+            listed = "\n".join(f"  · #{c['id'][:8]} {c.get('description','')[:50]}" for c in matches[:5])
+            return {"reply": f"Multiple matches:\n{listed}\nUse a longer ID.",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "gc_co_ambiguous"}
+        c = matches[0]
+        if c.get("status") not in ("draft", "awaiting_approval"):
+            return {"reply": f"CO #{c['id'][:8]} is already {c.get('status')} — not in approve state.",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "gc_co_already_advanced"}
+        mod_change_orders.mark_approved(DATA_DIR, c["id"], user_rec.get("username", "owner"))
+        proj = mod_projects.get(DATA_DIR, c.get("project_id", ""))
+        proj_label = proj.get("address", "?") if proj else "?"
+        return {"reply": f"Approved CO #{c['id'][:8]} on {proj_label}. Ready to send — say \"send CO #{c['id'][:8]} to client\".",
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_co_approved"}
+
+    # 6. SEND APPROVED CO TO CLIENT FOR SIGNATURE
+    m = _GC_SEND_CO_RE.match(msg)
+    if m:
+        co_id_in = (m.group("co_id") or m.group("co_id2") or "").strip().lstrip("#")
+        all_cos = mod_change_orders._load(DATA_DIR)
+        matches = [c for c in all_cos if c.get("id", "").startswith(co_id_in)]
+        if not matches:
+            return {"reply": f"No CO matching #{co_id_in}.",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "gc_co_not_found"}
+        c = matches[0]
+        if c.get("status") != "approved":
+            return {"reply": f"CO #{c['id'][:8]} status is {c.get('status')}. Approve it first with \"approve CO #{c['id'][:8]}\".",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "gc_co_not_approved"}
+        proj = mod_projects.get(DATA_DIR, c.get("project_id", ""))
+        if not proj:
+            return {"reply": "Linked project is missing — can't send.",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "gc_co_orphan"}
+        # Mint a one-time signing token + send email via the contact info
+        token = _mint_co_sign_token(c["id"])
+        sign_url = _co_sign_url(token)
+        email = proj.get("customer_email") or ""
+        delivery_via = "email"
+        if email:
+            try:
+                _send_co_for_signature_email(c, proj, sign_url, email)
+            except Exception as e:
+                log.warning(f"CO email send failed: {e}")
+                delivery_via = "no_delivery_method"
+        else:
+            delivery_via = "no_email_on_file"
+        mod_change_orders.mark_sent_for_signature(DATA_DIR, c["id"], via=delivery_via)
+        audit.log_event(DATA_DIR, actor=user_rec.get("username", "?"),
+                        action="co.sent_for_signature",
+                        meta={"co_id": c["id"], "project_id": c.get("project_id"),
+                              "amount": c.get("amount"),
+                              "delivery_via": delivery_via})
+        if delivery_via == "no_email_on_file":
+            return {"reply": (f"CO #{c['id'][:8]} marked sent BUT no customer email on file for {proj.get('address')}. "
+                              f"Give them this signing link directly:\n{sign_url}"),
+                    "tier": "local", "latency_ms": 0,
+                    "source": "gc_co_sent_no_email"}
+        return {"reply": (f"Sent — CO #{c['id'][:8]} to {proj.get('customer_name') or 'the client'} "
+                          f"at {email}. They'll get a signing link valid for 30 days. "
+                          f"You can also share directly:\n{sign_url}"),
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_co_sent"}
+
+    # 7. ADD CO (the trigger phrase — last so it doesn't shadow approve/send)
+    if _GC_ADD_CO_RE.match(msg):
+        return _handle_add_co(msg, user_rec)
+
     return None
+
+
+# ── Change-order draft + signing helpers ──────────────────────────────────
+
+def _handle_add_co(msg: str, user_rec: dict) -> dict:
+    """Parse the CO add intent. Looks for an amount + a project reference +
+    a description. Many natural phrasings — be forgiving."""
+    # Strip the leading verb so what's left is the meaningful payload.
+    payload = _GC_ADD_CO_RE.sub("", msg, count=1).strip(" :—–-,")
+    if not payload:
+        return {"reply": "Tell me which project, how much, and what the change is. "
+                          "E.g. \"CO on 555 Oak — $1200 extra trim work\".",
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_co_no_details"}
+    amount = _parse_money(payload)
+    if not amount:
+        return {"reply": "I need a dollar amount. E.g. \"$1200\".",
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_co_no_amount"}
+    # Find a project reference. Try matching any active project's address
+    # or label as a substring of the payload.
+    active = mod_projects.list_active(DATA_DIR)
+    payload_l = payload.lower()
+    project = None
+    for p in active:
+        addr_parts = (p.get("address", "") + " " + p.get("label", "")).lower().split()
+        # Match if any meaningful token (>=3 chars, not just numbers) appears
+        for token in addr_parts:
+            if len(token) >= 3 and token not in ("the", "and", "ave", "street",
+                                                  "avenue", "drive", "road", "blvd")\
+                    and not token.replace(",", "").isdigit() \
+                    and token in payload_l:
+                project = p
+                break
+        if project:
+            break
+    if not project:
+        if not active:
+            return {"reply": "You don't have any active projects yet. Add one first: \"new project at <address> — $X <label>\".",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "gc_co_no_projects"}
+        listed = "\n".join(f"  · {p['address']}" for p in active[:5])
+        return {"reply": f"Which project? I see these active:\n{listed}",
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_co_pick_project"}
+    # Extract description = payload minus the matched project label/address
+    # and minus the dollar amount.
+    description = _DOLLAR_AMT_RE.sub("", payload).strip(" ,—–-")
+    for token in (project.get("address", ""), project.get("label", "")):
+        if token:
+            description = _re.sub(_re.escape(token), "", description, flags=_re.IGNORECASE)
+    description = _re.sub(r"\s+", " ", description).strip(" :—–-,.")
+    # Strip leading filler words separately — str.strip() takes a char
+    # set, not a word set, so passing 'for' would eat 'f','o','r' as
+    # individual characters (and chop the 'o' off "on the Oak project").
+    description = _re.sub(r"^(?:for|on|that|with|of|to)\s+", "", description,
+                            flags=_re.IGNORECASE).strip()
+    if not description:
+        description = "Additional scope agreed with client"
+    # Build the draft + save
+    draft = _draft_change_order_text(project, description, amount)
+    co = mod_change_orders.add(
+        DATA_DIR,
+        project_id=project["id"],
+        description=description,
+        amount=amount,
+        draft_text=draft,
+        status="awaiting_approval",
+    )
+    audit.log_event(DATA_DIR, actor=user_rec.get("username", "?"),
+                    action="co.drafted",
+                    meta={"co_id": co["id"], "project_id": project["id"],
+                          "amount": amount})
+    sign = "+" if amount >= 0 else ""
+    return {"reply": (f"Drafted CO #{co['id'][:8]} on {project['address']}: "
+                      f"\"{description[:70]}\" ({sign}${amount:,.0f}). "
+                      f"In your queue — review the draft + approve with "
+                      f"\"approve CO #{co['id'][:8]}\"."),
+            "tier": "local", "latency_ms": 0,
+            "source": "gc_co_drafted"}
+
+
+def _mint_co_sign_token(co_id: str) -> str:
+    """Generate a one-time signing token and store it in
+    co_sign_tokens.json with the CO id + expiry. Token is opaque to the
+    customer — they just click the link."""
+    import secrets as _secrets
+    token = _secrets.token_urlsafe(32)
+    tokens_path = DATA_DIR / "co_sign_tokens.json"
+    try:
+        existing = json.loads(tokens_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        existing = {}
+    existing[token] = {
+        "co_id":      co_id,
+        "issued_at":  int(time.time()),
+        "expires_at": int(time.time()) + 30 * 86400,  # 30 days
+        "used_at":    None,
+    }
+    tokens_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = tokens_path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+    tmp.replace(tokens_path)
+    return token
+
+
+def _co_sign_url(token: str) -> str:
+    """Public URL the client clicks. Uses the tunnel URL so it's reachable
+    from outside the LAN. Falls back to localhost for dev."""
+    base = (CONFIG.get("tunnel_url") or
+            (CONFIG.get("brain") or {}).get("local_public_url") or
+            "http://127.0.0.1:5050").rstrip("/")
+    return f"{base}/co/sign/{token}"
+
+
+def _send_co_for_signature_email(co: dict, project: dict,
+                                   sign_url: str, to_email: str) -> None:
+    """Log the signing link for now. Real email delivery is wired in a
+    follow-on once we pick the IMAP/SMTP account format (existing
+    imap_smtp module expects per-user account configs we don't have for
+    contractor-mode yet). For v1, the chat reply gives the GC the URL
+    to share with the client directly — fine for the first contractor
+    while we work out the email-delivery story properly."""
+    log.info(f"CO sign URL ready for {to_email}: {sign_url}")
 
 
 # ── Calendar action handlers — cancel + reschedule ────────────────────────
