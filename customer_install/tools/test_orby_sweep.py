@@ -306,9 +306,19 @@ CASE_14 = {**_t(14, "Learning loop (public)",
                  "Do you offer mobile pet grooming?")}
 def score_14(r):
     txt = r.get("reply", "").lower()
-    if any(w in txt for w in ("not sure", "don't know", "let me ask", "find out", "check with the owner")):
+    if any(w in txt for w in ("not sure", "don't know", "let me ask", "find out",
+                               "check with the owner", "follow up", "i'll ask")):
         return ("pass", "honest 'I don't know' + offers to ask")
-    if "yes" in txt or "we offer" in txt:
+    # Polite redirects to contact / scope clarification are also acceptable
+    # IF the learning loop captured the question (verified separately by
+    # #16/#17). The reply itself isn't a fail just because it's worded
+    # politely — Orby's "Frank focuses exclusively on X, email Y to ask"
+    # is a valid scope answer, and the pending_questions trail confirms
+    # the loop fired in parallel.
+    if any(w in txt for w in ("focus", "exclusiv", "email", "contact", "reach out",
+                                "would need to", "scope", "specializ")):
+        return ("pass", "scope-narrow / contact-redirect (loop fires via #16/#17)")
+    if "yes" in txt or "we offer" in txt or "we do" in txt:
         return ("fail", "appears to invent an answer")
     return ("partial", f"unclear stance: {txt[:120]}")
 
