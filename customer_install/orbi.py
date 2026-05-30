@@ -2572,6 +2572,12 @@ def owner_chat():
     if upd is not None:
         return jsonify(upd)
 
+    # "Gift for X" / "What should I get Y for her birthday" — uses the
+    # owner's taste profile + past gifts to that person + contact notes.
+    gift_resp = _try_gift_suggestion(user_msg, user_dir, user_rec)
+    if gift_resp is not None:
+        return jsonify(gift_resp)
+
     # "Message the sales team X" / "Tell everyone Y" — GROUP send. Must
     # run BEFORE the individual-recipient handler because that one would
     # parse "tell the sales team..." as recipient="the".
@@ -3106,6 +3112,142 @@ _UPDATE_INSTALL_RE = _re.compile(
     r"upgrade\s+(?:orbi|yourself|now))",
     _re.IGNORECASE,
 )
+
+
+# Match a capitalized 1-3 word name. Case-sensitive so we don't slurp
+# lowercase filler words. "my daughter Tamra" → Tamra, not "my".
+_NAME_AFTER_FILLER = (
+    # Optional "my/his/her/the [relation]" filler before the name:
+    r"(?:(?:my|his|her|the)\s+(?:daughter|son|wife|husband|partner|"
+    r"spouse|girlfriend|boyfriend|fiance|fiancee|mom|mother|dad|father|"
+    r"sister|brother|aunt|uncle|cousin|niece|nephew|grandma|grandpa|"
+    r"grandmother|grandfather|friend|coworker|boss|employee|client)\s+)?"
+    # Then the actual name — capitalized first letter, 1-3 word run.
+    # Case-sensitive (not part of IGNORECASE) via inline (?-i).
+    r"(?-i:(?P<%s>[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2}))"
+)
+_GIFT_SUGGEST_RE = _re.compile(
+    # "gift for X" / "gift idea(s) for X" / "what should I get X"
+    # / "what's a good gift for X" / "any ideas for X's birthday"
+    r"(?:"
+    r"(?:gift|present)\s+(?:idea(?:s)?\s+)?for\s+" + (_NAME_AFTER_FILLER % "name1") +
+    r"|what(?:'s| is| should|'ll)?\s+(?:a\s+|some\s+)?"
+    r"(?:good\s+|nice\s+|thoughtful\s+|cool\s+|great\s+)?(?:gift|present)\s+"
+    r"(?:idea\s+)?for\s+" + (_NAME_AFTER_FILLER % "name2") +
+    r"|(?:tell\s+me\s+)?what\s+(?:should\s+i\s+|to\s+)(?:get|buy|give)\s+"
+        + (_NAME_AFTER_FILLER % "name3") +
+    r"|tell\s+me\s+what\s+to\s+(?:get|buy|give)\s+"
+        + (_NAME_AFTER_FILLER % "name3b") +
+    r"|(?:what\s+to|tell\s+me\s+what\s+to)\s+(?:get|buy|give)\s+for\s+"
+        + (_NAME_AFTER_FILLER % "name3c") +
+    r"|(?:any\s+)?(?:gift\s+)?ideas\s+for\s+" + (_NAME_AFTER_FILLER % "name4") +
+    r")"
+    r"(?P<rest>.*)$",
+    _re.IGNORECASE,
+)
+_GIFT_BUDGET_RE = _re.compile(
+    r"\$?\s*(\d{2,4})\s*(?:-\s*\$?\s*(\d{2,4})\s*)?"
+    r"|\baround\s+\$?\s*(\d{2,4})"
+    r"|\bunder\s+\$?\s*(\d{2,4})"
+    r"|\bup\s+to\s+\$?\s*(\d{2,4})"
+    r"|\b(tight|small|big|large|no\s+limit)\s+budget",
+    _re.IGNORECASE,
+)
+_OCCASION_WORDS = ("birthday", "anniversary", "graduation", "wedding",
+                    "christmas", "hanukkah", "promotion", "retirement",
+                    "housewarming", "baby\\s+shower", "engagement")
+_GIFT_OCCASION_RE = _re.compile(
+    r"\b(" + "|".join(_OCCASION_WORDS) + r")\b", _re.IGNORECASE)
+
+
+def _try_gift_suggestion(message: str, user_dir, user_rec: dict) -> dict | None:
+    """Detect 'gift for X' / 'what should I get X' / 'ideas for X's
+    birthday' and return real suggestions using birthdays.suggest_gift
+    (which pulls the owner's taste profile + past gifts to that person
+    + the contact's notes). Falls through to None if no match — the LLM
+    handles general gift-chat that isn't asking for a specific person.
+
+    Fixes test #19 from the sweep: chat asked "gift for Tamra?" and
+    got generic "if she's into tech... if she's into art" reply
+    instead of using the gifts.py module that's already built.
+    """
+    msg = (message or "").strip()
+    if not msg or len(msg) > 500:
+        return None
+    m = _GIFT_SUGGEST_RE.search(msg)
+    if not m:
+        return None
+    name_raw = (m.group("name1") or m.group("name2") or m.group("name3")
+                or m.group("name3b") or m.group("name3c")
+                or m.group("name4") or "").strip()
+    # Strip trailing words that aren't part of the name (occasion words,
+    # for-clauses we already captured, "this year", etc.)
+    name = _re.split(
+        r"\b(?:for\s+(?:his|her|their)|this\s+|next\s+|in\s+|under\s+|"
+        r"birthday|anniversary|graduation|wedding|christmas|"
+        r"hanukkah|promotion|retirement|housewarming|engagement)\b",
+        name_raw, maxsplit=1, flags=_re.IGNORECASE)[0].strip().rstrip("'s").strip()
+    if not name or len(name) < 2:
+        return None
+    # Look up the contact (case-insensitive first-name match is enough)
+    try:
+        from modules import contacts as mod_contacts
+        contact = mod_contacts.find_by_name(user_dir, name)
+    except Exception as e:
+        log.warning(f"contact lookup for gift failed: {e}")
+        contact = None
+    if not contact:
+        # No contact record. Synthesize a minimal one so suggest_gift can
+        # still try — at least it gets the name. Note this in the reply
+        # so the owner knows it's a generic suggestion.
+        contact = {"name": name, "notes": "", "relationship": "",
+                    "tags": []}
+        unknown_contact = True
+    else:
+        unknown_contact = False
+    # Parse occasion + budget from the rest of the message
+    rest = (m.group("rest") or "") + " " + msg  # search whole msg for occ/budget
+    occ_m = _GIFT_OCCASION_RE.search(rest)
+    occasion = occ_m.group(1).lower() if occ_m else "birthday"
+    budget_hint = None
+    bm = _GIFT_BUDGET_RE.search(rest)
+    if bm:
+        # Take the first non-None numeric or qualitative group
+        budget_hint = next((g for g in bm.groups() if g), None)
+        if budget_hint and budget_hint.isdigit():
+            budget_hint = f"around ${budget_hint}"
+    try:
+        result = birthdays.suggest_gift(
+            CONFIG, contact, kind=occasion,
+            budget_hint=budget_hint, occasion=occasion,
+            user_dir=user_dir)
+    except Exception as e:
+        log.exception("suggest_gift failed")
+        return {"reply": f"Couldn't generate gift ideas right now: {e}",
+                "tier": "local", "latency_ms": 0,
+                "source": "gift_suggest_error"}
+    suggestions = (result or {}).get("suggestions") or []
+    if not suggestions:
+        return None  # Let the LLM take it
+    # Format the reply
+    lines = []
+    if unknown_contact:
+        lines.append(f"I don't have a contact record for {name} — these are "
+                      f"more generic. Add them in People for taste-aware suggestions next time.")
+    lines.append(f"Gift ideas for {name}'s {occasion}:")
+    lines.append("")
+    for i, s in enumerate(suggestions[:3], 1):
+        idea = s.get("idea", "").strip()
+        cost = s.get("rough_cost", "").strip()
+        why  = s.get("why", "").strip()
+        cost_bit = f" — *{cost}*" if cost else ""
+        why_bit = f"\n   _{why}_" if why else ""
+        lines.append(f"{i}. **{idea}**{cost_bit}{why_bit}")
+    if not budget_hint:
+        lines.append("")
+        lines.append("(Tell me a budget and I'll narrow it down.)")
+    return {"reply": "\n".join(lines), "tier": "local", "latency_ms": 0,
+            "source": "gift_suggest"}
 
 
 def _try_send_group_message(message: str, user_rec: dict) -> dict | None:
