@@ -3478,6 +3478,56 @@ _GC_SEND_CO_RE = _re.compile(
     r")\s*[?.!]?\s*$",
     _re.IGNORECASE,
 )
+_GC_LIST_UNPAID_RE = _re.compile(
+    r"^\s*(?:"
+    r"who\s+owes\s+(?:me\s+)?(?:money|right\s+now)?"
+    r"|what\s+(?:invoices?\s+)?(?:are\s+)?(?:unpaid|outstanding|open|due)"
+    r"|(?:unpaid|outstanding|open)\s+invoices?"
+    r"|invoices?\s+(?:open|outstanding|due)"
+    r"|receivables?"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+_GC_AGING_RE = _re.compile(
+    r"^\s*(?:"
+    r"aging(?:\s+report)?"
+    r"|what(?:'s| is)?\s+overdue"
+    r"|overdue\s+(?:invoices?|amounts?)"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+_GC_ADD_INVOICE_RE = _re.compile(
+    # "send invoice for Oak — $5000 progress draw"
+    # "bill Maple $3000 for framing"
+    # "invoice the Oak project $4200 — draw 2"
+    r"^\s*(?:"
+    r"(?:send|create|generate|cut)\s+(?:an?\s+)?invoice\s+(?:for\s+|on\s+|to\s+)?"
+    r"|bill\s+(?:the\s+)?"
+    r"|invoice\s+(?:the\s+|for\s+)?"
+    r")",
+    _re.IGNORECASE,
+)
+_GC_RECORD_PAYMENT_RE = _re.compile(
+    # "Sarah paid $3000 on INV-2026-0001"
+    # "Mark INV-2026-0001 paid"
+    # "received $500 on INV-2026-0042"
+    r"^\s*(?:"
+    r"(?:received|recorded|paid|got)\s+\$?(?P<amt1>[\d,]+(?:\.\d{1,2})?)"
+    r"|.+?\s+paid\s+\$?(?P<amt2>[\d,]+(?:\.\d{1,2})?)"
+    r"|mark\s+(?:invoice\s+)?(?P<inv1>INV-[\w-]+)\s+paid"
+    r")",
+    _re.IGNORECASE,
+)
+_GC_REPORT_RE = _re.compile(
+    r"^\s*(?:"
+    r"(?:show\s+me\s+(?:the\s+)?money|money\s+report|contractor\s+report"
+    r"|captured\s+(?:this\s+(?:week|month|year)|so\s+far))"
+    r"|(?:where\s+(?:are\s+|am\s+i\s+)?(?:at|standing)\s+(?:on\s+)?(?:the\s+)?money)"
+    r"|gc\s+(?:report|dashboard|stats)"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+_INV_NUMBER_RE = _re.compile(r"\bINV-\d{4}-\d{4}\b", _re.IGNORECASE)
 
 
 def _draft_change_order_text(project: dict, description: str, amount: float,
@@ -3727,6 +3777,75 @@ def _try_contractor_chat(message: str, user_rec: dict) -> dict | None:
     if _GC_ADD_CO_RE.match(msg):
         return _handle_add_co(msg, user_rec)
 
+    # 8. UNPAID / OWED LIST — "who owes me", "what invoices are open"
+    if _GC_LIST_UNPAID_RE.match(msg):
+        unpaid = mod_invoices.list_unpaid(DATA_DIR)
+        mod_invoices.list_overdue(DATA_DIR)  # side-effect: promote status
+        unpaid = mod_invoices.list_unpaid(DATA_DIR)  # re-read post-promote
+        if not unpaid:
+            return {"reply": "Nothing outstanding — every invoice is either paid, void, or still in draft.",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "gc_no_unpaid"}
+        lines = [f"Outstanding invoices ({len(unpaid)}):"]
+        for i in unpaid[:15]:
+            proj = mod_projects.get(DATA_DIR, i.get("project_id", "")) or {}
+            owed = float(i.get("amount_due", 0)) - float(i.get("amount_paid", 0))
+            status = i.get("status", "?").upper()
+            due_str = ""
+            if i.get("due_at"):
+                from datetime import datetime as _dt
+                due_str = " due " + _dt.fromtimestamp(int(i["due_at"])).strftime("%b %-d")
+            lines.append(f"  · {i.get('invoice_number','?')} — {proj.get('address','?')} ${owed:,.0f} ({status}){due_str}")
+        return {"reply": "\n".join(lines), "tier": "local",
+                "latency_ms": 0, "source": "gc_unpaid_listed"}
+
+    # 9. AGING REPORT — "aging report", "what's overdue", "receivables"
+    if _GC_AGING_RE.match(msg):
+        mod_invoices.list_overdue(DATA_DIR)
+        aging = mod_invoices.aging_buckets(DATA_DIR)
+        total = sum(aging.values())
+        if total <= 0:
+            return {"reply": "Aging: $0 outstanding. Nothing past due.",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "gc_aging_clear"}
+        lines = [
+            f"Aging — ${total:,.0f} outstanding:",
+            f"  Current (not yet due): ${aging['current']:,.0f}",
+            f"  1-30 days late:        ${aging['1-30']:,.0f}",
+            f"  31-60 days late:       ${aging['31-60']:,.0f}",
+            f"  61-90 days late:       ${aging['61-90']:,.0f}",
+            f"  90+ days late:         ${aging['90+']:,.0f}",
+        ]
+        return {"reply": "\n".join(lines), "tier": "local",
+                "latency_ms": 0, "source": "gc_aging"}
+
+    # 10. ADD/SEND INVOICE — "send invoice for Oak — $5000 progress draw"
+    if _GC_ADD_INVOICE_RE.match(msg):
+        return _handle_add_invoice(msg, user_rec)
+
+    # 11. RECORD PAYMENT — "Sarah paid $3000 on INV-2026-0001"
+    if _GC_RECORD_PAYMENT_RE.match(msg):
+        return _handle_record_payment(msg, user_rec)
+
+    # 12. REPORTING — "show me the money", "captured this month", "totals"
+    if _GC_REPORT_RE.match(msg):
+        p_sum = mod_projects.summary(DATA_DIR)
+        co_sum = mod_change_orders.summary(DATA_DIR)
+        i_sum = mod_invoices.summary(DATA_DIR)
+        active_count = (p_sum.get("by_status") or {}).get("active", 0)
+        lines = [
+            "💰 Money report:",
+            f"  Active projects:        {active_count}",
+            f"  Contracted total:       ${p_sum.get('contracted_total', 0):,.0f}",
+            f"  CO dollars captured:    ${co_sum.get('captured_dollars', 0):,.0f}",
+            f"  CO dollars pending:     ${co_sum.get('pending_dollars', 0):,.0f}",
+            f"  Total billed:           ${i_sum.get('total_billed', 0):,.0f}",
+            f"  Total collected:        ${i_sum.get('total_collected', 0):,.0f}",
+            f"  Outstanding:            ${i_sum.get('total_outstanding', 0):,.0f}",
+        ]
+        return {"reply": "\n".join(lines), "tier": "local",
+                "latency_ms": 0, "source": "gc_report"}
+
     return None
 
 
@@ -3808,6 +3927,127 @@ def _handle_add_co(msg: str, user_rec: dict) -> dict:
                       f"\"approve CO #{co['id'][:8]}\"."),
             "tier": "local", "latency_ms": 0,
             "source": "gc_co_drafted"}
+
+
+def _handle_add_invoice(msg: str, user_rec: dict) -> dict:
+    """Parse 'send invoice for Oak — $5000 progress draw' / 'bill Maple
+    $3000 for framing' and create the invoice record. Same project-
+    fuzzy-match approach as CO. v1 just records the invoice + returns
+    the customer's email so the GC can copy/paste — PDF generation +
+    Stripe-link send come later."""
+    payload = _GC_ADD_INVOICE_RE.sub("", msg, count=1).strip(" :—–-,")
+    amount = _parse_money(payload)
+    if not amount:
+        return {"reply": "I need a dollar amount. E.g. \"bill Oak $5000 for framing\".",
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_inv_no_amount"}
+    # Find project
+    active = mod_projects.list_active(DATA_DIR)
+    payload_l = payload.lower()
+    project = None
+    for p in active:
+        addr_parts = (p.get("address", "") + " " + p.get("label", "")).lower().split()
+        for token in addr_parts:
+            if len(token) >= 3 and token not in ("the", "and", "ave", "street",
+                                                  "avenue", "drive", "road", "blvd") \
+                    and not token.replace(",", "").isdigit() \
+                    and token in payload_l:
+                project = p
+                break
+        if project:
+            break
+    if not project:
+        if not active:
+            return {"reply": "No active projects to invoice.",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "gc_inv_no_projects"}
+        listed = "\n".join(f"  · {p['address']}" for p in active[:5])
+        return {"reply": f"Which project? I see these active:\n{listed}",
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_inv_pick_project"}
+    # Extract memo = payload minus dollar minus project label
+    memo = _DOLLAR_AMT_RE.sub("", payload).strip(" ,—–-")
+    for token in (project.get("address", ""), project.get("label", "")):
+        if token:
+            memo = _re.sub(_re.escape(token), "", memo, flags=_re.IGNORECASE)
+    memo = _re.sub(r"\s+", " ", memo).strip(" :—–-,")
+    memo = _re.sub(r"^(?:for|on|of|to|—)\s+", "", memo, flags=_re.IGNORECASE).strip()
+    is_draw = bool(_re.search(r"\b(draw|progress)\b", payload, _re.IGNORECASE))
+    # Due in 30 days by default
+    due_at = int(time.time()) + 30 * 86400
+    try:
+        inv = mod_invoices.add(
+            DATA_DIR,
+            project_id=project["id"],
+            line_items=[{"label": memo or "Progress billing", "amount": amount}],
+            subtotal=amount,
+            memo=memo,
+            due_at=due_at,
+            is_draw=is_draw,
+            status="approved",  # GC initiated it, ready to send
+        )
+        # Auto-mark sent so it counts as billed immediately. (Real send
+        # via Stripe-hosted invoice or email PDF is the follow-on; for
+        # v1 the GC delivers it manually and Orby tracks status.)
+        mod_invoices.mark_sent(DATA_DIR, inv["id"])
+    except ValueError as e:
+        return {"reply": f"Couldn't create invoice: {e}",
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_inv_error"}
+    audit.log_event(DATA_DIR, actor=user_rec.get("username", "?"),
+                    action="invoice.created",
+                    meta={"invoice_id": inv["id"], "project_id": project["id"],
+                          "amount": amount})
+    draw_bit = f" (draw #{inv['draw_number']})" if inv.get("draw_number") else ""
+    email = project.get("customer_email") or "(no email on file — share manually)"
+    return {"reply": (f"Invoice {inv['invoice_number']}{draw_bit} created — "
+                      f"{project['address']}: \"{memo}\" ${amount:,.0f}. "
+                      f"Due in 30 days. Send to {email}."),
+            "tier": "local", "latency_ms": 0,
+            "source": "gc_inv_created"}
+
+
+def _handle_record_payment(msg: str, user_rec: dict) -> dict:
+    """Parse 'received $3000 on INV-2026-0001' / 'mark INV-2026-0042
+    paid'. Records the payment and updates invoice status."""
+    m = _GC_RECORD_PAYMENT_RE.match(msg)
+    if not m:
+        return None
+    inv_num_m = _INV_NUMBER_RE.search(msg) or _INV_NUMBER_RE.search(m.group("inv1") or "")
+    if not inv_num_m:
+        return {"reply": "I need an invoice number (like INV-2026-0001) to record a payment.",
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_payment_no_inv"}
+    inv_num = inv_num_m.group(0).upper()
+    target = None
+    for i in mod_invoices._load(DATA_DIR):
+        if (i.get("invoice_number") or "").upper() == inv_num:
+            target = i; break
+    if not target:
+        return {"reply": f"I don't see {inv_num} on the books.",
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_payment_not_found"}
+    # If "mark X paid" with no amount, pay it in full
+    amt_str = m.group("amt1") or m.group("amt2")
+    if amt_str:
+        amount = float(amt_str.replace(",", ""))
+    else:
+        amount = float(target.get("amount_due", 0)) - float(target.get("amount_paid", 0))
+    updated = mod_invoices.record_payment(DATA_DIR, target["id"], amount)
+    audit.log_event(DATA_DIR, actor=user_rec.get("username", "?"),
+                    action="invoice.payment_recorded",
+                    meta={"invoice_id": target["id"], "amount": amount,
+                          "new_status": updated["status"]})
+    proj = mod_projects.get(DATA_DIR, target.get("project_id", "")) or {}
+    if updated["status"] == "paid":
+        return {"reply": (f"Recorded ${amount:,.2f} — {inv_num} ({proj.get('address','')}) is now fully PAID."),
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_payment_paid"}
+    remaining = float(updated["amount_due"]) - float(updated["amount_paid"])
+    return {"reply": (f"Recorded ${amount:,.2f} on {inv_num} ({proj.get('address','')}). "
+                      f"${remaining:,.2f} still owed."),
+            "tier": "local", "latency_ms": 0,
+            "source": "gc_payment_partial"}
 
 
 def _mint_co_sign_token(co_id: str) -> str:
