@@ -423,3 +423,101 @@ def detect_send_intent(message: str) -> dict | None:
                 continue
             return {"recipient_name": name, "body": body}
     return None
+
+
+# ── Group send detection (multi-recipient: "the sales team", "everyone") ──
+# These patterns match BEFORE the individual-recipient ones in the caller,
+# because "tell the sales team..." would otherwise parse as recipient="the"
+# (and "sales team..." as the body — which it did before this was added).
+
+_GROUP_QUALIFIER = (
+    # Phrases that introduce a group reference:
+    r"(?:everyone|everybody|all\s+staff|all\s+(?:my\s+)?(?:team|staff)|"
+    r"whole\s+team|the\s+whole\s+team|"
+    r"the\s+(?P<group_named>[A-Za-z][\w&'\- ]{1,40}?)\s+"
+    r"(?:team|crew|group|staff|squad|department|dept))"
+)
+
+_GROUP_INTENT_PATTERNS = [
+    # "tell <group> <body>"
+    _re.compile(r"^\s*(?:please\s+|can\s+you\s+(?:please\s+)?)?"
+                 r"tell\s+" + _GROUP_QUALIFIER + r"\s+(?P<body>.+)",
+                 _re.IGNORECASE),
+    # "let <group> know <body>"
+    _re.compile(r"^\s*(?:please\s+|can\s+you\s+(?:please\s+)?)?"
+                 r"let\s+" + _GROUP_QUALIFIER + r"\s+know\s+"
+                 r"(?:that\s+)?(?P<body>.+)",
+                 _re.IGNORECASE),
+    # "send <group> a message ..."
+    _re.compile(r"^\s*(?:please\s+|can\s+you\s+(?:please\s+)?)?"
+                 r"send\s+" + _GROUP_QUALIFIER + r"\s+(?:a\s+)?"
+                 r"(?:message|note|text|dm|im|update|announcement)\s*"
+                 r"(?:that\s+|about\s+|saying\s+|[:\-—]\s*)?(?P<body>.+)",
+                 _re.IGNORECASE),
+    # "message <group> ..." / "ping <group> ..." / "notify <group> ..."
+    _re.compile(r"^\s*(?:please\s+|can\s+you\s+(?:please\s+)?)?"
+                 r"(?:message|msg|ping|notify|dm|im|announce(?:\s+to)?)\s+"
+                 + _GROUP_QUALIFIER + r"\s*"
+                 r"(?:[:\-—]\s*|that\s+|about\s+|saying\s+)?(?P<body>.+)",
+                 _re.IGNORECASE),
+    # "announce to <group>" + body — handled above via "announce to"
+]
+
+
+def detect_group_send_intent(message: str) -> dict | None:
+    """Return {group_query, body} if message is a group-send intent.
+
+    group_query is the raw group name from the message ("sales", "kitchen",
+    "everyone", "whole team", etc.) — the caller resolves it against
+    existing stored groups (fuzzy match) or to the virtual __all__ Whole
+    Team group. Returns None if the message isn't a group send.
+
+    IMPORTANT: callers must try this BEFORE detect_send_intent(), because
+    the individual-recipient patterns would parse "tell the sales team..."
+    as recipient="the" / body="sales team ..." (which is what bit Frank's
+    test: "Message the sales team — 4:30 meeting" → "I don't see a staff
+    member named 'the'").
+    """
+    msg = (message or "").strip()
+    if not msg or len(msg) > 1000:
+        return None
+    for pat in _GROUP_INTENT_PATTERNS:
+        m = pat.match(msg)
+        if not m:
+            continue
+        # group_named is set only when the message used the
+        # "the <X> team/crew/group/..." form; everyone/all/whole-team
+        # collapses to the __all__ virtual group.
+        named = m.groupdict().get("group_named")
+        group_query = (named or "").strip().lower() if named else "__all__"
+        body = m.group("body").strip().rstrip(".?!")
+        if len(body) < 2:
+            continue
+        return {"group_query": group_query, "body": body}
+    return None
+
+
+def resolve_group(data_dir: Path, group_query: str) -> dict | None:
+    """Fuzzy-match a group query string to a stored group, or return the
+    virtual Whole Team group if the query is __all__ / everyone / etc.
+    Returns the group dict (id, name, members) or None if no match."""
+    q = (group_query or "").strip().lower()
+    if not q or q in {"__all__", "everyone", "everybody", "all", "all staff",
+                       "whole team", "the whole team"}:
+        return {"id": ALL_GROUP_ID, "name": ALL_GROUP_NAME,
+                "members": [], "virtual": True}
+    groups = list_groups(data_dir)
+    # Exact match first
+    for g in groups:
+        if g.get("name", "").lower() == q:
+            return g
+    # Substring match — "sales" matches "Sales Team", "Top Sales"
+    matches = [g for g in groups if q in g.get("name", "").lower()]
+    if len(matches) == 1:
+        return matches[0]
+    # Reverse — try "X" matches a group whose name's first word equals X
+    for g in groups:
+        first_word = (g.get("name", "").split() or [""])[0].lower()
+        if first_word == q:
+            return g
+    return None

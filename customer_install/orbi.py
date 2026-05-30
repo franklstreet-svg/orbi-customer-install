@@ -2468,6 +2468,13 @@ def owner_chat():
     if upd is not None:
         return jsonify(upd)
 
+    # "Message the sales team X" / "Tell everyone Y" — GROUP send. Must
+    # run BEFORE the individual-recipient handler because that one would
+    # parse "tell the sales team..." as recipient="the".
+    grp = _try_send_group_message(user_msg, user_rec)
+    if grp is not None:
+        return jsonify(grp)
+
     # "Tell Cathi X" / "Send Joe a message: Y" — internal staff messaging
     im = _try_send_internal_message(user_msg, user_rec)
     if im is not None:
@@ -2995,6 +3002,80 @@ _UPDATE_INSTALL_RE = _re.compile(
     r"upgrade\s+(?:orbi|yourself|now))",
     _re.IGNORECASE,
 )
+
+
+def _try_send_group_message(message: str, user_rec: dict) -> dict | None:
+    """Detect group-send phrasings ('message the sales team', 'tell
+    everyone', 'announce to the kitchen staff') and route to the
+    multi-recipient group thread. Returns chat reply dict or None.
+
+    Group resolution:
+      - "everyone" / "whole team" / "all staff" → __all__ (Whole Team)
+      - "the X team/staff/group/crew" → fuzzy-match against stored groups
+      - No match → falls through to individual handler (which will say
+        "I don't see a staff member named X" with the active list)
+    """
+    intent = mod_imsg.detect_group_send_intent(message)
+    if not intent:
+        return None
+    sender_username = user_rec["username"]
+    group_query = intent["group_query"]
+    body = intent["body"]
+    group = mod_imsg.resolve_group(DATA_DIR, group_query)
+    if not group:
+        # No saved group with that name. Tell Frank and list what's available.
+        existing = [g.get("name") for g in mod_imsg.list_groups(DATA_DIR)]
+        existing_str = ", ".join(existing) if existing else "(no saved groups yet)"
+        return {"reply": (f"I don't see a group called \"{group_query}\". "
+                          f"Your saved groups: {existing_str}. "
+                          "Plus the built-in Whole Team. Create a new group in "
+                          "Team Chat → + New, then try again."),
+                "tier": "local", "latency_ms": 0,
+                "source": "internal_group_no_match"}
+    # Resolve members. For Whole Team it's all active staff; for stored
+    # groups it's the group's member list.
+    if group["id"] == mod_imsg.ALL_GROUP_ID:
+        active = users_mod.list_users(DATA_DIR)
+        members = [u["username"] for u in active]
+        group_name = mod_imsg.ALL_GROUP_NAME
+    else:
+        members = list(group.get("members", []))
+        group_name = group.get("name") or "Group"
+    # Owner sending into a group they're not in? Add them so they appear
+    # in the snapshot (mirrors the REST endpoint behavior).
+    if sender_username not in members:
+        members = members + [sender_username]
+    try:
+        entry = mod_imsg.send_to_group(
+            DATA_DIR,
+            group_id=group["id"], group_name=group_name,
+            member_usernames=members,
+            from_user=sender_username,
+            from_name=user_rec.get("display_name") or sender_username,
+            body=body, via="orby")
+    except ValueError as e:
+        return {"reply": f"Couldn't send: {e}",
+                "tier": "local", "latency_ms": 0,
+                "source": "internal_group_error"}
+    # Notify each recipient except sender
+    for m in members:
+        if m == sender_username:
+            continue
+        try:
+            notify.send(CONFIG, DATA_DIR, event="new_message",
+                         title=f"{group_name}: {entry['from_name']}",
+                         body=body[:140], url="/owner#messages")
+        except Exception:
+            pass
+    audit.log_event(DATA_DIR, actor=sender_username,
+                    action="group_msg.sent",
+                    meta={"group_id": group["id"], "name": group_name,
+                          "members": len(members), "via": "orby"})
+    n_others = len([m for m in members if m != sender_username])
+    return {"reply": (f"Sent — \"{body[:80]}{'...' if len(body) > 80 else ''}\" "
+                      f"to {group_name} ({n_others} {'person' if n_others == 1 else 'people'})."),
+            "tier": "local", "latency_ms": 0,
+            "source": "internal_group_sent"}
 
 
 def _try_send_internal_message(message: str, user_rec: dict) -> dict | None:
