@@ -1413,15 +1413,45 @@ body {{ font-family: -apple-system, system-ui, "Segoe UI", sans-serif;
 
   {contact_html}
 
-  <div class="section">
-    <h2>Need something added or changed?</h2>
-    <p class="dim">Have an idea for the project? Send {_esc(biz_name)} a change request — they'll review and send you a formal change order.</p>
-    <a class="sign-btn" href="/p/{_esc(project.get('client_portal_token',''))}/request-change">Request a change</a>
-  </div>
+  {_render_portal_review_or_request(project, biz_name)}
 
   <div class="footer">Powered by Orbi</div>
 </div>
 </body></html>"""
+
+
+def _render_portal_review_or_request(project: dict, biz_name: str) -> str:
+    """If the project is completed, show a review CTA. Otherwise show
+    the change-request CTA. Either way the customer has one clear next
+    step from the portal."""
+    token = project.get("client_portal_token", "")
+    if project.get("status") == "completed":
+        # Find or mint an unsubmitted review for this project so the
+        # portal link doesn't fail.
+        try:
+            review = mod_reviews.issue(DATA_DIR, project["id"])
+            if review.get("submitted_at"):
+                # Already rated — show a quiet thanks
+                return f"""
+        <div class="section">
+          <h2>✓ Thanks for the rating</h2>
+          <p class="dim">You already rated {_esc(biz_name)} on this project — really appreciate it.</p>
+        </div>"""
+            review_url = f"/r/{review['token']}"
+            return f"""
+        <div class="section">
+          <h2>How did we do?</h2>
+          <p class="dim">Job's done. If you've got 30 seconds, a quick rating helps {_esc(biz_name)} a ton.</p>
+          <a class="sign-btn" href="{_esc(review_url)}">Rate the job</a>
+        </div>"""
+        except Exception:
+            pass
+    return f"""
+        <div class="section">
+          <h2>Need something added or changed?</h2>
+          <p class="dim">Have an idea for the project? Send {_esc(biz_name)} a change request — they'll review and send you a formal change order.</p>
+          <a class="sign-btn" href="/p/{_esc(token)}/request-change">Request a change</a>
+        </div>"""
 
 
 def _live_co_sign_url_for_co(co_id: str) -> str:
