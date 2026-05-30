@@ -2832,6 +2832,14 @@ def owner_chat():
 
     # Capability overview — answers "give me a full list of your capabilities"
     # without touching the LLM, so it works in offline mode.
+    # "Give me my morning brief" / "daily brief" — route to the real
+    # build_briefing path instead of the LLM, so contractor sections
+    # (pending COs, overdue invoices, receivables totals) actually
+    # show up.
+    brief_resp = _try_morning_brief(user_msg, user_rec)
+    if brief_resp is not None:
+        return jsonify(brief_resp)
+
     cap_overview = _try_capabilities_overview(user_msg)
     if cap_overview is not None:
         return jsonify({"reply": cap_overview, "tier": "local", "latency_ms": 0,
@@ -5048,6 +5056,59 @@ def _friend_personal_context(business: dict, user_dir: Path) -> str:
                  "they mentioned last week, celebrating a win you remember. "
                  "Don't dump it back at them.")
     return "\n".join(lines)
+
+
+_MORNING_BRIEF_RE = _re.compile(
+    r"^\s*(?:"
+    r"(?:give\s+me\s+|show\s+me\s+|what'?s?\s+(?:in\s+)?)?(?:my\s+)?"
+    r"(?:morning|daily|today'?s?)\s+(?:brief|briefing|update|rundown|recap)"
+    r"|brief\s+me(?:\s+(?:on\s+)?today)?"
+    r"|(?:my\s+)?(?:brief|briefing)\s+(?:now|for\s+today)?"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+
+
+def _try_morning_brief(message: str, user_rec: dict) -> dict | None:
+    """Route 'give me my morning brief' / 'daily brief' to the real
+    build_briefing path so contractor sections + accurate counts show
+    up instead of an LLM-fabricated summary."""
+    msg = _strip_polite_prefix(message or "")
+    if not _MORNING_BRIEF_RE.match(msg):
+        return None
+    try:
+        brief = briefing.build_briefing(CONFIG, DATA_DIR, user_rec.get("username", "owner"))
+    except Exception as e:
+        log.warning(f"morning brief build failed: {e}")
+        return None  # Let LLM take it as fallback
+    reply = brief.get("summary_text") or "Nothing to brief on yet."
+    # If contractor sections fired, append the key item details so the
+    # GC sees specific CO #s and invoice #s in the chat without having
+    # to open the dashboard.
+    items = brief.get("items") or []
+    pending = [i for i in items if i.get("kind") == "co_pending"]
+    awaiting = [i for i in items if i.get("kind") == "co_awaiting_sig"]
+    overdue = [i for i in items if i.get("kind") == "invoice_overdue"]
+    extra_lines = []
+    if pending:
+        extra_lines.append("\nChange orders waiting on you:")
+        for it in pending[:5]:
+            amt = it.get("amount", 0)
+            sign = "+" if amt >= 0 else ""
+            extra_lines.append(f"  · #{it['co_id']} {it['project']} ({sign}${amt:,.0f}) — {it['desc'][:60]}")
+    if awaiting:
+        extra_lines.append("\nChange orders out for client signature:")
+        for it in awaiting[:5]:
+            amt = it.get("amount", 0)
+            extra_lines.append(f"  · #{it['co_id']} {it['project']} (${amt:,.0f})")
+    if overdue:
+        extra_lines.append("\nOverdue invoices:")
+        for it in overdue[:5]:
+            extra_lines.append(f"  · {it['invoice_number']} {it['project']} (${it['owed']:,.0f})")
+    if extra_lines:
+        reply = reply + "\n" + "\n".join(extra_lines)
+    return {"reply": reply, "tier": "local", "latency_ms": 0,
+            "source": "morning_brief"}
 
 
 def _try_capabilities_overview(message: str) -> str | None:
