@@ -28,8 +28,11 @@ from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer,
 
 
 def generate(project: dict, cos: list, invoices: list, logs: list,
-              business: dict, out_dir: Path) -> Path:
-    """Render the closeout PDF. Returns the Path."""
+              business: dict, out_dir: Path,
+              review_url: str = "") -> Path:
+    """Render the closeout PDF. If review_url is provided, embed a
+    "We'd love your feedback" section with the URL so the customer
+    can rate the job in one click. Returns the Path."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     out = out_dir / f"closeout_{project['id']}.pdf"
@@ -193,6 +196,18 @@ def generate(project: dict, cos: list, invoices: list, logs: list,
     if warranty_text:
         elements.append(Paragraph("Warranty", h2))
         elements.append(Paragraph(warranty_text, body))
+
+    # ── Review request (if we minted one) ────────────────────────────
+    if review_url:
+        elements.append(Spacer(1, 0.2 * inch))
+        elements.append(Paragraph("We'd love your feedback", h2))
+        elements.append(Paragraph(
+            f"Rate your experience in 30 seconds — it really helps "
+            f"{biz_name} land more jobs in the neighborhood:",
+            body))
+        elements.append(Spacer(1, 4))
+        elements.append(Paragraph(
+            f'<font color="#8b5cf6"><b>{review_url}</b></font>', body))
 
     # ── Thank-you closing ─────────────────────────────────────────────
     elements.append(Spacer(1, 0.25 * inch))

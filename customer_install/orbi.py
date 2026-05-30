@@ -6004,10 +6004,22 @@ def _handle_closeout_pdf(msg: str, user_rec: dict) -> dict | None:
     invs = mod_invoices.list_for_project(DATA_DIR, project["id"])
     logs = mod_daily_logs.list_for_project(DATA_DIR, project["id"], limit=10)
     business = mod_business.load(DATA_DIR)
+    # Auto-mint a review link and embed in the PDF — closes the
+    # closeout→review loop without the GC having to remember a second step.
+    try:
+        review = mod_reviews.issue(DATA_DIR, project["id"])
+        base = (CONFIG.get("tunnel_url")
+                 or (CONFIG.get("brain") or {}).get("local_public_url")
+                 or "http://127.0.0.1:5050").rstrip("/")
+        review_url = f"{base}/r/{review['token']}"
+    except Exception as e:
+        log.warning(f"closeout review mint failed: {e}")
+        review_url = ""
     try:
         pdf_path = mod_closeout_pdf.generate(
             project, cos, invs, logs, business,
             DATA_DIR / "closeout_pdfs",
+            review_url=review_url,
         )
     except Exception as e:
         log.exception("closeout PDF generation failed")
