@@ -2572,6 +2572,19 @@ def owner_chat():
     if upd is not None:
         return jsonify(upd)
 
+    # Calendar CANCEL — "cancel my Tuesday appointment" — actually
+    # removes the event from the calendar (was returning fake "done" via
+    # the LLM before, never wrote anything).
+    cancel_resp = _try_cancel_appointment(user_msg, user_dir)
+    if cancel_resp is not None:
+        return jsonify(cancel_resp)
+
+    # Calendar RESCHEDULE — "move my haircut from Tuesday to Friday" —
+    # actually updates the event start (was also faking it via the LLM).
+    resched_resp = _try_reschedule_appointment(user_msg, user_dir)
+    if resched_resp is not None:
+        return jsonify(resched_resp)
+
     # "Gift for X" / "What should I get Y for her birthday" — uses the
     # owner's taste profile + past gifts to that person + contact notes.
     gift_resp = _try_gift_suggestion(user_msg, user_dir, user_rec)
@@ -3126,6 +3139,196 @@ _NAME_AFTER_FILLER = (
     # Case-sensitive (not part of IGNORECASE) via inline (?-i).
     r"(?-i:(?P<%s>[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2}))"
 )
+# ── Calendar action handlers — cancel + reschedule ────────────────────────
+# The BOOKING side already works via quick_capture (_APPT_RE in
+# modules/quick_capture.py) — "book a meeting with Joe Thursday at 2pm"
+# writes to the calendar. What WASN'T wired:
+#   - Cancel: "cancel my Tuesday appointment" → Orby said "done" but
+#     never removed the event. Test #8.
+#   - Reschedule: "move my haircut from Tuesday to Friday" → Orby said
+#     "moved" but never updated. Test #10.
+# These handlers fix both by ACTUALLY writing to the calendar through
+# modules/calendar.remove() and .update().
+
+_CANCEL_APPT_RE = _re.compile(
+    r"^\s*(?:cancel|delete|remove|drop)\s+"
+    r"(?:my\s+|the\s+)?"
+    r"(?P<what>.+?)"
+    r"(?:\s+appointment|\s+meeting|\s+event|\s+booking)?"
+    r"\s*[.?!]?\s*$",
+    _re.IGNORECASE,
+)
+_RESCHEDULE_APPT_RE = _re.compile(
+    r"^\s*(?:reschedule|move|shift|change|push)\s+"
+    r"(?:my\s+|the\s+)?"
+    r"(?P<what>.+?)"
+    r"\s+(?:from\s+(?P<from_when>[^,]+?)\s+)?"
+    r"(?:to|until|for)\s+(?P<to_when>.+?)\s*[.?!]?\s*$",
+    _re.IGNORECASE,
+)
+_DAY_HINT_RE = _re.compile(
+    r"\b(today|tomorrow|tonight|monday|tuesday|wednesday|thursday|friday|"
+    r"saturday|sunday|next\s+\w+|this\s+\w+)\b",
+    _re.IGNORECASE,
+)
+
+
+def _find_matching_events(user_dir, query: str, days_window: int = 30) -> list[dict]:
+    """Fuzzy-match upcoming events. Returns events that match by either:
+      - a day-word in the query against the event's start date
+      - a substring of the query against the event title
+    Newest-first within the window."""
+    from datetime import datetime, timedelta, timezone
+    events = mod_calendar.upcoming(user_dir, days=days_window)
+    if not events:
+        return []
+    q = (query or "").strip().lower()
+    if not q:
+        return events
+    # Pull all words; check title substring matches and day matches.
+    day_hint_m = _DAY_HINT_RE.search(q)
+    day_word = day_hint_m.group(0).lower() if day_hint_m else None
+    matches = []
+    for e in events:
+        title = (e.get("title") or "").lower()
+        start = e.get("start", "")
+        # Day match
+        if day_word:
+            try:
+                s = start.replace("Z", "+00:00")
+                dt = datetime.fromisoformat(s).astimezone()
+                now = datetime.now().astimezone()
+                if day_word == "today" and dt.date() == now.date():
+                    matches.append(e); continue
+                if day_word == "tomorrow" and dt.date() == (now + timedelta(days=1)).date():
+                    matches.append(e); continue
+                weekdays = {"monday":0,"tuesday":1,"wednesday":2,"thursday":3,
+                             "friday":4,"saturday":5,"sunday":6}
+                if day_word in weekdays and dt.weekday() == weekdays[day_word]:
+                    matches.append(e); continue
+            except (ValueError, OSError):
+                pass
+        # Title substring match (strip "my/the/a" filler from query)
+        q_words = [w for w in q.split() if w not in
+                    {"my","the","a","an","please","appointment","meeting",
+                     "event","booking","today","tomorrow","tonight",
+                     "monday","tuesday","wednesday","thursday","friday",
+                     "saturday","sunday"}]
+        for w in q_words:
+            if len(w) >= 3 and w in title:
+                matches.append(e); break
+    # Dedupe preserving order
+    seen = set(); deduped = []
+    for e in matches:
+        if e["id"] not in seen:
+            seen.add(e["id"])
+            deduped.append(e)
+    return deduped
+
+
+def _event_display(e: dict) -> str:
+    """Compact human description of a calendar event for chat replies."""
+    from datetime import datetime
+    title = e.get("title", "(untitled)")
+    start = e.get("start", "")
+    try:
+        s = start.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s).astimezone()
+        when = dt.strftime("%a %b %-d at %-I:%M %p")
+    except (ValueError, OSError):
+        when = start
+    return f"{title} ({when})"
+
+
+def _try_cancel_appointment(message: str, user_dir) -> dict | None:
+    """Handle 'cancel my Tuesday appointment' / 'remove the dentist' /
+    'delete my 2pm'. ACTUALLY removes from the calendar."""
+    m = _CANCEL_APPT_RE.match(message or "")
+    if not m:
+        return None
+    what = (m.group("what") or "").strip()
+    if not what or what.lower() in {"that", "it", "this"}:
+        return None  # Too vague — let LLM handle
+    matches = _find_matching_events(user_dir, what)
+    if not matches:
+        upcoming = mod_calendar.upcoming(user_dir, days=14)
+        if not upcoming:
+            reply = "I don't see any upcoming appointments on your calendar to cancel."
+        else:
+            sample = "\n".join(f"  · {_event_display(e)}" for e in upcoming[:5])
+            reply = f"I don't see an appointment matching \"{what}\". Your upcoming:\n{sample}"
+        return {"reply": reply, "tier": "local", "latency_ms": 0,
+                "source": "calendar_cancel_no_match"}
+    if len(matches) > 1:
+        listed = "\n".join(f"  {i+1}. {_event_display(e)}" for i, e in enumerate(matches))
+        return {"reply": f"I see {len(matches)} appointments that could be \"{what}\":\n{listed}\nWhich one? (Say the title or time exactly.)",
+                "tier": "local", "latency_ms": 0,
+                "source": "calendar_cancel_ambiguous"}
+    target = matches[0]
+    ok = mod_calendar.remove(user_dir, target["id"])
+    if ok:
+        return {"reply": f"Cancelled — {_event_display(target)}.",
+                "tier": "local", "latency_ms": 0,
+                "source": "calendar_cancel_done"}
+    return {"reply": f"Couldn't cancel — {_event_display(target)} may have been removed already.",
+            "tier": "local", "latency_ms": 0,
+            "source": "calendar_cancel_failed"}
+
+
+def _try_reschedule_appointment(message: str, user_dir) -> dict | None:
+    """Handle 'reschedule my haircut from Tuesday to Friday' / 'move my
+    2pm meeting to 4pm'. ACTUALLY updates the calendar."""
+    m = _RESCHEDULE_APPT_RE.match(message or "")
+    if not m:
+        return None
+    what = (m.group("what") or "").strip()
+    from_when = (m.group("from_when") or "").strip()
+    to_when = (m.group("to_when") or "").strip()
+    if not what or not to_when:
+        return None
+    # Find the event by what + optional from_when hint
+    query = f"{what} {from_when}".strip()
+    matches = _find_matching_events(user_dir, query)
+    if not matches:
+        # Try without the from-when filter
+        matches = _find_matching_events(user_dir, what)
+    if not matches:
+        upcoming = mod_calendar.upcoming(user_dir, days=14)
+        if not upcoming:
+            return {"reply": "I don't see any upcoming appointments to reschedule.",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "calendar_reschedule_no_match"}
+        sample = "\n".join(f"  · {_event_display(e)}" for e in upcoming[:5])
+        return {"reply": f"I don't see an appointment matching \"{what}\". Your upcoming:\n{sample}",
+                "tier": "local", "latency_ms": 0,
+                "source": "calendar_reschedule_no_match"}
+    if len(matches) > 1:
+        listed = "\n".join(f"  {i+1}. {_event_display(e)}" for i, e in enumerate(matches))
+        return {"reply": f"Multiple matches for \"{what}\":\n{listed}\nWhich one should I move to {to_when}?",
+                "tier": "local", "latency_ms": 0,
+                "source": "calendar_reschedule_ambiguous"}
+    target = matches[0]
+    # Parse the new time using quick_capture._parse_when (already handles
+    # "Friday" / "Friday at 3pm" / "tomorrow at 2" / etc.)
+    try:
+        from modules import quick_capture as mod_qc_local
+        new_iso = mod_qc_local._parse_when(to_when)
+    except Exception as e:
+        new_iso = None
+    if not new_iso:
+        return {"reply": f"I matched the appointment ({_event_display(target)}) but couldn't parse \"{to_when}\" as a day/time. Try \"Friday at 3pm\" or \"tomorrow at 10\".",
+                "tier": "local", "latency_ms": 0,
+                "source": "calendar_reschedule_bad_when"}
+    updated = mod_calendar.update(user_dir, target["id"], start=new_iso, end=new_iso)
+    if updated:
+        return {"reply": f"Moved — {target.get('title','event')} is now {_event_display(updated)}.",
+                "tier": "local", "latency_ms": 0,
+                "source": "calendar_reschedule_done"}
+    return {"reply": f"Couldn't update {_event_display(target)} — try again.",
+            "tier": "local", "latency_ms": 0,
+            "source": "calendar_reschedule_failed"}
+
+
 _GIFT_SUGGEST_RE = _re.compile(
     # "gift for X" / "gift idea(s) for X" / "what should I get X"
     # / "what's a good gift for X" / "any ideas for X's birthday"
@@ -5364,7 +5567,14 @@ def _try_office_gen(message: str, username: str) -> dict | None:
 
 _POLITE_PREFIX_RE = _re.compile(
     r"^\s*(?:hey\s+orbi[,\s]+|orbi[,\s]+|"
-    r"(?:can|could|would|will)\s+you\s+(?:please\s+)?|"
+    r"(?:can|could|would|will|may)\s+you\s+(?:please\s+)?|"
+    # Question form with "I" as subject — "Can I book...", "Could I get...",
+    # "May I have..." — strip the prefix so the quick-capture trigger sees
+    # the verb that follows. Without this, "Can I book an appointment for
+    # Thursday at 2pm" never reaches the booking handler and falls to the
+    # LLM, which then talks like it scheduled the appointment without
+    # actually writing anything to the calendar.
+    r"(?:can|could|would|will|may|should)\s+i\s+(?:please\s+)?|"
     r"please\s+|"
     r"i\s+(?:want|need)\s+(?:you\s+)?to\s+|"
     r"i'?d\s+like\s+(?:you\s+)?to\s+|"
