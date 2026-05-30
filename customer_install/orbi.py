@@ -1094,6 +1094,24 @@ def _render_client_project_portal(project: dict) -> str:
         </div>
         """
 
+    # Payment instructions block — only show when there's a balance
+    payment_html = ""
+    if balance > 0:
+        pay_methods = (business.get("policies") or {}).get("payment_methods", "") if isinstance(business.get("policies"), dict) else ""
+        if pay_methods or biz_phone or biz_email:
+            instructions = pay_methods or "Reach out to the contractor for payment instructions."
+            payment_html = f"""
+        <div class="section payment">
+          <h2>How to pay</h2>
+          <p>{_esc(instructions)}</p>
+          {('<p class="dim">Questions about your invoice? ' +
+             '<a href="tel:' + _esc(biz_phone) + '">' + _esc(biz_phone) + '</a>'
+             if biz_phone else '') +
+            (' or <a href="mailto:' + _esc(biz_email) + '">' + _esc(biz_email) + '</a>'
+             if biz_email else '') + '</p>'}
+        </div>
+        """
+
     contact_html = ""
     if biz_phone or biz_email:
         bits = []
@@ -1154,8 +1172,9 @@ body {{ font-family: -apple-system, system-ui, "Segoe UI", sans-serif;
 .activity li:last-child {{ border-bottom: none; }}
 .activity .date {{ display: inline-block; min-width: 90px; color: #6c7592;
                    font-size: 12px; }}
-.contact p {{ font-size: 14px; margin: 0; }}
-.contact a {{ color: #8b5cf6; text-decoration: none; font-weight: 600; }}
+.contact p, .payment p {{ font-size: 14px; margin: 0 0 8px; }}
+.contact a, .payment a {{ color: #8b5cf6; text-decoration: none; font-weight: 600; }}
+.payment {{ border-left: 4px solid #2e7d32; }}
 .footer {{ text-align: center; font-size: 12px; color: #9aa4c0;
            margin-top: 20px; }}
 </style>
@@ -1183,6 +1202,8 @@ body {{ font-family: -apple-system, system-ui, "Segoe UI", sans-serif;
     </div>
     {paid_status_html}
   </div>
+
+  {payment_html}
 
   {activity_html}
 
