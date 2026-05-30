@@ -3605,6 +3605,14 @@ def owner_chat():
     if upd is not None:
         return jsonify(upd)
 
+    # First-install onboarding wizard — fires when business_info has
+    # placeholder values from a fresh customer install. Walks the user
+    # through 5 setup questions. Once business_info is populated, this
+    # handler permanently no-ops for the lifetime of the install.
+    onb_resp = _try_onboarding(user_msg, user_rec)
+    if onb_resp is not None:
+        return jsonify(onb_resp)
+
     # Contractor module — "add project at X", "what jobs are open",
     # "status of the Maple project". Gated by enabled_modules so it's
     # invisible for base-Orby customers and active for paid Contractor
@@ -4188,6 +4196,147 @@ _NAME_AFTER_FILLER = (
     # Case-sensitive (not part of IGNORECASE) via inline (?-i).
     r"(?-i:(?P<%s>[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2}))"
 )
+# ── First-install onboarding wizard ───────────────────────────────────────
+# When a fresh customer just paid + ran the installer, business_info
+# still has REPLACE_WITH placeholders. The first thing they say in chat
+# triggers a setup flow that captures the essentials — business name,
+# license, phone, services — and saves them so Orby is ready to take
+# real calls 60 seconds after login.
+#
+# State lives in data/.onboarding_state.json (single record — only one
+# owner per install). Once business_info.name is real, this entire
+# block no-ops and Orby behaves normally.
+
+ONBOARDING_STEPS = [
+    ("name",        "What's your business called?"),
+    ("phone",       "What's the main phone number for your business?"),
+    ("services",    "What services do you offer? (one line, comma-separated is fine)"),
+    ("address",     "What's your street address?"),
+    ("license",     "What's your contractor license number? (Type 'skip' if you don't have one yet.)"),
+]
+
+
+def _onboarding_state_path() -> "Path":
+    return DATA_DIR / ".onboarding_state.json"
+
+
+def _load_onboarding_state() -> dict:
+    p = _onboarding_state_path()
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {"complete": False, "step": 0, "collected": {}}
+
+
+def _save_onboarding_state(state: dict) -> None:
+    p = _onboarding_state_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    tmp.replace(p)
+
+
+def _needs_onboarding() -> bool:
+    """True if business_info still has template placeholders (or is empty)."""
+    try:
+        biz = mod_business.load(DATA_DIR) or {}
+    except Exception:
+        return False
+    name = (biz.get("name") or "").strip()
+    if not name or name.startswith("REPLACE_") or name == "My Orby AI Solutions":
+        # We treat Frank's own install (name = "My Orby AI Solutions") as
+        # not-needing-onboarding because he set it. For real customers,
+        # the install drops REPLACE_WITH_BUSINESS_NAME as the default.
+        if name == "My Orby AI Solutions":
+            return False
+        return True
+    return False
+
+
+def _try_onboarding(message: str, user_rec: dict) -> dict | None:
+    """If business_info needs onboarding, walk the user through it via
+    chat. Returns a reply dict or None to fall through.
+
+    The first chat after install short-circuits whatever they typed and
+    starts the flow. Each subsequent message captures the answer for
+    the current step. 'skip' moves on for optional fields."""
+    if not _needs_onboarding():
+        # Wizard already complete (or N/A on this install)
+        state = _load_onboarding_state()
+        if not state.get("complete"):
+            state["complete"] = True
+            _save_onboarding_state(state)
+        return None
+    state = _load_onboarding_state()
+    if state.get("complete"):
+        return None
+    step_idx = int(state.get("step", 0))
+    collected = state.get("collected") or {}
+    # If this is the very first message, ignore content + ask first question
+    if step_idx == 0 and not collected:
+        first_key, first_q = ONBOARDING_STEPS[0]
+        return {"reply": ("👋 Welcome! Quick setup before we take any calls — "
+                          "5 questions, 60 seconds.\n\n"
+                          f"{first_q}"),
+                "tier": "local", "latency_ms": 0,
+                "source": "onboarding_start"}
+    # Save the answer to the current step
+    answer = (message or "").strip()
+    if step_idx < len(ONBOARDING_STEPS):
+        key, _q = ONBOARDING_STEPS[step_idx]
+        if answer.lower() in {"skip", "none", "n/a"} and key in ("license",):
+            collected[key] = ""
+        else:
+            collected[key] = answer
+    step_idx += 1
+    state["step"] = step_idx
+    state["collected"] = collected
+    _save_onboarding_state(state)
+    # If more steps remain, ask the next
+    if step_idx < len(ONBOARDING_STEPS):
+        _next_key, next_q = ONBOARDING_STEPS[step_idx]
+        return {"reply": f"Got it.\n\n{next_q}",
+                "tier": "local", "latency_ms": 0,
+                "source": "onboarding_step"}
+    # All done — save to business_info, mark complete
+    try:
+        biz = mod_business.load(DATA_DIR) or {}
+        biz["name"] = collected.get("name", "")
+        contact = biz.get("contact") or {}
+        if collected.get("phone"):
+            contact["phone"] = collected["phone"]
+        biz["contact"] = contact
+        services = [s.strip() for s in (collected.get("services") or "").split(",")
+                     if s.strip()]
+        if services:
+            biz["services"] = services
+        if collected.get("address"):
+            # Store as a string for simplicity — the address field accepts
+            # either string or dict per business_info.py handling.
+            biz["address"] = collected["address"]
+        if collected.get("license"):
+            biz["license"] = collected["license"]
+        mod_business.save(DATA_DIR, biz)
+        state["complete"] = True
+        _save_onboarding_state(state)
+        audit.log_event(DATA_DIR, actor=user_rec.get("username", "?"),
+                        action="onboarding.completed",
+                        meta={"business_name": collected.get("name")})
+    except Exception as e:
+        log.exception("onboarding save failed")
+        return {"reply": f"Almost — but saving failed: {e}. You can fill in your "
+                          f"business info under the Settings tab instead.",
+                "tier": "local", "latency_ms": 0,
+                "source": "onboarding_save_error"}
+    biz_name = collected.get("name", "your business")
+    return {"reply": (f"🎉 Setup complete. {biz_name} is ready to take calls "
+                      f"and chats. Try asking me anything — \"what's on my "
+                      f"calendar today\" or \"morning brief\" — or jump into "
+                      f"Settings to add staff, hours, payment methods, etc."),
+            "tier": "local", "latency_ms": 0,
+            "source": "onboarding_complete"}
+
+
 # ── Contractor module chat handlers (paid add-on) ─────────────────────────
 # Gated by is_module_enabled('contractor'). When the customer has the
 # Contractor Orby add-on, these handlers fire BEFORE the LLM so things
