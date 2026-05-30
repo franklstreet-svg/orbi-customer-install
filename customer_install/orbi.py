@@ -108,6 +108,7 @@ from modules import invoices as mod_invoices
 from modules import daily_logs as mod_daily_logs
 from modules import subcontractors as mod_subs
 from modules import invoice_pdf as mod_invoice_pdf
+from modules import closeout_pdf as mod_closeout_pdf
 from tools import url_fetch as tool_url_fetch
 from tools import web_search as tool_web_search
 
@@ -3969,6 +3970,15 @@ _GC_INSURANCE_CHECK_RE = _re.compile(
 )
 
 # ── Unsigned-work leak alarm pattern ──────────────────────────────────────
+_GC_CLOSEOUT_RE = _re.compile(
+    r"^\s*(?:"
+    r"(?:generate|create|build|make|send)\s+(?:the\s+)?closeout"
+    r"\s+(?:package\s+)?(?:for\s+|on\s+)?(?P<q1>.+?)"
+    r"|closeout\s+(?:package\s+)?(?:for\s+|on\s+)?(?P<q2>.+?)"
+    r"|(?P<q3>.+?)\s+closeout(?:\s+(?:pdf|package|doc))?"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
 _GC_SHARE_PORTAL_RE = _re.compile(
     # "share Oak with the client" / "client portal for Maple" /
     # "send Sarah her project link" / "Oak portal link"
@@ -4636,6 +4646,11 @@ def _try_contractor_chat(message: str, user_rec: dict) -> dict | None:
     if share_resp is not None:
         return share_resp
 
+    # 15f. CLOSEOUT PDF — "closeout for Birch" / "generate closeout Maple"
+    close_resp = _handle_closeout_pdf(msg, user_rec)
+    if close_resp is not None:
+        return close_resp
+
     # 16. REPORTING — "show me the money", "captured this month", "totals"
     if _GC_REPORT_RE.match(msg):
         p_sum = mod_projects.summary(DATA_DIR)
@@ -5161,6 +5176,64 @@ def _handle_project_full_report(msg: str, user_rec: dict) -> dict | None:
             lines.append(f"  · {l['date']}{crew_bit}{hrs_bit} {l.get('work_done','')[:70]}")
     return {"reply": "\n".join(lines), "tier": "local",
             "latency_ms": 0, "source": "gc_project_report"}
+
+
+def _handle_closeout_pdf(msg: str, user_rec: dict) -> dict | None:
+    m = _GC_CLOSEOUT_RE.match(msg)
+    if not m:
+        return None
+    q = (m.group("q1") or m.group("q2") or m.group("q3") or "").strip()
+    q = _re.sub(r"^the\s+", "", q, flags=_re.IGNORECASE)
+    q = _re.sub(r"\s+project$", "", q, flags=_re.IGNORECASE)
+    if not q or q.lower() in {"my", "the", "all"}:
+        return None
+    matches = mod_projects.find_by_address(DATA_DIR, q)
+    if not matches:
+        return None
+    if len(matches) > 1:
+        listed = "\n".join(f"  · {p['address']}" for p in matches[:5])
+        return {"reply": f"Multiple projects match \"{q}\":\n{listed}\nWhich one?",
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_closeout_ambiguous"}
+    project = matches[0]
+    cos = mod_change_orders.list_for_project(DATA_DIR, project["id"])
+    invs = mod_invoices.list_for_project(DATA_DIR, project["id"])
+    logs = mod_daily_logs.list_for_project(DATA_DIR, project["id"], limit=10)
+    business = mod_business.load(DATA_DIR)
+    try:
+        pdf_path = mod_closeout_pdf.generate(
+            project, cos, invs, logs, business,
+            DATA_DIR / "closeout_pdfs",
+        )
+    except Exception as e:
+        log.exception("closeout PDF generation failed")
+        return {"reply": f"Closeout PDF generation failed: {e}",
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_closeout_error"}
+    try:
+        token = file_fetch.mint_download_token(
+            DATA_DIR, str(pdf_path),
+            ttl_minutes=60 * 24,   # 24h — give plenty of time to forward to customer
+            extra_allowed_roots=[DATA_DIR / "closeout_pdfs"],
+        )
+    except Exception as e:
+        log.warning(f"closeout PDF token mint failed: {e}")
+        token = None
+    audit.log_event(DATA_DIR, actor=user_rec.get("username", "?"),
+                    action="closeout.generated",
+                    meta={"project_id": project["id"]})
+    size_kb = pdf_path.stat().st_size // 1024
+    customer = project.get("customer_name") or "the customer"
+    if token:
+        return {"reply": (f"Closeout package built for {project['address']} ({size_kb} KB). "
+                          f"[Download here](/download/{token}) — link valid 24 hours. "
+                          f"Forward to {customer} when ready."),
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_closeout_generated",
+                "download_url": f"/download/{token}"}
+    return {"reply": f"Closeout package saved at {pdf_path} ({size_kb} KB).",
+            "tier": "local", "latency_ms": 0,
+            "source": "gc_closeout_generated_no_token"}
 
 
 def _handle_share_portal(msg: str, user_rec: dict) -> dict | None:
