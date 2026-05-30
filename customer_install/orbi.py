@@ -1299,23 +1299,11 @@ def _render_client_project_portal(project: dict) -> str:
         </div>
         """
 
-    # Payment instructions block — only show when there's a balance
+    # No "How to pay" block — Orby is not a payment channel. Construction
+    # loan draws go through the lender, cash jobs go through whatever
+    # arrangement the GC and homeowner already have. The portal just
+    # shows the running account so the customer knows where they stand.
     payment_html = ""
-    if balance > 0:
-        pay_methods = (business.get("policies") or {}).get("payment_methods", "") if isinstance(business.get("policies"), dict) else ""
-        if pay_methods or biz_phone or biz_email:
-            instructions = pay_methods or "Reach out to the contractor for payment instructions."
-            payment_html = f"""
-        <div class="section payment">
-          <h2>How to pay</h2>
-          <p>{_esc(instructions)}</p>
-          {('<p class="dim">Questions about your invoice? ' +
-             '<a href="tel:' + _esc(biz_phone) + '">' + _esc(biz_phone) + '</a>'
-             if biz_phone else '') +
-            (' or <a href="mailto:' + _esc(biz_email) + '">' + _esc(biz_email) + '</a>'
-             if biz_email else '') + '</p>'}
-        </div>
-        """
 
     contact_html = ""
     if biz_phone or biz_email:
@@ -4800,8 +4788,8 @@ def _draft_nudge_text(invoice: dict, project: dict, escalation: int = 1) -> str:
             f"Hi {customer},\n\n"
             f"Just a friendly reminder that invoice {inv_num} for the work at "
             f"{addr} (${owed:,.2f}) is now due{(' — was due ' + due_str) if due_str else ''}"
-            f"{days_late}. If you've already sent it, thank you — please ignore "
-            f"this note. Otherwise, you can pay any way that works for you.\n\n"
+            f"{days_late}. If your lender's already cut the draw or your "
+            f"payment is on the way, thank you — please ignore this note.\n\n"
             f"Thanks,\n{biz_name}"
         )
     if escalation == 2:
