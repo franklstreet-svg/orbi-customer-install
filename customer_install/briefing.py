@@ -817,7 +817,8 @@ def _build_summary(display_name: str, stats: dict) -> str:
         parts.append(("Change orders: " + ", ".join(co_bits) + ".").capitalize())
     if n_inv_od:
         parts.append(
-            f"{n_inv_od} invoice{'s' if n_inv_od != 1 else ''} are overdue."
+            f"{n_inv_od} invoice{'s' if n_inv_od != 1 else ''} "
+            f"{'are' if n_inv_od != 1 else 'is'} overdue."
         )
     if contractor_present and receivables_total > 0:
         parts.append(f"Total outstanding receivables: ${receivables_total:,.0f}.")
