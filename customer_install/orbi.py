@@ -110,6 +110,7 @@ from modules import subcontractors as mod_subs
 from modules import invoice_pdf as mod_invoice_pdf
 from modules import closeout_pdf as mod_closeout_pdf
 from modules import bids as mod_bids
+from modules import reviews as mod_reviews
 from tools import url_fetch as tool_url_fetch
 from tools import web_search as tool_web_search
 
@@ -1445,6 +1446,196 @@ def _live_co_sign_url_for_co(co_id: str) -> str:
         return ""
     candidates.sort(reverse=True)
     return _co_sign_url(candidates[0][1])
+
+
+# ── Customer review form (post-closeout) ──────────────────────────────────
+# After a project closes, GC mints a token via "review link for X" and
+# shares the URL with the customer. Customer visits /r/<token>, leaves
+# a 1-5 star + optional comment + may grant permission to share publicly.
+
+@app.route("/r/<token>", methods=["GET"])
+def client_review_view(token):
+    review = mod_reviews.get_by_token(DATA_DIR, token)
+    if not review:
+        return _render_review_error("This review link isn't valid or has been retired."), 404
+    if review.get("submitted_at"):
+        return _render_review_thanks(review, already_submitted=True)
+    project = mod_projects.get(DATA_DIR, review["project_id"]) or {}
+    return _render_review_form(token, project)
+
+
+@app.route("/r/<token>", methods=["POST"])
+def client_review_submit(token):
+    review = mod_reviews.get_by_token(DATA_DIR, token)
+    if not review:
+        return _render_review_error("This review link isn't valid or has been retired."), 404
+    if review.get("submitted_at"):
+        return _render_review_thanks(review, already_submitted=True)
+    try:
+        rating = int(request.form.get("rating") or 0)
+    except ValueError:
+        rating = 0
+    if rating < 1 or rating > 5:
+        project = mod_projects.get(DATA_DIR, review["project_id"]) or {}
+        return _render_review_form(token, project,
+                                      error="Please pick a star rating."), 400
+    comment = (request.form.get("comment") or "").strip()
+    recommend = (request.form.get("recommend") or "yes").lower() == "yes"
+    share_ok = request.form.get("share_ok") == "on"
+    ip = request.headers.get("X-Forwarded-For", request.remote_addr or "")
+    updated = mod_reviews.submit(
+        DATA_DIR, token,
+        rating=rating, comment=comment,
+        would_recommend=recommend, permission_to_share=share_ok,
+        submitter_ip=ip,
+    )
+    if not updated:
+        return _render_review_error("This review was already submitted earlier."), 410
+    project = mod_projects.get(DATA_DIR, review["project_id"]) or {}
+    try:
+        notify.send(CONFIG, DATA_DIR, event="review_submitted",
+                     title=f"⭐ {'★' * rating} review — {project.get('address','')}",
+                     body=f"{project.get('customer_name') or 'Customer'} "
+                          f"left a {rating}-star review"
+                          + (f": \"{comment[:80]}...\"" if comment else ""),
+                     url="/owner")
+    except Exception:
+        log.exception("review notify failed")
+    audit.log_event(DATA_DIR, actor=project.get("customer_name") or "client",
+                    action="review.submitted",
+                    meta={"project_id": project.get("id"), "rating": rating,
+                          "would_recommend": recommend,
+                          "permission_to_share": share_ok, "ip": ip})
+    return _render_review_thanks(updated, project=project)
+
+
+def _render_review_form(token: str, project: dict, error: str = "") -> str:
+    biz_name = (mod_business.load(DATA_DIR).get("name") or "your contractor")
+    customer = project.get("customer_name") or "there"
+    first_name = customer.split(" ", 1)[0]
+    addr = project.get("address", "")
+    label = project.get("label", "")
+    err_html = (f'<div class="err">{_esc(error)}</div>' if error else "")
+    # Star input — 5 radio buttons styled as stars
+    stars_html = ""
+    for i in range(5, 0, -1):
+        stars_html += (f'<input type="radio" id="star{i}" name="rating" '
+                       f'value="{i}">'
+                       f'<label for="star{i}" title="{i} star{"s" if i > 1 else ""}">★</label>')
+    return f"""<!doctype html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How did we do? — {_esc(biz_name)}</title>
+<style>
+body {{ font-family: -apple-system, system-ui, sans-serif; background: #f4f6fb;
+       color: #1a2240; margin: 0; padding: 20px; line-height: 1.5; }}
+.card {{ max-width: 560px; margin: 30px auto; background: white;
+        border-radius: 14px; padding: 28px; box-shadow: 0 2px 8px rgba(0,0,0,0.04); }}
+h1 {{ font-size: 22px; margin: 0 0 6px; }}
+.sub {{ color: #6c7592; font-size: 14px; margin-bottom: 22px; }}
+.field {{ margin-bottom: 18px; }}
+label {{ display: block; font-weight: 600; margin-bottom: 6px; font-size: 14px; }}
+textarea {{ width: 100%; padding: 12px 14px; background: #f9fafc;
+            border: 1px solid #d0d6e6; color: #1a2240; border-radius: 8px;
+            font-size: 15px; box-sizing: border-box; min-height: 100px;
+            font-family: inherit; resize: vertical; }}
+button {{ width: 100%; padding: 14px; background: #8b5cf6; color: white;
+          border: none; border-radius: 8px; font-size: 15px; font-weight: 600;
+          cursor: pointer; margin-top: 8px; }}
+button:hover {{ background: #7c4ef0; }}
+.err {{ background: #fef2f2; color: #991b1b; padding: 10px 12px;
+        border-radius: 6px; margin-bottom: 14px; }}
+/* Star rating — radio buttons styled as clickable stars */
+.stars {{ direction: rtl; display: inline-flex; font-size: 38px;
+          line-height: 1; gap: 4px; }}
+.stars input {{ display: none; }}
+.stars label {{ color: #ccc; cursor: pointer; transition: color 0.1s; }}
+.stars label:hover, .stars label:hover ~ label,
+.stars input:checked ~ label {{ color: #fbbf24; }}
+.rec-row {{ display: flex; gap: 14px; }}
+.rec-row label {{ display: flex; align-items: center; gap: 6px;
+                   font-weight: normal; cursor: pointer; }}
+.checkbox-row {{ font-weight: normal; display: flex; align-items: center;
+                  gap: 8px; font-size: 13px; }}
+.checkbox-row input {{ width: 16px; height: 16px; }}
+.help {{ color: #6c7592; font-size: 12px; margin-top: 6px; }}
+</style></head><body>
+<div class="card">
+  <h1>How did we do, {_esc(first_name)}?</h1>
+  <p class="sub">Quick rating on the {_esc(label) or 'project'} at {_esc(addr)}. Takes 30 seconds.</p>
+  {err_html}
+  <form method="POST">
+    <div class="field">
+      <label>Overall rating</label>
+      <div class="stars">{stars_html}</div>
+    </div>
+    <div class="field">
+      <label for="comment">Anything you'd like to add? (optional)</label>
+      <textarea id="comment" name="comment" maxlength="2000"
+                 placeholder="What went well? Anything we could do better?"></textarea>
+    </div>
+    <div class="field">
+      <label>Would you recommend {_esc(biz_name)} to a friend?</label>
+      <div class="rec-row">
+        <label><input type="radio" name="recommend" value="yes" checked> Yes</label>
+        <label><input type="radio" name="recommend" value="no"> No</label>
+      </div>
+    </div>
+    <div class="field">
+      <label class="checkbox-row">
+        <input type="checkbox" name="share_ok">
+        OK to quote me publicly (website, marketing) — optional
+      </label>
+    </div>
+    <button type="submit">Send rating</button>
+  </form>
+</div>
+</body></html>"""
+
+
+def _render_review_thanks(review: dict, project: dict = None,
+                            already_submitted: bool = False) -> str:
+    biz_name = (mod_business.load(DATA_DIR).get("name") or "your contractor")
+    rating = int(review.get("rating") or 0)
+    stars = "★" * rating + "☆" * (5 - rating) if rating else ""
+    msg = ("Thanks — we got your rating earlier."
+           if already_submitted else
+           f"Thanks for the review! It really helps {_esc(biz_name)} land "
+           f"more jobs in the area.")
+    return f"""<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Thanks</title>
+<style>
+body {{ font-family: -apple-system, system-ui, sans-serif; background: #f4f6fb;
+       color: #1a2240; margin: 0; padding: 20px; text-align: center; }}
+.card {{ max-width: 480px; margin: 60px auto; background: white;
+        border-radius: 14px; padding: 32px; box-shadow: 0 2px 8px rgba(0,0,0,0.04); }}
+h1 {{ color: #2e7d32; margin: 0 0 16px; font-size: 22px; }}
+.stars {{ font-size: 32px; color: #fbbf24; margin: 16px 0; }}
+p {{ color: #444; line-height: 1.5; }}
+</style></head><body>
+<div class="card">
+<h1>✓ Got it</h1>
+{f'<div class="stars">{stars}</div>' if stars else ''}
+<p>{msg}</p>
+</div></body></html>"""
+
+
+def _render_review_error(reason: str) -> str:
+    return f"""<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Link unavailable</title>
+<style>
+body {{ font-family: -apple-system, system-ui, sans-serif; background: #f4f6fb;
+       color: #1a2240; margin: 0; padding: 20px; text-align: center; }}
+.card {{ max-width: 480px; margin: 60px auto; background: white;
+        border-radius: 14px; padding: 32px; box-shadow: 0 2px 8px rgba(0,0,0,0.04); }}
+h1 {{ color: #b91c1c; margin: 0 0 16px; }}
+</style></head><body>
+<div class="card">
+<h1>Link unavailable</h1>
+<p>{_esc(reason)}</p>
+</div></body></html>"""
 
 
 def _render_portal_error(reason: str) -> str:
@@ -4202,6 +4393,23 @@ _GC_INSURANCE_CHECK_RE = _re.compile(
 )
 
 # ── Unsigned-work leak alarm pattern ──────────────────────────────────────
+_GC_REVIEW_LINK_RE = _re.compile(
+    r"^\s*(?:"
+    r"(?:get|mint|generate|create|send)\s+(?:a\s+)?review\s+link\s+for\s+(?P<q1>.+?)"
+    r"|review\s+link\s+(?:for\s+)?(?P<q2>.+?)"
+    r"|ask\s+(?:for\s+)?(?:a\s+)?review\s+(?:from\s+|on\s+)?(?P<q3>.+?)"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+_GC_MY_RATING_RE = _re.compile(
+    r"^\s*(?:"
+    r"(?:what(?:'s| is)?\s+my|show\s+(?:me\s+)?my)\s+(?:rating|reviews|stars|score)"
+    r"|my\s+(?:rating|reviews|review\s+score|average)"
+    r"|how(?:'?s| are|'?ve)\s+my\s+reviews?"
+    r"|review\s+(?:summary|report|stats)"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
 _GC_ADD_BID_RE = _re.compile(
     # "sent bid for Sarah Johnson at 123 Maple — $48,500 kitchen remodel"
     # "logged bid $24k Tom Anderson deck Sparks"
@@ -4925,6 +5133,14 @@ def _try_contractor_chat(message: str, user_rec: dict) -> dict | None:
     if close_resp is not None:
         return close_resp
 
+    # 15g0. REVIEWS — link minting + summary
+    review_link_resp = _handle_review_link(msg, user_rec)
+    if review_link_resp is not None:
+        return review_link_resp
+    my_rating_resp = _handle_my_rating(msg, user_rec)
+    if my_rating_resp is not None:
+        return my_rating_resp
+
     # 15g. BIDS — list / report first (specific patterns), then won/lost,
     # then add (trigger phrase last so it doesn't shadow list/report).
     bid_list_resp = _handle_list_bids(msg, user_rec)
@@ -5467,6 +5683,78 @@ def _handle_project_full_report(msg: str, user_rec: dict) -> dict | None:
             lines.append(f"  · {l['date']}{crew_bit}{hrs_bit} {l.get('work_done','')[:70]}")
     return {"reply": "\n".join(lines), "tier": "local",
             "latency_ms": 0, "source": "gc_project_report"}
+
+
+def _handle_review_link(msg: str, user_rec: dict) -> dict | None:
+    m = _GC_REVIEW_LINK_RE.match(msg)
+    if not m:
+        return None
+    q = (m.group("q1") or m.group("q2") or m.group("q3") or "").strip()
+    q = _re.sub(r"^the\s+", "", q, flags=_re.IGNORECASE)
+    q = _re.sub(r"\s+project$", "", q, flags=_re.IGNORECASE)
+    if not q:
+        return None
+    matches = mod_projects.find_by_address(DATA_DIR, q)
+    if not matches:
+        return None
+    if len(matches) > 1:
+        listed = "\n".join(f"  · {p['address']}" for p in matches[:5])
+        return {"reply": f"Multiple projects match \"{q}\":\n{listed}\nWhich one?",
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_review_ambiguous"}
+    project = matches[0]
+    review = mod_reviews.issue(DATA_DIR, project["id"])
+    base = (CONFIG.get("tunnel_url")
+             or (CONFIG.get("brain") or {}).get("local_public_url")
+             or "http://127.0.0.1:5050").rstrip("/")
+    url = f"{base}/r/{review['token']}"
+    customer = project.get("customer_name") or "the customer"
+    audit.log_event(DATA_DIR, actor=user_rec.get("username", "?"),
+                    action="review.link_issued",
+                    meta={"project_id": project["id"]})
+    return {"reply": (f"Review link for {customer} on {project.get('label') or project['address']}:\n\n"
+                      f"{url}\n\n"
+                      f"Single-use. Drop it in your closeout email or text."),
+            "tier": "local", "latency_ms": 0,
+            "source": "gc_review_link_issued"}
+
+
+def _handle_my_rating(msg: str, user_rec: dict) -> dict | None:
+    if not _GC_MY_RATING_RE.match(msg):
+        return None
+    s = mod_reviews.summary(DATA_DIR)
+    if s["count"] == 0 and s["issued_unanswered"] == 0:
+        return {"reply": "No reviews yet — no links issued. After you close a "
+                          "project, say \"review link for <project>\" to send "
+                          "the customer a 30-second 1-5 star form.",
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_rating_none"}
+    if s["count"] == 0:
+        return {"reply": f"No reviews submitted yet, but {s['issued_unanswered']} link(s) "
+                          f"out there waiting. Customers usually fill them out within a week.",
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_rating_pending"}
+    stars = "★" * int(round(s["average"]))
+    lines = [
+        f"⭐ Your average: {s['average']:.2f}/5 {stars} ({s['count']} review{'s' if s['count'] != 1 else ''})",
+        f"   {s['would_recommend_pct']:.0f}% would recommend you",
+        "",
+        f"   Distribution:",
+    ]
+    for v in (5, 4, 3, 2, 1):
+        c = s["distribution"].get(v, 0)
+        bar = "█" * c if c else "·"
+        lines.append(f"     {v}★ {bar} ({c})")
+    if s["issued_unanswered"]:
+        lines.append("")
+        lines.append(f"   {s['issued_unanswered']} review link(s) still pending")
+    shareable = mod_reviews.list_shareable(DATA_DIR)
+    if shareable:
+        lines.append("")
+        lines.append(f"   {len(shareable)} customer{'s' if len(shareable) != 1 else ''} "
+                      f"gave permission to quote publicly — good marketing material.")
+    return {"reply": "\n".join(lines), "tier": "local",
+            "latency_ms": 0, "source": "gc_rating_summary"}
 
 
 def _handle_add_bid(msg: str, user_rec: dict) -> dict:
