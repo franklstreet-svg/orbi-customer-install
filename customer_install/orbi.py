@@ -4297,8 +4297,10 @@ def _handle_add_sub(msg: str, user_rec: dict) -> dict:
                           "\"add sub Bob's Plumbing — plumbing — 555-555-1234\"",
                 "tier": "local", "latency_ms": 0,
                 "source": "gc_sub_no_details"}
-    # Split by — or , to get fields
-    parts = [p.strip() for p in _re.split(r"\s*[—–\-,]\s*", payload) if p.strip()]
+    # Split by em-dash, en-dash, or comma — NOT plain hyphen, because
+    # license numbers like "NV-99999" contain hyphens and would
+    # otherwise get split across fields.
+    parts = [p.strip() for p in _re.split(r"\s*[—–,]\s*", payload) if p.strip()]
     name = parts[0] if parts else ""
     # Common trades to detect
     trade = ""
