@@ -5949,6 +5949,7 @@ def _gc_help_text() -> str:
   · Sarah won the kitchen bid          (auto-creates the project!)
   · Jennifer passed on the bathroom — went with someone cheaper
   · win rate / bid report
+  · proposal for Sarah Johnson         (polished PDF for outgoing bids)
 
 🎯 CLIENT-FACING
   · share Oak with the client          (permanent portal URL)
@@ -5969,6 +5970,7 @@ def _gc_help_text() -> str:
 
 📈 REPORTING
   · morning brief                     (real-time daily picture)
+  · tomorrow's brief                  (end-of-day preview)
   · weekly recap                      (Friday afternoon debrief)
   · show me the money                 (full money report)
 
