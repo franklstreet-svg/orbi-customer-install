@@ -14,7 +14,7 @@
 #   3. Copies files into /opt/orbi/
 #   4. Installs Python deps
 #   5. Initializes data/ from templates
-#   6. If --token is given, verifies it against billing.orbi.frank.com
+#   6. If --token is given, verifies it against brain.twickell.com
 #      and pre-populates the api_key + owner_email automatically
 #   7. Prompts for owner email + password and writes them into config.json
 #   8. Prompts for brain URL, API key, HuggingFace token (skipped if token used)
@@ -39,7 +39,7 @@ SOURCE="/home/frank/orbi_web"
 INSTALL_DIR="/opt/orbi"
 ORBI_USER="orbi"
 INSTALL_TOKEN=""
-BILLING_URL="${ORBI_BILLING_URL:-https://billing.orbi.frank.com}"
+BILLING_URL="${ORBI_BILLING_URL:-https://brain.twickell.com}"
 
 # ---------------------------------------------------------------------------
 # Argument parsing
@@ -205,7 +205,7 @@ else
     [[ ${#OWNER_PW} -ge 8 ]] && break
     echo "  Password must be at least 8 characters."
   done
-  read -r -p "  Brain URL (e.g. https://orbi-brain.frank.com) [skip]: " BRAIN_URL
+  read -r -p "  Brain URL (e.g. https://brain.twickell.com) [skip]: " BRAIN_URL
   if [[ -n "$TOKEN_API_KEY" ]]; then
     BRAIN_KEY="$TOKEN_API_KEY"
     echo "  Brain API key (from install token): ${BRAIN_KEY:0:14}…"

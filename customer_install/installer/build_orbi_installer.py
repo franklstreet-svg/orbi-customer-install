@@ -16,7 +16,7 @@ What this script produces:
 
 Each artifact, when a customer runs it:
    a) Asks for the install token (the one Stripe gave them in email)
-   b) Calls billing.orbi.frank.com/api/verify/<token> over HTTPS
+   b) Calls brain.twickell.com/api/verify/<token> over HTTPS
    c) On success, creates /opt/orbi (or C:\\Program Files\\Orbi)
    d) Writes config.json from the template, pre-populated with api_key
       and owner_email from the billing response

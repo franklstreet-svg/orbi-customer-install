@@ -7,7 +7,7 @@ The PyInstaller bundle produced by build_orbi_installer.py wraps THIS module
 as its entry point. It performs the install flow end-to-end:
 
   1. Prompts for the install-token Stripe gave the customer.
-  2. Calls billing.orbi.frank.com to verify the token and pull
+  2. Calls brain.twickell.com to verify the token and pull
      {customer_id, api_key, tier, owner_email}.
   3. Creates the install directory layout (/opt/orbi on Linux/Mac,
      C:\\Program Files\\Orbi on Windows).
@@ -59,7 +59,7 @@ log = logging.getLogger("orbi.installer")
 # ---------------------------------------------------------------------------
 
 BILLING_BASE_URL = os.environ.get(
-    "ORBI_BILLING_URL", "https://billing.orbi.frank.com"
+    "ORBI_BILLING_URL", "https://brain.twickell.com"
 )
 # Brain proxy URL — separate env var so Frank can move the LLM brain to a
 # different host (a self-owned 70B box, an alternate Cloudflare tunnel)

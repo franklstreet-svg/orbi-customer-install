@@ -14,7 +14,7 @@
     "_password_hash": "SET_BY_ONBOARDING_WIZARD"
   },
   "brain": {
-    "url": "https://orbi-brain.frank.com",
+    "url": "https://brain.twickell.com",
     "api_key": "REPLACE_WITH_API_KEY_FROM_STRIPE_WEBHOOK",
     "timeout_seconds": 15
   },
@@ -31,7 +31,7 @@
     "ctx_size": 2048
   },
   "billing": {
-    "check_url": "https://billing.orbi.frank.com/api/active",
+    "check_url": "https://brain.twickell.com/api/active",
     "check_interval_seconds": 3600
   },
   "phone": {
