@@ -107,6 +107,7 @@ from modules import change_orders as mod_change_orders
 from modules import invoices as mod_invoices
 from modules import daily_logs as mod_daily_logs
 from modules import subcontractors as mod_subs
+from modules import invoice_pdf as mod_invoice_pdf
 from tools import url_fetch as tool_url_fetch
 from tools import web_search as tool_web_search
 
@@ -3625,6 +3626,17 @@ _GC_ADD_INVOICE_RE = _re.compile(
     r")",
     _re.IGNORECASE,
 )
+_GC_PDF_INVOICE_RE = _re.compile(
+    # "PDF INV-2026-0001" / "generate PDF for INV-2026-0001" /
+    # "send INV-2026-0001 as PDF" / "invoice PDF for INV-2026-0001"
+    r"^\s*(?:"
+    r"(?:pdf|print)\s+(?:invoice\s+)?(?P<inv1>INV-[\w-]+)"
+    r"|(?:generate|make|create)\s+(?:a\s+)?(?:invoice\s+)?pdf\s+(?:for\s+)?(?P<inv2>INV-[\w-]+)"
+    r"|invoice\s+pdf\s+(?:for\s+)?(?P<inv3>INV-[\w-]+)"
+    r"|send\s+(?P<inv4>INV-[\w-]+)\s+as\s+(?:a\s+)?pdf"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
 _GC_RECORD_PAYMENT_RE = _re.compile(
     # "Sarah paid $3000 on INV-2026-0001"
     # "Mark INV-2026-0001 paid"
@@ -4100,6 +4112,55 @@ def _try_contractor_chat(message: str, user_rec: dict) -> dict | None:
         ]
         return {"reply": "\n".join(lines), "tier": "local",
                 "latency_ms": 0, "source": "gc_aging"}
+
+    # 9b. GENERATE PDF INVOICE — "PDF INV-2026-0001"
+    m = _GC_PDF_INVOICE_RE.match(msg)
+    if m:
+        inv_num = (m.group("inv1") or m.group("inv2") or m.group("inv3") or m.group("inv4") or "").upper()
+        target = None
+        for i in mod_invoices._load(DATA_DIR):
+            if (i.get("invoice_number") or "").upper() == inv_num:
+                target = i; break
+        if not target:
+            return {"reply": f"I don't see {inv_num} on the books.",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "gc_pdf_not_found"}
+        project = mod_projects.get(DATA_DIR, target.get("project_id", "")) or {}
+        business = mod_business.load(DATA_DIR)
+        try:
+            pdf_path = mod_invoice_pdf.generate(
+                target, project, business, DATA_DIR / "invoice_pdfs"
+            )
+        except Exception as e:
+            log.exception("invoice PDF generation failed")
+            return {"reply": f"PDF generation failed: {e}",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "gc_pdf_error"}
+        # Mint a download token (60 min) — pass the invoice_pdfs dir as
+        # an extra allowed root so the token-mint accepts a path outside
+        # the user's normal file_fetch scope (we just wrote it ourselves).
+        try:
+            token = file_fetch.mint_download_token(
+                DATA_DIR, str(pdf_path),
+                ttl_minutes=60,
+                extra_allowed_roots=[DATA_DIR / "invoice_pdfs"],
+            )
+        except Exception as e:
+            log.warning(f"PDF token mint failed: {e}")
+            token = None
+        audit.log_event(DATA_DIR, actor=user_rec.get("username", "?"),
+                        action="invoice.pdf_generated",
+                        meta={"invoice_id": target["id"], "invoice_number": inv_num})
+        size_kb = pdf_path.stat().st_size // 1024
+        if token:
+            return {"reply": (f"Generated {inv_num}.pdf ({size_kb} KB). "
+                              f"[Download here](/download/{token}) — link valid 60 min."),
+                    "tier": "local", "latency_ms": 0,
+                    "source": "gc_pdf_generated",
+                    "download_url": f"/download/{token}"}
+        return {"reply": f"Generated {inv_num}.pdf at {pdf_path} ({size_kb} KB).",
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_pdf_generated_no_token"}
 
     # 10. ADD/SEND INVOICE — "send invoice for Oak — $5000 progress draw"
     if _GC_ADD_INVOICE_RE.match(msg):
