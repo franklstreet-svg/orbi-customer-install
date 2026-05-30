@@ -3528,6 +3528,77 @@ _GC_REPORT_RE = _re.compile(
     _re.IGNORECASE,
 )
 _INV_NUMBER_RE = _re.compile(r"\bINV-\d{4}-\d{4}\b", _re.IGNORECASE)
+_GC_NUDGE_RE = _re.compile(
+    # "nudge INV-2026-0001" / "send a reminder on INV-2026-0001"
+    # / "draft a follow-up for INV-2026-0001" / "remind them about ..."
+    r"^\s*(?:"
+    r"(?:nudge|chase|ping)\s+(?:invoice\s+)?(?P<inv1>INV-[\w-]+|client|customer|them)"
+    r"|(?:send|draft|write|compose)\s+(?:a\s+)?(?:reminder|nudge|follow[\s-]up)\s+"
+    r"(?:on|for|about)?\s*(?P<inv2>INV-[\w-]+)?"
+    r"|remind\s+(?:them|the\s+client)\s+(?:about\s+)?(?P<inv3>INV-[\w-]+)?"
+    r")",
+    _re.IGNORECASE,
+)
+_GC_NUDGE_ALL_RE = _re.compile(
+    r"^\s*(?:"
+    r"(?:draft|send)\s+(?:all\s+)?(?:overdue\s+)?(?:reminders|nudges|follow[\s-]ups)"
+    r"|nudge\s+(?:all|everyone|everybody|every(?:one|body)\s+overdue)"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+
+
+def _draft_nudge_text(invoice: dict, project: dict, escalation: int = 1) -> str:
+    """Generate the polite-escalating reminder body. Tone tiers:
+       1 = friendly first nudge
+       2 = firmer (week 2)
+       3 = formal (week 3+, mentions next-step options)
+    Frank can edit the text by changing this one function. No LLM — kept
+    deterministic so the GC knows exactly what's being sent on their behalf.
+    """
+    from datetime import datetime as _dt
+    biz_name = (CONFIG.get("business") or {}).get("name", "your contractor")
+    customer = project.get("customer_name") or "there"
+    addr = project.get("address", "")
+    inv_num = invoice.get("invoice_number", "")
+    owed = float(invoice.get("amount_due", 0)) - float(invoice.get("amount_paid", 0))
+    due_at = invoice.get("due_at")
+    due_str = ""
+    if due_at:
+        due_str = _dt.fromtimestamp(int(due_at)).strftime("%B %-d, %Y")
+    days_late = ""
+    if due_at and int(due_at) < int(time.time()):
+        days = (int(time.time()) - int(due_at)) // 86400
+        days_late = f" ({days} day{'s' if days != 1 else ''} past due)"
+    if escalation <= 1:
+        return (
+            f"Hi {customer},\n\n"
+            f"Just a friendly reminder that invoice {inv_num} for the work at "
+            f"{addr} (${owed:,.2f}) is now due{(' — was due ' + due_str) if due_str else ''}"
+            f"{days_late}. If you've already sent it, thank you — please ignore "
+            f"this note. Otherwise, you can pay any way that works for you.\n\n"
+            f"Thanks,\n{biz_name}"
+        )
+    if escalation == 2:
+        return (
+            f"Hi {customer},\n\n"
+            f"Following up on invoice {inv_num} for the work at {addr}. "
+            f"The balance is ${owed:,.2f}, which was due {due_str or 'recently'}"
+            f"{days_late}. Could you let me know when I should expect payment? "
+            f"If there's an issue with the invoice or the work, please just "
+            f"reach out — happy to talk it through.\n\n"
+            f"Thanks,\n{biz_name}"
+        )
+    # escalation >= 3 — formal but still measured
+    return (
+        f"{customer},\n\n"
+        f"This is a formal notice that invoice {inv_num} for {addr} (${owed:,.2f}) "
+        f"remains unpaid{days_late}. If payment isn't received within seven (7) days, "
+        f"we'll need to discuss next steps including possible lien filing.\n\n"
+        f"If there's a dispute we can resolve, please contact me directly today. "
+        f"I'd rather work this out with a phone call.\n\n"
+        f"{biz_name}"
+    )
 
 
 def _draft_change_order_text(project: dict, description: str, amount: float,
@@ -3826,6 +3897,65 @@ def _try_contractor_chat(message: str, user_rec: dict) -> dict | None:
     # 11. RECORD PAYMENT — "Sarah paid $3000 on INV-2026-0001"
     if _GC_RECORD_PAYMENT_RE.match(msg):
         return _handle_record_payment(msg, user_rec)
+
+    # 11b. NUDGE ALL OVERDUE — "draft all overdue reminders"
+    if _GC_NUDGE_ALL_RE.match(msg):
+        mod_invoices.list_overdue(DATA_DIR)  # promote statuses
+        overdue = [i for i in mod_invoices.list_unpaid(DATA_DIR)
+                    if i.get("status") == "overdue"]
+        if not overdue:
+            return {"reply": "No overdue invoices to nudge — all current.",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "gc_nudge_none_overdue"}
+        lines = [f"Drafted {len(overdue)} reminder{'s' if len(overdue) != 1 else ''} — review and send:"]
+        for i in overdue[:10]:
+            proj = mod_projects.get(DATA_DIR, i.get("project_id", "")) or {}
+            escalation = min(3, max(1, int(i.get("follow_up_count", 0)) + 1))
+            text = _draft_nudge_text(i, proj, escalation=escalation)
+            mod_invoices.mark_followed_up(DATA_DIR, i["id"])
+            audit.log_event(DATA_DIR, actor=user_rec.get("username", "?"),
+                            action="invoice.nudge_drafted",
+                            meta={"invoice_id": i["id"], "escalation": escalation})
+            email = proj.get("customer_email") or "(no email on file)"
+            lines.append(f"\n────── {i['invoice_number']} → {email} ──────")
+            lines.append(text)
+        return {"reply": "\n".join(lines), "tier": "local",
+                "latency_ms": 0, "source": "gc_nudge_all_drafted"}
+
+    # 11c. NUDGE SINGLE — "nudge INV-2026-0001"
+    if _GC_NUDGE_RE.match(msg):
+        m = _GC_NUDGE_RE.match(msg)
+        inv_token = (m.group("inv1") or m.group("inv2") or m.group("inv3") or "").strip()
+        inv_num_m = _INV_NUMBER_RE.search(inv_token) or _INV_NUMBER_RE.search(msg)
+        if not inv_num_m:
+            return {"reply": "Which invoice? Give me an invoice number like INV-2026-0001, or say \"nudge all overdue\".",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "gc_nudge_no_inv"}
+        inv_num = inv_num_m.group(0).upper()
+        target = None
+        for i in mod_invoices._load(DATA_DIR):
+            if (i.get("invoice_number") or "").upper() == inv_num:
+                target = i; break
+        if not target:
+            return {"reply": f"I don't see {inv_num} on the books.",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "gc_nudge_not_found"}
+        if target.get("status") in ("paid", "void", "draft"):
+            return {"reply": f"{inv_num} is {target.get('status')} — no nudge needed.",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "gc_nudge_not_overdue"}
+        proj = mod_projects.get(DATA_DIR, target.get("project_id", "")) or {}
+        escalation = min(3, max(1, int(target.get("follow_up_count", 0)) + 1))
+        text = _draft_nudge_text(target, proj, escalation=escalation)
+        mod_invoices.mark_followed_up(DATA_DIR, target["id"])
+        audit.log_event(DATA_DIR, actor=user_rec.get("username", "?"),
+                        action="invoice.nudge_drafted",
+                        meta={"invoice_id": target["id"], "escalation": escalation})
+        email = proj.get("customer_email") or "(no email on file — share manually)"
+        tier_label = ["", "friendly", "firmer", "formal"][escalation]
+        return {"reply": f"Reminder #{escalation} ({tier_label}) for {inv_num} → {email}:\n\n{text}",
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_nudge_drafted"}
 
     # 12. REPORTING — "show me the money", "captured this month", "totals"
     if _GC_REPORT_RE.match(msg):

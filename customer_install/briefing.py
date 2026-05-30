@@ -250,6 +250,64 @@ def build_briefing(config: dict, data_dir: Path, username: str) -> dict:
             "text":   (r.get("text") or "")[:140],
         })
 
+    # ── Contractor module (gated by enabled_modules) ────────────────────
+    # Pending CO approvals, COs out for signature, overdue invoices,
+    # and the day's outstanding total. Only fires for customers who
+    # bought the Contractor add-on — base Orby skips this block.
+    enabled_modules = set(
+        str(x).strip().lower() for x in (config.get("enabled_modules") or [])
+        if isinstance(x, str)
+    )
+    if "contractor" in enabled_modules:
+        try:
+            from modules import change_orders as mod_co
+            from modules import invoices as mod_invoices
+            from modules import projects as mod_projects
+
+            pending = mod_co.list_pending_approval(data_dir)
+            awaiting_sig = mod_co.list_awaiting_signature(data_dir)
+            stats["co_pending_approval"] = len(pending)
+            stats["co_awaiting_signature"] = len(awaiting_sig)
+            for c in pending[:5]:
+                proj = mod_projects.get(data_dir, c.get("project_id", "")) or {}
+                items.append({
+                    "kind":    "co_pending",
+                    "co_id":   c["id"][:8],
+                    "project": proj.get("address", "?"),
+                    "amount":  float(c.get("amount") or 0),
+                    "desc":    (c.get("description") or "")[:100],
+                })
+            for c in awaiting_sig[:5]:
+                proj = mod_projects.get(data_dir, c.get("project_id", "")) or {}
+                items.append({
+                    "kind":    "co_awaiting_sig",
+                    "co_id":   c["id"][:8],
+                    "project": proj.get("address", "?"),
+                    "amount":  float(c.get("amount") or 0),
+                })
+
+            # Force overdue-status promotion before reading
+            mod_invoices.list_overdue(data_dir)
+            i_sum = mod_invoices.summary(data_dir)
+            stats["receivables_outstanding"] = i_sum.get("total_outstanding", 0)
+            stats["receivables_aging"]       = i_sum.get("aging", {})
+            overdue = [i for i in mod_invoices.list_unpaid(data_dir)
+                        if i.get("status") == "overdue"]
+            stats["invoices_overdue"] = len(overdue)
+            for i in overdue[:5]:
+                proj = mod_projects.get(data_dir, i.get("project_id", "")) or {}
+                owed = float(i.get("amount_due", 0)) - float(i.get("amount_paid", 0))
+                items.append({
+                    "kind":           "invoice_overdue",
+                    "invoice_number": i.get("invoice_number", ""),
+                    "project":        proj.get("address", "?"),
+                    "owed":           owed,
+                    "due_at":         i.get("due_at"),
+                })
+        except Exception as exc:    # noqa: BLE001
+            log.warning("briefing[%s] contractor section failed: %s", username, exc)
+            stats["errors"].append(f"contractor: {exc}")
+
     # ── Build the human-readable summary ────────────────────────────────
     summary_text = _build_summary(display_name, stats)
 
@@ -743,7 +801,29 @@ def _build_summary(display_name: str, stats: dict) -> str:
             f"waiting for your answer."
         )
 
-    if not (n_events or n_rem or n_tasks or n_email or n_msgs or n_revs or n_qs or rev):
+    # Contractor module sentences (only if those stats exist)
+    n_co_pend = stats.get("co_pending_approval", 0) or 0
+    n_co_sig  = stats.get("co_awaiting_signature", 0) or 0
+    n_inv_od  = stats.get("invoices_overdue", 0) or 0
+    receivables_total = stats.get("receivables_outstanding", 0) or 0
+    contractor_present = ("co_pending_approval" in stats
+                          or "receivables_outstanding" in stats)
+    co_bits = []
+    if n_co_pend:
+        co_bits.append(f"{n_co_pend} change order{'s' if n_co_pend != 1 else ''} waiting on you to approve")
+    if n_co_sig:
+        co_bits.append(f"{n_co_sig} out for client signature")
+    if co_bits:
+        parts.append(("Change orders: " + ", ".join(co_bits) + ".").capitalize())
+    if n_inv_od:
+        parts.append(
+            f"{n_inv_od} invoice{'s' if n_inv_od != 1 else ''} are overdue."
+        )
+    if contractor_present and receivables_total > 0:
+        parts.append(f"Total outstanding receivables: ${receivables_total:,.0f}.")
+
+    if not (n_events or n_rem or n_tasks or n_email or n_msgs or n_revs or n_qs or rev
+            or n_co_pend or n_co_sig or n_inv_od):
         parts.append("Nothing pressing — a quiet start to the day.")
 
     return " ".join(parts)
