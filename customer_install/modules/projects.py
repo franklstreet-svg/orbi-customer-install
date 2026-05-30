@@ -169,6 +169,51 @@ def remove(data_dir: Path, project_id: str) -> bool:
     return False
 
 
+def ensure_client_portal_token(data_dir: Path, project_id: str) -> str | None:
+    """Mint (or return existing) a persistent shareable token for a
+    customer-facing project portal. Stable for the life of the project
+    so the GC can share the URL once and the homeowner keeps using it.
+
+    Returns the token or None if the project doesn't exist."""
+    import secrets
+    with _LOCK:
+        projects = _load(data_dir)
+        for p in projects:
+            if p.get("id") == project_id:
+                if not p.get("client_portal_token"):
+                    p["client_portal_token"] = secrets.token_urlsafe(24)
+                    p["updated_at"] = int(time.time())
+                    _save(data_dir, projects)
+                return p["client_portal_token"]
+    return None
+
+
+def get_by_client_portal_token(data_dir: Path, token: str) -> dict | None:
+    """Reverse lookup for the public portal route. Returns the full
+    project record or None."""
+    if not token:
+        return None
+    for p in _load(data_dir):
+        if p.get("client_portal_token") == token:
+            return p
+    return None
+
+
+def rotate_client_portal_token(data_dir: Path, project_id: str) -> str | None:
+    """Invalidate the old token and mint a fresh one — used when the GC
+    wants to revoke access (e.g. project ended in dispute)."""
+    import secrets
+    with _LOCK:
+        projects = _load(data_dir)
+        for p in projects:
+            if p.get("id") == project_id:
+                p["client_portal_token"] = secrets.token_urlsafe(24)
+                p["updated_at"] = int(time.time())
+                _save(data_dir, projects)
+                return p["client_portal_token"]
+    return None
+
+
 def find_by_address(data_dir: Path, address_fragment: str) -> list[dict]:
     """Fuzzy-match projects by address substring (case-insensitive).
     Used by the chat handler when the foreman says 'the Maple project'."""

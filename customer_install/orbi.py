@@ -985,6 +985,257 @@ p {{ color: #c8d0e8; line-height: 1.5; }}
 </body></html>"""
 
 
+# ── Public client-facing project portal ───────────────────────────────────
+# The homeowner visits /p/<token> to see their project status anytime.
+# No auth — token is the credential. Stable for the life of the project
+# so the GC shares once and the customer keeps using the same URL.
+#
+# Read-only by design. The portal shows project status, money summary,
+# any pending change orders awaiting their signature (with sign links),
+# and recent activity. Sanitized — no internal pricing details, no sub
+# names, no daily-log scope-change flags (those are GC-internal).
+
+@app.route("/p/<token>", methods=["GET"])
+def client_project_portal(token):
+    project = mod_projects.get_by_client_portal_token(DATA_DIR, token)
+    if not project:
+        return _render_portal_error("This project link isn't valid or has been retired."), 404
+    return _render_client_project_portal(project)
+
+
+def _render_client_project_portal(project: dict) -> str:
+    from datetime import datetime as _dt
+    business = mod_business.load(DATA_DIR)
+    biz_name = business.get("name") or "Your contractor"
+    biz_phone = (business.get("contact") or {}).get("phone") or ""
+    biz_email = (business.get("contact") or {}).get("email") or ""
+
+    # Money
+    contract = float(project.get("contract_amount") or 0)
+    signed_co = mod_change_orders.signed_total_for_project(DATA_DIR, project["id"])
+    authorized_total = contract + signed_co
+    invs = mod_invoices.list_for_project(DATA_DIR, project["id"])
+    billed = sum(float(i.get("amount_due", 0)) for i in invs
+                  if i.get("status") not in ("draft", "void"))
+    paid = sum(float(i.get("amount_paid", 0)) for i in invs)
+    balance = billed - paid
+    remaining_on_contract = authorized_total - paid
+
+    # COs awaiting their signature
+    awaiting = mod_change_orders.list_awaiting_signature(DATA_DIR)
+    awaiting = [c for c in awaiting if c.get("project_id") == project["id"]]
+
+    # Recent activity (sanitized — strip the scope_changes_mentioned
+    # field that's for GC's eyes only)
+    logs = mod_daily_logs.list_for_project(DATA_DIR, project["id"], limit=5)
+    activity_lines = []
+    for l in logs[:5]:
+        date_str = l.get("date", "")
+        wd = l.get("work_done") or ""
+        activity_lines.append((date_str, wd[:200]))
+
+    # Customer's name for greeting
+    customer = project.get("customer_name") or "there"
+    first_name = customer.split(" ", 1)[0]
+    addr = project.get("address", "")
+    status = (project.get("status") or "active").replace("_", " ")
+    stage = project.get("stage") or ""
+    label = project.get("label") or ""
+
+    # Awaiting-signature CO HTML (each with a sign-it link)
+    awaiting_html = ""
+    if awaiting:
+        items = []
+        for c in awaiting:
+            amt = float(c.get("amount") or 0)
+            sign = "+" if amt >= 0 else "-"
+            # Get the live sign URL for this CO
+            sign_url = _live_co_sign_url_for_co(c["id"])
+            items.append(f"""
+              <div class="co-item">
+                <div class="co-desc">{_esc(c.get('description',''))}</div>
+                <div class="co-amount">{sign}${abs(amt):,.2f}</div>
+                {'<a class="sign-btn" href="' + _esc(sign_url) + '">Review &amp; sign</a>' if sign_url else ''}
+              </div>
+            """)
+        awaiting_html = f"""
+        <div class="section attention">
+          <h2>⚠ Needs your signature</h2>
+          <p class="dim">These change orders are waiting on you. Sign each to authorize the work.</p>
+          {''.join(items)}
+        </div>
+        """
+
+    activity_html = ""
+    if activity_lines:
+        items = "".join(
+            f'<li><span class="date">{_esc(d)}</span> {_esc(w)}</li>'
+            for d, w in activity_lines
+        )
+        activity_html = f"""
+        <div class="section">
+          <h2>Recent activity</h2>
+          <ul class="activity">{items}</ul>
+        </div>
+        """
+
+    paid_status_html = ""
+    if balance > 0:
+        paid_status_html = f"""
+        <div class="balance-row warn">
+          <div>Balance due</div><div>${balance:,.2f}</div>
+        </div>
+        """
+    else:
+        paid_status_html = """
+        <div class="balance-row good">
+          <div>Account current</div><div>✓</div>
+        </div>
+        """
+
+    contact_html = ""
+    if biz_phone or biz_email:
+        bits = []
+        if biz_phone: bits.append(f'<a href="tel:{_esc(biz_phone)}">{_esc(biz_phone)}</a>')
+        if biz_email: bits.append(f'<a href="mailto:{_esc(biz_email)}">{_esc(biz_email)}</a>')
+        contact_html = f"""
+        <div class="section contact">
+          <h2>Questions?</h2>
+          <p>Reach {_esc(biz_name)}:<br>{' &middot; '.join(bits)}</p>
+        </div>
+        """
+
+    return f"""<!doctype html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{_esc(label) or 'Your project'} — {_esc(biz_name)}</title>
+<style>
+* {{ box-sizing: border-box; }}
+body {{ font-family: -apple-system, system-ui, "Segoe UI", sans-serif;
+       background: #f4f6fb; color: #1a2240; margin: 0; padding: 20px;
+       line-height: 1.5; }}
+.wrap {{ max-width: 640px; margin: 0 auto; }}
+.header {{ background: white; border-radius: 14px; padding: 24px 24px 18px;
+          box-shadow: 0 2px 8px rgba(0,0,0,0.04); margin-bottom: 16px; }}
+.greeting {{ font-size: 14px; color: #6c7592; margin-bottom: 4px; }}
+.project-title {{ font-size: 22px; font-weight: 700; margin: 0 0 6px; }}
+.project-meta {{ font-size: 14px; color: #555; }}
+.status-pill {{ display: inline-block; padding: 3px 10px; border-radius: 12px;
+                background: #e8f5e9; color: #2e7d32; font-size: 12px;
+                font-weight: 600; margin-left: 6px; text-transform: capitalize; }}
+.section {{ background: white; border-radius: 14px; padding: 20px 24px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.04); margin-bottom: 16px; }}
+.section h2 {{ font-size: 16px; margin: 0 0 12px; color: #1a2240; }}
+.dim {{ color: #6c7592; font-size: 13px; margin: 0 0 14px; }}
+.money-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 12px 24px;
+                margin-bottom: 10px; }}
+.money-grid div {{ font-size: 14px; }}
+.money-grid .label {{ color: #6c7592; }}
+.money-grid .value {{ font-weight: 600; text-align: right; }}
+.balance-row {{ display: flex; justify-content: space-between;
+                font-size: 16px; font-weight: 700;
+                padding: 12px 0 0; border-top: 1px solid #e0e4ee;
+                margin-top: 10px; }}
+.balance-row.warn {{ color: #b45309; }}
+.balance-row.good {{ color: #2e7d32; }}
+.section.attention {{ border-left: 4px solid #d97706; }}
+.co-item {{ padding: 12px 0; border-bottom: 1px solid #f0f2f8; }}
+.co-item:last-child {{ border-bottom: none; }}
+.co-desc {{ font-weight: 500; }}
+.co-amount {{ color: #b45309; font-weight: 700; margin-top: 2px; }}
+.sign-btn {{ display: inline-block; margin-top: 8px; padding: 8px 14px;
+             background: #8b5cf6; color: white; text-decoration: none;
+             border-radius: 6px; font-size: 13px; font-weight: 600; }}
+.sign-btn:hover {{ background: #7c4ef0; }}
+.activity {{ list-style: none; padding: 0; margin: 0; }}
+.activity li {{ padding: 8px 0; border-bottom: 1px solid #f0f2f8;
+                font-size: 14px; color: #444; }}
+.activity li:last-child {{ border-bottom: none; }}
+.activity .date {{ display: inline-block; min-width: 90px; color: #6c7592;
+                   font-size: 12px; }}
+.contact p {{ font-size: 14px; margin: 0; }}
+.contact a {{ color: #8b5cf6; text-decoration: none; font-weight: 600; }}
+.footer {{ text-align: center; font-size: 12px; color: #9aa4c0;
+           margin-top: 20px; }}
+</style>
+</head><body>
+<div class="wrap">
+  <div class="header">
+    <div class="greeting">Hi {_esc(first_name)},</div>
+    <h1 class="project-title">{_esc(label) or 'Your project'}<span class="status-pill">{_esc(status)}{(': ' + _esc(stage)) if stage else ''}</span></h1>
+    <div class="project-meta">{_esc(addr)}</div>
+  </div>
+
+  {awaiting_html}
+
+  <div class="section">
+    <h2>Money</h2>
+    <div class="money-grid">
+      <div class="label">Original contract</div>
+      <div class="value">${contract:,.2f}</div>
+      {('<div class="label">Signed change orders</div><div class="value">+$' + format(signed_co, ',.2f') + '</div>') if signed_co else ''}
+      {('<div class="label">Authorized total</div><div class="value"><b>$' + format(authorized_total, ',.2f') + '</b></div>') if signed_co else ''}
+      <div class="label">Invoiced so far</div>
+      <div class="value">${billed:,.2f}</div>
+      <div class="label">Paid</div>
+      <div class="value">${paid:,.2f}</div>
+    </div>
+    {paid_status_html}
+  </div>
+
+  {activity_html}
+
+  {contact_html}
+
+  <div class="footer">Powered by Orbi</div>
+</div>
+</body></html>"""
+
+
+def _live_co_sign_url_for_co(co_id: str) -> str:
+    """Look in co_sign_tokens for the most recent unused token bound to
+    this CO. Returns full URL or empty string if no live token."""
+    tokens_path = DATA_DIR / "co_sign_tokens.json"
+    try:
+        tokens = json.loads(tokens_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return ""
+    candidates = []
+    now_ts = int(time.time())
+    for t, info in tokens.items():
+        if info.get("co_id") != co_id:
+            continue
+        if info.get("used_at"):
+            continue
+        if int(info.get("expires_at", 0)) < now_ts:
+            continue
+        candidates.append((int(info.get("issued_at", 0)), t))
+    if not candidates:
+        return ""
+    candidates.sort(reverse=True)
+    return _co_sign_url(candidates[0][1])
+
+
+def _render_portal_error(reason: str) -> str:
+    return f"""<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Link unavailable</title>
+<style>
+body {{ font-family: -apple-system, system-ui, sans-serif;
+       background: #f4f6fb; color: #1a2240; margin: 0; padding: 40px 20px;
+       text-align: center; }}
+.card {{ max-width: 480px; margin: 60px auto; background: white;
+        border-radius: 14px; padding: 32px; }}
+h1 {{ color: #b91c1c; margin: 0 0 14px; }}
+p {{ color: #444; line-height: 1.5; }}
+</style></head><body>
+<div class="card">
+<h1>Link unavailable</h1>
+<p>{_esc(reason)}</p>
+<p>If you need a fresh project link, please reach out to your contractor.</p>
+</div></body></html>"""
+
+
 @app.route("/health")
 def health():
     business = mod_business.load(DATA_DIR)
@@ -3718,6 +3969,17 @@ _GC_INSURANCE_CHECK_RE = _re.compile(
 )
 
 # ── Unsigned-work leak alarm pattern ──────────────────────────────────────
+_GC_SHARE_PORTAL_RE = _re.compile(
+    # "share Oak with the client" / "client portal for Maple" /
+    # "send Sarah her project link" / "Oak portal link"
+    r"^\s*(?:"
+    r"share\s+(?P<q1>.+?)\s+(?:with\s+(?:the\s+)?(?:client|customer|homeowner)|link)"
+    r"|(?:client\s+)?portal\s+(?:for\s+|link\s+for\s+)?(?P<q2>.+?)"
+    r"|(?P<q3>.+?)\s+(?:client\s+)?(?:portal|link)"
+    r"|(?:get|generate|mint)\s+(?:a\s+)?(?:client\s+)?(?:portal|link)\s+(?:for\s+)?(?P<q4>.+?)"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
 _GC_WEEKLY_RECAP_RE = _re.compile(
     r"^\s*(?:"
     r"(?:weekly|week'?s?|this\s+week'?s?)\s+(?:recap|summary|report|review|wrap[\s-]?up)"
@@ -4369,6 +4631,11 @@ def _try_contractor_chat(message: str, user_rec: dict) -> dict | None:
     if _GC_WEEKLY_RECAP_RE.match(msg):
         return _handle_weekly_recap(msg, user_rec)
 
+    # 15e. SHARE CLIENT PORTAL — "share Oak with the client" / "portal for Maple"
+    share_resp = _handle_share_portal(msg, user_rec)
+    if share_resp is not None:
+        return share_resp
+
     # 16. REPORTING — "show me the money", "captured this month", "totals"
     if _GC_REPORT_RE.match(msg):
         p_sum = mod_projects.summary(DATA_DIR)
@@ -4894,6 +5161,49 @@ def _handle_project_full_report(msg: str, user_rec: dict) -> dict | None:
             lines.append(f"  · {l['date']}{crew_bit}{hrs_bit} {l.get('work_done','')[:70]}")
     return {"reply": "\n".join(lines), "tier": "local",
             "latency_ms": 0, "source": "gc_project_report"}
+
+
+def _handle_share_portal(msg: str, user_rec: dict) -> dict | None:
+    m = _GC_SHARE_PORTAL_RE.match(msg)
+    if not m:
+        return None
+    q = (m.group("q1") or m.group("q2") or m.group("q3") or m.group("q4") or "").strip()
+    # Strip leading "the" + trailing "project"
+    q = _re.sub(r"^the\s+", "", q, flags=_re.IGNORECASE)
+    q = _re.sub(r"\s+project$", "", q, flags=_re.IGNORECASE)
+    if not q or q.lower() in {"my", "the", "all"}:
+        return None
+    matches = mod_projects.find_by_address(DATA_DIR, q)
+    if not matches:
+        return None  # Don't claim "no project" — let LLM handle (might be a different intent)
+    if len(matches) > 1:
+        listed = "\n".join(f"  · {p['address']}" for p in matches[:5])
+        return {"reply": f"Multiple projects match \"{q}\":\n{listed}\nWhich one?",
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_portal_ambiguous"}
+    project = matches[0]
+    token = mod_projects.ensure_client_portal_token(DATA_DIR, project["id"])
+    if not token:
+        return {"reply": "Couldn't mint a portal link — try again.",
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_portal_mint_failed"}
+    base = (CONFIG.get("tunnel_url")
+             or (CONFIG.get("brain") or {}).get("local_public_url")
+             or "http://127.0.0.1:5050").rstrip("/")
+    url = f"{base}/p/{token}"
+    customer = project.get("customer_name") or "the client"
+    customer_email = project.get("customer_email") or ""
+    audit.log_event(DATA_DIR, actor=user_rec.get("username", "?"),
+                    action="project.portal_link_shared",
+                    meta={"project_id": project["id"]})
+    contact_bit = f" Their email on file: {customer_email}." if customer_email else ""
+    return {"reply": (f"Share this with {customer} — they can check on "
+                      f"{project.get('label') or project['address']} anytime:\n\n"
+                      f"{url}\n\n"
+                      f"The link doesn't expire — same URL works for the life of the project."
+                      f"{contact_bit}"),
+            "tier": "local", "latency_ms": 0,
+            "source": "gc_portal_shared"}
 
 
 def _handle_weekly_recap(msg: str, user_rec: dict) -> dict:
