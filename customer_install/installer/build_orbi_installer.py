@@ -96,6 +96,12 @@ def build_app_tarball() -> Path:
     """Snapshot the customer_install/ tree (minus per-install state) into
     a .tar.gz that install_runtime extracts on the customer's machine.
 
+    Also picks up extra source dirs that live at the project root but are
+    used by the customer install — owner_dashboard/ is the main one. Its
+    customer_install/ entry was historically a local symlink that's
+    untracked in git, so on a CI fresh checkout it simply doesn't exist
+    and the dashboard would be missing from the bundled installer.
+
     Idempotent: re-runs always regenerate the tarball so source edits show
     up in the next build.
     """
@@ -105,15 +111,29 @@ def build_app_tarball() -> Path:
         APP_TARBALL.unlink()
     log.info("packing app source → %s", APP_TARBALL)
     total = 0
-    with tarfile.open(APP_TARBALL, "w:gz", compresslevel=6) as tar:
-        # followlinks=True is REQUIRED for os.walk — owner_dashboard/ is a
-        # symlink to ../owner_dashboard/. We also need to add each file
-        # with dereference so the tar contains REGULAR file entries rather
-        # than symlink entries (otherwise tarfile.data_filter on extract
-        # rejects them as "would link outside destination" — Python 3.12+
-        # strict mode).
-        for root, dirs, files in os.walk(CUSTOMER_INSTALL, followlinks=True):
-            # Trim excluded dirs in-place so os.walk doesn't recurse
+    # Extra source roots → arcname-prefix. These are project-root dirs that
+    # the customer install needs but aren't located inside customer_install/
+    # in git. Add them to the tarball as if they lived inside
+    # customer_install/ so install_runtime extracts them to the same place.
+    extra_roots: list[tuple[Path, str]] = []
+    project_owner_dash = PROJECT_ROOT / "owner_dashboard"
+    customer_owner_dash = CUSTOMER_INSTALL / "owner_dashboard"
+    # Only add the project-root version if the customer_install copy isn't
+    # a real directory with content (which it would be after `git
+    # checkout` on CI, since the symlink isn't tracked).
+    if project_owner_dash.is_dir() and not customer_owner_dash.is_dir():
+        extra_roots.append((project_owner_dash, "owner_dashboard"))
+    # If customer_install/owner_dashboard IS present (e.g. local dev where
+    # the symlink resolves), os.walk(followlinks=True) below picks it up
+    # natively — no extra_roots entry needed.
+    def _pack_tree(tar, base: Path, arcname_prefix: str = "") -> int:
+        """Walk `base`, packing files into `tar` rooted at arcname_prefix.
+        Returns count of files packed. Symlinks are dereferenced so the
+        archive only has regular file entries — required because
+        tarfile.data_filter (default in Python 3.12+) rejects symlinks
+        that point outside the extraction destination."""
+        count = 0
+        for root, dirs, files in os.walk(base, followlinks=True):
             dirs[:] = [d for d in dirs if d not in _APP_TARBALL_EXCLUDES
                         and not d.startswith(".")]
             for f in files:
@@ -122,16 +142,26 @@ def build_app_tarball() -> Path:
                 if f.startswith(".") and f not in {".gitkeep"}:
                     continue
                 abs_path = Path(root) / f
-                rel = abs_path.relative_to(CUSTOMER_INSTALL)
-                # Resolve symlinks to their target so the tar contains a
-                # plain regular-file entry — required for safe extraction.
+                rel_inside = abs_path.relative_to(base)
+                arc = f"{arcname_prefix}/{rel_inside}" if arcname_prefix \
+                    else str(rel_inside)
                 real = abs_path.resolve()
-                info = tar.gettarinfo(name=str(real), arcname=str(rel))
+                info = tar.gettarinfo(name=str(real), arcname=arc)
                 if info is None:
                     continue
                 with open(real, "rb") as fp:
                     tar.addfile(info, fp)
-                total += 1
+                count += 1
+        return count
+
+    with tarfile.open(APP_TARBALL, "w:gz", compresslevel=6) as tar:
+        # 1) Pack customer_install/ as the main payload
+        total += _pack_tree(tar, CUSTOMER_INSTALL, arcname_prefix="")
+        # 2) Pack each extra source root under its configured arcname
+        for src, arc in extra_roots:
+            n = _pack_tree(tar, src, arcname_prefix=arc)
+            log.info("packed extra root %s (%d files) → %s/", src, n, arc)
+            total += n
     size_mb = APP_TARBALL.stat().st_size / 1_000_000
     log.info("packed %d files into %s (%.2f MB)", total, APP_TARBALL.name, size_mb)
     return APP_TARBALL
