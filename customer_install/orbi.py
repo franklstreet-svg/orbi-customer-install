@@ -1186,31 +1186,64 @@ def public_chat():
         except Exception as e:
             log.warning(f"learning-loop capture failed: {e}")
 
-    # Capture lead / order / callback if visitor info is present
+    # Capture lead / order / callback if visitor info is present.
+    # If the chat widget hasn't collected name/phone in its form, try to
+    # pull them out of the message body itself (e.g. "call me back at
+    # 555-1234, this is Bob"). If we still can't find a phone OR email,
+    # the LLM reply will ask for it on the next turn — we override the
+    # reply below in that case so the visitor isn't left hanging while
+    # their lead silently vaporizes.
     capture_kind = _detect_capture(user_msg, scope)
-    if capture_kind and (visitor.get("name") or visitor.get("phone") or visitor.get("email")):
-        try:
-            captured = mod_messages.capture(
-                DATA_DIR,
-                msg_type=capture_kind,
-                from_name=visitor.get("name"),
-                from_phone=visitor.get("phone"),
-                from_email=visitor.get("email"),
-                body=user_msg,
-                source="chat",
-            )
-            event_map = {"order": "new_order", "lead": "new_lead",
-                         "callback": "new_lead", "voicemail": "new_voicemail"}
-            from_name = visitor.get('name') or visitor.get('phone') or 'Unknown'
-            notify.send(
-                CONFIG, DATA_DIR,
-                event=event_map.get(capture_kind, "new_message"),
-                title=f"New {capture_kind} from {from_name}",
-                body=user_msg[:200],
-                url="/owner",
-            )
-        except Exception as e:
-            log.warning(f"capture failed: {e}")
+    if capture_kind:
+        extracted_name  = visitor.get("name")
+        extracted_phone = visitor.get("phone")
+        extracted_email = visitor.get("email")
+        # Always run extraction so widget data + body-extracted data merge.
+        body_text = _conversation_text(history, user_msg)
+        if not extracted_phone:
+            extracted_phone = _extract_phone(body_text)
+        if not extracted_email:
+            extracted_email = _extract_email(body_text)
+        if not extracted_name:
+            extracted_name = _extract_name(body_text)
+        has_contact = bool(extracted_phone or extracted_email)
+        if has_contact:
+            try:
+                captured = mod_messages.capture(
+                    DATA_DIR,
+                    msg_type=capture_kind,
+                    from_name=extracted_name,
+                    from_phone=extracted_phone,
+                    from_email=extracted_email,
+                    body=user_msg,
+                    source="chat",
+                )
+                event_map = {"order": "new_order", "lead": "new_lead",
+                             "callback": "new_lead", "voicemail": "new_voicemail"}
+                from_label = extracted_name or extracted_phone or extracted_email or 'Unknown'
+                notify.send(
+                    CONFIG, DATA_DIR,
+                    event=event_map.get(capture_kind, "new_message"),
+                    title=f"New {capture_kind} from {from_label}",
+                    body=user_msg[:200],
+                    url="/owner",
+                )
+            except Exception as e:
+                log.warning(f"capture failed: {e}")
+        else:
+            # No contact info found — override the LLM reply with a direct
+            # ask so the visitor knows we need their info, AND so the next
+            # message they send (with their phone) actually completes the
+            # capture instead of disappearing into the LLM's wording.
+            log.info("capture intent (%s) but no contact info — asking for it",
+                      capture_kind)
+            ask = ("Of course — what's the best name and phone number "
+                   "for the owner to reach you at?")
+            return jsonify({
+                "reply": ask, "tier": "local", "latency_ms": 0,
+                "source": "capture_needs_contact",
+                "capture_pending": capture_kind,
+            })
 
     return jsonify({
         "reply": resp.text or (
@@ -1233,7 +1266,8 @@ def _detect_capture(user_msg: str, scope: dict) -> str | None:
     ):
         return "lead"
     if scope.get("public_can_request_callbacks") and any(
-        kw in msg for kw in ("call me back", "callback", "call back")
+        kw in msg for kw in ("call me back", "callback", "call back",
+                              "someone to call", "have someone call")
     ):
         return "callback"
     if scope.get("public_can_request_quotes") and any(
@@ -1241,6 +1275,76 @@ def _detect_capture(user_msg: str, scope: dict) -> str | None:
     ):
         return "lead"
     return None
+
+
+# ── Contact-info extractors for public chat ──────────────────────────────
+# Used when the chat widget doesn't pre-collect name/phone in a form. We
+# pull contact details out of whatever the visitor typed in the message
+# (or recent history) so leads aren't lost when someone says "call me
+# back at 555-1234, name's Bob" without filling out a form.
+
+_PHONE_RE = _re.compile(
+    r"\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b"
+)
+_EMAIL_RE = _re.compile(
+    r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b"
+)
+_NAME_INTRO_RE = _re.compile(
+    # The intro phrase is case-insensitive ("My name is" / "my name is")
+    # but the captured name must START WITH AN UPPERCASE LETTER so we
+    # don't slurp trailing lowercase words like "reaching" in "this is
+    # John Smith reaching out".
+    r"(?i:(?:my\s+name\s+is|i\s+am|i'?m|this\s+is|it'?s|it\s+is|name'?s))\s+"
+    r"([A-Z][a-z]{1,20}(?:\s+[A-Z][a-z]{1,20}){0,2})\b",
+)
+
+
+def _conversation_text(history: list, current_msg: str) -> str:
+    """Concatenate visitor-side messages (history + current) into one
+    string for regex scanning. Server-side responses aren't included —
+    we only mine what the visitor said."""
+    parts = []
+    for h in history or []:
+        if (h or {}).get("role") == "user":
+            parts.append(str(h.get("content") or ""))
+    parts.append(current_msg or "")
+    return " ".join(parts)
+
+
+def _extract_phone(text: str) -> str | None:
+    m = _PHONE_RE.search(text or "")
+    if not m:
+        return None
+    # Normalize to digits-only with a leading + if E.164-like, otherwise
+    # keep formatting reasonable. Strip non-digit chars except leading +.
+    raw = m.group(0)
+    digits = _re.sub(r"\D", "", raw)
+    if len(digits) == 11 and digits.startswith("1"):
+        return "+" + digits
+    if len(digits) == 10:
+        return "+1" + digits
+    return raw  # leave as-is for weird formats
+
+
+def _extract_email(text: str) -> str | None:
+    m = _EMAIL_RE.search(text or "")
+    return m.group(0).lower() if m else None
+
+
+def _extract_name(text: str) -> str | None:
+    """Find a likely visitor name from intro phrases ('my name is X',
+    'I'm X', 'this is X'). Capitalized 1-3 word run after the intro."""
+    m = _NAME_INTRO_RE.search(text or "")
+    if not m:
+        return None
+    candidate = m.group(1).strip()
+    # Reject pronouns / very short / numeric-looking
+    if not candidate or len(candidate) < 2:
+        return None
+    if candidate.lower() in {"good", "fine", "ok", "okay", "calling",
+                              "interested", "looking", "wondering", "trying"}:
+        return None
+    return candidate
 
 # ---------------------------------------------------------------------------
 # Owner UI
