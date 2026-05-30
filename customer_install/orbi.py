@@ -6003,7 +6003,23 @@ def _handle_proposal_pdf(msg: str, user_rec: dict) -> dict | None:
         return None
     matches = mod_bids.find_by_customer(DATA_DIR, q)
     if not matches:
-        return None  # Let LLM handle, may not be a bid intent
+        # Be helpful — they explicitly asked for a proposal, so don't
+        # silently fall through to the LLM. List the bids on file
+        # so the GC can pick a name we have.
+        all_bids = mod_bids.list_all(DATA_DIR, limit=10)
+        if not all_bids:
+            return {"reply": (f"I don't have a bid on file for \"{q}\". "
+                              f"Log one first: \"sent bid for {q} at <address> "
+                              f"— $<amount> <project type>\"."),
+                    "tier": "local", "latency_ms": 0,
+                    "source": "gc_proposal_no_bid"}
+        listed = "\n".join(f"  · {b['customer_name']}"
+                            f"{' — ' + b.get('project_type','') if b.get('project_type') else ''}"
+                            for b in all_bids[:10])
+        return {"reply": (f"No bid on file matching \"{q}\". On the books:\n"
+                          f"{listed}\nSay \"proposal for <one of those names>\"."),
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_proposal_no_match"}
     if len(matches) > 1:
         listed = "\n".join(f"  · {b['customer_name']} — {b.get('project_type','')} ${b.get('amount',0):,.0f}"
                             for b in matches[:5])
@@ -6136,12 +6152,16 @@ def _handle_add_bid(msg: str, user_rec: dict) -> dict:
     # Customer name = first capitalized 1-3 word run we find (excluding
     # the dollar amount + addresses with numbers).
     cust_match = _re.search(
-        r"(?:for|to)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})",
+        # Allow internal caps + apostrophes + hyphens so McDonald,
+        # O'Brien, Saint-John, TestPerson all match.
+        r"(?:for|to)\s+([A-Z][A-Za-z'\-]+(?:\s+[A-Z][A-Za-z'\-]+){0,2})",
         payload)
     customer_name = cust_match.group(1) if cust_match else ""
     if not customer_name:
         # Fallback: first capitalized phrase
-        nm = _re.search(r"\b([A-Z][a-z]{1,15}(?:\s+[A-Z][a-z]{1,15}){0,2})\b",
+        # Allow internal caps/apostrophes/hyphens so McDonald, O'Brien,
+        # Saint-John, TestPerson all match as a single name token.
+        nm = _re.search(r"\b([A-Z][A-Za-z'\-]{1,20}(?:\s+[A-Z][A-Za-z'\-]{1,20}){0,2})\b",
                          payload)
         if nm:
             candidate = nm.group(1)
