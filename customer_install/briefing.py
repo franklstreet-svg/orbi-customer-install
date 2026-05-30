@@ -268,6 +268,11 @@ def build_briefing(config: dict, data_dir: Path, username: str) -> dict:
             awaiting_sig = mod_co.list_awaiting_signature(data_dir)
             stats["co_pending_approval"] = len(pending)
             stats["co_awaiting_signature"] = len(awaiting_sig)
+            # Split pending into client-initiated vs Orby-drafted —
+            # client requests get extra attention in the brief because
+            # they're a customer-facing response time signal.
+            stats["co_client_requested"] = sum(
+                1 for c in pending if c.get("status") == "client_requested")
             for c in pending[:5]:
                 proj = mod_projects.get(data_dir, c.get("project_id", "")) or {}
                 items.append({
@@ -276,6 +281,7 @@ def build_briefing(config: dict, data_dir: Path, username: str) -> dict:
                     "project": proj.get("address", "?"),
                     "amount":  float(c.get("amount") or 0),
                     "desc":    (c.get("description") or "")[:100],
+                    "from_client": c.get("status") == "client_requested",
                 })
             for c in awaiting_sig[:5]:
                 proj = mod_projects.get(data_dir, c.get("project_id", "")) or {}
@@ -818,8 +824,17 @@ def _build_summary(display_name: str, stats: dict) -> str:
     contractor_present = ("co_pending_approval" in stats
                           or "receivables_outstanding" in stats)
     co_bits = []
-    if n_co_pend:
-        co_bits.append(f"{n_co_pend} change order{'s' if n_co_pend != 1 else ''} waiting on you to approve")
+    n_client_req = stats.get("co_client_requested", 0) or 0
+    if n_client_req:
+        # Lead with client-initiated requests — they're the time-sensitive ones
+        parts.append(
+            f"🔔 {n_client_req} change request{'s' if n_client_req != 1 else ''} "
+            f"from your customer{'s' if n_client_req != 1 else ''} — "
+            f"review in your pending COs queue."
+        )
+    n_co_pend_orby = n_co_pend - n_client_req
+    if n_co_pend_orby:
+        co_bits.append(f"{n_co_pend_orby} change order{'s' if n_co_pend_orby != 1 else ''} waiting on you to approve")
     if n_co_sig:
         co_bits.append(f"{n_co_sig} out for client signature")
     if co_bits:

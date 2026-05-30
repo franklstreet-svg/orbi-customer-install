@@ -4436,7 +4436,8 @@ def _try_contractor_chat(message: str, user_rec: dict) -> dict | None:
                 proj_label = proj.get("address", "?") if proj else "?"
                 amt = float(c.get("amount") or 0)
                 sign = "+" if amt >= 0 else ""
-                lines.append(f"  · #{c['id'][:8]} {proj_label} — {c.get('description','')} ({sign}${amt:,.0f})")
+                from_client = " 🔔 [client request]" if c.get("status") == "client_requested" else ""
+                lines.append(f"  · #{c['id'][:8]} {proj_label} — {c.get('description','')} ({sign}${amt:,.0f}){from_client}")
             lines.append("  Approve with: \"approve CO #<id>\"")
         if awaiting_sig:
             if lines: lines.append("")
