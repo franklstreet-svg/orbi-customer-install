@@ -4146,10 +4146,12 @@ _GC_ADD_LOG_RE = _re.compile(
     # "log today on Oak — crew Mike + Jose, framing complete, lumber delivered, 8 hours"
     # "daily log Oak: framing done, 6 hours"
     # "logged 8 hours on Maple, drywall in"
+    # NOT "logged bid ..." — that's a bid not a log; bid handler takes it.
     r"^\s*(?:"
     r"(?:add|create|file|write)\s+(?:a\s+)?(?:daily\s+)?log"
     r"|(?:daily\s+)?log\s+(?:today|for|on)?"
-    r"|logged?\s+(?:\d+\s+hours?\s+)?(?:on|for)?"
+    r"|logged?\s+(?:\d+\s+hours?\s+)(?:on|for)?"     # require an hours count
+    r"|logged?\s+(?:on|for)\s+"                       # OR explicit on/for
     r")\b\s*",
     _re.IGNORECASE,
 )
@@ -4232,9 +4234,12 @@ _GC_BID_LOST_RE = _re.compile(
 )
 _GC_BID_REPORT_RE = _re.compile(
     r"^\s*(?:"
-    r"(?:bid|win[/\s]*loss|win[/\s]*rate)\s+(?:report|stats?|summary)"
+    r"(?:bid|win[/\s]*loss|win[/\s]*rate)\s+(?:report|stats?|summary|pipeline)?"
+    r"|win\s*rate"
+    r"|winrate"
     r"|what'?s?\s+my\s+(?:win[/\s]*rate|conversion)"
     r"|how\s+(?:many\s+)?bids?\s+(?:have\s+i\s+)?won"
+    r"|bid\s+pipeline"
     r")\s*[?.!]?\s*$",
     _re.IGNORECASE,
 )
