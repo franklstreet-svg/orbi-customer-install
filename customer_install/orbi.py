@@ -5934,12 +5934,15 @@ def _gc_help_text() -> str:
   · full report on Oak  (the deep dive: money + COs + invoices + subs + logs)
   · mark Oak complete
 
-📝 CHANGE ORDERS
+📝 CHANGE ORDERS (foreman-on-site flow)
   · CO on the Oak project — $1200 extra trim work
-  · pending COs                       (queue + things awaiting signature)
-  · approve CO #abcd1234
-  · send CO #abcd1234 to client       (mints signing URL for the homeowner)
+      → Orby drafts it + returns a signing URL right away.
+      → Hand the iPad to the customer; they sign on the spot.
+      → Office gets notified the moment they sign — added to billing.
+  · pending COs                       (things still out for signature)
   · leak check                        (work in daily logs with no covering CO)
+  · (approve CO #xxx + send CO #xxx)  edge cases when office wants
+                                        to review before customer sees it
 
 🧾 INVOICING & PAYMENTS
   · send invoice for Oak — $5000 progress draw 1
