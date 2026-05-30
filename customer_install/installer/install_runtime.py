@@ -286,6 +286,83 @@ def extract_bundled_binaries(bin_dir: Path) -> list[Path]:
 
 
 # ---------------------------------------------------------------------------
+# 2b. Extract the Orby app source from the PyInstaller bundle into the
+# install dir and install Python dependencies. Without this step the
+# systemd service would point at a non-existent /opt/orbi/orbi.py.
+# ---------------------------------------------------------------------------
+
+APP_TARBALL_NAME = "orbi_app.tar.gz"
+
+
+def extract_app_source(install_dir: Path) -> int:
+    """Extract the bundled orbi_app.tar.gz into install_dir. Returns the
+    number of files written. Safe to re-run — overwrites existing files
+    but doesn't touch data/, snapshots/, or .session_secret.
+
+    The tarball was built by build_orbi_installer.build_app_tarball() and
+    embedded by PyInstaller --add-data. It contains orbi.py, modules/,
+    owner_dashboard/, static/, pwa/, requirements.txt, and every other
+    file the running Orby process needs (excluding per-install state).
+    """
+    import tarfile
+    install_dir = Path(install_dir)
+    meipass = getattr(sys, "_MEIPASS", None)
+    candidates = []
+    if meipass:
+        candidates.append(Path(meipass) / APP_TARBALL_NAME)
+    here = Path(__file__).resolve().parent
+    candidates.append(here.parent / "build" / APP_TARBALL_NAME)
+    candidates.append(here / APP_TARBALL_NAME)
+    src = next((c for c in candidates if c.is_file()), None)
+    if not src:
+        raise FileNotFoundError(
+            "Cannot find orbi_app.tar.gz — installer bundle is incomplete. "
+            "Tried: " + ", ".join(str(c) for c in candidates)
+        )
+    # Protect per-install state — never overwrite these from the tarball.
+    protected = {"data", "backups", "snapshots", "_archive",
+                  "config.json", ".session_secret"}
+    count = 0
+    with tarfile.open(src, "r:gz") as tar:
+        for member in tar.getmembers():
+            top = member.name.split("/", 1)[0]
+            if top in protected:
+                continue
+            tar.extract(member, install_dir, filter="data")
+            count += 1
+    log.info("extracted %d app files into %s", count, install_dir)
+    return count
+
+
+def install_python_deps(install_dir: Path) -> None:
+    """pip install -r requirements.txt into install_dir/.venv so the
+    systemd service runs with all packages available. Creates the venv
+    if it doesn't exist."""
+    install_dir = Path(install_dir)
+    req = install_dir / "requirements.txt"
+    if not req.is_file():
+        log.warning("no requirements.txt in %s — skipping pip install", install_dir)
+        return
+    venv_dir = install_dir / ".venv"
+    if not venv_dir.exists():
+        log.info("creating venv at %s", venv_dir)
+        subprocess.run([sys.executable, "-m", "venv", str(venv_dir)],
+                        check=True)
+    pip = venv_dir / ("Scripts" if _SYS.startswith("win") else "bin") / "pip"
+    if not pip.exists():
+        # Fallback to using the venv's python -m pip
+        py = venv_dir / ("Scripts" if _SYS.startswith("win") else "bin") / "python"
+        pip_cmd = [str(py), "-m", "pip"]
+    else:
+        pip_cmd = [str(pip)]
+    log.info("installing Python deps from %s into %s", req, venv_dir)
+    subprocess.run(pip_cmd + ["install", "--upgrade", "pip"],
+                    check=False)
+    subprocess.run(pip_cmd + ["install", "-r", str(req)], check=True)
+    log.info("Python deps installed")
+
+
+# ---------------------------------------------------------------------------
 # 3. write_config
 # ---------------------------------------------------------------------------
 
@@ -490,7 +567,13 @@ WantedBy=multi-user.target
 def _install_service_linux(install_dir: Path) -> None:
     install_dir = Path(install_dir)
     unit_path = Path("/etc/systemd/system/orbi.service")
-    python_bin = shutil.which("python3") or "/usr/bin/python3"
+    # Prefer the venv's python (which has Flask + edge-tts + the rest
+    # installed by install_python_deps). Fall back to system python if
+    # the venv wasn't set up.
+    venv_py = install_dir / ".venv" / "bin" / "python"
+    python_bin = str(venv_py) if venv_py.exists() else (
+        shutil.which("python3") or "/usr/bin/python3"
+    )
     content = _LINUX_UNIT.format(install_dir=install_dir, python=python_bin)
     try:
         atomic_write_text(unit_path, content, mode=0o644)
@@ -825,6 +908,10 @@ def run_interactive(install_dir: Path | None = None,
     _print(f"Creating install at {install_dir} …")
     try:
         setup_directories(install_dir)
+        _print("Extracting Orby app files …")
+        extract_app_source(install_dir)
+        _print("Installing Python dependencies (this takes a minute) …")
+        install_python_deps(install_dir)
         write_config(install_dir, billing, biz_name)
         temp_pw = bootstrap_owner(install_dir, billing["owner_email"])
     except Exception as e:

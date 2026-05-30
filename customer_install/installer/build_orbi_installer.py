@@ -66,6 +66,67 @@ DATA_FILES = [
     CUSTOMER_INSTALL / "config.json.template",
 ]
 
+# Where the app-source tarball gets written before PyInstaller embeds it.
+# install_runtime.py extracts this tarball into the customer's install dir
+# at install time — that's how orbi.py, modules/, owner_dashboard/, etc.
+# actually land on the customer's machine.
+APP_TARBALL = BUILD_DIR / "orbi_app.tar.gz"
+
+# Exclusions when building the app tarball. Everything else in
+# customer_install/ ships to the customer.
+_APP_TARBALL_EXCLUDES = {
+    "data",            # per-install customer data, never ship
+    "backups",         # local backups, never ship
+    "snapshots",       # watchdog snapshots, never ship
+    "_archive",        # deactivated-user archives, never ship
+    "__pycache__",     # bytecode noise
+    "installer",       # this very directory — recursive nope
+    "_bin_cache",      # build cache
+    "build",           # build cache
+    "dist",            # build output
+    "tests",           # test fixtures we don't need to ship
+    ".git",            # never
+    ".pytest_cache",
+    ".mypy_cache",
+}
+_APP_TARBALL_EXCLUDE_SUFFIXES = {".pyc", ".pyo", ".log", ".tmp"}
+
+
+def build_app_tarball() -> Path:
+    """Snapshot the customer_install/ tree (minus per-install state) into
+    a .tar.gz that install_runtime extracts on the customer's machine.
+
+    Idempotent: re-runs always regenerate the tarball so source edits show
+    up in the next build.
+    """
+    import tarfile
+    APP_TARBALL.parent.mkdir(parents=True, exist_ok=True)
+    if APP_TARBALL.exists():
+        APP_TARBALL.unlink()
+    log.info("packing app source → %s", APP_TARBALL)
+    total = 0
+    with tarfile.open(APP_TARBALL, "w:gz", compresslevel=6) as tar:
+        # followlinks=True is REQUIRED — owner_dashboard/ in this repo is
+        # a symlink to ../owner_dashboard/, so without following links the
+        # tarball would silently skip the dashboard HTML/JS/CSS and the
+        # customer's Orbi would 404 on the dashboard route.
+        for root, dirs, files in os.walk(CUSTOMER_INSTALL, followlinks=True):
+            # Trim excluded dirs in-place so os.walk doesn't recurse
+            dirs[:] = [d for d in dirs if d not in _APP_TARBALL_EXCLUDES
+                        and not d.startswith(".")]
+            for f in files:
+                if any(f.endswith(s) for s in _APP_TARBALL_EXCLUDE_SUFFIXES):
+                    continue
+                if f.startswith(".") and f not in {".gitkeep"}:
+                    continue
+                abs_path = Path(root) / f
+                rel = abs_path.relative_to(CUSTOMER_INSTALL)
+                tar.add(abs_path, arcname=str(rel))
+                total += 1
+    size_mb = APP_TARBALL.stat().st_size / 1_000_000
+    log.info("packed %d files into %s (%.2f MB)", total, APP_TARBALL.name, size_mb)
+    return APP_TARBALL
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -127,6 +188,12 @@ def _pyinstaller_cmd(out_subdir: Path, name: str = "orbi-installer",
             f"{CUSTOMER_INSTALL / 'users.py'}{sep}."]
     cmd += ["--add-data",
             f"{CUSTOMER_INSTALL / 'auth.py'}{sep}."]
+    # Include the app-source tarball so install_runtime.extract_app_source
+    # can drop orbi.py + modules/ + dashboards into the customer's
+    # install dir at install time. Without this the systemd service
+    # would point at a non-existent /opt/orbi/orbi.py.
+    if APP_TARBALL.exists():
+        cmd += ["--add-data", f"{APP_TARBALL}{sep}."]
     # Ship the helper binaries (ffmpeg + cloudflared + piper) so the
     # customer gets a self-contained install with no internet needed at
     # install time.
@@ -306,6 +373,7 @@ def build_windows() -> Path:
     out = DIST_DIR / "windows"
     out.mkdir(parents=True, exist_ok=True)
     _ensure_pyinstaller()
+    build_app_tarball()
     bins = fetch_platform_binaries("windows")
     models = fetch_piper_voice_models()
     cmd = _pyinstaller_cmd(out, name="orbi-installer", bundled_bins=bins,
@@ -331,6 +399,7 @@ def build_mac() -> Path:
     out = DIST_DIR / "mac"
     out.mkdir(parents=True, exist_ok=True)
     _ensure_pyinstaller()
+    build_app_tarball()
     # Stage 1: PyInstaller binary
     bins = fetch_platform_binaries("darwin")
     models = fetch_piper_voice_models()
@@ -390,6 +459,7 @@ def build_linux() -> Path:
     out = DIST_DIR / "linux"
     out.mkdir(parents=True, exist_ok=True)
     _ensure_pyinstaller()
+    build_app_tarball()
     bins = fetch_platform_binaries("linux")
     models = fetch_piper_voice_models()
     _run(_pyinstaller_cmd(out, name="orbi-installer", bundled_bins=bins,

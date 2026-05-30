@@ -46,3 +46,8 @@ cross_platform/build/
 *.exe
 *.pkg
 usb_bundle/dist/
+
+# Installer build artifacts (rebuild with build_orbi_installer.py)
+customer_install/installer/dist/
+customer_install/installer/build/
+customer_install/installer/_bin_cache/
