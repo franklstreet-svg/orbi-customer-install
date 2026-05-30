@@ -5596,13 +5596,43 @@ def _handle_bid_won(msg: str, user_rec: dict) -> dict | None:
                 "tier": "local", "latency_ms": 0,
                 "source": "gc_bid_won_ambiguous"}
     b = open_matches[0]
-    mod_bids.mark_won(DATA_DIR, b["id"])
+    # Auto-create the project — closes the lead→bid→project funnel so
+    # the GC doesn't have to retype the address + amount + type.
+    project = None
+    auto_created = False
+    if b.get("project_address"):
+        try:
+            project = mod_projects.add(
+                DATA_DIR,
+                address=b["project_address"],
+                label=b.get("project_type") or "",
+                customer_name=b.get("customer_name") or "",
+                customer_phone=b.get("customer_phone") or "",
+                customer_email=b.get("customer_email") or "",
+                contract_amount=float(b.get("amount") or 0),
+                status="active",
+                notes=f"Auto-created from won bid #{b['id'][:8]}",
+            )
+            auto_created = True
+        except Exception as e:
+            log.warning(f"auto-create project from won bid failed: {e}")
+    mod_bids.mark_won(DATA_DIR, b["id"],
+                       project_id=project["id"] if project else "")
     audit.log_event(DATA_DIR, actor=user_rec.get("username", "?"),
                     action="bid.won",
-                    meta={"bid_id": b["id"], "amount": b.get("amount")})
+                    meta={"bid_id": b["id"], "amount": b.get("amount"),
+                          "auto_created_project": project["id"] if project else None})
+    if auto_created and project:
+        return {"reply": (f"🎉 {b['customer_name']} signed — ${b.get('amount',0):,.0f} "
+                          f"{b.get('project_type','')}. "
+                          f"I auto-created the project at {project['address']} so it's "
+                          f"on your active board. Say \"share {project.get('label') or 'this'} "
+                          f"with the client\" to send them their portal link."),
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_bid_won_with_project"}
     return {"reply": (f"🎉 Marked bid as WON — {b['customer_name']} "
                       f"({b.get('project_type','')}) ${b.get('amount',0):,.0f}. "
-                      f"Add the project with \"new project at {b.get('project_address') or '<address>'} "
+                      f"Add the project with \"new project at <address> "
                       f"— ${b.get('amount',0):,.0f} {b.get('project_type','')}\""),
             "tier": "local", "latency_ms": 0,
             "source": "gc_bid_won"}
