@@ -4398,7 +4398,12 @@ _GC_PROJECT_STATUS_RE = _re.compile(
     r"\s*[?.!]?\s*$",
     _re.IGNORECASE,
 )
-_DOLLAR_AMT_RE = _re.compile(r"\$\s*(\d{1,3}(?:[,\d]*)?(?:\.\d{1,2})?)\s*(k|K|thousand)?")
+_DOLLAR_AMT_RE = _re.compile(
+    # $36,500 / $36,500.00 / $36k / 36 thousand
+    # Word boundary on the k/thousand suffix so "$36,500 kitchen" doesn't
+    # multiply by 1000 because of the leading 'k' in 'kitchen'.
+    r"\$\s*(\d{1,3}(?:[,\d]*)?(?:\.\d{1,2})?)(?:\s*(k|K|thousand)\b)?"
+)
 
 
 def _parse_money(text: str) -> float:

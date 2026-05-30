@@ -115,13 +115,24 @@ def generate(bid: dict, business: dict, out_dir: Path,
     if scope_summary:
         elements.append(Paragraph(scope_summary, body))
     else:
-        # Fallback: generic scope from services
-        services = business.get("services") or []
-        if services:
+        # Fallback: generic scope from services. Services can be either
+        # a list of strings ("Kitchen remodels") OR a list of dicts
+        # ({"name": "Kitchen remodels", "price": "...", "description": "..."}).
+        services_raw = business.get("services") or []
+        service_names = []
+        for s in services_raw[:6]:
+            if isinstance(s, dict):
+                name = (s.get("name") or "").strip()
+                if name:
+                    service_names.append(name)
+            elif isinstance(s, str):
+                if s.strip():
+                    service_names.append(s.strip())
+        if service_names:
             elements.append(Paragraph(
                 f"Work as discussed: {project_type}. Detailed scope to be "
                 f"finalized at contract signing. {biz_name} provides these "
-                f"services: " + ", ".join(services[:6]) + ".",
+                f"services: " + ", ".join(service_names) + ".",
                 body))
         else:
             elements.append(Paragraph(
