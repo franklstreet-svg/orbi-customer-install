@@ -4946,7 +4946,8 @@ def _handle_weekly_recap(msg: str, user_rec: dict) -> dict:
             continue
         try:
             ac_dt = _dt.fromisoformat(ac.replace("Z", "+00:00"))
-            if ac_dt.replace(tzinfo=None) >= week_ago.replace(tzinfo=ac_dt.tzinfo):
+            # Compare as naive UTC — drop tzinfo from both sides.
+            if ac_dt.replace(tzinfo=None) >= week_ago.replace(tzinfo=None):
                 projects_completed_this_week.append(p)
         except (ValueError, OSError):
             continue
