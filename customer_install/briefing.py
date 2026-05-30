@@ -294,6 +294,15 @@ def build_briefing(config: dict, data_dir: Path, username: str) -> dict:
             overdue = [i for i in mod_invoices.list_unpaid(data_dir)
                         if i.get("status") == "overdue"]
             stats["invoices_overdue"] = len(overdue)
+            # Pending receivables nudges in the auto-scheduler queue
+            try:
+                pf_path = data_dir / "pending_followups.json"
+                if pf_path.exists():
+                    pf = json.loads(pf_path.read_text(encoding="utf-8"))
+                    unsent = [p for p in pf if isinstance(p, dict) and not p.get("sent_at")]
+                    stats["receivables_nudges_queued"] = len(unsent)
+            except Exception:
+                pass
             for i in overdue[:5]:
                 proj = mod_projects.get(data_dir, i.get("project_id", "")) or {}
                 owed = float(i.get("amount_due", 0)) - float(i.get("amount_paid", 0))
@@ -822,6 +831,12 @@ def _build_summary(display_name: str, stats: dict) -> str:
         )
     if contractor_present and receivables_total > 0:
         parts.append(f"Total outstanding receivables: ${receivables_total:,.0f}.")
+    n_nudges = stats.get("receivables_nudges_queued", 0) or 0
+    if n_nudges:
+        parts.append(
+            f"{n_nudges} payment reminder{'s' if n_nudges != 1 else ''} "
+            f"ready to send — say \"show queued reminders\" or \"send queued reminders\"."
+        )
 
     if not (n_events or n_rem or n_tasks or n_email or n_msgs or n_revs or n_qs or rev
             or n_co_pend or n_co_sig or n_inv_od):

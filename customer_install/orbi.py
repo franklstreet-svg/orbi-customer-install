@@ -302,6 +302,114 @@ def _check_all_users_reminders():
 threading.Thread(target=reminder_fire_loop, daemon=True).start()
 
 
+# ── Contractor module: nightly receivables auto-follow-up sweep ───────────
+# Once a day, walk all overdue invoices for installs with the contractor
+# module enabled. For each invoice that hasn't been nudged in 7+ days,
+# draft a tone-escalating reminder text and queue it in
+# data/pending_followups.json. Doesn't auto-SEND — keeps the GC in the
+# loop (Orbi assists, the human decides who gets a chasing letter).
+# Queue is surfaced in the morning brief; chat command "send queued
+# reminders" delivers them.
+
+RECEIVABLES_FOLLOWUP_DAYS = 7   # min days between nudges per invoice
+RECEIVABLES_FOLLOWUP_CHECK_INTERVAL = 6 * 3600   # check every 6 hours
+
+
+def _load_pending_followups() -> list[dict]:
+    p = DATA_DIR / "pending_followups.json"
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return []
+
+
+def _save_pending_followups(items: list[dict]) -> None:
+    p = DATA_DIR / "pending_followups.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(items, indent=2), encoding="utf-8")
+    tmp.replace(p)
+
+
+def receivables_followup_loop():
+    """Sleep, then run a sweep every RECEIVABLES_FOLLOWUP_CHECK_INTERVAL.
+    The sweep itself is cheap (handful of file reads, only fires for
+    enabled installs)."""
+    time.sleep(45)   # wait for app to settle
+    while True:
+        try:
+            _receivables_followup_sweep()
+        except Exception as e:
+            log.warning(f"receivables follow-up sweep error: {e}")
+        time.sleep(RECEIVABLES_FOLLOWUP_CHECK_INTERVAL)
+
+
+def _receivables_followup_sweep() -> int:
+    """Draft nudges for overdue invoices that haven't been chased in
+    RECEIVABLES_FOLLOWUP_DAYS days. Returns count drafted.
+
+    Only runs if the contractor module is enabled on this install — base
+    Orby installs short-circuit immediately."""
+    if not is_module_enabled("contractor"):
+        return 0
+    # Promote any newly-overdue invoices to status='overdue'
+    mod_invoices.list_overdue(DATA_DIR)
+    overdue = [i for i in mod_invoices.list_unpaid(DATA_DIR)
+                if i.get("status") == "overdue"]
+    if not overdue:
+        return 0
+    now_ts = int(time.time())
+    threshold = RECEIVABLES_FOLLOWUP_DAYS * 86400
+    pending = _load_pending_followups()
+    # Dedupe: don't add a new draft if there's already one queued for
+    # this invoice that hasn't been sent yet.
+    pending_invoice_ids = {p.get("invoice_id") for p in pending if not p.get("sent_at")}
+    drafted = 0
+    for inv in overdue:
+        last_nudged = inv.get("last_follow_up_at") or 0
+        if now_ts - int(last_nudged) < threshold:
+            continue
+        if inv["id"] in pending_invoice_ids:
+            continue
+        proj = mod_projects.get(DATA_DIR, inv.get("project_id", "")) or {}
+        escalation = min(3, max(1, int(inv.get("follow_up_count", 0)) + 1))
+        try:
+            text = _draft_nudge_text(inv, proj, escalation=escalation)
+        except Exception as e:
+            log.warning(f"draft nudge failed for {inv.get('invoice_number')}: {e}")
+            continue
+        pending.append({
+            "id":              uuid.uuid4().hex[:10],
+            "invoice_id":      inv["id"],
+            "invoice_number":  inv.get("invoice_number"),
+            "project_id":      inv.get("project_id"),
+            "project_address": proj.get("address", ""),
+            "customer_email":  proj.get("customer_email", ""),
+            "escalation":      escalation,
+            "amount_owed":     float(inv.get("amount_due", 0)) - float(inv.get("amount_paid", 0)),
+            "drafted_text":    text,
+            "drafted_at":      now_ts,
+            "sent_at":         None,
+            "sent_via":        "",
+        })
+        mod_invoices.mark_followed_up(DATA_DIR, inv["id"])
+        try:
+            audit.log_event(DATA_DIR, actor="scheduler",
+                            action="invoice.nudge_auto_drafted",
+                            meta={"invoice_id": inv["id"], "escalation": escalation})
+        except Exception:
+            pass
+        drafted += 1
+    if drafted:
+        _save_pending_followups(pending)
+        log.info(f"receivables sweep drafted {drafted} nudge(s)")
+    return drafted
+
+
+import uuid    # used by the sweep above; safe to re-import (idempotent)
+threading.Thread(target=receivables_followup_loop, daemon=True).start()
+
+
 # ---------------------------------------------------------------------------
 # Fleet heartbeat — phone home to Frank's central brain server every ~5 min
 # so the mother ship knows this install is alive. Layered on top of the
@@ -3625,6 +3733,30 @@ _GC_NUDGE_ALL_RE = _re.compile(
     r")\s*[?.!]?\s*$",
     _re.IGNORECASE,
 )
+_GC_RUN_SWEEP_RE = _re.compile(
+    r"^\s*(?:"
+    r"(?:run|trigger|do)\s+(?:the\s+)?(?:receivables?|nudge|followup|follow[\s-]up)\s+(?:sweep|check|scan)"
+    r"|check\s+(?:for\s+)?overdue\s+(?:invoices?|payments?)"
+    r"|sweep\s+(?:overdue|receivables?)"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+_GC_SHOW_QUEUE_RE = _re.compile(
+    r"^\s*(?:"
+    r"(?:show|list|view)\s+(?:me\s+)?(?:my\s+)?(?:queued|pending|drafted|auto)\s+(?:reminders?|nudges?|follow[\s-]ups?)"
+    r"|(?:queued|pending|drafted)\s+(?:reminders?|nudges?|follow[\s-]ups?)"
+    r"|what'?s?\s+in\s+(?:the\s+)?(?:reminder|nudge|follow[\s-]up)\s+queue"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+_GC_SEND_QUEUE_RE = _re.compile(
+    r"^\s*(?:"
+    r"send\s+(?:all\s+)?(?:my\s+)?(?:queued|pending|drafted|auto)\s+(?:reminders?|nudges?|follow[\s-]ups?)"
+    r"|fire\s+(?:off\s+)?(?:the\s+)?(?:reminder|nudge|follow[\s-]up)\s+queue"
+    r"|approve\s+(?:and\s+send\s+)?(?:all\s+)?(?:queued|pending|drafted)\s+(?:reminders?|nudges?)"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
 
 
 def _draft_nudge_text(invoice: dict, project: dict, escalation: int = 1) -> str:
@@ -3976,6 +4108,68 @@ def _try_contractor_chat(message: str, user_rec: dict) -> dict | None:
     # 11. RECORD PAYMENT — "Sarah paid $3000 on INV-2026-0001"
     if _GC_RECORD_PAYMENT_RE.match(msg):
         return _handle_record_payment(msg, user_rec)
+
+    # 11. RUN SWEEP MANUALLY (mostly for demos; the daemon runs every 6h)
+    if _GC_RUN_SWEEP_RE.match(msg):
+        try:
+            n = _receivables_followup_sweep()
+        except Exception as e:
+            return {"reply": f"Sweep failed: {e}",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "gc_sweep_error"}
+        if n == 0:
+            return {"reply": "Sweep done — nothing new to draft. Either no invoices are 7+ days past last contact, or all overdue invoices already have a queued reminder.",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "gc_sweep_no_new"}
+        return {"reply": f"Sweep done — drafted {n} new reminder{'s' if n != 1 else ''}. Say \"show queued reminders\" to review.",
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_sweep_done"}
+
+    # 11a. RECEIVABLES QUEUE — "show queued reminders" / "send queued reminders"
+    if _GC_SHOW_QUEUE_RE.match(msg):
+        queue = _load_pending_followups()
+        unsent = [p for p in queue if not p.get("sent_at")]
+        if not unsent:
+            return {"reply": "No reminders in the queue. The nightly sweep drafts them once an invoice goes 7+ days past due without contact.",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "gc_queue_empty"}
+        lines = [f"Receivables nudges queued ({len(unsent)}):"]
+        for p in unsent[:10]:
+            tier = ["", "friendly", "firmer", "formal"][p.get("escalation", 1)]
+            lines.append(f"  · {p['invoice_number']} {p.get('project_address','?')[:25]} "
+                          f"${p.get('amount_owed', 0):,.0f} ({tier}) → {p.get('customer_email','no email')}")
+        lines.append("\nSay \"send queued reminders\" to fire them all, "
+                      "or just copy/paste from the queue file.")
+        return {"reply": "\n".join(lines), "tier": "local",
+                "latency_ms": 0, "source": "gc_queue_listed"}
+
+    if _GC_SEND_QUEUE_RE.match(msg):
+        queue = _load_pending_followups()
+        unsent = [p for p in queue if not p.get("sent_at")]
+        if not unsent:
+            return {"reply": "Nothing queued to send.",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "gc_queue_send_empty"}
+        # For v1, "sending" = marking sent + logging (real email delivery
+        # waits on the SMTP wiring story). The GC still has to deliver
+        # the text via their own channel; this just clears the queue
+        # and records intent.
+        now_ts = int(time.time())
+        sent = 0
+        lines = [f"Marking {len(unsent)} reminder{'s' if len(unsent) != 1 else ''} as sent. Copy each from the list:"]
+        for p in unsent:
+            p["sent_at"] = now_ts
+            p["sent_via"] = "manual_after_queue"
+            audit.log_event(DATA_DIR, actor=user_rec.get("username", "?"),
+                            action="invoice.nudge_queue_sent",
+                            meta={"invoice_id": p.get("invoice_id"),
+                                  "escalation": p.get("escalation")})
+            sent += 1
+            lines.append(f"\n────── {p['invoice_number']} → {p.get('customer_email','no email')} ──────")
+            lines.append(p.get("drafted_text", ""))
+        _save_pending_followups(queue)
+        return {"reply": "\n".join(lines), "tier": "local",
+                "latency_ms": 0, "source": "gc_queue_sent"}
 
     # 11b. NUDGE ALL OVERDUE — "draft all overdue reminders"
     if _GC_NUDGE_ALL_RE.match(msg):
