@@ -137,8 +137,9 @@ def capture(user_dir: Path, text: str) -> dict:
                     break
             due_iso = _parse_when(when_phrase) or _default_tomorrow_9am()
             item = mod_reminders.add(user_dir, body, due_iso)
+            note = _rollover_note(when_phrase, due_iso)
             return {"kind": "reminder", "item": item,
-                    "summary": f"Reminder set: \"{item['text']}\" for {_iso_to_local_display(due_iso)}"}
+                    "summary": f"Reminder set: \"{item['text']}\" for {_iso_to_local_display(due_iso)}{note}"}
     m = _REMIND_SIMPLE_RE.match(text)
     if m:
         body = m.group(1).strip()
@@ -383,6 +384,35 @@ def _parse_when(phrase: str) -> str | None:
 def _default_tomorrow_9am() -> str:
     """9 AM the user's local time, tomorrow. Stored as UTC."""
     return _local_at(1, 9)
+
+
+def _rollover_note(when_phrase: str, due_iso: str) -> str:
+    """Returns a short parenthetical to append to the reminder summary IF
+    we silently rolled a bare time-of-day to tomorrow because the time had
+    already passed today. Without this note, "remind me at 3:37pm" at 5pm
+    becomes "Reminder set for 3:37 PM tomorrow" and the user thinks Orby
+    invented "tomorrow" out of nowhere.
+    """
+    if not when_phrase or not due_iso:
+        return ""
+    wp_lower = when_phrase.lower()
+    # Skip if user explicitly said tomorrow / today / a weekday — no surprise.
+    explicit_day = ("tomorrow", "today", "tonight", "monday", "tuesday",
+                    "wednesday", "thursday", "friday", "saturday", "sunday",
+                    "next ", "in ")
+    if any(w in wp_lower for w in explicit_day):
+        return ""
+    try:
+        s = due_iso.replace("Z", "+00:00")
+        due_dt = datetime.fromisoformat(s).astimezone()
+        now_local = datetime.now().astimezone()
+        # Is the due date tomorrow (or later) instead of today?
+        if due_dt.date() > now_local.date():
+            time_str = due_dt.strftime("%-I:%M %p").lower() if hasattr(due_dt, 'strftime') else ""
+            return f" (since {time_str} already passed today — say so if you meant today)"
+    except (ValueError, OSError):
+        pass
+    return ""
 
 
 def _iso_to_local_display(due_iso: str) -> str:
