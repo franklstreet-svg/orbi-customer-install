@@ -935,6 +935,50 @@ def admin_deactivate(api_key: str):
         )
     return jsonify({"status": "deactivated", "api_key": api_key})
 
+
+@app.route("/api/admin/modules/<api_key>", methods=["GET", "POST"])
+def admin_modules(api_key: str):
+    """Frank-only: view + set enabled_modules on a customer record.
+
+    GET  → returns the current list
+    POST → body {"modules": ["contractor", "plumbing"]} replaces the list
+
+    Used to:
+      · manually grant module access without a full Stripe round-trip
+        (e.g. comp-ing a beta tester, fixing a webhook miss)
+      · verify what a customer currently has enabled
+    """
+    if request.headers.get("X-Admin-Token") != ADMIN_TOKEN:
+        abort(403)
+    cust = get_customer_by_api_key(api_key)
+    if not cust:
+        return jsonify({"error": "unknown api_key"}), 404
+    if request.method == "GET":
+        em = cust.get("enabled_modules") or "[]"
+        try:
+            parsed = json.loads(em) if isinstance(em, str) else em
+        except Exception:
+            parsed = []
+        return jsonify({"api_key": api_key,
+                          "enabled_modules": parsed,
+                          "email": cust.get("email"),
+                          "tier": cust.get("tier")})
+    # POST — replace the list
+    data = request.get_json(silent=True) or {}
+    modules = data.get("modules")
+    if not isinstance(modules, list):
+        return jsonify({"error": "body must be {'modules': [...]}"}, ), 400
+    cleaned = sorted({str(m).strip().lower() for m in modules if m})
+    with db() as conn:
+        conn.execute(
+            "UPDATE customers SET enabled_modules = ?, updated_at = ? "
+            "WHERE api_key = ?",
+            (json.dumps(cleaned), now(), api_key),
+        )
+    return jsonify({"status": "updated", "api_key": api_key,
+                     "enabled_modules": cleaned})
+    return jsonify({"status": "deactivated", "api_key": api_key})
+
 @app.route("/api/verify/<token>", methods=["GET"])
 def api_verify(token: str):
     """Public endpoint — the customer's installer calls this with the token
