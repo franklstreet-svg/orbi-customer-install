@@ -106,10 +106,12 @@ def build_app_tarball() -> Path:
     log.info("packing app source → %s", APP_TARBALL)
     total = 0
     with tarfile.open(APP_TARBALL, "w:gz", compresslevel=6) as tar:
-        # followlinks=True is REQUIRED — owner_dashboard/ in this repo is
-        # a symlink to ../owner_dashboard/, so without following links the
-        # tarball would silently skip the dashboard HTML/JS/CSS and the
-        # customer's Orbi would 404 on the dashboard route.
+        # followlinks=True is REQUIRED for os.walk — owner_dashboard/ is a
+        # symlink to ../owner_dashboard/. We also need to add each file
+        # with dereference so the tar contains REGULAR file entries rather
+        # than symlink entries (otherwise tarfile.data_filter on extract
+        # rejects them as "would link outside destination" — Python 3.12+
+        # strict mode).
         for root, dirs, files in os.walk(CUSTOMER_INSTALL, followlinks=True):
             # Trim excluded dirs in-place so os.walk doesn't recurse
             dirs[:] = [d for d in dirs if d not in _APP_TARBALL_EXCLUDES
@@ -121,7 +123,14 @@ def build_app_tarball() -> Path:
                     continue
                 abs_path = Path(root) / f
                 rel = abs_path.relative_to(CUSTOMER_INSTALL)
-                tar.add(abs_path, arcname=str(rel))
+                # Resolve symlinks to their target so the tar contains a
+                # plain regular-file entry — required for safe extraction.
+                real = abs_path.resolve()
+                info = tar.gettarinfo(name=str(real), arcname=str(rel))
+                if info is None:
+                    continue
+                with open(real, "rb") as fp:
+                    tar.addfile(info, fp)
                 total += 1
     size_mb = APP_TARBALL.stat().st_size / 1_000_000
     log.info("packed %d files into %s (%.2f MB)", total, APP_TARBALL.name, size_mb)

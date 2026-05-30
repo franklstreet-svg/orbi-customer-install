@@ -311,8 +311,8 @@ def extract_app_source(install_dir: Path) -> int:
     if meipass:
         candidates.append(Path(meipass) / APP_TARBALL_NAME)
     here = Path(__file__).resolve().parent
-    candidates.append(here.parent / "build" / APP_TARBALL_NAME)
-    candidates.append(here / APP_TARBALL_NAME)
+    candidates.append(here / "build" / APP_TARBALL_NAME)   # source-tree dev
+    candidates.append(here / APP_TARBALL_NAME)              # alongside script
     src = next((c for c in candidates if c.is_file()), None)
     if not src:
         raise FileNotFoundError(

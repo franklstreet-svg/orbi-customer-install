@@ -16,7 +16,10 @@ import secrets
 import time
 from pathlib import Path
 
-from flask import request, make_response, abort
+# NOTE: flask is imported lazily inside the HTTP middleware functions below
+# (not at module load) so this file can be imported by the installer
+# bootstrap (which has no Flask in its PyInstaller bundle) just to use
+# hash_password() / verify_password() during owner-user creation.
 
 SESSION_DURATION_SECONDS = 60 * 60 * 24 * 30  # 30 days
 COOKIE_NAME = "orbi_session"
@@ -102,6 +105,7 @@ def validate_session(orbi_dir: Path, token: str) -> dict | None:
 
 def current_session(orbi_dir: Path) -> dict | None:
     """Return the session payload (username/role/issued/expires) or None."""
+    from flask import request
     token = request.cookies.get(COOKIE_NAME)
     if not token:
         return None
@@ -132,6 +136,7 @@ def current_user(orbi_dir: Path, data_dir: Path) -> dict | None:
 
 def require_user(orbi_dir: Path, data_dir: Path) -> dict:
     """Abort 401 if no live user; else return the user record."""
+    from flask import abort
     user = current_user(orbi_dir, data_dir)
     if not user:
         abort(401)
@@ -141,6 +146,7 @@ def require_user(orbi_dir: Path, data_dir: Path) -> dict:
 def require_role(orbi_dir: Path, data_dir: Path, role: str) -> dict:
     """Abort 401 if not logged in, 403 if logged in but wrong role.
     'owner' role implicitly satisfies any role check (owner can do anything)."""
+    from flask import abort
     user = require_user(orbi_dir, data_dir)
     if user.get("role") == "owner":
         return user
@@ -160,6 +166,7 @@ def current_owner(orbi_dir: Path) -> dict | None:
 def require_owner(orbi_dir: Path) -> dict:
     """Legacy: 401 if not logged in. New code should use require_role(orbi_dir, data_dir, 'owner')
     so that staff can't reach owner-only routes."""
+    from flask import abort
     sess = current_session(orbi_dir)
     if not sess:
         abort(401)
