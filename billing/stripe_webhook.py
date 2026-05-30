@@ -95,6 +95,55 @@ TIER_CAPS = {
     "enterprise": {"chats_per_mo": 999_999,"calls_per_mo": 5_000, "staff": 999},
 }
 
+# ── Add-on module pricing ─────────────────────────────────────────────────
+# Each module is its own Stripe Price. When a customer's subscription
+# contains one of these price IDs (in addition to their base tier),
+# we flip the corresponding name in enabled_modules in their install
+# config, which unlocks the chat handlers gated by that module.
+#
+# Set the env vars below when you create the Stripe products tomorrow.
+# Until they're set, the env var fallback strings are placeholders that
+# obviously won't match real Stripe prices — safe no-op.
+
+PRICE_TO_MODULE = {
+    os.environ.get("STRIPE_PRICE_CONTRACTOR",  "price_contractor_placeholder"):  "contractor",
+    # Future add-ons — uncomment + add Stripe Price env vars when built:
+    # os.environ.get("STRIPE_PRICE_LEGAL",        "price_legal_placeholder"):       "legal",
+    # os.environ.get("STRIPE_PRICE_PARALEGAL",    "price_paralegal_placeholder"):   "paralegal",
+    # os.environ.get("STRIPE_PRICE_MEDICAL",      "price_medical_placeholder"):     "medical",
+    # Per-trade subcontractor specialty modules (priced as Contractor add-ons):
+    # os.environ.get("STRIPE_PRICE_PLUMBING",     "price_plumbing_placeholder"):    "plumbing",
+    # os.environ.get("STRIPE_PRICE_ELECTRICAL",   "price_electrical_placeholder"):  "electrical",
+    # os.environ.get("STRIPE_PRICE_FRAMING",      "price_framing_placeholder"):     "framing",
+    # os.environ.get("STRIPE_PRICE_ROOFING",      "price_roofing_placeholder"):     "roofing",
+    # os.environ.get("STRIPE_PRICE_PAINTING",     "price_painting_placeholder"):    "painting",
+    # os.environ.get("STRIPE_PRICE_CONCRETE",     "price_concrete_placeholder"):    "concrete",
+    # os.environ.get("STRIPE_PRICE_DRYWALL",      "price_drywall_placeholder"):     "drywall",
+    # os.environ.get("STRIPE_PRICE_HVAC",         "price_hvac_placeholder"):        "hvac",
+}
+
+
+def modules_from_subscription_items(subscription_items) -> list[str]:
+    """Walk the subscription line items, pull out any that match a
+    PRICE_TO_MODULE entry, return the unique sorted list. Used at
+    webhook-handle time + at /api/verify/<token> response time so the
+    installer gets the right enabled_modules from day one."""
+    out: set[str] = set()
+    for item in (subscription_items or []):
+        try:
+            # Items can come as dicts (after to_dict) or as objects
+            if hasattr(item, "get"):
+                price_id = ((item.get("price") or {}).get("id")
+                             or (item.get("plan") or {}).get("id") or "")
+            else:
+                price_id = (getattr(getattr(item, "price", None), "id", "")
+                             or getattr(getattr(item, "plan", None), "id", ""))
+            if price_id and price_id in PRICE_TO_MODULE:
+                out.add(PRICE_TO_MODULE[price_id])
+        except Exception:
+            continue
+    return sorted(out)
+
 stripe.api_key = STRIPE_API_KEY
 app = Flask(__name__)
 
@@ -126,6 +175,7 @@ def init_db() -> None:
                 last_heartbeat     TEXT,               -- last heartbeat payload (JSON)
                 is_dark            INTEGER DEFAULT 0,  -- 1 = no heartbeat in 30+ min
                 dark_since         INTEGER,            -- unix ts of when they went dark
+                enabled_modules    TEXT DEFAULT '[]',  -- JSON list: paid add-on modules
                 created_at         INTEGER,
                 updated_at         INTEGER
             );
@@ -138,6 +188,24 @@ def init_db() -> None:
                 payload      TEXT,
                 received_at  INTEGER
             );
+        """)
+        # Migration: add enabled_modules to pre-existing customers tables
+        # that were created before the modules concept landed. No-op on
+        # fresh DBs where the column was already created above.
+        try:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(customers)")}
+            if "enabled_modules" not in cols:
+                conn.execute(
+                    "ALTER TABLE customers ADD COLUMN enabled_modules "
+                    "TEXT DEFAULT '[]'"
+                )
+        except Exception:
+            pass
+        # Restart the schema script so the rest of the original
+        # executescript continues. (executescript can't return mid-way,
+        # so we just close + reopen the script context.)
+        conn.executescript("""
+            -- (continuation marker; remaining indices etc. can go here)
 
             -- Per-customer per-month usage counters. The brain proxy
             -- increments these on every call so we can enforce tier caps
@@ -239,8 +307,17 @@ def upsert_customer(*, stripe_customer_id: str, email: str | None = None,
                     business_name: str | None = None, tier: str | None = None,
                     billing_cycle: str | None = None,
                     active: bool | None = None, subscription_id: str | None = None,
-                    period_end: int | None = None, grace_until: int | None = None) -> str:
+                    period_end: int | None = None, grace_until: int | None = None,
+                    enabled_modules: list | None = None) -> str:
+    """enabled_modules: list of lowercase module names this customer paid
+    for (e.g. ['contractor'] or ['contractor','plumbing']). Stored as a
+    JSON string in the customers row. Used by the installer to write
+    config.enabled_modules at install time + by api/verify."""
     existing = get_customer_by_stripe_id(stripe_customer_id)
+    em_json = None
+    if enabled_modules is not None:
+        em_json = json.dumps(sorted({str(m).strip().lower()
+                                       for m in enabled_modules if m}))
     with db() as conn:
         if existing:
             updates = []
@@ -257,6 +334,9 @@ def upsert_customer(*, stripe_customer_id: str, email: str | None = None,
             if active is not None:
                 updates.append("active = ?")
                 params.append(1 if active else 0)
+            if em_json is not None:
+                updates.append("enabled_modules = ?")
+                params.append(em_json)
             updates.append("updated_at = ?")
             params.append(now())
             params.append(existing["api_key"])
@@ -270,12 +350,13 @@ def upsert_customer(*, stripe_customer_id: str, email: str | None = None,
             conn.execute(
                 "INSERT INTO customers "
                 "(api_key, stripe_customer_id, email, business_name, tier, billing_cycle, "
-                "active, subscription_id, period_end, grace_until, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "active, subscription_id, period_end, grace_until, "
+                "enabled_modules, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     api_key, stripe_customer_id, email, business_name, tier, billing_cycle,
                     1 if active else 0, subscription_id, period_end, grace_until,
-                    now(), now(),
+                    em_json or "[]", now(), now(),
                 ),
             )
             return api_key
@@ -452,6 +533,7 @@ def handle_checkout_completed(event: dict) -> None:
     # Resolve which tier + billing cycle they bought
     tier = None
     billing_cycle = None
+    enabled_modules: list = []
     if subscription_id:
         sub = stripe.Subscription.retrieve(subscription_id)
         for item in sub["items"]["data"]:
@@ -459,6 +541,10 @@ def handle_checkout_completed(event: dict) -> None:
             if price_id in PRICE_TO_TIER:
                 tier, billing_cycle = PRICE_TO_TIER[price_id]
                 break
+        # Walk the same items for paid add-on modules (contractor,
+        # legal, plumbing, etc.). A customer's subscription can carry
+        # the base tier price + any number of module prices.
+        enabled_modules = modules_from_subscription_items(sub["items"]["data"])
         period_end = sub["current_period_end"]
     else:
         period_end = None
@@ -472,6 +558,7 @@ def handle_checkout_completed(event: dict) -> None:
         subscription_id=subscription_id,
         period_end=period_end,
         grace_until=None,
+        enabled_modules=enabled_modules,
     )
 
     # Auto-provision a Twilio number for tiers that include the phone
@@ -664,6 +751,9 @@ def handle_subscription_updated(event: dict) -> None:
         if price_id in PRICE_TO_TIER:
             new_tier, new_cycle = PRICE_TO_TIER[price_id]
             break
+    # Recompute paid add-on modules — handles add/remove of module-only
+    # subscription items (e.g. a contractor adding Plumbing later).
+    enabled_modules = modules_from_subscription_items(sub["items"]["data"])
 
     active = status in ("active", "trialing")
     upsert_customer(
@@ -674,8 +764,10 @@ def handle_subscription_updated(event: dict) -> None:
         subscription_id=sub["id"],
         period_end=period_end,
         grace_until=None if active else now() + GRACE_PERIOD_DAYS * 86400,
+        enabled_modules=enabled_modules,
     )
-    print(f"[subscription] {stripe_customer_id} status={status} active={active}")
+    print(f"[subscription] {stripe_customer_id} status={status} "
+          f"active={active} modules={enabled_modules}")
 
 def handle_invoice_payment_failed(event: dict) -> None:
     """Payment failed. Start the grace period."""
@@ -869,11 +961,25 @@ def api_verify(token: str):
     if not rec:
         return jsonify({"error": "token_not_found_or_used"}), 404
 
+    # Pull enabled_modules from the customer record (set by the Stripe
+    # webhook when their subscription was created/updated).
+    enabled_modules: list = []
+    try:
+        cust = get_customer_by_api_key(rec["api_key"])
+        if cust:
+            em_raw = cust.get("enabled_modules") or "[]"
+            parsed = json.loads(em_raw) if isinstance(em_raw, str) else em_raw
+            if isinstance(parsed, list):
+                enabled_modules = [str(m).strip().lower() for m in parsed if m]
+    except Exception:
+        log.exception("verify: enabled_modules lookup failed")
+
     return jsonify({
-        "customer_id": rec["stripe_customer_id"],
-        "api_key":     rec["api_key"],
-        "tier":        rec.get("tier") or "standard",
-        "owner_email": rec.get("email") or "",
+        "customer_id":     rec["stripe_customer_id"],
+        "api_key":         rec["api_key"],
+        "tier":            rec.get("tier") or "standard",
+        "owner_email":     rec.get("email") or "",
+        "enabled_modules": enabled_modules,
     })
 
 

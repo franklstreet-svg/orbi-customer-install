@@ -472,6 +472,11 @@ def write_config(install_dir: Path, billing_data: dict,
 
     cfg["tier"] = tier
     cfg["active"] = True
+    # Paid add-on modules (Contractor Orby, Legal Orby, etc.). The Stripe
+    # webhook computes this list based on which prices the customer
+    # bought. Empty list = base Orby; lists like ['contractor'] or
+    # ['legal','paralegal'] unlock the corresponding chat handlers.
+    cfg["enabled_modules"] = list(billing_data.get("enabled_modules", []))
     cfg["installed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z") or time.strftime("%Y-%m-%dT%H:%M:%SZ")
     cfg["_customer_id"] = billing_data.get("customer_id", "")
 
