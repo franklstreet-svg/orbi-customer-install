@@ -111,6 +111,7 @@ from modules import invoice_pdf as mod_invoice_pdf
 from modules import closeout_pdf as mod_closeout_pdf
 from modules import bids as mod_bids
 from modules import reviews as mod_reviews
+from modules import proposal_pdf as mod_proposal_pdf
 from tools import url_fetch as tool_url_fetch
 from tools import web_search as tool_web_search
 
@@ -4627,6 +4628,14 @@ _GC_BID_LOST_RE = _re.compile(
     r")\s*[?.!]?\s*$",
     _re.IGNORECASE,
 )
+_GC_PROPOSAL_PDF_RE = _re.compile(
+    r"^\s*(?:"
+    r"(?:generate|create|make|build|print)\s+(?:a\s+)?(?:bid\s+)?(?:proposal|estimate)\s+(?:pdf\s+)?(?:for\s+)?(?P<q1>.+?)"
+    r"|(?:proposal|estimate)\s+(?:pdf\s+)?(?:for\s+)?(?P<q2>.+?)"
+    r"|pdf\s+(?:the\s+)?(?P<q3>.+?)(?:'s)?\s+(?:bid|proposal|estimate)"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
 _GC_BID_REPORT_RE = _re.compile(
     r"^\s*(?:"
     r"(?:bid|win[/\s]*loss|win[/\s]*rate)\s+(?:report|stats?|summary|pipeline)?"
@@ -5343,6 +5352,11 @@ def _try_contractor_chat(message: str, user_rec: dict) -> dict | None:
     if my_rating_resp is not None:
         return my_rating_resp
 
+    # 15g0b. PROPOSAL PDF — "proposal for Sarah Johnson"
+    proposal_resp = _handle_proposal_pdf(msg, user_rec)
+    if proposal_resp is not None:
+        return proposal_resp
+
     # 15g. BIDS — list / report first (specific patterns), then won/lost,
     # then add (trigger phrase last so it doesn't shadow list/report).
     bid_list_resp = _handle_list_bids(msg, user_rec)
@@ -5950,6 +5964,61 @@ def _gc_help_text() -> str:
   · show me the money                 (full money report)
 
 💡 Type "help" any time to see this list again."""
+
+
+def _handle_proposal_pdf(msg: str, user_rec: dict) -> dict | None:
+    """Generate a polished proposal PDF for an existing bid record.
+    Customer fuzzy-match against bid's customer_name."""
+    m = _GC_PROPOSAL_PDF_RE.match(msg)
+    if not m:
+        return None
+    q = (m.group("q1") or m.group("q2") or m.group("q3") or "").strip()
+    q = _re.sub(r"^the\s+", "", q, flags=_re.IGNORECASE)
+    if not q:
+        return None
+    matches = mod_bids.find_by_customer(DATA_DIR, q)
+    if not matches:
+        return None  # Let LLM handle, may not be a bid intent
+    if len(matches) > 1:
+        listed = "\n".join(f"  · {b['customer_name']} — {b.get('project_type','')} ${b.get('amount',0):,.0f}"
+                            for b in matches[:5])
+        return {"reply": f"Multiple bids match \"{q}\":\n{listed}\nBe more specific.",
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_proposal_ambiguous"}
+    bid = matches[0]
+    business = mod_business.load(DATA_DIR)
+    try:
+        pdf_path = mod_proposal_pdf.generate(bid, business,
+                                                DATA_DIR / "proposal_pdfs")
+    except Exception as e:
+        log.exception("proposal PDF failed")
+        return {"reply": f"Proposal PDF generation failed: {e}",
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_proposal_error"}
+    try:
+        token = file_fetch.mint_download_token(
+            DATA_DIR, str(pdf_path),
+            ttl_minutes=24 * 60,
+            extra_allowed_roots=[DATA_DIR / "proposal_pdfs"],
+        )
+    except Exception as e:
+        log.warning(f"proposal token mint failed: {e}")
+        token = None
+    audit.log_event(DATA_DIR, actor=user_rec.get("username", "?"),
+                    action="proposal.generated",
+                    meta={"bid_id": bid["id"]})
+    size_kb = pdf_path.stat().st_size // 1024
+    if token:
+        return {"reply": (f"Proposal PDF built for {bid['customer_name']} "
+                          f"(${bid.get('amount',0):,.0f} {bid.get('project_type','')}, "
+                          f"{size_kb} KB). [Download here](/download/{token}) "
+                          f"— link valid 24 hours."),
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_proposal_generated",
+                "download_url": f"/download/{token}"}
+    return {"reply": f"Proposal saved at {pdf_path} ({size_kb} KB).",
+            "tier": "local", "latency_ms": 0,
+            "source": "gc_proposal_generated_no_token"}
 
 
 def _handle_review_link(msg: str, user_rec: dict) -> dict | None:
