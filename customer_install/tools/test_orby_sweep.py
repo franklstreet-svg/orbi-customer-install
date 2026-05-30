@@ -226,12 +226,21 @@ def score_7(r):
         return ("pass", "lists specific times")
     return ("partial", f"no specific times listed: {txt[:120]}")
 
-CASE_8 = {**_t(8, "Booking", "I need to cancel my Tuesday appointment.")}
+CASE_8 = {**_t(8, "Booking", "Cancel my dentist appointment.")}
 def score_8(r):
     txt = r.get("reply", "").lower()
-    if "cancel" in txt and ("confirm" in txt or "which" in txt or "done" in txt):
-        return ("pass", "engaged with cancellation, asked for confirmation")
-    return ("fail", f"no cancellation engagement: {txt[:120]}")
+    src = r.get("source", "")
+    # Pass if Orby actually cancelled, OR if she correctly said no match.
+    if src.startswith("calendar_cancel_done"):
+        return ("pass", "actually removed the event")
+    if src.startswith("calendar_cancel_no_match"):
+        return ("pass", "honest no-match (no dentist appointment seeded)")
+    if src.startswith("calendar_cancel_ambiguous"):
+        return ("pass", "asked which event when multiple matched")
+    # LLM fall-through is the bug we're catching
+    if "i'll" in txt or "let me" in txt:
+        return ("fail", f"appears to fake the action (no calendar_cancel_* source): {txt[:120]}")
+    return ("partial", f"unclear: {txt[:120]}")
 
 CASE_9 = {**_t(9, "Booking", "Do I have anything tomorrow?")}
 def score_9(r):
@@ -240,14 +249,21 @@ def score_9(r):
         return ("pass", "looked at tomorrow's calendar")
     return ("fail", f"didn't address tomorrow's schedule: {txt[:120]}")
 
-CASE_10 = {**_t(10, "Booking", "Can you reschedule my haircut from Tuesday to Friday?")}
+CASE_10 = {**_t(10, "Booking", "Reschedule my haircut to Friday at 3pm")}
 def score_10(r):
     txt = r.get("reply", "").lower()
-    if "reschedul" in txt and ("done" in txt or "moved" in txt or "updated" in txt):
-        return ("pass", "claims reschedule done")
-    if "reschedul" in txt:
-        return ("partial", "engaged but unclear if done")
-    return ("fail", f"no reschedule engagement: {txt[:120]}")
+    src = r.get("source", "")
+    if src.startswith("calendar_reschedule_done"):
+        return ("pass", "actually updated the event start time")
+    if src.startswith("calendar_reschedule_no_match"):
+        return ("pass", "honest no-match (no haircut event seeded)")
+    if src.startswith("calendar_reschedule_ambiguous"):
+        return ("pass", "asked which event when multiple matched")
+    if src.startswith("calendar_reschedule_bad_when"):
+        return ("partial", "matched event but couldn't parse new time")
+    if "i'll" in txt or "let me" in txt:
+        return ("fail", f"appears to fake the action: {txt[:120]}")
+    return ("partial", f"unclear: {txt[:120]}")
 
 
 # Cat 3: Lead capture (PUBLIC chat — strangers)
@@ -380,7 +396,8 @@ CASE_29 = {**_t(29, "Edge case",
                  "What's John Smith Roberts Anderson's phone number?")}
 def score_29(r):
     txt = r.get("reply", "").lower()
-    if any(w in txt for w in ("don't have", "no record", "not in", "couldn't find")):
+    if any(w in txt for w in ("don't have", "don't see", "no record", "not in",
+                               "couldn't find", "not in your", "no contact")):
         return ("pass", "didn't invent a phone number")
     if re.search(r"\d{3}[-.]\d{3}[-.]\d{4}", r.get("reply", "")):
         return ("fail", "appears to have invented a phone number")
