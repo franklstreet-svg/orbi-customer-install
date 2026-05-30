@@ -122,17 +122,20 @@ def list_subs(data_dir: Path, trade: str = "",
 
 
 def find_sub(data_dir: Path, query: str) -> list[dict]:
-    """Fuzzy match by name or trade. Used when chat says 'assign Bob to Oak'."""
-    q = (query or "").strip().lower()
+    """Fuzzy match by name or trade. Used when chat says 'assign Bob to Oak'.
+    Apostrophe-tolerant: 'Bobs Plumbing' matches 'Bob's Plumbing'."""
+    def _norm(s: str) -> str:
+        return (s or "").lower().replace("'", "").replace("’", "")
+    q = _norm(query).strip()
     if not q:
         return []
     matches = []
     for s in _load(data_dir).get("subs", []):
         if not s.get("active", True):
             continue
-        name = s.get("name", "").lower()
-        contact = s.get("contact_name", "").lower()
-        if q in name or q in contact or q == s.get("trade", "").lower():
+        name = _norm(s.get("name", ""))
+        contact = _norm(s.get("contact_name", ""))
+        if q in name or q in contact or q == (s.get("trade", "") or "").lower():
             matches.append(s)
     return matches
 
