@@ -3718,6 +3718,14 @@ _GC_INSURANCE_CHECK_RE = _re.compile(
 )
 
 # ── Unsigned-work leak alarm pattern ──────────────────────────────────────
+_GC_WEEKLY_RECAP_RE = _re.compile(
+    r"^\s*(?:"
+    r"(?:weekly|week'?s?|this\s+week'?s?)\s+(?:recap|summary|report|review|wrap[\s-]?up)"
+    r"|(?:wrap\s+up|recap)\s+(?:my\s+|the\s+)?week"
+    r"|how(?:'s| was| did)\s+(?:my\s+|the\s+)?week\s+(?:go|going)?"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
 _GC_PROJECT_REPORT_RE = _re.compile(
     # "full report on Oak" / "everything on Maple" / "deep dive Oak"
     # / "show me all of Oak" / "Oak summary"
@@ -4357,6 +4365,10 @@ def _try_contractor_chat(message: str, user_rec: dict) -> dict | None:
     if proj_report_resp is not None:
         return proj_report_resp
 
+    # 15d. WEEKLY RECAP — "weekly recap" / "wrap up my week" / "how did my week go"
+    if _GC_WEEKLY_RECAP_RE.match(msg):
+        return _handle_weekly_recap(msg, user_rec)
+
     # 16. REPORTING — "show me the money", "captured this month", "totals"
     if _GC_REPORT_RE.match(msg):
         p_sum = mod_projects.summary(DATA_DIR)
@@ -4882,6 +4894,103 @@ def _handle_project_full_report(msg: str, user_rec: dict) -> dict | None:
             lines.append(f"  · {l['date']}{crew_bit}{hrs_bit} {l.get('work_done','')[:70]}")
     return {"reply": "\n".join(lines), "tier": "local",
             "latency_ms": 0, "source": "gc_project_report"}
+
+
+def _handle_weekly_recap(msg: str, user_rec: dict) -> dict:
+    """Friday-afternoon 'what happened this week' bundle. Hours by crew
+    + CO activity + invoice activity + leak count + completed milestones
+    — the contractor's natural end-of-week debrief."""
+    from datetime import datetime as _dt, timedelta as _td
+    now = _dt.now()
+    week_ago = now - _td(days=7)
+    week_ago_ts = int(week_ago.timestamp())
+    # Logs this week
+    logs = mod_daily_logs.list_for_week(DATA_DIR)
+    hours_by_crew: dict[str, float] = {}
+    project_hours: dict[str, float] = {}
+    project_log_counts: dict[str, int] = {}
+    for l in logs:
+        h = float(l.get("hours") or 0)
+        proj_id = l.get("project_id") or ""
+        project_hours[proj_id] = project_hours.get(proj_id, 0.0) + h
+        project_log_counts[proj_id] = project_log_counts.get(proj_id, 0) + 1
+        crew = l.get("crew") or []
+        if crew and h > 0:
+            per = h / len(crew)
+            for name in crew:
+                hours_by_crew[name] = hours_by_crew.get(name, 0.0) + per
+        elif crew:
+            for name in crew:
+                hours_by_crew[name] = hours_by_crew.get(name, 0.0)
+    total_hours = sum(hours_by_crew.values())
+    # COs this week
+    all_cos = mod_change_orders._load(DATA_DIR)
+    cos_new = [c for c in all_cos if c.get("created_at", 0) >= week_ago_ts]
+    cos_signed = [c for c in all_cos
+                   if c.get("client_signed_at") and c["client_signed_at"] >= week_ago_ts]
+    co_captured_dollars = sum(float(c.get("amount", 0)) for c in cos_signed)
+    # Invoices this week
+    all_invs = mod_invoices._load(DATA_DIR)
+    invs_sent = [i for i in all_invs
+                  if i.get("sent_at") and i["sent_at"] >= week_ago_ts]
+    invs_billed = sum(float(i.get("amount_due", 0)) for i in invs_sent)
+    invs_paid = [i for i in all_invs
+                  if i.get("paid_at") and i["paid_at"] >= week_ago_ts]
+    invs_collected = sum(float(i.get("amount_paid", 0)) for i in invs_paid)
+    # Projects completed this week
+    all_projects = mod_projects._load(DATA_DIR)
+    projects_completed_this_week = []
+    for p in all_projects:
+        ac = p.get("actual_complete") or ""
+        if not ac:
+            continue
+        try:
+            ac_dt = _dt.fromisoformat(ac.replace("Z", "+00:00"))
+            if ac_dt.replace(tzinfo=None) >= week_ago.replace(tzinfo=ac_dt.tzinfo):
+                projects_completed_this_week.append(p)
+        except (ValueError, OSError):
+            continue
+    # Leak check
+    leaks = mod_daily_logs.find_unmatched_scope_changes(DATA_DIR, recent_days=7)
+
+    # Build output
+    lines = [
+        f"━━━ Weekly recap • {week_ago.strftime('%b %-d')}–{now.strftime('%b %-d')} ━━━",
+        "",
+        f"💪 Hours logged: {total_hours:g}h across {len(logs)} daily log{'s' if len(logs) != 1 else ''}",
+    ]
+    if hours_by_crew:
+        top = sorted(hours_by_crew.items(), key=lambda x: -x[1])[:6]
+        lines.append("  Crew:")
+        for name, h in top:
+            lines.append(f"    · {name}: {h:.1f}h")
+    if project_hours:
+        lines.append("  Hours per project:")
+        for pid, h in sorted(project_hours.items(), key=lambda x: -x[1])[:5]:
+            proj = mod_projects.get(DATA_DIR, pid) or {}
+            lines.append(f"    · {proj.get('address','?')[:35]}: {h:.1f}h ({project_log_counts[pid]} log{'s' if project_log_counts[pid] != 1 else ''})")
+    lines.append("")
+    lines.append(f"📋 Change orders:")
+    lines.append(f"  · {len(cos_new)} drafted this week")
+    lines.append(f"  · {len(cos_signed)} signed by clients (${co_captured_dollars:,.0f} captured)")
+    lines.append("")
+    lines.append(f"🧾 Invoicing:")
+    lines.append(f"  · {len(invs_sent)} invoice{'s' if len(invs_sent) != 1 else ''} sent (${invs_billed:,.0f} billed)")
+    lines.append(f"  · {len(invs_paid)} payment{'s' if len(invs_paid) != 1 else ''} received (${invs_collected:,.0f} collected)")
+    if projects_completed_this_week:
+        lines.append("")
+        lines.append(f"🏁 Projects completed ({len(projects_completed_this_week)}):")
+        for p in projects_completed_this_week[:5]:
+            lines.append(f"  · {p.get('address','?')} — {p.get('label','')}")
+    if leaks:
+        lines.append("")
+        lines.append(f"⚠ {len(leaks)} scope mention(s) in this week's logs with no matching CO")
+        lines.append(f"  (Run \"leak check\" for details.)")
+    if total_hours == 0 and not cos_new and not invs_sent and not invs_paid:
+        lines.append("")
+        lines.append("(Quiet week — no logs, COs, or invoices recorded.)")
+    return {"reply": "\n".join(lines), "tier": "local",
+            "latency_ms": 0, "source": "gc_weekly_recap"}
 
 
 def _handle_leak_check(msg: str, user_rec: dict) -> dict:
