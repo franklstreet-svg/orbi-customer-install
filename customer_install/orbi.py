@@ -968,15 +968,24 @@ def co_sign_submit(token):
         tokens[token]["signer_ip"] = request.headers.get("X-Forwarded-For",
                                                            request.remote_addr or "")
         _save_co_sign_tokens(tokens)
-    # Notify the GC's office
+    # Notify the GC's office. Workflow per Frank: foreman drafts on-site
+    # in front of the customer, customer signs on the foreman's iPad
+    # right then. So the moment we get here, it's effectively "office,
+    # heads-up — Sarah just signed an extra $1,200 onto the Maple job
+    # so update the billing/specs."
     project = mod_projects.get(DATA_DIR, co.get("project_id", "")) or {}
     try:
         amount = float(co.get("amount") or 0)
         sign = "+" if amount >= 0 else ""
+        sent_via = co.get("sent_via", "")
+        on_site = sent_via == "in_person"
         notify.send(CONFIG, DATA_DIR, event="co_signed",
-                     title=f"CO signed — {project.get('address', '?')}",
+                     title=(f"✓ CO signed on-site — {project.get('address', '?')}"
+                            if on_site else
+                            f"CO signed — {project.get('address', '?')}"),
                      body=f"{typed_name} signed CO #{co['id'][:8]} ({sign}${amount:,.0f}). "
-                          f"{co.get('description','')[:80]}",
+                          f"{co.get('description','')[:80]}"
+                          + (" Add to billing / specs." if on_site else ""),
                      url="/owner#projects")
     except Exception:
         log.exception("co_signed notify failed")
@@ -5450,7 +5459,11 @@ def _handle_add_co(msg: str, user_rec: dict) -> dict:
                             flags=_re.IGNORECASE).strip()
     if not description:
         description = "Additional scope agreed with client"
-    # Build the draft + save
+    # Build the draft + save. Per Frank's actual workflow: the foreman is
+    # standing next to the customer when they create the CO. Customer
+    # signs ON THE FOREMAN'S DEVICE, right then, no GC-approval gate.
+    # So we skip "awaiting_approval" → go straight to "sent_for_signature"
+    # and mint a sign URL the foreman opens on the spot.
     draft = _draft_change_order_text(project, description, amount)
     co = mod_change_orders.add(
         DATA_DIR,
@@ -5458,19 +5471,29 @@ def _handle_add_co(msg: str, user_rec: dict) -> dict:
         description=description,
         amount=amount,
         draft_text=draft,
-        status="awaiting_approval",
+        status="sent_for_signature",
     )
+    # Stamp the "sent" metadata so the audit trail shows in_person, not email
+    mod_change_orders.update(
+        DATA_DIR, co["id"],
+        sent_at=int(time.time()),
+        sent_via="in_person",
+    )
+    token = _mint_co_sign_token(co["id"])
+    sign_url = _co_sign_url(token)
     audit.log_event(DATA_DIR, actor=user_rec.get("username", "?"),
-                    action="co.drafted",
+                    action="co.drafted_for_in_person_sign",
                     meta={"co_id": co["id"], "project_id": project["id"],
                           "amount": amount})
     sign = "+" if amount >= 0 else ""
-    return {"reply": (f"Drafted CO #{co['id'][:8]} on {project['address']}: "
-                      f"\"{description[:70]}\" ({sign}${amount:,.0f}). "
-                      f"In your queue — review the draft + approve with "
-                      f"\"approve CO #{co['id'][:8]}\"."),
+    return {"reply": (f"CO drafted — {project['address']}: \"{description[:70]}\" "
+                      f"({sign}${amount:,.0f}).\n\n"
+                      f"👉 Hand the device to {project.get('customer_name') or 'the customer'} "
+                      f"to review + sign:\n{sign_url}\n\n"
+                      f"Office gets notified the moment they sign."),
             "tier": "local", "latency_ms": 0,
-            "source": "gc_co_drafted"}
+            "source": "gc_co_drafted_for_sign",
+            "sign_url": sign_url}
 
 
 def _find_project_in_payload(payload: str) -> dict | None:
