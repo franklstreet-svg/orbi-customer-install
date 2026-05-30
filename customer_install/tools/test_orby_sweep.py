@@ -411,18 +411,133 @@ def score_30(r):
     return ("partial", f"may have rambled: {txt[:150]}")
 
 
-# Cat 8: System (manual / state checks)
+CASE_16 = {**_t(16, "Learning loop (state)", "[after #14 — did Orby capture the unknown question?]")}
+def score_16(r):
+    # Looks at pending_questions.json for any entry matching the
+    # test-#14 prompt. This proves the learning loop actually captured
+    # the unknown question (first half of the moat feature).
+    pq = _data_file(["pending_questions.json"]) or []
+    if not isinstance(pq, list):
+        return ("fail", "pending_questions.json missing or wrong shape")
+    needles = ("mobile pet grooming", "group bookings of 8")
+    hits = [q for q in pq
+            if any(n in (q.get("question_normalized") or q.get("question") or "").lower()
+                   for n in needles)]
+    if hits:
+        owner_notified = sum(1 for h in hits if h.get("owner_notified_at"))
+        return ("pass", f"captured {len(hits)} unknown question(s), {owner_notified} forwarded to owner")
+    return ("fail", "no learning-loop entries from this sweep's #14/#15")
+
+CASE_17 = {**_t(17, "Learning loop (state)", "[after #14 — was the owner pinged?]")}
+def score_17(r):
+    pq = _data_file(["pending_questions.json"]) or []
+    if not pq:
+        return ("fail", "no pending questions to check")
+    notified = [q for q in pq if q.get("owner_notified_at")]
+    if notified:
+        return ("pass", f"{len(notified)} pending question(s) have owner_notified_at set")
+    return ("fail", "no questions show owner_notified_at — owner ping didn't fire")
+
+
+# Cat 8: System (auto checks)
+CASE_31 = {**_t(31, "System", "[systemd unit auto-restart config]")}
+def score_31(r):
+    # We can't reboot in dev. The customer-side guarantee is the
+    # systemd unit's Restart=always RestartSec=5 — verify that template
+    # in install_runtime.py would write it correctly.
+    unit_py = (ORBI_DIR / "installer" / "install_runtime.py")
+    if not unit_py.is_file():
+        return ("fail", "install_runtime.py missing")
+    src = unit_py.read_text(encoding="utf-8")
+    has_restart = "Restart=always" in src
+    has_secs = "RestartSec=" in src
+    has_wanted_by = "WantedBy=multi-user.target" in src
+    if has_restart and has_secs and has_wanted_by:
+        return ("pass", "systemd unit has Restart=always + RestartSec + WantedBy")
+    return ("fail", f"systemd unit incomplete — restart:{has_restart} secs:{has_secs} wanted:{has_wanted_by}")
+
+CASE_32 = {**_t(32, "System", "[LLM third-tier fallback]")}
+def score_32(r):
+    # Live probe local LLM port. If it answers, third tier exists.
+    import urllib.request, urllib.error
+    cfg_path = ORBI_DIR / "config.json"
+    if not cfg_path.is_file():
+        return ("manual", "config.json missing — verify on real customer install")
+    try:
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except Exception:
+        return ("manual", "couldn't parse config.json")
+    port = (cfg.get("local_llm") or {}).get("port") or 11434
+    url = f"http://127.0.0.1:{port}/v1/models"
+    try:
+        with urllib.request.urlopen(url, timeout=2) as resp:
+            if resp.status == 200:
+                return ("pass", f"local LLM responding on port {port}")
+    except Exception:
+        pass
+    return ("fail", f"no local LLM on port {port} — fleet single-point-of-failure if brain + HF both die")
+
 CASE_33 = {**_t(33, "System", "[staff permission check]")}
 def score_33(r):
-    return ("manual", "Log in as a staff user; confirm they don't see owner-only buttons.")
+    # Look for a staff user and probe an owner-only endpoint as them.
+    users_json = _data_file(["users.json"]) or {}
+    if not isinstance(users_json, dict):
+        return ("manual", "users.json shape unexpected")
+    staff = [u for u, v in users_json.items()
+             if isinstance(v, dict) and v.get("role") == "staff"
+                and v.get("status") == "active"]
+    if not staff:
+        return ("manual", "no active staff user to test against")
+    return ("manual", f"To verify: log in as one of {staff[:3]} and confirm "
+                       f"Settings → Staff is hidden (owner-only).")
 
 CASE_34 = {**_t(34, "System", "[data folder local check]")}
 def score_34(r):
-    # Auto: check the data folder exists + has user data
     p = DATA_DIR
     if p.exists() and any((p / sub).exists() for sub in ("users", "business_info.json", "messages.json")):
         return ("pass", f"data folder populated at {p}")
     return ("fail", f"data folder missing or empty at {p}")
+
+CASE_35 = {**_t(35, "System", "[uptime + stability check]")}
+def score_35(r):
+    # Find the orbi.py PID listening on 5050 and check its process age
+    # + memory. A long-running process with stable memory is the best
+    # proxy we have for "24-hour uptime" without literally waiting.
+    import subprocess as _sp
+    try:
+        out = _sp.run(["ss", "-ltnp"], capture_output=True, text=True, timeout=5)
+        pid = None
+        for line in out.stdout.splitlines():
+            if ":5050" in line and "pid=" in line:
+                pid = line.split("pid=")[1].split(",")[0]
+                break
+        if not pid:
+            return ("fail", "no process listening on 5050")
+        # Process start time
+        with open(f"/proc/{pid}/stat", "r") as f:
+            stat_fields = f.read().split()
+        start_ticks = int(stat_fields[21])
+        with open("/proc/uptime", "r") as f:
+            sys_uptime = float(f.read().split()[0])
+        clk_tck = 100  # SC_CLK_TCK on Linux is almost always 100
+        proc_start_secs_ago = sys_uptime - (start_ticks / clk_tck)
+        with open(f"/proc/{pid}/status", "r") as f:
+            status = f.read()
+        rss_kb = 0
+        for line in status.splitlines():
+            if line.startswith("VmRSS:"):
+                rss_kb = int(line.split()[1])
+                break
+        rss_mb = rss_kb / 1024
+        hours = proc_start_secs_ago / 3600
+        # Threshold: at least 1 hour up AND under 500MB
+        if hours >= 1 and rss_mb < 500:
+            return ("pass", f"PID {pid} up {hours:.1f}h, RSS {rss_mb:.0f} MB (stable)")
+        if hours < 1:
+            return ("partial", f"PID {pid} only up {hours:.1f}h — need 1h+ for confidence")
+        return ("partial", f"PID {pid} up {hours:.1f}h but RSS {rss_mb:.0f} MB (possible leak)")
+    except Exception as e:
+        return ("manual", f"couldn't auto-check: {e}")
 
 
 # ─── Test registry ────────────────────────────────────────────────────────
@@ -444,7 +559,9 @@ PUBLIC_TESTS = [
     (CASE_14, score_14), (CASE_15, score_15),
 ]
 STATE_TESTS = [
-    (CASE_33, score_33), (CASE_34, score_34),
+    (CASE_16, score_16), (CASE_17, score_17),
+    (CASE_31, score_31), (CASE_32, score_32), (CASE_33, score_33),
+    (CASE_34, score_34), (CASE_35, score_35),
 ]
 
 
