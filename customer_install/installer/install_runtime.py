@@ -334,10 +334,56 @@ def extract_app_source(install_dir: Path) -> int:
     return count
 
 
+def _find_system_python() -> str:
+    """Find a real Python interpreter on the customer's system. Inside a
+    PyInstaller bundle, sys.executable points at the bundle binary itself,
+    NOT at a Python interpreter — so we can't use sys.executable to spawn
+    `python -m venv`. We have to find python3 on the host PATH.
+
+    Raises RuntimeError if no Python ≥3.10 is found, with a clear hint
+    to install one. (apt install python3 / brew install python / the
+    python.org installer on Windows.)
+    """
+    candidates = []
+    if _SYS.startswith("win"):
+        candidates = ["py", "python", "python3"]
+    else:
+        candidates = ["python3.12", "python3.11", "python3.10", "python3"]
+    for name in candidates:
+        path = shutil.which(name)
+        if not path:
+            continue
+        # Quick sanity check — must be ≥3.10 (Flask + edge-tts both want it)
+        try:
+            r = subprocess.run(
+                [path, "-c", "import sys; print(sys.version_info[:2])"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if r.returncode == 0 and "(3," in r.stdout:
+                major_minor = r.stdout.strip()
+                # Parse "(3, 11)" → minor=11
+                try:
+                    minor = int(major_minor.split(",")[1].strip().rstrip(")"))
+                    if minor >= 10:
+                        log.info("using system python: %s (3.%d)", path, minor)
+                        return path
+                except ValueError:
+                    continue
+        except (subprocess.SubprocessError, OSError):
+            continue
+    raise RuntimeError(
+        "No Python ≥3.10 found on PATH. Install python3 (apt install python3 "
+        "on Ubuntu, brew install python3 on macOS, or python.org installer "
+        "on Windows) and re-run this installer."
+    )
+
+
 def install_python_deps(install_dir: Path) -> None:
     """pip install -r requirements.txt into install_dir/.venv so the
     systemd service runs with all packages available. Creates the venv
-    if it doesn't exist."""
+    if it doesn't exist. Uses the host system's python3, NOT
+    sys.executable (which inside a PyInstaller bundle points to the
+    bundle binary itself)."""
     install_dir = Path(install_dir)
     req = install_dir / "requirements.txt"
     if not req.is_file():
@@ -346,7 +392,8 @@ def install_python_deps(install_dir: Path) -> None:
     venv_dir = install_dir / ".venv"
     if not venv_dir.exists():
         log.info("creating venv at %s", venv_dir)
-        subprocess.run([sys.executable, "-m", "venv", str(venv_dir)],
+        system_python = _find_system_python()
+        subprocess.run([system_python, "-m", "venv", str(venv_dir)],
                         check=True)
     pip = venv_dir / ("Scripts" if _SYS.startswith("win") else "bin") / "pip"
     if not pip.exists():
@@ -571,9 +618,13 @@ def _install_service_linux(install_dir: Path) -> None:
     # installed by install_python_deps). Fall back to system python if
     # the venv wasn't set up.
     venv_py = install_dir / ".venv" / "bin" / "python"
-    python_bin = str(venv_py) if venv_py.exists() else (
-        shutil.which("python3") or "/usr/bin/python3"
-    )
+    if venv_py.exists():
+        python_bin = str(venv_py)
+    else:
+        try:
+            python_bin = _find_system_python()
+        except RuntimeError:
+            python_bin = shutil.which("python3") or "/usr/bin/python3"
     content = _LINUX_UNIT.format(install_dir=install_dir, python=python_bin)
     try:
         atomic_write_text(unit_path, content, mode=0o644)
@@ -954,11 +1005,66 @@ def run_interactive(install_dir: Path | None = None,
 # ---------------------------------------------------------------------------
 
 def _smoke_test() -> int:
+    """End-to-end smoke test of the install flow that DOESN'T need root.
+    Designed to run in CI so any regression that would ship a broken
+    installer to a customer is caught at build time, not after the
+    customer types their install token.
+
+    Covers:
+      1. setup_directories (file system layout)
+      2. extract_app_source (the app actually unpacks from the bundle)
+      3. install_python_deps (pip in venv works, requirements resolve)
+      4. write_config (config.json written from billing payload)
+      5. bootstrap_owner (owner user + password created)
+      6. orbi.py imports cleanly under the freshly-created venv python
+         (proves both the source + the deps actually work together)
+
+    SKIPS (need root + a running systemd/launchd/SCM):
+      - install_service
+      - verify_install (HTTP probe)
+      - launch_setup_wizard (opens a browser)
+    """
     logging.basicConfig(level=logging.INFO)
     tmp = Path(tempfile.mkdtemp(prefix="orbi-installer-smoke-"))
     try:
+        print("[1/6] setup_directories ...", flush=True)
         setup_directories(tmp)
-        pw = bootstrap_owner(tmp, "test.owner@example.com")
+
+        print("[2/6] extract_app_source ...", flush=True)
+        n = extract_app_source(tmp)
+        for required in ("orbi.py", "requirements.txt",
+                          "modules/internal_messages.py",
+                          "owner_dashboard/dashboard.html",
+                          "owner_dashboard/dashboard.js",
+                          "pwa/manifest.json"):
+            if not (tmp / required).is_file():
+                print(f"FAIL: required app file missing after extract: {required}")
+                return 1
+        print(f"  extracted {n} files")
+
+        print("[3/6] install_python_deps ...", flush=True)
+        install_python_deps(tmp)
+        if _SYS.startswith("win"):
+            venv_py = tmp / ".venv" / "Scripts" / "python.exe"
+        else:
+            venv_py = tmp / ".venv" / "bin" / "python"
+        if not venv_py.exists():
+            print(f"FAIL: venv python not created at {venv_py}")
+            return 1
+
+        print("[4/6] write_config ...", flush=True)
+        write_config(tmp, {
+            "api_key": "smoke_test_api_key_" + secrets.token_urlsafe(16),
+            "owner_email": "smoke.test@example.com",
+            "tier": "starter",
+            "customer_id": "cust_smoketest",
+        }, "Smoke Test Business")
+        if not (tmp / "config.json").is_file():
+            print("FAIL: config.json not written")
+            return 1
+
+        print("[5/6] bootstrap_owner ...", flush=True)
+        pw = bootstrap_owner(tmp, "smoke.test@example.com")
         users_json = tmp / "data" / "users.json"
         if not users_json.exists():
             print("FAIL: users.json not written")
@@ -971,7 +1077,26 @@ def _smoke_test() -> int:
         if len(pw) != 12:
             print(f"FAIL: password is {len(pw)} chars, expected 12")
             return 1
-        print(f"PASS: owner={owners[0]} password={pw}")
+
+        print("[6/6] import orbi under venv python ...", flush=True)
+        env = os.environ.copy()
+        env["ORBI_DIR"] = str(tmp)
+        rc = subprocess.run(
+            [str(venv_py), "-c",
+             f"import sys; sys.path.insert(0, {str(tmp)!r}); "
+             f"import orbi; "
+             f"assert len(orbi.app.url_map._rules) > 50, 'too few routes'; "
+             f"print('orbi imported,', len(orbi.app.url_map._rules), 'routes')"],
+            capture_output=True, text=True, env=env, timeout=60,
+        )
+        if rc.returncode != 0:
+            print("FAIL: orbi.py would not import in venv")
+            print("  stdout:", rc.stdout.strip())
+            print("  stderr (last 2000):", rc.stderr.strip()[-2000:])
+            return 1
+        print(" ", rc.stdout.strip())
+
+        print(f"PASS — owner={owners[0]} password={pw}")
         return 0
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

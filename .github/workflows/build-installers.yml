@@ -57,6 +57,24 @@ jobs:
       - name: Build installer (${{ matrix.target }})
         run: python customer_install/installer/build_orbi_installer.py --target ${{ matrix.target }}
 
+      - name: Smoke-test the built installer (Linux + Mac only)
+        # The smoke test runs the built PyInstaller binary with --smoke-test,
+        # which exercises: extract_app_source, install_python_deps, write_config,
+        # bootstrap_owner, AND imports orbi.py under the freshly-created venv
+        # python to prove the bundled source + deps actually work together.
+        # Windows: skipped because runner doesn't have a way to invoke the
+        # nested .exe without UAC and the binary is named differently.
+        if: matrix.target != 'windows'
+        run: |
+          set -e
+          if [ "${{ matrix.target }}" = "linux" ]; then
+            BIN=customer_install/installer/dist/linux/orbi-installer
+          else
+            BIN=customer_install/installer/dist/mac/orbi-installer
+          fi
+          chmod +x "$BIN"
+          "$BIN" --smoke-test
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
