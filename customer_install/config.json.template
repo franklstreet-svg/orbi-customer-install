@@ -1,5 +1,7 @@
 {
   "_comment": "Orby customer install configuration. Copy to config.json and fill in real values during onboarding.",
+  "enabled_modules": [],
+  "_enabled_modules_help": "Paid add-on modules this customer has purchased. Lowercase names. Examples: ['contractor'], ['legal', 'paralegal'], ['contractor', 'plumbing']. Set by the Stripe webhook on subscription create/update; can be edited manually here too. Base Orby modules (calendar/contacts/messages/etc.) ship with every install regardless of this list.",
   "business": {
     "name": "REPLACE_WITH_BUSINESS_NAME",
     "phone": "REPLACE_WITH_PHONE",

@@ -99,6 +99,12 @@ from modules import quick_capture as mod_qc
 from modules import reminders as mod_reminders
 from modules import tasks as mod_tasks
 from modules import workspace as mod_workspace
+# Contractor module (paid add-on, gated via is_module_enabled('contractor')).
+# Imports always happen so the handlers can use them; route registration
+# + chat dispatch check the flag before doing anything visible.
+from modules import projects as mod_projects
+from modules import change_orders as mod_change_orders
+from modules import invoices as mod_invoices
 from tools import url_fetch as tool_url_fetch
 from tools import web_search as tool_web_search
 
@@ -152,6 +158,44 @@ def save_config(cfg: dict) -> None:
     tmp.replace(CONFIG_FILE)
 
 CONFIG: dict = load_config()
+
+# ── Module enablement (paid add-on gate) ─────────────────────────────────
+# The customer's tier or Stripe purchase determines which modules are
+# active for them. Base Orby = no entries; Contractor Orby = ["contractor"];
+# Legal Orby (when built) = ["legal", "paralegal"]; etc.
+#
+# Stored under CONFIG["enabled_modules"] as a list of lowercase strings.
+# Stripe webhook flips entries on subscription creation/update.
+#
+# Helpers below are used by chat handlers and route registration to no-op
+# when the customer hasn't bought a module — keeps the codebase one tree
+# but gates the surface area per customer.
+
+def is_module_enabled(name: str) -> bool:
+    """Returns True if this customer has paid for `name`. Base Orby
+    modules (calendar, contacts, etc.) always return True — they ship
+    with every install regardless of tier. Only premium add-ons need
+    the gate."""
+    if not name:
+        return False
+    enabled = CONFIG.get("enabled_modules") or []
+    if not isinstance(enabled, list):
+        return False
+    return name.strip().lower() in {str(x).strip().lower() for x in enabled}
+
+
+def require_module(name: str):
+    """Use as a Flask before-request decorator or inline check. Returns
+    a 402 Payment Required JSON if the module isn't enabled. Keeps the
+    'this is a paid feature, upgrade to unlock' UX consistent."""
+    from flask import jsonify
+    if is_module_enabled(name):
+        return None
+    return jsonify({
+        "error":   f"This feature is part of the {name.title()} Orby add-on.",
+        "upgrade": True,
+        "module":  name,
+    }), 402
 
 # Import all connector modules so each one's @register decorator fires.
 # Done after CONFIG is loaded so connector imports can read config if they need to.
@@ -2572,6 +2616,14 @@ def owner_chat():
     if upd is not None:
         return jsonify(upd)
 
+    # Contractor module — "add project at X", "what jobs are open",
+    # "status of the Maple project". Gated by enabled_modules so it's
+    # invisible for base-Orby customers and active for paid Contractor
+    # Orbi installs.
+    gc_resp = _try_contractor_chat(user_msg, user_rec)
+    if gc_resp is not None:
+        return jsonify(gc_resp)
+
     # Calendar CANCEL — "cancel my Tuesday appointment" — actually
     # removes the event from the calendar (was returning fake "done" via
     # the LLM before, never wrote anything).
@@ -3139,6 +3191,170 @@ _NAME_AFTER_FILLER = (
     # Case-sensitive (not part of IGNORECASE) via inline (?-i).
     r"(?-i:(?P<%s>[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2}))"
 )
+# ── Contractor module chat handlers (paid add-on) ─────────────────────────
+# Gated by is_module_enabled('contractor'). When the customer has the
+# Contractor Orby add-on, these handlers fire BEFORE the LLM so things
+# like "add project at 123 Maple" actually write to projects.json
+# instead of getting a fabricated "got it" from the LLM.
+#
+# Three v1 intents:
+#   1. Add project: "add project at 123 Maple" / "new job at 555 Oak —
+#      $18k kitchen remodel"
+#   2. List active projects: "what jobs are open" / "what's active" /
+#      "list my projects"
+#   3. Project status / lookup: "status of the Maple project" /
+#      "what's going on at 555 Oak"
+#
+# Change-order + invoice intents come in a follow-on pass (need the
+# e-sign decision + real templates first).
+
+_GC_ADD_PROJECT_RE = _re.compile(
+    r"^\s*(?:add|new|start|create|open)\s+"
+    r"(?:project|job|build)"
+    r"(?:\s+at)?\s+"
+    r"(?P<address>.+?)"
+    r"(?:\s*[—–-]\s*(?P<desc>.+?))?"
+    r"\s*[.!]?\s*$",
+    _re.IGNORECASE,
+)
+_GC_LIST_JOBS_RE = _re.compile(
+    # "what active jobs" / "what's open" / "list active projects" / etc.
+    # Also catches the inverted form: "what jobs are open / are active".
+    r"^\s*(?:"
+    r"what(?:'s| is| are)?\s+(?:my\s+)?(?:open|active|current)\s+(?:jobs|projects|builds)"
+    r"|what\s+(?:jobs|projects|builds)\s+(?:are\s+|do\s+i\s+have\s+)?(?:open|active|going|current)"
+    r"|(?:list|show)\s+(?:me\s+)?(?:my\s+)?(?:active\s+|open\s+)?(?:jobs|projects)"
+    r"|jobs(?:\s+open)?|projects(?:\s+open)?"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+_GC_PROJECT_STATUS_RE = _re.compile(
+    # "status of the Maple project" / "what's going on at 555 Oak" /
+    # "what IS going on at X" / "how's the Maple project doing"
+    r"^\s*(?:"
+    r"status\s+(?:of|on)"
+    r"|how(?:'s| is)"
+    r"|what(?:'s| is)?\s+(?:going\s+on|happening)\s+(?:at|with)"
+    r"|tell\s+me\s+about"
+    r"|details?\s+(?:of|on)"
+    r")\s+"
+    r"(?:the\s+)?(?P<query>.+?)"
+    r"(?:\s+(?:project|job|build))?"
+    r"\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+_DOLLAR_AMT_RE = _re.compile(r"\$\s*(\d{1,3}(?:[,\d]*)?(?:\.\d{1,2})?)\s*(k|K|thousand)?")
+
+
+def _parse_money(text: str) -> float:
+    """Pull a dollar amount out of free text. '$18k' → 18000.
+    '$18,500' → 18500. '$18,500.50' → 18500.50. Returns 0 if none found."""
+    m = _DOLLAR_AMT_RE.search(text or "")
+    if not m:
+        return 0.0
+    raw = m.group(1).replace(",", "")
+    try:
+        n = float(raw)
+    except ValueError:
+        return 0.0
+    if m.group(2):  # "k" / "K" / "thousand"
+        n *= 1000
+    return n
+
+
+def _try_contractor_chat(message: str, user_rec: dict) -> dict | None:
+    """Detect contractor-module intents and act. Returns chat reply or
+    None to fall through. Gated by is_module_enabled('contractor') —
+    if the module isn't purchased, this handler is invisible.
+    """
+    if not is_module_enabled("contractor"):
+        return None
+    msg = _strip_polite_prefix(message or "")
+
+    # 1. ADD PROJECT
+    m = _GC_ADD_PROJECT_RE.match(msg)
+    if m:
+        address = (m.group("address") or "").strip()
+        desc = (m.group("desc") or "").strip()
+        # Pull money out of either the address tail or the description
+        amount = _parse_money(desc) or _parse_money(address)
+        # If the description had the money, strip it back out for label
+        label = desc
+        if amount and label:
+            label = _DOLLAR_AMT_RE.sub("", label).strip(" ,—–-")
+        try:
+            p = mod_projects.add(
+                DATA_DIR, address=address, label=label,
+                contract_amount=amount, status="active",
+                notes=f"Added via chat by {user_rec.get('username', '?')}",
+            )
+        except ValueError as e:
+            return {"reply": f"Couldn't add: {e}",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "gc_project_add_error"}
+        amount_bit = f" (${amount:,.0f})" if amount else ""
+        label_bit = f" — {label}" if label else ""
+        return {"reply": f"Project added — {address}{label_bit}{amount_bit}. ID {p['id'][:8]}.",
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_project_added"}
+
+    # 2. LIST OPEN JOBS
+    if _GC_LIST_JOBS_RE.match(msg):
+        active = mod_projects.list_active(DATA_DIR)
+        if not active:
+            return {"reply": "No active projects on your board. Add one with: \"new project at 123 Maple — $18k kitchen remodel\"",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "gc_no_active"}
+        lines = [f"Active jobs ({len(active)}):"]
+        for p in active[:20]:
+            label = p.get("label") or "(no label)"
+            amt = p.get("contract_amount") or 0
+            stage = p.get("stage") or p.get("status") or ""
+            signed_co = mod_change_orders.signed_total_for_project(DATA_DIR, p["id"])
+            total = amt + signed_co
+            co_bit = f" (+${signed_co:,.0f} CO)" if signed_co else ""
+            stage_bit = f" — {stage}" if stage else ""
+            lines.append(f"  · {p['address']} — {label} ${total:,.0f}{co_bit}{stage_bit}")
+        return {"reply": "\n".join(lines), "tier": "local",
+                "latency_ms": 0, "source": "gc_jobs_listed"}
+
+    # 3. PROJECT STATUS / LOOKUP
+    m = _GC_PROJECT_STATUS_RE.match(msg)
+    if m:
+        query = (m.group("query") or "").strip()
+        if query and query.lower() not in {"things", "stuff", "everything"}:
+            matches = mod_projects.find_by_address(DATA_DIR, query)
+            if not matches:
+                return {"reply": f"I don't see a project matching \"{query}\". Try part of the address or the label.",
+                        "tier": "local", "latency_ms": 0,
+                        "source": "gc_project_not_found"}
+            if len(matches) > 1:
+                listed = "\n".join(f"  · {p['address']} ({p.get('label','')})" for p in matches[:5])
+                return {"reply": f"Multiple matches:\n{listed}\nWhich one?",
+                        "tier": "local", "latency_ms": 0,
+                        "source": "gc_project_ambiguous"}
+            p = matches[0]
+            signed_co = mod_change_orders.signed_total_for_project(DATA_DIR, p["id"])
+            invs = mod_invoices.list_for_project(DATA_DIR, p["id"])
+            billed = sum(float(i.get("amount_due", 0)) for i in invs
+                         if i.get("status") not in ("draft", "void"))
+            paid = sum(float(i.get("amount_paid", 0)) for i in invs)
+            lines = [
+                f"{p['address']} — {p.get('label','(no label)')}",
+                f"  Status:   {p.get('status','?')}{' (' + p['stage'] + ')' if p.get('stage') else ''}",
+                f"  Foreman:  {p.get('foreman','(none)')}",
+                f"  Contract: ${(p.get('contract_amount') or 0):,.0f}"
+                + (f" + ${signed_co:,.0f} signed COs = ${(p.get('contract_amount',0) or 0) + signed_co:,.0f}" if signed_co else ""),
+                f"  Billed:   ${billed:,.0f}  Paid: ${paid:,.0f}  Owed: ${billed - paid:,.0f}",
+            ]
+            if p.get("notes"):
+                lines.append(f"  Notes:    {p['notes'][:100]}")
+            return {"reply": "\n".join(lines), "tier": "local",
+                    "latency_ms": 0, "source": "gc_project_status"}
+
+    return None
+
+
 # ── Calendar action handlers — cancel + reschedule ────────────────────────
 # The BOOKING side already works via quick_capture (_APPT_RE in
 # modules/quick_capture.py) — "book a meeting with Joe Thursday at 2pm"
@@ -3243,7 +3459,10 @@ def _event_display(e: dict) -> str:
 def _try_cancel_appointment(message: str, user_dir) -> dict | None:
     """Handle 'cancel my Tuesday appointment' / 'remove the dentist' /
     'delete my 2pm'. ACTUALLY removes from the calendar."""
-    m = _CANCEL_APPT_RE.match(message or "")
+    # Strip polite prefix so "I need to cancel..." / "Can you cancel..."
+    # both reach the cancel regex (which requires the verb up-front).
+    stripped = _strip_polite_prefix(message or "")
+    m = _CANCEL_APPT_RE.match(stripped)
     if not m:
         return None
     what = (m.group("what") or "").strip()
@@ -3278,7 +3497,8 @@ def _try_cancel_appointment(message: str, user_dir) -> dict | None:
 def _try_reschedule_appointment(message: str, user_dir) -> dict | None:
     """Handle 'reschedule my haircut from Tuesday to Friday' / 'move my
     2pm meeting to 4pm'. ACTUALLY updates the calendar."""
-    m = _RESCHEDULE_APPT_RE.match(message or "")
+    stripped = _strip_polite_prefix(message or "")
+    m = _RESCHEDULE_APPT_RE.match(stripped)
     if not m:
         return None
     what = (m.group("what") or "").strip()
