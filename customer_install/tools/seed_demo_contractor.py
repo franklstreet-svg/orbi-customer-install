@@ -53,11 +53,77 @@ DATA_DIR = Path(os.environ.get("ORBI_DIR", str(ORBI_DIR))) / "data"
 def _reset():
     """Wipe contractor-module data files but leave everything else alone."""
     for f in ("projects.json", "change_orders.json", "invoices.json",
-              "daily_logs.json", "subcontractors.json", "co_sign_tokens.json"):
+              "daily_logs.json", "subcontractors.json", "co_sign_tokens.json",
+              "pending_followups.json"):
         p = DATA_DIR / f
         if p.exists():
             p.unlink()
             print(f"  removed {f}")
+
+
+def _paint_business_profile_as_contractor():
+    """Overwrite business_info.json with a credible contractor profile so
+    the demo's morning brief + base-Orby "what services" / "what hours"
+    answers feel coherent with the contractor data we're seeding."""
+    from modules import business_info as mod_business
+    contractor_profile = {
+        "name":        "Reno Ridge Construction",
+        "tagline":     "Residential remodels + new builds — Reno, Sparks, Carson City",
+        "description": ("General contractor specializing in kitchen + bath "
+                         "remodels, deck builds, garage conversions, and "
+                         "whole-home repaints. Licensed, bonded, insured. "
+                         "20+ years building in northern Nevada."),
+        "address": {
+            "street": "4488 Industrial Way",
+            "city":   "Reno",
+            "state":  "NV",
+            "zip":    "89502",
+        },
+        "contact": {
+            "phone":   "(775) 555-0100",
+            "email":   "office@renoridgeconstruction.test",
+            "website": "https://renoridge.test",
+        },
+        "hours": {
+            "monday":    {"open": "07:00", "close": "17:00", "closed": False},
+            "tuesday":   {"open": "07:00", "close": "17:00", "closed": False},
+            "wednesday": {"open": "07:00", "close": "17:00", "closed": False},
+            "thursday":  {"open": "07:00", "close": "17:00", "closed": False},
+            "friday":    {"open": "07:00", "close": "17:00", "closed": False},
+            "saturday":  {"open": "08:00", "close": "12:00", "closed": False},
+            "sunday":    {"open": "",      "close": "",      "closed": True},
+        },
+        "services": [
+            "Kitchen remodels", "Bathroom remodels",
+            "Deck + outdoor structures", "Garage conversions",
+            "Whole-home repainting", "Insurance restoration",
+            "Tenant improvements (small commercial)",
+        ],
+        "license":     "NV-GC-44219",
+        "_pricing_notes": ("Free estimates within 30-mile radius. "
+                            "Most projects 10% deposit, draws at milestones, "
+                            "balance + retainage at closeout."),
+        "personality": {
+            "tone": "warm, practical, no-BS",
+            "voice_for_phone": "polite professional, sounds like the contractor's "
+                                "front-office person",
+        },
+        "policies": {
+            "payment_methods":   "Check, ACH, credit card (3% fee), Stripe link.",
+            "service_area":      "Reno, Sparks, Carson City, Truckee.",
+            "warranty":          "1-year workmanship on all jobs; manufacturer warranties on materials.",
+            "after_hours_emergencies": "Text the foreman directly; office returns calls 7am-5pm M-F.",
+        },
+        "faq": [
+            {"q": "Are you licensed?", "a": "Yes — NV-GC-44219, bonded and insured."},
+            {"q": "Do you do free estimates?",
+             "a": "Yes, within 30 miles of Reno. Out further we charge a trip fee that's credited against the job."},
+            {"q": "Typical project timeline?",
+             "a": "Kitchens 4-6 weeks, baths 2-4 weeks, decks 1-2 weeks weather permitting."},
+        ],
+    }
+    mod_business.save(DATA_DIR, contractor_profile)
+    print("  + Painted business_info as 'Reno Ridge Construction'")
 
 
 def _ago(days: int) -> str:
@@ -87,6 +153,9 @@ def main():
     if args.reset:
         print("Resetting contractor data...")
         _reset()
+
+    print("\nPainting business profile as a contractor...")
+    _paint_business_profile_as_contractor()
 
     print("\nSeeding projects...")
     p_oak = mod_projects.add(DATA_DIR,
