@@ -3663,6 +3663,10 @@ def owner_chat():
     if brief_resp is not None:
         return jsonify(brief_resp)
 
+    tomorrow_resp = _try_tomorrow_brief(user_msg, user_rec)
+    if tomorrow_resp is not None:
+        return jsonify(tomorrow_resp)
+
     cap_overview = _try_capabilities_overview(user_msg)
     if cap_overview is not None:
         return jsonify({"reply": cap_overview, "tier": "local", "latency_ms": 0,
@@ -7549,6 +7553,16 @@ _MORNING_BRIEF_RE = _re.compile(
     r")\s*[?.!]?\s*$",
     _re.IGNORECASE,
 )
+_TOMORROW_BRIEF_RE = _re.compile(
+    r"^\s*(?:"
+    r"(?:what'?s?|show\s+me|give\s+me)\s+(?:on\s+)?(?:my\s+|the\s+)?(?:agenda\s+|schedule\s+|calendar\s+)?"
+    r"(?:for\s+)?tomorrow"
+    r"|tomorrow'?s?\s+(?:brief|briefing|agenda|schedule|rundown|preview)"
+    r"|what\s+do\s+i\s+have\s+tomorrow"
+    r"|brief\s+me\s+(?:for\s+|on\s+)tomorrow"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
 
 
 def _try_morning_brief(message: str, user_rec: dict) -> dict | None:
@@ -7591,6 +7605,76 @@ def _try_morning_brief(message: str, user_rec: dict) -> dict | None:
         reply = reply + "\n" + "\n".join(extra_lines)
     return {"reply": reply, "tier": "local", "latency_ms": 0,
             "source": "morning_brief"}
+
+
+def _try_tomorrow_brief(message: str, user_rec: dict) -> dict | None:
+    """End-of-day preview of tomorrow's calendar + tasks + due reminders.
+    Sister of morning brief but forward-looking — Frank reads it
+    before sign-off so he knows what to walk into."""
+    msg = _strip_polite_prefix(message or "")
+    if not _TOMORROW_BRIEF_RE.match(msg):
+        return None
+    username = user_rec.get("username", "owner")
+    from datetime import date as _date, timedelta as _td
+    tomorrow = _date.today() + _td(days=1)
+    tomorrow_iso = tomorrow.isoformat()
+    try:
+        user_dir = users_mod.get_user_dir(DATA_DIR, username)
+    except Exception:
+        return None
+    lines = [f"📅 Tomorrow ({tomorrow.strftime('%A %b %-d')}):"]
+    # Calendar events tomorrow
+    try:
+        from modules import calendar as mod_calendar
+        events = mod_calendar._range(user_dir, tomorrow, tomorrow) or []
+    except Exception:
+        events = []
+    if events:
+        lines.append(f"  {len(events)} appointment{'s' if len(events) != 1 else ''}:")
+        for e in events[:8]:
+            start = (e.get("start") or "")[11:16] or "?"
+            title = e.get("title", "")
+            lines.append(f"    · {start} — {title}")
+    else:
+        lines.append("  No appointments scheduled.")
+    # Reminders due tomorrow
+    try:
+        from modules import reminders as mod_reminders
+        all_rem = mod_reminders.list_all(user_dir) or []
+        tomorrow_rem = [r for r in all_rem
+                         if (r.get("due", "") or "")[:10] == tomorrow_iso]
+    except Exception:
+        tomorrow_rem = []
+    if tomorrow_rem:
+        lines.append(f"  {len(tomorrow_rem)} reminder{'s' if len(tomorrow_rem) != 1 else ''} due:")
+        for r in tomorrow_rem[:5]:
+            t = (r.get("due", "") or "")[11:16] or "?"
+            lines.append(f"    · {t} — {r.get('text', '')}")
+    # Contractor: subs scheduled for tomorrow (best-effort string match)
+    if is_module_enabled("contractor"):
+        try:
+            day_name = tomorrow.strftime("%A")
+            data = mod_subs._load(DATA_DIR)
+            scheduled_tomorrow = [
+                a for a in data.get("assignments", [])
+                if not a.get("completed")
+                and (day_name.lower() in (a.get("scheduled", "") or "").lower()
+                     or tomorrow_iso in (a.get("scheduled", "") or ""))
+            ]
+            if scheduled_tomorrow:
+                lines.append(f"  Subs on site:")
+                for a in scheduled_tomorrow[:5]:
+                    sub_rec = next((s for s in data.get("subs", [])
+                                     if s.get("id") == a.get("sub_id")), None)
+                    sub_name = sub_rec.get("name", "?") if sub_rec else "?"
+                    proj = mod_projects.get(DATA_DIR, a.get("project_id", "")) or {}
+                    lines.append(f"    · {sub_name} → {proj.get('address','?')} ({a.get('scope','')[:40]})")
+        except Exception:
+            pass
+    if len(lines) == 1:
+        lines.append("  Nothing on the books for tomorrow. Quiet day.")
+    return {"reply": "\n".join(lines), "tier": "local",
+            "latency_ms": 0, "source": "tomorrow_brief"}
 
 
 def _try_capabilities_overview(message: str) -> str | None:
