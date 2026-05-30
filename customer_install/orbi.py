@@ -3718,6 +3718,33 @@ _GC_INSURANCE_CHECK_RE = _re.compile(
 )
 
 # ── Unsigned-work leak alarm pattern ──────────────────────────────────────
+_GC_PROJECT_REPORT_RE = _re.compile(
+    # "full report on Oak" / "everything on Maple" / "deep dive Oak"
+    # / "show me all of Oak" / "Oak summary"
+    r"^\s*(?:"
+    r"(?:full\s+report|deep\s+dive|everything|all\s+(?:about|on))\s+(?:on\s+|of\s+)?(?:the\s+)?(?P<q1>.+?)"
+    r"|(?P<q2>.+?)\s+(?:summary|recap|breakdown|deep\s+dive)"
+    r"|show\s+me\s+(?:all\s+|every(?:thing)?\s+)?(?:on\s+|of\s+|for\s+)?(?:the\s+)?(?P<q3>.+?)\s+project"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+_GC_MARK_PROJECT_DONE_RE = _re.compile(
+    r"^\s*(?:"
+    r"(?:mark|close|complete|finish)\s+(?:the\s+)?(?P<q>.+?)\s+(?:project\s+)?(?:as\s+)?(?:done|complete|finished|closed)"
+    r"|(?P<q2>.+?)\s+(?:is\s+)?(?:done|complete|finished|wrapped\s+up)"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+_GC_SUB_SCHEDULE_RE = _re.compile(
+    # "what's Bob working on" / "Bob's schedule" / "where is Acme"
+    # / "whats Bob working on" (no apostrophe) / "what is Bob doing"
+    r"^\s*(?:"
+    r"(?:what(?:'?s| is)?|whats)\s+(?P<sub1>.+?)\s+(?:working\s+on|doing|on)"
+    r"|(?P<sub2>.+?)(?:'s)?\s+(?:schedule|assignments|jobs)"
+    r"|where\s+(?:is\s+|are\s+)?(?P<sub3>.+?)\s*(?:assigned|working)?"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
 _GC_LEAK_CHECK_RE = _re.compile(
     r"^\s*(?:"
     r"(?:any\s+)?(?:unsigned|unbilled|leaked|missing|uncovered)\s+(?:work|scope|cos?|change[\s-]orders?)"
@@ -4311,9 +4338,24 @@ def _try_contractor_chat(message: str, user_rec: dict) -> dict | None:
     if _GC_INSURANCE_CHECK_RE.match(msg):
         return _handle_insurance_check(msg, user_rec)
 
+    # 14b. SUB SCHEDULE — "what's Bob working on" / "Bob's schedule"
+    sub_sched_resp = _handle_sub_schedule(msg, user_rec)
+    if sub_sched_resp is not None:
+        return sub_sched_resp
+
     # 15. UNSIGNED-WORK LEAK ALARM — "leak check" / "any unsigned scope"
     if _GC_LEAK_CHECK_RE.match(msg):
         return _handle_leak_check(msg, user_rec)
+
+    # 15b. MARK PROJECT DONE — "mark Oak complete" / "Oak is finished"
+    proj_done_resp = _handle_mark_project_done(msg, user_rec)
+    if proj_done_resp is not None:
+        return proj_done_resp
+
+    # 15c. FULL PROJECT REPORT — "full report on Oak" / "Maple summary"
+    proj_report_resp = _handle_project_full_report(msg, user_rec)
+    if proj_report_resp is not None:
+        return proj_report_resp
 
     # 16. REPORTING — "show me the money", "captured this month", "totals"
     if _GC_REPORT_RE.match(msg):
@@ -4683,6 +4725,163 @@ def _handle_insurance_check(msg: str, user_rec: dict) -> dict:
         lines.append(f"  · {s['name']} ({s.get('trade','?')}) — expires {s.get('insurance_expires','?')}")
     return {"reply": "\n".join(lines), "tier": "local",
             "latency_ms": 0, "source": "gc_insurance_expiring"}
+
+
+def _handle_sub_schedule(msg: str, user_rec: dict) -> dict | None:
+    """'What's Bob working on' / 'Bob's schedule' — list a sub's active +
+    completed assignments."""
+    m = _GC_SUB_SCHEDULE_RE.match(msg)
+    if not m:
+        return None
+    sub_q = (m.group("sub1") or m.group("sub2") or m.group("sub3") or "").strip()
+    # Filter out non-sub queries the regex may have caught (e.g. "what's
+    # Joe working on" should only match if Joe is a known sub)
+    if not sub_q or sub_q.lower() in {"i", "frank", "orby", "you", "we"}:
+        return None
+    matches = mod_subs.find_sub(DATA_DIR, sub_q)
+    if not matches:
+        return None  # Don't claim "no sub" — let LLM handle, may be a person
+    if len(matches) > 1:
+        listed = "\n".join(f"  · {s['name']} ({s.get('trade','?')})" for s in matches[:5])
+        return {"reply": f"Multiple subs match \"{sub_q}\":\n{listed}",
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_sub_schedule_ambiguous"}
+    sub = matches[0]
+    assignments = mod_subs.list_assignments_for_sub(DATA_DIR, sub["id"])
+    if not assignments:
+        return {"reply": f"{sub['name']} has no assignments on the books.",
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_sub_schedule_empty"}
+    active = [a for a in assignments if not a.get("completed")]
+    completed = [a for a in assignments if a.get("completed")]
+    lines = [f"{sub['name']} ({sub.get('trade','?')}):"]
+    if active:
+        lines.append(f"  Active ({len(active)}):")
+        for a in active[:10]:
+            proj = mod_projects.get(DATA_DIR, a.get("project_id", "")) or {}
+            sched = f" — {a.get('scheduled')}" if a.get("scheduled") else ""
+            scope = f" — {a.get('scope')}" if a.get("scope") else ""
+            lines.append(f"    · {proj.get('address','?')}{sched}{scope}")
+    if completed:
+        lines.append(f"  Completed ({len(completed)}, last 5):")
+        for a in completed[-5:]:
+            proj = mod_projects.get(DATA_DIR, a.get("project_id", "")) or {}
+            lines.append(f"    · {proj.get('address','?')}"
+                          + (f" — {a.get('scope')}" if a.get("scope") else ""))
+    return {"reply": "\n".join(lines), "tier": "local",
+            "latency_ms": 0, "source": "gc_sub_schedule"}
+
+
+def _handle_mark_project_done(msg: str, user_rec: dict) -> dict | None:
+    m = _GC_MARK_PROJECT_DONE_RE.match(msg)
+    if not m:
+        return None
+    q = (m.group("q") or m.group("q2") or "").strip()
+    if not q or q.lower() in {"i", "we", "you", "it", "everything", "that"}:
+        return None
+    matches = mod_projects.find_by_address(DATA_DIR, q)
+    if not matches:
+        return None  # Let LLM handle — too easy to false-positive
+    if len(matches) > 1:
+        listed = "\n".join(f"  · {p['address']}" for p in matches[:5])
+        return {"reply": f"Multiple projects match \"{q}\":\n{listed}\nWhich one?",
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_mark_done_ambiguous"}
+    p = matches[0]
+    from datetime import datetime as _dt
+    mod_projects.update(DATA_DIR, p["id"],
+                         status="completed",
+                         actual_complete=_dt.now().strftime("%Y-%m-%dT%H:%M:%SZ"))
+    audit.log_event(DATA_DIR, actor=user_rec.get("username", "?"),
+                    action="project.completed",
+                    meta={"project_id": p["id"], "address": p["address"]})
+    signed_co = mod_change_orders.signed_total_for_project(DATA_DIR, p["id"])
+    invs = mod_invoices.list_for_project(DATA_DIR, p["id"])
+    billed = sum(float(i.get("amount_due", 0)) for i in invs
+                  if i.get("status") not in ("draft", "void"))
+    paid = sum(float(i.get("amount_paid", 0)) for i in invs)
+    retainage = mod_invoices.retainage_held_for_project(DATA_DIR, p["id"])
+    total = float(p.get("contract_amount") or 0) + signed_co
+    lines = [f"Closed {p['address']}.",
+              f"  Contract + signed COs: ${total:,.0f}",
+              f"  Billed: ${billed:,.0f}  Paid: ${paid:,.0f}"]
+    if retainage > 0:
+        lines.append(f"  Retainage held: ${retainage:,.2f} — generate the retainage release invoice when ready.")
+    return {"reply": "\n".join(lines), "tier": "local",
+            "latency_ms": 0, "source": "gc_project_completed"}
+
+
+def _handle_project_full_report(msg: str, user_rec: dict) -> dict | None:
+    """The big one — everything about a project in one chat reply.
+    Contract + COs + invoices + recent logs + assigned subs."""
+    m = _GC_PROJECT_REPORT_RE.match(msg)
+    if not m:
+        return None
+    q = (m.group("q1") or m.group("q2") or m.group("q3") or "").strip()
+    if not q or q.lower() in {"things", "stuff", "money", "today"}:
+        return None
+    matches = mod_projects.find_by_address(DATA_DIR, q)
+    if not matches:
+        return None
+    if len(matches) > 1:
+        listed = "\n".join(f"  · {p['address']}" for p in matches[:5])
+        return {"reply": f"Multiple projects match \"{q}\":\n{listed}\nWhich one?",
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_project_report_ambiguous"}
+    p = matches[0]
+    # All the data
+    contract = float(p.get("contract_amount") or 0)
+    cos = mod_change_orders.list_for_project(DATA_DIR, p["id"])
+    signed_co = sum(float(c.get("amount") or 0) for c in cos
+                     if c.get("status") == "signed")
+    invs = mod_invoices.list_for_project(DATA_DIR, p["id"])
+    billed = sum(float(i.get("amount_due", 0)) for i in invs
+                  if i.get("status") not in ("draft", "void"))
+    paid = sum(float(i.get("amount_paid", 0)) for i in invs)
+    logs = mod_daily_logs.list_for_project(DATA_DIR, p["id"], limit=5)
+    assignments = mod_subs.list_assignments_for_project(DATA_DIR, p["id"])
+    # Build
+    lines = [f"━━━ {p['address']} ━━━"]
+    if p.get("label"): lines.append(f"  {p['label']}")
+    lines.append(f"  Status: {p.get('status','?')}"
+                  + (f" ({p['stage']})" if p.get("stage") else ""))
+    if p.get("customer_name"):
+        lines.append(f"  Customer: {p['customer_name']}"
+                      + (f" ({p['customer_phone']})" if p.get("customer_phone") else ""))
+    if p.get("foreman"):
+        lines.append(f"  Foreman: {p['foreman']}")
+    lines.append("")
+    lines.append(f"💰 Money:")
+    lines.append(f"  Contract: ${contract:,.0f}"
+                  + (f" + ${signed_co:,.0f} signed COs = ${contract + signed_co:,.0f}" if signed_co else ""))
+    lines.append(f"  Billed ${billed:,.0f}  Paid ${paid:,.0f}  Owed ${billed - paid:,.0f}")
+    if cos:
+        lines.append("")
+        lines.append(f"📋 Change orders ({len(cos)}):")
+        for c in cos[:5]:
+            amt = float(c.get("amount") or 0)
+            sign = "+" if amt >= 0 else ""
+            lines.append(f"  · #{c['co_number']} {c.get('status','?').upper()} ({sign}${amt:,.0f}) {c.get('description','')[:55]}")
+    if invs:
+        lines.append("")
+        lines.append(f"🧾 Invoices ({len(invs)}):")
+        for i in invs[:5]:
+            owed = float(i.get("amount_due", 0)) - float(i.get("amount_paid", 0))
+            lines.append(f"  · {i.get('invoice_number','?')} {i.get('status','?').upper()} owed ${owed:,.0f}")
+    if assignments:
+        lines.append("")
+        lines.append(f"👷 Subs on site ({len(assignments)}):")
+        for a in assignments[:5]:
+            lines.append(f"  · {a.get('sub_name','?')} ({a.get('sub_trade','?')}) — {a.get('scope','')[:50]}")
+    if logs:
+        lines.append("")
+        lines.append(f"📓 Recent logs ({len(logs)}):")
+        for l in logs[:3]:
+            crew_bit = f" {','.join(l.get('crew',[]))}" if l.get('crew') else ""
+            hrs_bit = f" {l['hours']:g}h" if l.get('hours') else ""
+            lines.append(f"  · {l['date']}{crew_bit}{hrs_bit} {l.get('work_done','')[:70]}")
+    return {"reply": "\n".join(lines), "tier": "local",
+            "latency_ms": 0, "source": "gc_project_report"}
 
 
 def _handle_leak_check(msg: str, user_rec: dict) -> dict:
