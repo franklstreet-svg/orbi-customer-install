@@ -4225,7 +4225,10 @@ def _load_onboarding_state() -> dict:
     try:
         return json.loads(p.read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return {"complete": False, "step": 0, "collected": {}}
+        # step=-1 means "we haven't even shown the welcome yet". First
+        # chat triggers the welcome + bumps to step=0 (waiting for
+        # answer to question #0).
+        return {"complete": False, "step": -1, "collected": {}}
 
 
 def _save_onboarding_state(state: dict) -> None:
