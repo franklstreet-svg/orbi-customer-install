@@ -64,13 +64,14 @@ _LOCK = threading.Lock()
 FILE = "change_orders.json"
 
 VALID_STATUSES = {
-    "draft",                # foreman raised it, Orbi composed it, GC hasn't seen it
-    "awaiting_approval",    # GC has it in their dashboard queue
-    "approved",              # GC said go, but not sent to client yet
-    "sent_for_signature",    # at the client for e-signature
-    "signed",                # signed by client — counts toward contract total
-    "rejected",              # client declined to sign
-    "cancelled",             # GC withdrew it
+    "draft",                  # foreman raised it, Orbi composed it, GC hasn't seen it
+    "client_requested",       # homeowner asked for it via the portal; GC must review
+    "awaiting_approval",      # GC has it in their dashboard queue
+    "approved",                # GC said go, but not sent to client yet
+    "sent_for_signature",      # at the client for e-signature
+    "signed",                  # signed by client — counts toward contract total
+    "rejected",                # client declined to sign
+    "cancelled",               # GC withdrew it
 }
 
 
@@ -166,8 +167,12 @@ def list_for_project(data_dir: Path, project_id: str,
 
 def list_pending_approval(data_dir: Path) -> list[dict]:
     """COs sitting in the GC's queue waiting for them to approve the
-    draft. Surfaced in the morning brief so they don't get forgotten."""
-    return [c for c in _load(data_dir) if c.get("status") == "awaiting_approval"]
+    draft. Includes both Orby-drafted CO (awaiting_approval) AND
+    homeowner-initiated requests from the project portal
+    (client_requested). The GC needs to see both — surfaced in the
+    morning brief so they don't get forgotten."""
+    return [c for c in _load(data_dir)
+            if c.get("status") in ("awaiting_approval", "client_requested")]
 
 
 def list_awaiting_signature(data_dir: Path) -> list[dict]:

@@ -1004,6 +1004,134 @@ def client_project_portal(token):
     return _render_client_project_portal(project)
 
 
+@app.route("/p/<token>/request-change", methods=["GET", "POST"])
+def client_request_change(token):
+    """Customer-side change request flow. Sees a simple form, submits,
+    Orby creates a CO record with status='client_requested' + notifies
+    the GC. GC then reviews → marks awaiting_approval → standard CO
+    flow takes over."""
+    project = mod_projects.get_by_client_portal_token(DATA_DIR, token)
+    if not project:
+        return _render_portal_error("This project link isn't valid or has been retired."), 404
+    if request.method == "GET":
+        return _render_change_request_form(token, project)
+    description = (request.form.get("description") or "").strip()
+    if len(description) < 10:
+        return _render_change_request_form(token, project,
+            error="Please describe the change in a bit more detail (10+ characters)."), 400
+    if len(description) > 2000:
+        description = description[:2000]
+    # Some customers will paste a number they have in mind ("about $500")
+    raw_amount = (request.form.get("estimated_cost") or "").strip()
+    estimated_amount = 0.0
+    if raw_amount:
+        cleaned = _re.sub(r"[^\d.]", "", raw_amount)
+        try:
+            estimated_amount = float(cleaned) if cleaned else 0.0
+        except ValueError:
+            estimated_amount = 0.0
+    co = mod_change_orders.add(
+        DATA_DIR,
+        project_id=project["id"],
+        description=description,
+        amount=estimated_amount,
+        scope_detail="Requested by customer via project portal.",
+        status="client_requested",
+    )
+    audit.log_event(DATA_DIR, actor=project.get("customer_name") or "client",
+                    action="co.client_requested",
+                    meta={"co_id": co["id"], "project_id": project["id"],
+                          "client_estimate": estimated_amount,
+                          "ip": request.headers.get("X-Forwarded-For",
+                                                      request.remote_addr or "")})
+    # Notify the GC
+    try:
+        notify.send(CONFIG, DATA_DIR, event="client_change_request",
+                     title=f"Change request — {project.get('address', '')}",
+                     body=f"{project.get('customer_name') or 'Client'}: "
+                          f"{description[:120]}",
+                     url="/owner#projects")
+    except Exception:
+        log.exception("client change request notify failed")
+    return _render_change_request_thanks(project)
+
+
+def _render_change_request_form(token: str, project: dict,
+                                  error: str = "") -> str:
+    biz_name = (mod_business.load(DATA_DIR).get("name") or "your contractor")
+    customer = project.get("customer_name") or "there"
+    first_name = customer.split(" ", 1)[0]
+    err_html = (f'<div style="background:#fef2f2;color:#991b1b;padding:10px 12px;'
+                f'border-radius:6px;margin-bottom:14px">{_esc(error)}</div>'
+                if error else "")
+    return f"""<!doctype html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Request a Change — {_esc(project.get('label','your project'))}</title>
+<style>
+body {{ font-family: -apple-system, system-ui, sans-serif; background: #f4f6fb;
+       color: #1a2240; margin: 0; padding: 20px; line-height: 1.5; }}
+.card {{ max-width: 560px; margin: 30px auto; background: white;
+        border-radius: 14px; padding: 28px; box-shadow: 0 2px 8px rgba(0,0,0,0.04); }}
+h1 {{ font-size: 22px; margin: 0 0 6px; }}
+.sub {{ color: #6c7592; font-size: 14px; margin-bottom: 22px; }}
+label {{ display: block; font-weight: 600; margin-bottom: 6px; font-size: 14px; }}
+textarea, input[type="text"] {{ width: 100%; padding: 12px 14px; background: #f9fafc;
+                                  border: 1px solid #d0d6e6; color: #1a2240;
+                                  border-radius: 8px; font-size: 15px; box-sizing: border-box;
+                                  font-family: inherit; resize: vertical; }}
+textarea {{ min-height: 100px; }}
+.field {{ margin-bottom: 18px; }}
+.help {{ color: #6c7592; font-size: 12px; margin-top: 6px; }}
+button {{ width: 100%; padding: 14px; background: #8b5cf6; color: white;
+          border: none; border-radius: 8px; font-size: 15px; font-weight: 600;
+          cursor: pointer; }}
+button:hover {{ background: #7c4ef0; }}
+.back {{ display: inline-block; margin-bottom: 18px; color: #6c7592;
+         font-size: 13px; text-decoration: none; }}
+.back:hover {{ color: #1a2240; }}
+</style></head><body>
+<div class="card">
+  <a href="/p/{_esc(token)}" class="back">← Back to project</a>
+  <h1>Request a change</h1>
+  <p class="sub">{_esc(first_name)}, tell {_esc(biz_name)} what you'd like added or changed on {_esc(project.get('label') or project.get('address',''))}. They'll review and send you a formal change order with a price.</p>
+  {err_html}
+  <form method="POST">
+    <div class="field">
+      <label for="description">What's the change?</label>
+      <textarea id="description" name="description" placeholder="e.g. Add a pot filler over the stove, or upgrade the back fence to 6 ft cedar." required minlength="10" maxlength="2000"></textarea>
+      <div class="help">Be as specific as you can — paint colors, materials, where, anything that helps.</div>
+    </div>
+    <div class="field">
+      <label for="estimated_cost">Your budget for this (optional)</label>
+      <input type="text" id="estimated_cost" name="estimated_cost" placeholder="e.g. $500 — or leave blank">
+      <div class="help">Helps {_esc(biz_name)} know what tier of solution you're thinking. They'll come back with a real number.</div>
+    </div>
+    <button type="submit">Send to {_esc(biz_name)}</button>
+  </form>
+</div>
+</body></html>"""
+
+
+def _render_change_request_thanks(project: dict) -> str:
+    biz_name = (mod_business.load(DATA_DIR).get("name") or "your contractor")
+    return f"""<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sent</title>
+<style>
+body {{ font-family: -apple-system, system-ui, sans-serif; background: #f4f6fb;
+       color: #1a2240; margin: 0; padding: 20px; text-align: center; }}
+.card {{ max-width: 480px; margin: 60px auto; background: white;
+        border-radius: 14px; padding: 32px; box-shadow: 0 2px 8px rgba(0,0,0,0.04); }}
+h1 {{ color: #2e7d32; margin: 0 0 16px; font-size: 22px; }}
+p {{ color: #444; line-height: 1.5; }}
+</style></head><body>
+<div class="card">
+<h1>✓ Request sent</h1>
+<p>{_esc(biz_name)} got your request and will review it. You'll hear back with a formal change order — review and sign right from this same project page.</p>
+</div></body></html>"""
+
+
 def _render_client_project_portal(project: dict) -> str:
     from datetime import datetime as _dt
     business = mod_business.load(DATA_DIR)
@@ -1208,6 +1336,12 @@ body {{ font-family: -apple-system, system-ui, "Segoe UI", sans-serif;
   {activity_html}
 
   {contact_html}
+
+  <div class="section">
+    <h2>Need something added or changed?</h2>
+    <p class="dim">Have an idea for the project? Send {_esc(biz_name)} a change request — they'll review and send you a formal change order.</p>
+    <a class="sign-btn" href="/p/{_esc(project.get('client_portal_token',''))}/request-change">Request a change</a>
+  </div>
 
   <div class="footer">Powered by Orbi</div>
 </div>
@@ -4334,7 +4468,7 @@ def _try_contractor_chat(message: str, user_rec: dict) -> dict | None:
                     "tier": "local", "latency_ms": 0,
                     "source": "gc_co_ambiguous"}
         c = matches[0]
-        if c.get("status") not in ("draft", "awaiting_approval"):
+        if c.get("status") not in ("draft", "awaiting_approval", "client_requested"):
             return {"reply": f"CO #{c['id'][:8]} is already {c.get('status')} — not in approve state.",
                     "tier": "local", "latency_ms": 0,
                     "source": "gc_co_already_advanced"}
