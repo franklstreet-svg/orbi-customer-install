@@ -1,0 +1,281 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Orby — Demo Mode</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, system-ui, sans-serif;
+      background: linear-gradient(135deg, #1a2240 0%, #4f8cff 100%);
+      color: #fff;
+      margin: 0;
+      min-height: 100vh;
+      padding: 20px;
+    }
+    .container { max-width: 600px; margin: 0 auto; }
+    h1 { margin: 0 0 8px; font-size: 28px; }
+    .subtitle { opacity: 0.85; margin-bottom: 28px; font-size: 14px; }
+    .card {
+      background: #fff;
+      color: #1a2240;
+      border-radius: 12px;
+      padding: 20px;
+      margin-bottom: 14px;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.18);
+    }
+    .card h2 { margin: 0 0 12px; font-size: 18px; color: #1a2240; }
+    label { display: block; font-weight: 600; font-size: 13px; margin-bottom: 6px; }
+    input[type=text], input[type=url] {
+      width: 100%;
+      padding: 12px 14px;
+      border: 1px solid #d4d8e0;
+      border-radius: 8px;
+      font-size: 16px;
+      margin-bottom: 12px;
+    }
+    button {
+      width: 100%;
+      padding: 14px;
+      border: none;
+      border-radius: 8px;
+      font-size: 15px;
+      font-weight: 700;
+      cursor: pointer;
+      letter-spacing: 0.3px;
+    }
+    button.primary { background: #1a8e3a; color: #fff; }
+    button.primary:hover { background: #157030; }
+    button.primary:disabled { background: #aaa; cursor: not-allowed; }
+    button.danger { background: #a02020; color: #fff; }
+    .status {
+      padding: 10px 12px;
+      border-radius: 6px;
+      font-size: 13px;
+      margin-top: 8px;
+    }
+    .status.info { background: #e8f0fe; color: #1a2240; }
+    .status.success { background: #e6f7ea; color: #1a6e2c; }
+    .status.error { background: #fde8e8; color: #a02020; }
+    .demo-url-box {
+      background: #f7f9fc;
+      border: 1px solid #d4d8e0;
+      border-radius: 8px;
+      padding: 12px 14px;
+      font-family: monospace;
+      font-size: 13px;
+      word-break: break-all;
+      margin: 10px 0;
+    }
+    .copy-btn {
+      width: auto;
+      padding: 8px 14px;
+      background: #1a2240;
+      color: #fff;
+      font-size: 13px;
+      display: inline-block;
+      margin-right: 6px;
+    }
+    .open-btn {
+      width: auto;
+      padding: 8px 14px;
+      background: #4f8cff;
+      color: #fff;
+      font-size: 13px;
+      display: inline-block;
+      text-decoration: none;
+    }
+    .profile-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 10px 0;
+      border-bottom: 1px solid #e6e8ec;
+    }
+    .profile-row:last-child { border-bottom: none; }
+    .profile-row strong { color: #1a2240; }
+    .profile-row .meta { font-size: 11px; color: #888; }
+    .profile-actions { display: flex; gap: 6px; }
+    .small-btn { width: auto; padding: 6px 10px; font-size: 12px; }
+    .small-btn.open { background: #4f8cff; color: #fff; }
+    .small-btn.del { background: #a02020; color: #fff; }
+    .live-log {
+      background: #0e1726;
+      color: #9ad8ff;
+      font-family: monospace;
+      font-size: 12px;
+      padding: 12px;
+      border-radius: 6px;
+      max-height: 200px;
+      overflow-y: auto;
+      margin-top: 10px;
+      display: none;
+    }
+    .live-log.show { display: block; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>🎬 Orby Demo Mode</h1>
+    <p class="subtitle">Walk into a restaurant. Scrape their site. Show them Orby acting as their business in 30 seconds.</p>
+
+    <div class="card">
+      <h2>Build a demo profile</h2>
+      <label for="site-url">Their website URL</label>
+      <input type="url" id="site-url" placeholder="https://franks-cafe.com" autocomplete="off">
+      <button class="primary" id="scrape-btn">Scrape This Site</button>
+      <div id="scrape-status"></div>
+      <div class="live-log" id="live-log"></div>
+    </div>
+
+    <div class="card" id="demo-ready-card" style="display:none">
+      <h2>✅ Demo ready</h2>
+      <p style="margin:0 0 8px;font-size:13px"><strong id="demo-biz-name">—</strong></p>
+      <div class="demo-url-box" id="demo-url-box">—</div>
+      <button class="copy-btn" onclick="copyDemoUrl()">Copy URL</button>
+      <a class="open-btn" id="demo-open-link" target="_blank">Open Demo →</a>
+    </div>
+
+    <div class="card">
+      <h2>Saved demo profiles</h2>
+      <div id="profiles-list"><em>Loading…</em></div>
+    </div>
+  </div>
+
+  <script>
+  const $ = (id) => document.getElementById(id);
+  const TUNNEL = window.location.origin;
+
+  function setStatus(text, kind) {
+    const el = $('scrape-status');
+    el.className = 'status ' + (kind || 'info');
+    el.textContent = text;
+  }
+
+  async function refreshProfiles() {
+    try {
+      const r = await fetch('/api/owner/demo/list');
+      if (!r.ok) { $('profiles-list').innerHTML = '<em>Not signed in. <a href="/owner" style="color:#4f8cff">Sign in</a></em>'; return; }
+      const data = await r.json();
+      const profiles = data.profiles || [];
+      if (!profiles.length) { $('profiles-list').innerHTML = '<em>No demo profiles yet — scrape a site above.</em>'; return; }
+      $('profiles-list').innerHTML = profiles.map(p => `
+        <div class="profile-row">
+          <div>
+            <strong>${p.name || p.slug}</strong>
+            <div class="meta">${p.slug} · ${p.menu_items || 0} items · ${p.pages || 0} pages</div>
+          </div>
+          <div class="profile-actions">
+            <a class="small-btn open" target="_blank" href="${TUNNEL}/?embed=1&demo_as=${encodeURIComponent(p.slug)}">Open</a>
+            <button class="small-btn del" onclick="deleteProfile('${p.slug}')">Delete</button>
+          </div>
+        </div>
+      `).join('');
+    } catch (e) {
+      $('profiles-list').innerHTML = `<em>Error loading: ${e.message}</em>`;
+    }
+  }
+
+  async function deleteProfile(slug) {
+    if (!confirm(`Wipe the demo profile for ${slug}?`)) return;
+    const r = await fetch(`/api/owner/demo/${encodeURIComponent(slug)}`, { method: 'DELETE' });
+    if (r.ok) {
+      refreshProfiles();
+      // Hide the "demo ready" card if it was for this slug
+      if ($('demo-url-box').textContent.includes(slug)) {
+        $('demo-ready-card').style.display = 'none';
+      }
+    } else {
+      alert('Delete failed: ' + r.status);
+    }
+  }
+
+  function copyDemoUrl() {
+    const url = $('demo-url-box').textContent;
+    navigator.clipboard?.writeText(url).then(() => alert('Copied'));
+  }
+
+  // Poll a running scrape job until it finishes or errors out. Returns the
+  // final job object. Capped at 6 minutes so a runaway job doesn't poll
+  // forever. Polls every 3 sec — slow enough to be polite, fast enough
+  // that Frank sees progress promptly.
+  async function pollScrapeJob(jobId) {
+    const startedAt = Date.now();
+    const maxWaitMs = 6 * 60 * 1000;
+    while (true) {
+      await new Promise(r => setTimeout(r, 3000));
+      let r;
+      try {
+        r = await fetch(`/api/owner/demo/scrape_status/${jobId}`);
+      } catch (e) {
+        // Transient network blip — keep polling
+        continue;
+      }
+      if (!r.ok) throw new Error(`status ${r.status}`);
+      const job = await r.json();
+      const elapsed = job.elapsed_seconds_so_far || 0;
+      $('live-log').textContent = `▶ Crawling ${job.url || ''}\n  ${elapsed}s elapsed…`;
+      if (job.status === 'done' || job.status === 'error') return job;
+      if (Date.now() - startedAt > maxWaitMs) {
+        throw new Error('Polling timeout — check Saved Profiles list, the scrape may still be running.');
+      }
+    }
+  }
+
+  $('scrape-btn').addEventListener('click', async () => {
+    let url = $('site-url').value.trim();
+    if (!url) { setStatus('Type a URL first.', 'error'); return; }
+    if (!/^https?:\/\//i.test(url)) url = 'https://' + url;
+
+    $('scrape-btn').disabled = true;
+    $('scrape-btn').textContent = 'Scraping…';
+    setStatus('Crawling their site with a real browser — usually 60-180 sec.', 'info');
+    $('live-log').classList.add('show');
+    $('live-log').textContent = `▶ Submitting scrape request for ${url}\n`;
+
+    try {
+      // Step 1: kick off the async job. Returns instantly with job_id.
+      const r = await fetch('/api/owner/demo/scrape', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: url }),
+      });
+      const submit = await r.json();
+      if (!r.ok || !submit.ok || !submit.job_id) {
+        setStatus(`✗ ${submit.error || 'Could not start scrape'}`, 'error');
+        return;
+      }
+      $('live-log').textContent = `▶ Scrape running (job ${submit.job_id})\n`;
+
+      // Step 2: poll until done. No CF tunnel timeout because each poll is fast.
+      const data = await pollScrapeJob(submit.job_id);
+
+      if (data.status === 'done' && data.ok) {
+        $('live-log').textContent += `\n✓ Visited ${data.pages_visited} pages\n`;
+        $('live-log').textContent += `✓ Found ${data.menu_items || 0} menu items\n`;
+        $('live-log').textContent += `✓ Profile slug: ${data.slug}\n`;
+        $('live-log').textContent += `✓ Done in ${Math.round(data.elapsed_seconds || 0)}s\n`;
+        setStatus(`✓ Ready — Orby is now trained on ${data.name || data.slug}.`, 'success');
+        const demoUrl = `${TUNNEL}/?embed=1&demo_as=${encodeURIComponent(data.slug)}`;
+        $('demo-biz-name').textContent = data.name || data.slug;
+        $('demo-url-box').textContent = demoUrl;
+        $('demo-open-link').href = demoUrl;
+        $('demo-ready-card').style.display = 'block';
+        $('site-url').value = '';
+        refreshProfiles();
+      } else {
+        setStatus(`✗ ${data.error || 'Scrape failed'}`, 'error');
+      }
+    } catch (e) {
+      setStatus(`✗ ${e.message}`, 'error');
+    } finally {
+      $('scrape-btn').disabled = false;
+      $('scrape-btn').textContent = 'Scrape This Site';
+    }
+  });
+
+  refreshProfiles();
+  </script>
+</body>
+</html>

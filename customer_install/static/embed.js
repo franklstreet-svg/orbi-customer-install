@@ -31,7 +31,16 @@
     return;
   }
   const origin = new URL(scriptEl.src).origin;
-  const chatSrc = origin + '/?embed=1';
+  // Pass the PARENT page's origin to the iframe so the chat shell can
+  // forward it on /chat requests as X-Embed-Parent header. Without this,
+  // the backend only sees the IFRAME's origin (the tunnel URL) and would
+  // default to the myOrbi (FST LLC) profile instead of the customer's.
+  const parentOrigin = window.location.origin;
+  // _=Date.now() makes every iframe URL unique per page load, so when the
+  // parent page is refreshed the browser fetches the iframe HTML + its
+  // referenced chat.js fresh instead of serving a stale cached copy.
+  const cacheBuster = '&_=' + Date.now();
+  const chatSrc = origin + '/?embed=1&parent=' + encodeURIComponent(parentOrigin) + cacheBuster;
 
   // ----- Styles (scoped, no global leakage) -----
   const css = `

@@ -112,6 +112,11 @@ from modules import closeout_pdf as mod_closeout_pdf
 from modules import bids as mod_bids
 from modules import reviews as mod_reviews
 from modules import proposal_pdf as mod_proposal_pdf
+from modules import clients as mod_clients
+from modules import forms as mod_forms
+from modules import form_filler as mod_form_filler
+from modules import pricing as mod_pricing
+from modules import line_items as mod_line_items
 from tools import url_fetch as tool_url_fetch
 from tools import web_search as tool_web_search
 
@@ -683,12 +688,222 @@ app = Flask(__name__)
 # Public routes
 # ---------------------------------------------------------------------------
 
+DEMO_ADMIN_COOKIE = "orby_demo_admin"
+
+
+def _check_demo_admin_or_owner():
+    """Auth gate for portable demo endpoints. Allow either an owner login
+    OR a valid demo_admin_pass cookie set by visiting /admin/demo?key=X.
+    Keeps Frank from needing two passwords when demoing from twickell."""
+    expected = (CONFIG.get("demo_admin_pass") or "").strip()
+    if expected and request.cookies.get(DEMO_ADMIN_COOKIE) == expected:
+        return
+    auth.require_owner(ORBI_DIR)
+
+
+@app.route("/admin/demo")
+def admin_demo_page():
+    """Frank's portable sales demo tool — scrape any restaurant's site
+    on the fly, get a demo URL to show the owner, wipe and repeat.
+    Auth: visit with ?key=<demo_admin_pass> to mint a 30-day cookie that
+    authorizes the API endpoints, OR be logged in as the owner."""
+    page = STATIC_DIR / "demo_mode.html"
+    if not page.exists():
+        return ("demo page not installed", 404)
+    resp = send_from_directory(STATIC_DIR, "demo_mode.html")
+    resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    key = (request.args.get("key") or "").strip()
+    expected = (CONFIG.get("demo_admin_pass") or "").strip()
+    if key and expected and key == expected:
+        resp.set_cookie(DEMO_ADMIN_COOKIE, expected,
+                        max_age=30 * 24 * 3600, httponly=True,
+                        secure=True, samesite="Lax")
+    return resp
+
+
+# In-memory scrape job tracker. Keyed by job_id, evicted after 1 hour.
+# Single dict guarded by a lock — light enough for one Frank scraping at a
+# time. Don't migrate to Redis until there's a real concurrency story.
+import threading as _scrape_threading
+import time as _scrape_time
+import uuid as _scrape_uuid
+
+_SCRAPE_JOBS: dict = {}
+_SCRAPE_JOBS_LOCK = _scrape_threading.Lock()
+
+
+def _evict_old_scrape_jobs() -> None:
+    """Drop jobs older than 1 hour from the tracker. Called opportunistically
+    at the top of each new scrape submission — no background sweeper needed."""
+    cutoff = _scrape_time.time() - 3600
+    with _SCRAPE_JOBS_LOCK:
+        stale = [jid for jid, j in _SCRAPE_JOBS.items()
+                 if j.get("finished_at", j.get("started_at", 0)) < cutoff]
+        for jid in stale:
+            _SCRAPE_JOBS.pop(jid, None)
+
+
+def _run_scrape_job(job_id: str, url: str, payload: dict) -> None:
+    """Background worker — does the actual scrape and updates the job dict.
+    Catches every exception so the polling status endpoint can report it."""
+    try:
+        import site_scraper
+        brain_call = site_scraper.make_brain_call(CONFIG)
+        result = site_scraper.crawl_site(
+            url, data_dir=DATA_DIR, brain_call=brain_call,
+            max_pages=int(payload.get("max_pages", 15)),
+            max_depth=int(payload.get("max_depth", 3)),
+            wall_time_seconds=int(payload.get("wall_time_seconds", 120)),
+            fetch_delay_seconds=float(payload.get("fetch_delay_seconds", 0.1)),
+        )
+        slug = result.get("slug") or result.get("domain", "").replace(".", "_")
+        profile_path = DATA_DIR / "customer_profiles" / f"{slug}.json"
+        biz_name, menu_items = "", 0
+        if profile_path.exists():
+            try:
+                with profile_path.open("r", encoding="utf-8") as f:
+                    prof = json.load(f)
+                biz_name = prof.get("name", "")
+                menu_items = len(prof.get("menu_items") or [])
+            except Exception:
+                pass
+        with _SCRAPE_JOBS_LOCK:
+            _SCRAPE_JOBS[job_id].update({
+                "status": "done",
+                "finished_at": _scrape_time.time(),
+                "ok": True,
+                "url": url,
+                "slug": slug,
+                "name": biz_name,
+                "pages_visited": result.get("pages_visited", 0),
+                "menu_items": menu_items,
+                "elapsed_seconds": result.get("elapsed_seconds", 0),
+            })
+    except ValueError as e:
+        with _SCRAPE_JOBS_LOCK:
+            _SCRAPE_JOBS[job_id].update({
+                "status": "error", "ok": False,
+                "finished_at": _scrape_time.time(),
+                "error": f"bad_url: {e}",
+            })
+    except Exception as e:
+        log.exception("async scrape failed for %s", url)
+        with _SCRAPE_JOBS_LOCK:
+            _SCRAPE_JOBS[job_id].update({
+                "status": "error", "ok": False,
+                "finished_at": _scrape_time.time(),
+                "error": f"crawl_failed: {e}",
+            })
+
+
+@app.route("/api/owner/demo/scrape", methods=["POST"])
+def api_owner_demo_scrape():
+    """Kick off a site scrape in a background thread. Returns immediately
+    with a job_id the client polls via /api/owner/demo/scrape_status/<id>.
+    Async pattern dodges the Cloudflare quick-tunnel 100-sec HTTP timeout
+    that was killing direct scrape responses."""
+    _check_demo_admin_or_owner()
+    payload = request.get_json(silent=True) or {}
+    url = (payload.get("url") or "").strip()
+    if not url:
+        return jsonify({"ok": False, "error": "url_required"}), 400
+    _evict_old_scrape_jobs()
+    job_id = _scrape_uuid.uuid4().hex[:16]
+    with _SCRAPE_JOBS_LOCK:
+        _SCRAPE_JOBS[job_id] = {
+            "status": "running",
+            "started_at": _scrape_time.time(),
+            "url": url,
+        }
+    t = _scrape_threading.Thread(
+        target=_run_scrape_job, args=(job_id, url, payload), daemon=True
+    )
+    t.start()
+    audit.log_event(DATA_DIR,
+                    actor=(auth.current_owner(ORBI_DIR) or {}).get("username") or "demo_admin",
+                    action="demo.scrape.start",
+                    meta={"url": url, "job_id": job_id})
+    return jsonify({"ok": True, "job_id": job_id, "status": "running"})
+
+
+@app.route("/api/owner/demo/scrape_status/<job_id>", methods=["GET"])
+def api_owner_demo_scrape_status(job_id):
+    """Poll endpoint — returns the current state of an async scrape job.
+    Client polls every 2-3 seconds until status is 'done' or 'error'."""
+    _check_demo_admin_or_owner()
+    with _SCRAPE_JOBS_LOCK:
+        job = _SCRAPE_JOBS.get(job_id)
+    if not job:
+        return jsonify({"ok": False, "error": "job_not_found"}), 404
+    elapsed = int(_scrape_time.time() - job.get("started_at", _scrape_time.time()))
+    out = dict(job)
+    out["elapsed_seconds_so_far"] = elapsed
+    return jsonify(out)
+
+
+@app.route("/api/owner/demo/list", methods=["GET"])
+def api_owner_demo_list():
+    """List all customer profiles available for demo (just shows slug +
+    name + menu count so the admin UI can render the list)."""
+    _check_demo_admin_or_owner()
+    profiles_dir = DATA_DIR / "customer_profiles"
+    out = []
+    if profiles_dir.exists():
+        for p in sorted(profiles_dir.glob("*.json")):
+            try:
+                with p.open("r", encoding="utf-8") as f:
+                    prof = json.load(f)
+                out.append({
+                    "slug": p.stem,
+                    "name": prof.get("name", ""),
+                    "menu_items": len(prof.get("menu_items") or []),
+                    "pages": len(prof.get("_pages") or []),
+                })
+            except Exception:
+                continue
+    return jsonify({"profiles": out})
+
+
+@app.route("/api/owner/demo/<slug>", methods=["DELETE"])
+def api_owner_demo_delete(slug):
+    """Wipe a customer profile (and its scraped-pages folder) so Frank
+    can start fresh for the next prospect."""
+    _check_demo_admin_or_owner()
+    import re as _r
+    slug_clean = _r.sub(r"[^a-z0-9_]", "", slug.lower())
+    if not slug_clean or slug_clean != slug.lower():
+        return jsonify({"ok": False, "error": "bad_slug"}), 400
+    profiles_dir = DATA_DIR / "customer_profiles"
+    profile_path = profiles_dir / f"{slug_clean}.json"
+    index_path = profiles_dir / f"{slug_clean}_index.json"
+    pages_dir = profiles_dir / f"{slug_clean}_pages"
+    deleted = []
+    for path in (profile_path, index_path):
+        if path.exists():
+            try: path.unlink(); deleted.append(path.name)
+            except Exception: pass
+    if pages_dir.exists() and pages_dir.is_dir():
+        import shutil as _sh
+        try: _sh.rmtree(pages_dir); deleted.append(pages_dir.name + "/")
+        except Exception: pass
+    audit.log_event(DATA_DIR, actor=(auth.current_owner(ORBI_DIR) or {}).get("username", "?"),
+                    action="demo.delete", meta={"slug": slug_clean, "deleted": deleted})
+    return jsonify({"ok": True, "deleted": deleted})
+
+
 @app.route("/")
 def index():
     # In Phase 1 we serve a single chat shell. Phase 2 adds branding per customer.
     chat_shell = STATIC_DIR / "chat.html"
     if chat_shell.exists():
-        return send_from_directory(STATIC_DIR, "chat.html")
+        resp = send_from_directory(STATIC_DIR, "chat.html")
+        # No-cache so widget updates land immediately when the embed iframe
+        # reloads — otherwise browsers serve a stale chat shell that
+        # references old chat.js / chat.css and customer never sees fixes.
+        resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        resp.headers["Pragma"] = "no-cache"
+        resp.headers["Expires"] = "0"
+        return resp
     return (f"Orby is running but no chat shell is installed. "
             f"Place chat.html in {STATIC_DIR}.", 503)
 
@@ -696,9 +911,19 @@ def index():
 def pwa_files(filename):
     return send_from_directory(PWA_DIR, filename)
 
+# Static files that change frequently and need to land in customers' browsers
+# the moment we change them (every chat.js / chat.css / embed.js edit). For
+# everything else, normal Flask static caching applies.
+_NO_CACHE_STATIC = {"chat.js", "chat.css", "embed.js"}
+
 @app.route("/static/<path:filename>")
 def static_files(filename):
-    return send_from_directory(STATIC_DIR, filename)
+    resp = send_from_directory(STATIC_DIR, filename)
+    if filename in _NO_CACHE_STATIC:
+        resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        resp.headers["Pragma"] = "no-cache"
+        resp.headers["Expires"] = "0"
+    return resp
 
 @app.route("/favicon.ico")
 def favicon():
@@ -1911,8 +2136,11 @@ def owner_catalog_reindex():
 @app.route("/api/public/business_summary")
 def public_business_summary():
     """Lightweight, no-auth snapshot for the visitor-facing chat shell.
-    Returns ONLY what's safe for any visitor to see."""
-    business = mod_business.load(DATA_DIR)
+    Returns ONLY what's safe for any visitor to see. Multi-tenant: picks
+    the business profile based on parent-origin / referer (same logic as
+    /chat) so the widget header on purblum.com says 'PurBlum' not the
+    default 'myOrbi'."""
+    business = _resolve_business_profile_for_request(request)
     # Default quick actions based on what scope is enabled
     scope = CONFIG.get("scope", {})
     actions = ["Are you open right now?", "Where are you located?"]
@@ -1955,8 +2183,19 @@ def public_chat():
     if not user_msg:
         return jsonify({"error": "empty message"}), 400
 
-    business = mod_business.load(DATA_DIR)
+    # Multi-tenant routing: if the visitor came from a customer's website
+    # (purblum.com, joes-pizza.com, etc.), load THEIR scraped profile so
+    # Orby answers as their business — not as the default Orby owner.
+    business = _resolve_business_profile_for_request(request)
     scope    = (CONFIG.get("scope") or {})
+
+    # REFERRAL — "where can I get one of these for my business?"
+    # Single-sentence URL + redirect to host business. Only fires on direct
+    # ask; never volunteers (LLM is prompt-gated). Toggleable in Settings.
+    referral_resp = _try_orby_referral(user_msg, business)
+    if referral_resp is not None:
+        return jsonify(referral_resp)
+
     system   = prompts.build_public_prompt(business, scope)
 
     # PRE-EXECUTE — fast local answer for common questions (greetings,
@@ -2117,6 +2356,56 @@ def public_chat():
         log.warning(f"public url_fetch failed: {e}")
     if extras:
         system += "\n\n" + "\n\n".join(extras)
+
+    # AUTHORITATIVE ORDER TOTALS — if the conversation has order intent,
+    # extract → cart → compute exact subtotal/tax/total in Python (not in
+    # the LLM, which makes arithmetic mistakes on multi-line money math).
+    # Inject the exact dollars as a system fact so the LLM quotes them
+    # verbatim when the customer asks "how much?" or at the end-summary.
+    _injected_totals = None  # filled in below, used in the response JSON
+    try:
+        history_for_total = [m for m in history if m.get("role") in ("user", "assistant")]
+        history_for_total.append({"role": "user", "content": user_msg})
+        # Latency fix — only run the expensive extraction when the customer
+        # is closing the order or explicitly asking the price. Mid-order
+        # modifier collection ("12 inch", "no onions") does NOT need totals.
+        if (_looks_like_order_chat(history_for_total)
+            and _is_end_of_order_message(user_msg)
+            and business.get("menu_items")):
+            import phone_order
+            # Construct a menu dict that phone_order.load_menu would have
+            # produced — categories+items+modifier_groups schema.
+            menu_for_compute = _menu_dict_from_profile(business)
+            extracted = phone_order.extract_order_from_history(
+                history_for_total, menu_for_compute, llm_client, CONFIG,
+            )
+            if extracted.get("ok") and extracted.get("items"):
+                cart, _warn = phone_order.build_cart_for_purblum(extracted["items"], menu_for_compute)
+                phone_order.annotate_cart_with_menu_prices(cart, menu_for_compute)
+                totals = phone_order.compute_cart_total(cart, business.get("tax_rate", 0))
+                if totals["subtotal"] > 0:
+                    lines = ["⚠️ AUTHORITATIVE ORDER TOTALS — YOU MUST INCLUDE THESE",
+                             "These prices were computed by Python from the canonical menu.",
+                             "When you summarize the order or the customer asks the price,",
+                             "INCLUDE these numbers verbatim. Do NOT omit them. Do NOT round.",
+                             "Do NOT guess different numbers.",
+                             ""]
+                    for li in totals["lines"]:
+                        lines.append(f"  • {li['qty']}x {li['name']}: ${li['line_total']:.2f}")
+                    lines.append("")
+                    lines.append(f"  SUBTOTAL: ${totals['subtotal']:.2f}")
+                    if totals['tax_rate_pct']:
+                        lines.append(f"  TAX ({totals['tax_rate_pct']:.2f}%): ${totals['tax']:.2f}")
+                        lines.append(f"  TOTAL: ${totals['total']:.2f}")
+                    lines.append("")
+                    lines.append("Quote these exact dollar figures in your end-of-order summary.")
+                    system += "\n\n" + "\n".join(lines)
+                    # Stash for the response JSON so the chat widget can
+                    # render a live cart panel.
+                    _injected_totals = totals
+                    log.info(f"chat order totals injected: subtotal=${totals['subtotal']} total=${totals['total']}")
+    except Exception as e:
+        log.warning(f"chat order-totals injection failed: {e}")
 
     messages = [m for m in history if m.get("role") in ("user", "assistant")][-10:]
     messages.append({"role": "user", "content": user_msg})
@@ -2284,6 +2573,10 @@ def public_chat():
         "tier": resp.tier,
         "latency_ms": resp.latency_ms,
         "billing_warning": BILLING_STATUS.get("warning"),
+        # If the chat has order intent + an extractable cart, the widget
+        # gets a live cart breakdown to render alongside Orby's reply.
+        # Math is server-computed (deterministic) — the widget just displays.
+        "order_summary": _injected_totals,
     })
 
 def _detect_capture(user_msg: str, scope: dict) -> str | None:
@@ -2560,11 +2853,74 @@ def owner_workspace_scan():
 
 
 _ALLOWED_UPLOAD_EXTS = {
-    ".txt", ".md", ".csv", ".log", ".json", ".html", ".htm",
-    ".pdf", ".docx", ".xlsx",
-    ".png", ".jpg", ".jpeg", ".gif",
+    # ── Text & documents ──────────────────────────────────────────────
+    ".txt", ".md", ".markdown", ".rst", ".log", ".rtf",
+    ".pdf", ".doc", ".docx", ".odt", ".pages",
+    ".html", ".htm", ".xml", ".xhtml",
+    # ── Spreadsheets & data ───────────────────────────────────────────
+    ".csv", ".tsv", ".xls", ".xlsx", ".xlsm", ".ods", ".numbers",
+    ".json", ".jsonl", ".ndjson", ".yaml", ".yml", ".toml",
+    ".sql", ".sqlite", ".sqlite3", ".db",
+    ".parquet", ".arrow", ".feather",
+    # ── Presentations ─────────────────────────────────────────────────
+    ".ppt", ".pptx", ".odp", ".key",
+    # ── Images ────────────────────────────────────────────────────────
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff", ".tif",
+    ".webp", ".svg", ".heic", ".heif", ".ico", ".avif",
+    ".raw", ".cr2", ".nef", ".arw", ".dng",
+    # ── Audio ─────────────────────────────────────────────────────────
+    ".mp3", ".wav", ".m4a", ".aac", ".ogg", ".oga", ".opus",
+    ".flac", ".wma", ".aiff", ".aif", ".amr",
+    # ── Video ─────────────────────────────────────────────────────────
+    ".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm", ".wmv",
+    ".flv", ".3gp", ".mpg", ".mpeg", ".ts", ".mts",
+    # ── Archives ──────────────────────────────────────────────────────
+    ".zip", ".tar", ".gz", ".tgz", ".bz2", ".tbz2", ".xz", ".txz",
+    ".7z", ".rar", ".lzma", ".zst",
+    # ── Ebooks ────────────────────────────────────────────────────────
+    ".epub", ".mobi", ".azw", ".azw3", ".fb2", ".djvu",
+    # ── Design / CAD / 3D ─────────────────────────────────────────────
+    ".psd", ".ai", ".sketch", ".fig", ".xd", ".indd",
+    ".dwg", ".dxf", ".stl", ".step", ".stp", ".iges", ".igs",
+    ".obj", ".fbx", ".blend", ".gltf", ".glb", ".dae",
+    # ── Code / config ─────────────────────────────────────────────────
+    ".py", ".pyi", ".ipynb",
+    ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx",
+    ".css", ".scss", ".sass", ".less",
+    ".java", ".kt", ".scala", ".groovy",
+    ".c", ".h", ".cpp", ".hpp", ".cc", ".cxx",
+    ".cs", ".vb", ".fs",
+    ".go", ".rs", ".swift", ".m", ".mm",
+    ".rb", ".php", ".pl", ".pm", ".lua", ".r", ".jl",
+    ".sh", ".bash", ".zsh", ".fish",
+    ".ps1", ".bat", ".cmd",
+    ".ini", ".conf", ".cfg", ".env", ".properties",
+    ".dockerfile", ".makefile", ".cmake",
+    # ── Fonts ─────────────────────────────────────────────────────────
+    ".ttf", ".otf", ".woff", ".woff2", ".eot",
+    # ── Installers / packages — flagged in the upload response but ALLOWED
+    # so Frank can use Orby as a file-stash for software he wants to keep
+    # near his workspace. They sit in ~/Orby/, Orby never runs them.
+    ".exe", ".msi", ".dmg", ".pkg", ".app",
+    ".apk", ".ipa", ".aab",
+    ".deb", ".rpm", ".AppImage", ".appimage", ".snap", ".flatpak",
+    # ── Misc / generic ────────────────────────────────────────────────
+    ".bin", ".dat", ".dump", ".bak",
+    ".eml", ".msg", ".mbox",
+    ".vcf", ".ics",
+    ".gpx", ".kml", ".kmz",
+    ".srt", ".vtt", ".ass", ".sub",
+    ".torrent",
 }
-_MAX_UPLOAD_BYTES = 25 * 1024 * 1024  # 25 MB per file
+# File extensions that are technically allowed but worth flagging to the
+# owner — uploaded executables sit in ~/Orby/ harmlessly until somebody
+# double-clicks them. Orby itself never executes uploads.
+_FLAGGED_UPLOAD_EXTS = {
+    ".exe", ".msi", ".dmg", ".pkg", ".app", ".apk", ".ipa",
+    ".deb", ".rpm", ".AppImage", ".appimage", ".snap", ".flatpak",
+    ".bat", ".cmd", ".ps1", ".sh", ".bash",
+}
+_MAX_UPLOAD_BYTES = 500 * 1024 * 1024  # 500 MB per file (was 25 MB)
 
 
 @app.route("/api/owner/workspace/upload", methods=["POST"])
@@ -2611,24 +2967,293 @@ def owner_workspace_upload():
                 dest.unlink(missing_ok=True)
                 rejected.append({"name": original, "reason": f"too_large ({size} bytes, max {_MAX_UPLOAD_BYTES})"})
                 continue
-            saved.append({"name": dest.name, "size": size})
+            entry = {"name": dest.name, "size": size}
+            if suffix in _FLAGGED_UPLOAD_EXTS:
+                entry["flagged"] = "executable_or_script"
+                entry["note"] = (
+                    "Stored safely in ~/Orby/ but never auto-run by Orby. "
+                    "Only opens if you double-click it yourself."
+                )
+            saved.append(entry)
             log.info(f"workspace upload by {owner_session.get('username','?')}: "
-                     f"{dest.name} ({size} bytes)")
+                     f"{dest.name} ({size} bytes)"
+                     + (" [flagged: executable]" if suffix in _FLAGGED_UPLOAD_EXTS else ""))
         except Exception as e:
             rejected.append({"name": original, "reason": f"save_failed: {e}"})
 
     scan_result = mod_workspace.scan(CONFIG, DATA_DIR) if saved else {}
+    flagged = [s for s in saved if s.get("flagged")]
     audit.log_event(DATA_DIR,
                     actor=owner_session.get("username", "?"),
                     action="workspace.upload",
                     meta={"saved": [s["name"] for s in saved],
-                          "rejected": [r["name"] for r in rejected]})
+                          "rejected": [r["name"] for r in rejected],
+                          "flagged": [s["name"] for s in flagged]})
     return jsonify({
         "status": "ok",
         "saved": saved,
         "rejected": rejected,
+        "flagged": flagged,
         "indexed": scan_result.get("added", 0) + scan_result.get("updated", 0),
     })
+
+
+# ── Form templates API (Forms tab) ────────────────────────────────────────
+
+@app.route("/api/owner/forms/upload", methods=["POST"])
+def owner_forms_upload():
+    """Upload a blank form template, classify it, auto-detect fillable
+    fields, and store. Form data:
+      - file: the PDF or DOCX
+      - kind: one of mod_forms.VALID_KINDS
+      - display_name: human label, e.g. "Acme Standard Change Order"
+      - is_default: "1" / "0" — whether to mark as default for this kind
+    """
+    owner_session = auth.require_owner(ORBI_DIR)
+    f = request.files.get("file")
+    if not f:
+        return jsonify({"error": "no_file"}), 400
+    kind = (request.form.get("kind") or "").strip()
+    if kind not in mod_forms.VALID_KINDS:
+        return jsonify({"error": "invalid_kind",
+                        "valid": sorted(mod_forms.VALID_KINDS)}), 400
+    display_name = (request.form.get("display_name") or "").strip()
+    is_default = (request.form.get("is_default") or "1").strip() in ("1", "true", "yes")
+    # Save to a temp path first
+    import tempfile, os as _os
+    suffix = _os.path.splitext(f.filename or "")[1].lower()
+    if suffix not in (".pdf", ".docx"):
+        return jsonify({"error": "unsupported_type",
+                        "allowed": [".pdf", ".docx"]}), 400
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        f.save(tmp.name)
+        tmp_path = Path(tmp.name)
+    try:
+        tpl = mod_forms.add(
+            DATA_DIR,
+            kind=kind, display_name=display_name or f.filename,
+            filename=f.filename, source_path=tmp_path,
+            uploaded_by=owner_session.get("username", "?"),
+            is_default=is_default,
+        )
+    finally:
+        try: tmp_path.unlink()
+        except OSError: pass
+    audit.log_event(DATA_DIR, actor=owner_session.get("username", "?"),
+                    action="form_template.uploaded",
+                    meta={"template_id": tpl["id"], "kind": kind,
+                          "fields_detected": len(tpl.get("detected_fields", []) or [])})
+    return jsonify({"status": "ok", "template": tpl})
+
+
+@app.route("/api/owner/forms", methods=["GET"])
+def owner_forms_list():
+    auth.require_owner(ORBI_DIR)
+    kind = (request.args.get("kind") or "").strip() or None
+    return jsonify({
+        "templates": mod_forms.list_all(DATA_DIR, kind=kind),
+        "summary": mod_forms.summary(DATA_DIR),
+        "valid_kinds": sorted(mod_forms.VALID_KINDS),
+    })
+
+
+@app.route("/api/owner/forms/<template_id>", methods=["GET"])
+def owner_forms_get(template_id):
+    auth.require_owner(ORBI_DIR)
+    tpl = mod_forms.get(DATA_DIR, template_id)
+    if not tpl:
+        return jsonify({"error": "not_found"}), 404
+    return jsonify(tpl)
+
+
+@app.route("/api/owner/forms/<template_id>/mapping", methods=["PUT"])
+def owner_forms_mapping(template_id):
+    """Owner-side correction of the auto-mapping. Body:
+      {"field_name": "Customer Name", "mapped_to": "customer_name"}"""
+    auth.require_owner(ORBI_DIR)
+    data = request.get_json(silent=True) or {}
+    field_name = (data.get("field_name") or "").strip()
+    mapped_to = (data.get("mapped_to") or "").strip()
+    if not field_name:
+        return jsonify({"error": "field_name_required"}), 400
+    ok = mod_forms.update_field_mapping(DATA_DIR, template_id,
+                                          field_name, mapped_to)
+    return jsonify({"status": "ok" if ok else "no_change"})
+
+
+@app.route("/api/owner/forms/<template_id>/default", methods=["POST"])
+def owner_forms_set_default(template_id):
+    auth.require_owner(ORBI_DIR)
+    ok = mod_forms.set_default(DATA_DIR, template_id)
+    return jsonify({"status": "ok" if ok else "not_found"})
+
+
+@app.route("/api/owner/forms/<template_id>", methods=["DELETE"])
+def owner_forms_remove(template_id):
+    owner_session = auth.require_owner(ORBI_DIR)
+    ok = mod_forms.remove(DATA_DIR, template_id)
+    if ok:
+        audit.log_event(DATA_DIR, actor=owner_session.get("username", "?"),
+                        action="form_template.removed",
+                        meta={"template_id": template_id})
+    return jsonify({"status": "ok" if ok else "not_found"})
+
+
+# ── Pricing catalog API ───────────────────────────────────────────────────
+
+@app.route("/api/owner/pricing", methods=["GET"])
+def owner_pricing_list():
+    auth.require_owner(ORBI_DIR)
+    return jsonify({
+        "items": mod_pricing.list_all(DATA_DIR),
+        "summary": mod_pricing.summary(DATA_DIR),
+    })
+
+
+@app.route("/api/owner/pricing", methods=["POST"])
+def owner_pricing_add():
+    owner_session = auth.require_owner(ORBI_DIR)
+    data = request.get_json(silent=True) or {}
+    try:
+        item = mod_pricing.add(
+            DATA_DIR,
+            label=(data.get("label") or "").strip(),
+            unit_price=float(data.get("unit_price") or 0),
+            aliases=data.get("aliases") or [],
+            unit=(data.get("unit") or "each").strip(),
+            notes=(data.get("notes") or "").strip(),
+        )
+    except (ValueError, TypeError) as e:
+        return jsonify({"error": str(e)}), 400
+    audit.log_event(DATA_DIR, actor=owner_session.get("username", "?"),
+                    action="pricing.added",
+                    meta={"id": item["id"], "label": item["label"]})
+    return jsonify({"status": "ok", "item": item})
+
+
+@app.route("/api/owner/pricing/<item_id>", methods=["PUT"])
+def owner_pricing_update(item_id):
+    auth.require_owner(ORBI_DIR)
+    data = request.get_json(silent=True) or {}
+    item = mod_pricing.update(DATA_DIR, item_id, **data)
+    if not item:
+        return jsonify({"error": "not_found"}), 404
+    return jsonify({"status": "ok", "item": item})
+
+
+@app.route("/api/owner/pricing/<item_id>", methods=["DELETE"])
+def owner_pricing_remove(item_id):
+    owner_session = auth.require_owner(ORBI_DIR)
+    ok = mod_pricing.remove(DATA_DIR, item_id)
+    if ok:
+        audit.log_event(DATA_DIR, actor=owner_session.get("username", "?"),
+                        action="pricing.removed", meta={"id": item_id})
+    return jsonify({"status": "ok" if ok else "not_found"})
+
+
+# ── Client folders API ────────────────────────────────────────────────────
+
+@app.route("/api/owner/clients", methods=["GET"])
+def owner_clients_list():
+    auth.require_owner(ORBI_DIR)
+    return jsonify({"clients": mod_clients.list_clients(CONFIG)})
+
+
+# ── Full-site crawler for customer onboarding ─────────────────────────────
+#
+# A new restaurant customer types their website URL into the onboarding
+# wizard. Orby crawls EVERY page on the domain (no prioritization, no
+# "this page looks unimportant" filtering), runs LLM extraction on each,
+# merges into a per-customer profile saved at
+# data/customer_profiles/<domain>.json. Raw page text is indexed for
+# full-text retrieval. Confidence scores per field surface gaps the
+# owner needs to fill manually.
+
+@app.route("/api/owner/onboarding/full_scrape", methods=["POST"])
+def owner_onboarding_full_scrape():
+    """POST {url} → crawl that website, save per-customer profile +
+    page index, return confidence + summary. Owner-authenticated."""
+    owner_session = auth.require_owner(ORBI_DIR)
+    payload = request.get_json(silent=True) or {}
+    url = (payload.get("url") or "").strip()
+    if not url:
+        return jsonify({"error": "url_required"}), 400
+    # Optional knobs — sensible defaults for restaurant onboarding
+    max_pages = int(payload.get("max_pages", 200))
+    max_depth = int(payload.get("max_depth", 5))
+    wall_time = int(payload.get("wall_time_seconds", 600))
+    delay     = float(payload.get("fetch_delay_seconds", 0.5))
+    try:
+        import site_scraper
+        brain_call = site_scraper.make_brain_call(CONFIG)
+        result = site_scraper.crawl_site(
+            url, data_dir=DATA_DIR, brain_call=brain_call,
+            max_pages=max_pages, max_depth=max_depth,
+            wall_time_seconds=wall_time, fetch_delay_seconds=delay,
+        )
+    except ValueError as e:
+        return jsonify({"error": f"bad_url: {e}"}), 400
+    except Exception as e:
+        log.exception("full_scrape failed for %s", url)
+        return jsonify({"error": f"crawl_failed: {e}"}), 500
+    audit.log_event(DATA_DIR, actor=owner_session.get("username", "?"),
+                    action="onboarding.full_scrape",
+                    meta={"url": url,
+                          "pages_visited": result["pages_visited"],
+                          "elapsed_seconds": result["elapsed_seconds"]})
+    # Trim the profile to a digestible response — the full thing is on disk
+    summary = {
+        "ok": True,
+        "url": url,
+        "domain": result["domain"],
+        "pages_visited": result["pages_visited"],
+        "pages_failed": result["pages_failed"],
+        "elapsed_seconds": result["elapsed_seconds"],
+        "stopped_reason": result["stopped_reason"],
+        "confidence": result["confidence"],
+        "profile_summary": {
+            "name": result["profile"].get("name"),
+            "tagline": result["profile"].get("tagline"),
+            "address": result["profile"].get("address"),
+            "contact": result["profile"].get("contact"),
+            "hours_days_count": len(result["profile"].get("hours", {})),
+            "services_count": len(result["profile"].get("services", [])),
+            "menu_items_count": len(result["profile"].get("menu_items", [])),
+            "faq_count": len(result["profile"].get("faq", [])),
+        },
+        "storage": result.get("storage"),
+        "pages": [{"url": p["url"], "title": p["title"]}
+                   for p in result["profile"].get("_pages", [])],
+    }
+    return jsonify(summary)
+
+
+@app.route("/api/owner/customer_profiles", methods=["GET"])
+def owner_customer_profiles_list():
+    """List every scraped customer profile in data/customer_profiles/.
+    Used by the multi-tenant routing UI later — also useful for debugging."""
+    auth.require_owner(ORBI_DIR)
+    base = DATA_DIR / "customer_profiles"
+    if not base.exists():
+        return jsonify({"profiles": []})
+    out = []
+    for f in sorted(base.glob("*.json")):
+        if f.name.endswith("_index.json"):
+            continue
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+            out.append({
+                "slug": f.stem,
+                "name": data.get("name"),
+                "website": data.get("contact", {}).get("website"),
+                "pages_count": len(data.get("_pages", [])),
+                "menu_items_count": len(data.get("menu_items", [])),
+                "services_count": len(data.get("services", [])),
+                "path": str(f),
+            })
+        except Exception:
+            continue
+    return jsonify({"profiles": out})
 
 
 @app.route("/api/owner/workspace/<path:filename>/convert", methods=["POST"])
@@ -3611,6 +4236,14 @@ def owner_chat():
     if onb_resp is not None:
         return jsonify(onb_resp)
 
+    # Safety refusals first — "sign for the customer", "modify a signed
+    # CO", "delete all X files", "create a CO and send without approval".
+    # Must run BEFORE contractor_chat so "create a CO" doesn't get caught
+    # by the CO-add handler.
+    safety_resp = _try_safety_refusal(user_msg, user_rec)
+    if safety_resp is not None:
+        return jsonify(safety_resp)
+
     # Contractor module — "add project at X", "what jobs are open",
     # "status of the Maple project". Gated by enabled_modules so it's
     # invisible for base-Orby customers and active for paid Contractor
@@ -3618,6 +4251,63 @@ def owner_chat():
     gc_resp = _try_contractor_chat(user_msg, user_rec)
     if gc_resp is not None:
         return jsonify(gc_resp)
+
+    # Contacts CRUD — "add contact X", "find Sarah", "show contacts for
+    # Johnson Construction", "every conversation with Sarah". Per-user
+    # contact book (modules/contacts.py).
+    contacts_resp = _try_contacts_chat(user_msg, user_rec)
+    if contacts_resp is not None:
+        return jsonify(contacts_resp)
+
+    # Leads / lead-list queries — "show me leads from this week",
+    # "what new leads came in overnight". Reads modules/messages.py.
+    leads_resp = _try_leads_chat(user_msg, user_rec)
+    if leads_resp is not None:
+        return jsonify(leads_resp)
+
+    # Lead CAPTURE from chat — "add me as a new lead, name John Smith,
+    # phone 775-...", "log a new lead: name X phone Y". Writes to
+    # messages.json so it shows up in the leads inbox + recent-leads
+    # query. Otherwise the LLM fakes "Done — added you."
+    lead_add_resp = _try_lead_add(user_msg, user_rec)
+    if lead_add_resp is not None:
+        return jsonify(lead_add_resp)
+
+    # Channel queries we can't honestly answer — email/SMS/files. Return a
+    # deterministic refusal so the LLM doesn't fabricate "here are 3 emails
+    # from Johnson." Honest > confident-wrong.
+    unwired_resp = _try_unwired_channel(user_msg, user_rec)
+    if unwired_resp is not None:
+        return jsonify(unwired_resp)
+
+    # Business-profile knowledge questions — "what services", "are you
+    # licensed", "what hours", "what warranty", "what service area",
+    # "what financing". Reads business_info directly so the answer is
+    # exact and consistent. Beats LLM, which fluffs or hedges.
+    knowledge_resp = _try_knowledge_chat(user_msg, user_rec)
+    if knowledge_resp is not None:
+        return jsonify(knowledge_resp)
+
+    # Self-introspection — "do you have a contractor module", "what
+    # modules / add-ons / plans am I on". Reads CONFIG.enabled_modules
+    # so she gives the truthful answer instead of LLM fabrication.
+    modules_resp = _try_modules_introspection(user_msg, user_rec)
+    if modules_resp is not None:
+        return jsonify(modules_resp)
+
+    # Form templates — "what forms do I have", "show my templates",
+    # "do I have a change order template uploaded"
+    forms_resp = _try_forms_introspection(user_msg, user_rec)
+    if forms_resp is not None:
+        return jsonify(forms_resp)
+
+    # Owner-side lead simulation — "I need a kitchen remodel", "my budget
+    # is $40k" coming through OWNER chat. In production these would land
+    # on public_chat. In testing they hit owner_chat. Deterministic
+    # acknowledgment + path forward.
+    sim_lead_resp = _try_owner_simulated_lead(user_msg, user_rec)
+    if sim_lead_resp is not None:
+        return jsonify(sim_lead_resp)
 
     # Calendar CANCEL — "cancel my Tuesday appointment" — actually
     # removes the event from the calendar (was returning fake "done" via
@@ -3663,6 +4353,37 @@ def owner_chat():
     tomorrow_resp = _try_tomorrow_brief(user_msg, user_rec)
     if tomorrow_resp is not None:
         return jsonify(tomorrow_resp)
+
+    appt_today_resp = _try_appointments_today(user_msg, user_rec)
+    if appt_today_resp is not None:
+        return jsonify(appt_today_resp)
+
+    # Task completion — "done with X", "finished X", "completed the supplier
+    # call". Has to run BEFORE friend-mode context-loading so she doesn't
+    # turn it into conversation instead of marking it done.
+    task_done_resp = _try_task_complete(user_msg, user_rec)
+    if task_done_resp is not None:
+        return jsonify(task_done_resp)
+
+    # Reminder removal — "don't remind me about X" / "cancel the reminder
+    # about Y". Has to run before friend-mode context-loading so she
+    # actually deletes the reminder instead of conversational acknowledgment.
+    rem_remove_resp = _try_reminder_remove(user_msg, user_rec)
+    if rem_remove_resp is not None:
+        return jsonify(rem_remove_resp)
+
+    # Project balance lookup — "what was the balance on the Birch closeout"
+    # / "how much does Maple owe". Honest "no such project" beats LLM
+    # hallucination about needing Stripe.
+    proj_bal_resp = _try_project_balance(user_msg, user_rec)
+    if proj_bal_resp is not None:
+        return jsonify(proj_bal_resp)
+
+    # Hypothetical math: "If I billed Sarah $5000 and she paid $2000,
+    # what's still owed?" — pure arithmetic, deterministic answer.
+    math_resp = _try_math_quick(user_msg)
+    if math_resp is not None:
+        return jsonify(math_resp)
 
     cap_overview = _try_capabilities_overview(user_msg)
     if cap_overview is not None:
@@ -3780,6 +4501,35 @@ def owner_chat():
                        mod_contacts.context_block(user_dir)):
         if module_ctx:
             extras.append(module_ctx)
+
+    # ALWAYS-ON self-context: which add-on modules are enabled. Tiny
+    # block, but it stops the LLM from claiming "I don't have a
+    # contractor module" when the contractor module is, in fact, on.
+    enabled_mods = CONFIG.get("enabled_modules") or []
+    if enabled_mods:
+        # Build the alias hint so the LLM treats synonyms correctly.
+        alias_lines = []
+        enabled_lower = {str(m).lower() for m in enabled_mods}
+        for alias, canonical in _MODULE_ALIASES.items():
+            if canonical in enabled_lower and alias != canonical:
+                alias_lines.append(f"    - \"{alias}\" → {canonical}")
+        alias_block = ""
+        if alias_lines:
+            alias_block = "  Synonyms (treat all of these as the same active module):\n" + "\n".join(alias_lines) + "\n"
+        extras.append(
+            "ORBY CONFIGURATION (authoritative — never contradict):\n"
+            f"  Enabled add-on modules: {', '.join(str(m) for m in enabled_mods)}\n"
+            + alias_block +
+            "  If the user asks 'do you have the X module' or 'do you "
+            "know anything about a Y module' and X/Y maps to anything in "
+            "the list above, answer YES."
+        )
+    else:
+        extras.append(
+            "ORBY CONFIGURATION (authoritative — never contradict):\n"
+            "  No paid add-on modules enabled. Base Orby only.\n"
+            "  If asked 'do you have the X module' for any add-on, answer NO."
+        )
     # Same three-way priority as public chat
     msg_lower = user_msg.lower()
     is_fresh_query = any(k in msg_lower for k in tool_web_search._FRESH_KEYWORDS)
@@ -4248,11 +4998,11 @@ def _needs_onboarding() -> bool:
     except Exception:
         return False
     name = (biz.get("name") or "").strip()
-    if not name or name.startswith("REPLACE_") or name == "My Orby AI Solutions":
-        # We treat Frank's own install (name = "My Orby AI Solutions") as
-        # not-needing-onboarding because he set it. For real customers,
-        # the install drops REPLACE_WITH_BUSINESS_NAME as the default.
-        if name == "My Orby AI Solutions":
+    # Sentinel names for Frank's own install (skip onboarding wizard).
+    # Old names kept for backward compat with stale local data.
+    frank_install_sentinels = {"myOrbi", "Orbi", "My Orbi AI Solutions", "My Orby AI Solutions"}
+    if not name or name.startswith("REPLACE_") or name in frank_install_sentinels:
+        if name in frank_install_sentinels:
             return False
         return True
     return False
@@ -4375,24 +5125,30 @@ _GC_ADD_PROJECT_RE = _re.compile(
 )
 _GC_LIST_JOBS_RE = _re.compile(
     # "what active jobs" / "what's open" / "list active projects" / etc.
-    # Also catches the inverted form: "what jobs are open / are active".
+    # Includes "show me all active jobs", "all jobs", "what jobs do I have",
+    # "current jobs", "all (my )?projects".
     r"^\s*(?:"
-    r"what(?:'s| is| are)?\s+(?:my\s+)?(?:open|active|current)\s+(?:jobs|projects|builds)"
+    r"what(?:'s| is| are)?\s+(?:my\s+)?(?:open|active|current|all)\s+(?:jobs|projects|builds)"
     r"|what\s+(?:jobs|projects|builds)\s+(?:are\s+|do\s+i\s+have\s+)?(?:open|active|going|current)"
-    r"|(?:list|show)\s+(?:me\s+)?(?:my\s+)?(?:active\s+|open\s+)?(?:jobs|projects)"
+    r"|what\s+(?:jobs|projects|builds)\s+do\s+i\s+have"
+    r"|(?:list|show)\s+(?:me\s+)?(?:all\s+(?:my\s+|the\s+)?|my\s+|the\s+)?(?:active\s+|open\s+|current\s+)?(?:jobs|projects|builds)"
+    r"|all\s+(?:my\s+|the\s+)?(?:active\s+|open\s+|current\s+)?(?:jobs|projects|builds)"
     r"|jobs(?:\s+open)?|projects(?:\s+open)?"
     r")\s*[?.!]?\s*$",
     _re.IGNORECASE,
 )
 _GC_PROJECT_STATUS_RE = _re.compile(
     # "status of the Maple project" / "what's going on at 555 Oak" /
-    # "what IS going on at X" / "how's the Maple project doing"
+    # "what IS going on at X" / "how's the Maple project doing" /
+    # "what is the (current )?contract value (for|on|of) X"
     r"^\s*(?:"
     r"status\s+(?:of|on)"
     r"|how(?:'s| is)"
     r"|what(?:'s| is)?\s+(?:going\s+on|happening)\s+(?:at|with)"
     r"|tell\s+me\s+about"
     r"|details?\s+(?:of|on)"
+    r"|what(?:'s| is)?\s+(?:the\s+)?(?:current\s+)?(?:contract\s+value|contract\s+amount|contract\s+total)\s+(?:for|on|of)"
+    r"|(?:current\s+)?(?:contract\s+value|contract\s+amount|contract\s+total)\s+(?:for|on|of)"
     r")\s+"
     r"(?:the\s+)?(?P<query>.+?)"
     r"(?:\s+(?:project|job|build))?"
@@ -4434,19 +5190,23 @@ _GC_ADD_CO_RE = _re.compile(
     #   "change order on [project] — $X for description"
     #   "CO on the Maple project: client agreed extra $1200 for trim"
     #   "client just approved $1200 extra trim work at 555 Oak"
-    r"^\s*(?:"
-    r"(?:add|new|create|raise|log)\s+(?:a\s+)?(?:c\.?o\.?|change[\s-]order)"
+    #   "We added a second bathroom on the Johnson project. Create a change order."
+    #   "The customer approved an extra $4,500 for electrical. Draft the paperwork."
+    # Sentence-boundary friendly: accepts ^ OR a sentence break before the verb.
+    r"(?:^|[.!?]\s+)\s*(?:"
+    r"(?:add|new|create|raise|log|draft|write|cut|file)\s+(?:a\s+|the\s+|some\s+)?(?:c\.?o\.?|change[\s-]order|change[\s-]order\s+paperwork|paperwork)"
     r"|(?:c\.?o\.?|change[\s-]order)"
-    r"|client\s+(?:just\s+)?(?:approved|agreed\s+to|signed\s+off\s+on|okayed?)"
+    r"|(?:the\s+)?(?:client|customer|homeowner|owner)\s+(?:just\s+)?(?:approved|agreed\s+to|signed\s+off\s+on|okayed?|gave\s+(?:the\s+)?go[\s-]?ahead\s+(?:on|for))"
     r")\b\s*",
     _re.IGNORECASE,
 )
 _GC_LIST_PENDING_CO_RE = _re.compile(
     r"^\s*(?:"
-    r"(?:what|which)\s+(?:c\.?o\.?s?|change[\s-]orders?)\s+(?:are\s+)?"
-    r"(?:pending|waiting|open|in\s+(?:my\s+)?queue|need\s+(?:my\s+)?approval)"
+    r"(?:what|which)\s+(?:c\.?o\.?s?|change[\s-]orders?)\s+(?:are\s+)?(?:still\s+)?"
+    r"(?:pending|waiting|open|in\s+(?:my\s+)?queue|need\s+(?:my\s+)?approval|waiting\s+for\s+(?:a\s+)?signatures?|out\s+for\s+signature|awaiting\s+(?:a\s+)?signature)"
     r"|pending\s+(?:c\.?o\.?s?|change[\s-]orders?)"
-    r"|list\s+(?:pending\s+)?(?:c\.?o\.?s?|change[\s-]orders?)"
+    r"|(?:list|show)\s+(?:me\s+)?(?:all\s+)?(?:pending\s+|open\s+|awaiting\s+|outstanding\s+)?(?:c\.?o\.?s?|change[\s-]orders?)"
+    r"|(?:c\.?o\.?s?|change[\s-]orders?)\s+(?:waiting|awaiting|out)\s+(?:for\s+)?(?:a\s+)?(?:signature|sign\s*off)"
     r")\s*[?.!]?\s*$",
     _re.IGNORECASE,
 )
@@ -4466,11 +5226,16 @@ _GC_SEND_CO_RE = _re.compile(
 )
 _GC_LIST_UNPAID_RE = _re.compile(
     r"^\s*(?:"
-    r"who\s+owes\s+(?:me\s+)?(?:money|right\s+now)?"
+    r"who(?:'s|\s+is)?\s+owes?\s+(?:me|us|the\s+company)?\s*(?:money(?:\s+right\s+now)?|right\s+now)?"
+    r"|who(?:'s|\s+is)?\s+(?:got|holding)\s+(?:my|our)\s+money"
     r"|what\s+(?:invoices?\s+)?(?:are\s+)?(?:unpaid|outstanding|open|due)"
+    r"|which\s+(?:invoices?\s+)?(?:are\s+)?(?:unpaid|outstanding|open|due)"
+    r"|(?:show|list)\s+(?:me\s+)?(?:all\s+)?(?:my\s+|the\s+)?(?:unpaid|outstanding|open|due)\s+invoices?"
     r"|(?:unpaid|outstanding|open)\s+invoices?"
-    r"|invoices?\s+(?:open|outstanding|due)"
+    r"|invoices?\s+(?:open|outstanding|due|unpaid)"
+    r"|(?:show|list)\s+(?:me\s+)?(?:all\s+)?(?:my\s+|the\s+)?(?:open|outstanding|unpaid)\s+receivables?"
     r"|receivables?"
+    r"|money\s+owed(?:\s+(?:to\s+us|to\s+me))?"
     r")\s*[?.!]?\s*$",
     _re.IGNORECASE,
 )
@@ -4478,7 +5243,12 @@ _GC_AGING_RE = _re.compile(
     r"^\s*(?:"
     r"aging(?:\s+report)?"
     r"|what(?:'s| is)?\s+overdue"
-    r"|overdue\s+(?:invoices?|amounts?)"
+    r"|(?:any(?:thing)?\s+)?overdue(?:\s+today)?"
+    r"|overdue\s+(?:invoices?|amounts?|receivables?|bills?)"
+    r"|(?:what|which)\s+invoices?\s+(?:are\s+)?(?:more\s+than\s+(?P<days>\d+)\s+days?\s+)?overdue"
+    r"|invoices?\s+(?:more\s+than\s+)?(?P<days2>\d+)?\s*days?\s+overdue"
+    r"|(?:show|list)\s+(?:me\s+)?(?:all\s+)?(?:my\s+)?(?:overdue|past[\s-]due|late)\s+(?:invoices?|receivables?|bills?)"
+    r"|(?:past[\s-]due|late)\s+(?:invoices?|receivables?|bills?)"
     r")\s*[?.!]?\s*$",
     _re.IGNORECASE,
 )
@@ -4521,6 +5291,13 @@ _GC_REPORT_RE = _re.compile(
     r"|captured\s+(?:this\s+(?:week|month|year)|so\s+far))"
     r"|(?:where\s+(?:are\s+|am\s+i\s+)?(?:at|standing)\s+(?:on\s+)?(?:the\s+)?money)"
     r"|gc\s+(?:report|dashboard|stats)"
+    r"|what(?:'s| is)?\s+(?:our|my|the)\s+(?:total\s+)?(?:accounts\s+receivable|a[/.\s]?r)(?:\s+balance|\s+total)?"
+    r"|(?:total\s+)?accounts\s+receivable(?:\s+balance|\s+total)?"
+    r"|a[/.\s]?r\s+balance"
+    r"|how\s+much\s+(?:money\s+)?(?:have\s+we\s+)?collected(?:\s+this\s+(?:week|month|year))?"
+    r"|(?:money|cash)\s+collected(?:\s+this\s+(?:week|month|year))?"
+    r"|what(?:'s| is)?\s+(?:our|my)\s+(?:current\s+)?cash\s+(?:position|on\s+hand)"
+    r"|cash\s+(?:position|on\s+hand)"
     r")\s*[?.!]?\s*$",
     _re.IGNORECASE,
 )
@@ -4532,12 +5309,15 @@ _GC_ADD_LOG_RE = _re.compile(
     # "daily log Oak: framing done, 6 hours"
     # "logged 8 hours on Maple, drywall in"
     # NOT "logged bid ..." — that's a bid not a log; bid handler takes it.
+    # NOT "log me in" / "log out" / "log into" — those are auth verbs.
+    # The bare "log" form requires explicit today/for/on suffix to avoid
+    # catching "log me/you/us in as <user>" type auth commands.
     r"^\s*(?:"
-    r"(?:add|create|file|write)\s+(?:a\s+)?(?:daily\s+)?log"
-    r"|(?:daily\s+)?log\s+(?:today|for|on)?"
+    r"(?:add|create|file|write)\s+(?:a\s+)?(?:daily\s+)?log\b(?!\s+me|\s+in|\s+out|\s+into)"
+    r"|(?:daily\s+)?log\s+(?:today|for|on)\b"
     r"|logged?\s+(?:\d+\s+hours?\s+)(?:on|for)?"     # require an hours count
     r"|logged?\s+(?:on|for)\s+"                       # OR explicit on/for
-    r")\b\s*",
+    r")\s*",
     _re.IGNORECASE,
 )
 _GC_LIST_LOGS_RE = _re.compile(
@@ -4683,11 +5463,14 @@ _GC_WEEKLY_RECAP_RE = _re.compile(
 )
 _GC_PROJECT_REPORT_RE = _re.compile(
     # "full report on Oak" / "everything on Maple" / "deep dive Oak"
-    # / "show me all of Oak" / "Oak summary"
+    # / "show me all of Oak" / "Oak summary" / "project history for Johnson"
+    # / "history (for|on|of) Johnson"
     r"^\s*(?:"
     r"(?:full\s+report|deep\s+dive|everything|all\s+(?:about|on))\s+(?:on\s+|of\s+)?(?:the\s+)?(?P<q1>.+?)"
     r"|(?P<q2>.+?)\s+(?:summary|recap|breakdown|deep\s+dive)"
     r"|show\s+me\s+(?:all\s+|every(?:thing)?\s+)?(?:on\s+|of\s+|for\s+)?(?:the\s+)?(?P<q3>.+?)\s+project"
+    r"|(?:show\s+me\s+(?:the\s+)?|give\s+me\s+(?:the\s+)?|tell\s+me\s+(?:the\s+)?)?(?:project\s+)?history\s+(?:for|on|of)\s+(?:the\s+)?(?P<q4>.+?)(?:\s+project)?"
+    r"|(?P<q5>.+?)(?:'s)?\s+project\s+history"
     r")\s*[?.!]?\s*$",
     _re.IGNORECASE,
 )
@@ -4710,9 +5493,11 @@ _GC_SUB_SCHEDULE_RE = _re.compile(
 )
 _GC_LEAK_CHECK_RE = _re.compile(
     r"^\s*(?:"
-    r"(?:any\s+)?(?:unsigned|unbilled|leaked|missing|uncovered)\s+(?:work|scope|cos?|change[\s-]orders?)"
-    r"|(?:scope|work)\s+(?:without|with\s+no)\s+(?:c\.?o\.?|change[\s-]order|sign(?:ature|ed))"
-    r"|leak\s+(?:check|alarm|report)"
+    r"(?:do|does|are|is|have)\s+(?:we|i|any\s+jobs?|any\s+projects?)\s+(?:have|got|do\s+we\s+have)?\s*(?:any\s+)?(?:work|scope|jobs?|builds?)\s+(?:being\s+performed|going\s+on|happening|done|active|in\s+progress)?\s*(?:without|with\s+no)\s+(?:a\s+)?(?:signed\s+)?(?:c\.?o\.?|change[\s-]orders?)"
+    r"|(?:which|what)\s+(?:jobs?|projects?|builds?)\s+(?:currently\s+|do\s+we\s+|do\s+i\s+)?(?:have|got|are\s+(?:showing|throwing))\s+(?:any\s+)?leak\s+(?:alarms?|alerts?|warnings?|flags?)"
+    r"|(?:any\s+)?(?:unsigned|unbilled|leaked|missing|uncovered)\s+(?:work|scope|cos?|change[\s-]orders?)"
+    r"|(?:scope|work)\s+(?:.{0,40}?)(?:without|with\s+no)\s+(?:a\s+)?(?:signed\s+)?(?:c\.?o\.?|change[\s-]order|sign(?:ature|ed))"
+    r"|leak\s+(?:check|alarm|report|alarms|alerts?)"
     r"|am\s+i\s+leaking\s+money"
     r")\s*[?.!]?\s*$",
     _re.IGNORECASE,
@@ -4736,11 +5521,14 @@ _GC_NUDGE_ALL_RE = _re.compile(
     _re.IGNORECASE,
 )
 _GC_HELP_RE = _re.compile(
+    # Strictly contractor-help — must explicitly name "contractor" or "gc"
+    # or "cheat-sheet". Generic "what can you do" / "help" is handled by
+    # the global capabilities-overview handler, not this one.
     r"^\s*(?:"
-    r"(?:help|commands?|what\s+can\s+(?:you|i)\s+do)"
-    r"|(?:what|which|list)\s+(?:the\s+)?(?:contractor\s+)?commands?"
-    r"|(?:contractor|gc)\s+(?:help|commands?|cheat[\s-]sheet)"
+    r"(?:contractor|gc)\s+(?:help|commands?|cheat[\s-]sheet)"
+    r"|(?:contractor|gc)\s+(?:commands?|cheat[\s-]sheet)"
     r"|cheat[\s-]sheet"
+    r"|(?:what|which|list)\s+(?:the\s+)?contractor\s+commands?"
     r")\s*[?.!]?\s*$",
     _re.IGNORECASE,
 )
@@ -4765,6 +5553,120 @@ _GC_SEND_QUEUE_RE = _re.compile(
     r"send\s+(?:all\s+)?(?:my\s+)?(?:queued|pending|drafted|auto)\s+(?:reminders?|nudges?|follow[\s-]ups?)"
     r"|fire\s+(?:off\s+)?(?:the\s+)?(?:reminder|nudge|follow[\s-]up)\s+queue"
     r"|approve\s+(?:and\s+send\s+)?(?:all\s+)?(?:queued|pending|drafted)\s+(?:reminders?|nudges?)"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+# "Send a payment reminder to Johnson Construction" — nudge by customer NAME,
+# not invoice number. Looks up the customer's unpaid invoices and drafts.
+_GC_NUDGE_BY_CUSTOMER_RE = _re.compile(
+    r"^\s*(?:"
+    r"(?:send|draft|write|compose|fire\s+off)\s+(?:a\s+|an?\s+)?(?:payment\s+)?"
+    r"(?:reminder|nudge|follow[\s-]up)\s+(?:to|for)\s+(?P<who>.+?)"
+    r"|nudge\s+(?P<who2>.+?)(?:\s+about\s+(?:their\s+|the\s+)?(?:invoice|payment|balance))?"
+    r"|remind\s+(?P<who3>.+?)\s+(?:about|to\s+pay)"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+_GC_RETAINAGE_RE = _re.compile(
+    r"^\s*(?:"
+    r"how\s+much\s+retainage\s+(?:are\s+we\s+(?:still\s+)?)?(?:owed|holding|still\s+holding|out)"
+    r"|(?:what(?:'s| is)?|total)\s+(?:our\s+|my\s+)?(?:total\s+)?retainage(?:\s+(?:balance|outstanding|owed|held))?"
+    r"|retainage\s+(?:owed|held|outstanding|balance|total)"
+    r"|(?:show|list)\s+(?:me\s+)?(?:the\s+|all\s+)?retainage"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+_GC_TOP_CLIENTS_RE = _re.compile(
+    r"^\s*(?:"
+    r"(?:show|list|give)\s+(?:me\s+)?(?:our\s+|my\s+|the\s+)?top\s+(?P<n>\d+|five|ten|three)?\s*(?:best\s+)?(?:clients?|customers?)"
+    r"(?:\s+by\s+(?:revenue|amount|spend|billing|paid|value))?"
+    r"|top\s+(?P<n2>\d+|five|ten|three)?\s*(?:clients?|customers?)\s+by\s+(?:revenue|amount|spend|billing|paid|value)"
+    r"|who(?:'?s| are)\s+(?:our|my)\s+top\s+(?P<n3>\d+|five|ten|three)?\s*(?:clients?|customers?)"
+    r"|biggest\s+(?:clients?|customers?)"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+_GC_FINISHING_THIS_MONTH_RE = _re.compile(
+    r"^\s*(?:"
+    r"(?:which|what)\s+(?:jobs|projects|builds)\s+(?:are\s+)?(?:scheduled\s+to\s+)?(?:finish|complete|wrap\s+up|end|close|done)"
+    r"\s+(?:this\s+|the\s+(?:rest\s+of\s+the\s+)?|by\s+(?:end\s+of\s+(?:the\s+)?)?)?"
+    r"(?P<period>month|week|quarter|year)"
+    r"|(?:jobs|projects|builds)\s+(?:finishing|completing|wrapping(?:\s+up)?|closing|done)"
+    r"\s+(?:this\s+|by\s+(?:end\s+of\s+)?)?(?P<period2>month|week|quarter|year)"
+    r"|what'?s?\s+(?:finishing|wrapping(?:\s+up)?|closing)\s+(?:this\s+)?(?P<period3>month|week|quarter|year)"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+_GC_HIGHEST_VALUE_RE = _re.compile(
+    r"^\s*(?:"
+    r"(?:what|which)\s+(?:jobs|projects|builds)\s+(?:have|are)\s+(?:the\s+)?(?:highest|biggest|largest|most|top)(?:\s+value|\s+contract|\s+dollar)?"
+    r"|(?:highest|biggest|largest|top)[\s-]value\s+(?:jobs|projects|builds)"
+    r"|biggest\s+(?:jobs|projects|builds)"
+    r"|(?:show|list)\s+(?:me\s+)?(?:my\s+)?(?:jobs|projects|builds)\s+by\s+(?:value|contract|size|dollar)"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+_GC_SIGNED_COS_FOR_PROJECT_RE = _re.compile(
+    r"^\s*(?:"
+    r"(?:show|list|give)\s+(?:me\s+)?(?:all\s+)?(?:the\s+)?signed\s+(?:c\.?o\.?s?|change[\s-]orders?)\s+(?:for|on)\s+(?:the\s+)?(?P<q1>.+?)(?:\s+project)?"
+    r"|signed\s+(?:c\.?o\.?s?|change[\s-]orders?)\s+(?:for|on)\s+(?:the\s+)?(?P<q2>.+?)(?:\s+project)?"
+    r"|what\s+(?:c\.?o\.?s?|change[\s-]orders?)\s+(?:are\s+)?signed\s+(?:for|on)\s+(?:the\s+)?(?P<q3>.+?)(?:\s+project)?"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+_GC_CO_REVENUE_PERIOD_RE = _re.compile(
+    r"^\s*(?:"
+    r"(?:show|tell|give)\s+(?:me\s+)?(?:my\s+|the\s+|our\s+)?(?:total\s+)?(?:change[\s-]order|c\.?o\.?)\s+(?:revenue|dollars?|total|captured|earnings?)"
+    r"\s+(?:this\s+|for\s+(?:this\s+|the\s+)?|so\s+far\s+this\s+)?(?P<period>month|week|quarter|year)"
+    r"|how\s+much\s+(?:change[\s-]order|c\.?o\.?)\s+(?:revenue|dollars?|money)\s+(?:(?:have|has)\s+(?:i|we|orby|she|you)\s+)?(?:captured|earned|made|landed|brought\s+in)?\s*"
+    r"(?:this\s+|for\s+(?:this\s+|the\s+)?|so\s+far\s+this\s+|in\s+the\s+(?:last\s+|past\s+)?)?(?P<period2>month|week|quarter|year)"
+    r"|(?:change[\s-]order|c\.?o\.?)\s+(?:revenue|dollars?|total|captured)\s+(?:this\s+|for\s+|so\s+far\s+this\s+)?(?P<period3>month|week|quarter|year)"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+# "Increase the Johnson contract by the approved change order amount" — the
+# user wants to confirm; signed COs already do this automatically. Status
+# explainer rather than a write.
+_GC_INCREASE_CONTRACT_BY_CO_RE = _re.compile(
+    r"^\s*(?:"
+    r"increase\s+(?:the\s+)?(?P<q>.+?)\s+contract\s+by\s+(?:the\s+)?(?:approved\s+)?(?:change[\s-]order|c\.?o\.?)\s+(?:amount|total)?"
+    r"|add\s+(?:the\s+)?(?:approved\s+)?(?:change[\s-]order|c\.?o\.?)\s+(?:amount|total)?\s+to\s+(?:the\s+)?(?P<q2>.+?)\s+contract"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+# Profitability: we don't track costs, so refuse honestly instead of inventing.
+_GC_PROJECTS_WITHOUT_FOREMAN_RE = _re.compile(
+    r"^\s*(?:"
+    r"(?:which|what)\s+(?:projects?|jobs?|builds?)\s+(?:do\s+)?(?:not|don'?t)\s+have\s+(?:a\s+|any\s+)?foreman(?:\s+assigned)?"
+    r"|(?:which|what)\s+(?:projects?|jobs?|builds?)\s+(?:are\s+)?(?:missing|without)\s+(?:a\s+|any\s+)?foreman(?:\s+assigned)?"
+    r"|(?:projects?|jobs?|builds?)\s+(?:with\s+no|missing|without)\s+(?:a\s+)?foreman(?:\s+assigned)?"
+    r"|(?:show|list)\s+(?:me\s+)?(?:projects?|jobs?|builds?)\s+(?:that\s+)?(?:lack|need|don'?t\s+have)\s+(?:a\s+)?foreman(?:\s+assigned)?"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+_GC_PCT_OVERDUE_RE = _re.compile(
+    r"^\s*(?:"
+    r"(?:what'?s|what\s+is)\s+(?:the\s+)?(?:percentage|percent|%)\s+of\s+(?:my\s+|our\s+|the\s+)?invoices?\s+(?:are\s+|that\s+are\s+)?overdue"
+    r"|what\s+(?:percentage|percent|%)\s+(?:of\s+(?:my\s+)?invoices?\s+)?(?:are\s+)?overdue"
+    r"|overdue\s+(?:percentage|percent|rate|ratio)"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+_GC_TOTAL_CONTRACT_VALUE_RE = _re.compile(
+    r"^\s*(?:"
+    r"(?:what'?s|what\s+is)\s+(?:the\s+|my\s+|our\s+)?total\s+contract\s+(?:value|amount|total)\s+(?:across\s+(?:all\s+)?(?:active\s+|open\s+)?(?:jobs|projects|builds)|of\s+(?:all\s+)?(?:active\s+|open\s+)?(?:jobs|projects|builds))"
+    r"|total\s+contract\s+(?:value|amount|total)\s+(?:across|of)\s+(?:all\s+)?(?:active\s+|open\s+)?(?:jobs|projects|builds)"
+    r"|(?:sum|total)\s+(?:of\s+)?(?:all\s+)?(?:active\s+|open\s+)?(?:job|project|build|contract)\s+values?"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+_GC_PROFITABILITY_RE = _re.compile(
+    r"^\s*(?:"
+    r"(?:what|which)\s+(?:jobs|projects|builds)\s+(?:are\s+(?:the\s+)?)?(?:most\s+|highest\s+)?profitab(?:le|ility)"
+    r"|(?:most\s+|highest\s+)profitab(?:le|ility)\s+(?:jobs|projects|builds)"
+    r"|(?:show|tell)\s+(?:me\s+)?(?:my\s+)?(?:job|project)\s+profitab(?:le|ility)"
+    r"|(?:job|project)\s+margins?"
+    r"|what\s+(?:are\s+)?(?:my\s+)?margins?\s+(?:per\s+|by\s+)?(?:job|project)?"
     r")\s*[?.!]?\s*$",
     _re.IGNORECASE,
 )
@@ -5068,7 +5970,7 @@ def _try_contractor_chat(message: str, user_rec: dict) -> dict | None:
                 "source": "gc_co_sent"}
 
     # 7. ADD CO (the trigger phrase — last so it doesn't shadow approve/send)
-    if _GC_ADD_CO_RE.match(msg):
+    if _GC_ADD_CO_RE.search(msg):
         return _handle_add_co(msg, user_rec)
 
     # 8. UNPAID / OWED LIST — "who owes me", "what invoices are open"
@@ -5399,14 +6301,465 @@ def _try_contractor_chat(message: str, user_rec: dict) -> dict | None:
         return {"reply": "\n".join(lines), "tier": "local",
                 "latency_ms": 0, "source": "gc_report"}
 
+    # 16a. NUDGE BY CUSTOMER NAME — "Send a payment reminder to Johnson"
+    nudge_by_cust = _handle_nudge_by_customer(msg, user_rec)
+    if nudge_by_cust is not None:
+        return nudge_by_cust
+
+    # 16b. RETAINAGE OWED — "how much retainage are we still owed"
+    if _GC_RETAINAGE_RE.match(msg):
+        return _handle_retainage_owed(user_rec)
+
+    # 16c. TOP CLIENTS BY REVENUE — "show me our top five clients"
+    m = _GC_TOP_CLIENTS_RE.match(msg)
+    if m:
+        n_raw = (m.group("n") or m.group("n2") or m.group("n3") or "5").strip().lower()
+        word_to_n = {"three": 3, "five": 5, "ten": 10}
+        try:
+            n = int(n_raw) if n_raw.isdigit() else word_to_n.get(n_raw, 5)
+        except ValueError:
+            n = 5
+        return _handle_top_clients(n, user_rec)
+
+    # 16d. JOBS FINISHING THIS PERIOD — "which jobs finish this month"
+    m = _GC_FINISHING_THIS_MONTH_RE.match(msg)
+    if m:
+        period = (m.group("period") or m.group("period2") or m.group("period3") or "month").lower()
+        return _handle_finishing_period(period, user_rec)
+
+    # 16e. HIGHEST-VALUE JOBS — "what jobs have the highest value"
+    if _GC_HIGHEST_VALUE_RE.match(msg):
+        return _handle_highest_value_jobs(user_rec)
+
+    # 16f. SIGNED COs FOR PROJECT — "show me signed COs for the Johnson project"
+    m = _GC_SIGNED_COS_FOR_PROJECT_RE.match(msg)
+    if m:
+        q = (m.group("q1") or m.group("q2") or m.group("q3") or "").strip()
+        if q:
+            return _handle_signed_cos_for_project(q, user_rec)
+
+    # 16g. CO REVENUE FOR PERIOD — "show me CO revenue this month/year"
+    m = _GC_CO_REVENUE_PERIOD_RE.match(msg)
+    if m:
+        period = (m.group("period") or m.group("period2") or m.group("period3") or "month").lower()
+        return _handle_co_revenue_period(period, user_rec)
+
+    # 16h. INCREASE CONTRACT BY CO — explainer (signed COs do this automatically)
+    m = _GC_INCREASE_CONTRACT_BY_CO_RE.match(msg)
+    if m:
+        q = (m.group("q") or m.group("q2") or "").strip()
+        return _handle_increase_contract_explainer(q, user_rec)
+
+    # 16h2. PROJECTS WITHOUT A FOREMAN — direct filter (was hallucinating
+    # project names because the LLM didn't have access to projects.json)
+    if _GC_PROJECTS_WITHOUT_FOREMAN_RE.match(msg):
+        nofor = [p for p in mod_projects.list_active(DATA_DIR)
+                 if not (p.get("foreman") or "").strip()]
+        if not nofor:
+            return {"reply": "Every active project has a foreman assigned. Nothing missing.",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "gc_projects_all_have_foreman"}
+        lines = [f"Projects missing a foreman ({len(nofor)}):"]
+        for p in nofor[:15]:
+            lines.append(f"  · {p.get('address','?')} — {p.get('label','(no label)')}")
+        lines.append("\nAssign one with: \"set foreman <name> on <project>\".")
+        return {"reply": "\n".join(lines), "tier": "local",
+                "latency_ms": 0, "source": "gc_projects_no_foreman"}
+
+    # 16h3. TOTAL CONTRACT VALUE ACROSS ACTIVE JOBS
+    if _GC_TOTAL_CONTRACT_VALUE_RE.match(msg):
+        active = mod_projects.list_active(DATA_DIR)
+        if not active:
+            return {"reply": "No active projects — total contract value is $0.",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "gc_total_contract_empty"}
+        base_total = sum(float(p.get("contract_amount") or 0) for p in active)
+        signed_co_total = sum(
+            mod_change_orders.signed_total_for_project(DATA_DIR, p["id"])
+            for p in active
+        )
+        grand = base_total + signed_co_total
+        co_bit = f"\n  + ${signed_co_total:,.0f} signed change orders" if signed_co_total else ""
+        return {"reply": (
+            f"💰 Total contract value across {len(active)} active "
+            f"job{'s' if len(active) != 1 else ''}: ${grand:,.0f}\n"
+            f"  Base contracts: ${base_total:,.0f}{co_bit}"
+            + (f"\n  Grand authorized: ${grand:,.0f}" if signed_co_total else "")
+        ), "tier": "local", "latency_ms": 0,
+           "source": "gc_total_contract_value"}
+
+    # 16h4. PERCENTAGE OF INVOICES OVERDUE
+    if _GC_PCT_OVERDUE_RE.match(msg):
+        all_invs = mod_invoices._load(DATA_DIR)
+        non_void = [i for i in all_invs if i.get("status") not in ("draft", "void")]
+        if not non_void:
+            return {"reply": "No invoices on the books yet — nothing to calculate.",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "gc_pct_overdue_empty"}
+        mod_invoices.list_overdue(DATA_DIR)  # side-effect: promote statuses
+        non_void = [i for i in mod_invoices._load(DATA_DIR)
+                    if i.get("status") not in ("draft", "void")]
+        overdue = [i for i in non_void if i.get("status") == "overdue"]
+        pct = (len(overdue) / len(non_void)) * 100 if non_void else 0
+        return {"reply": (
+            f"📊 {len(overdue)} of {len(non_void)} active invoices are overdue "
+            f"({pct:.1f}%).\n"
+            f"Run \"aging report\" to see the dollar breakdown."
+        ), "tier": "local", "latency_ms": 0,
+           "source": "gc_pct_overdue"}
+
+    # 16i. PROFITABILITY / MARGIN — honest refusal (no cost data tracked yet)
+    if _GC_PROFITABILITY_RE.match(msg):
+        return {"reply": (
+            "I don't track job costs yet, so I can't tell you which jobs are "
+            "the most profitable.\n"
+            "What I CAN tell you per job:\n"
+            "  · contract amount + signed CO total (authorized revenue)\n"
+            "  · amount billed and amount collected\n"
+            "  · current outstanding balance\n"
+            "For real margins I'd need labor hours, material spend, and sub "
+            "payouts — add a cost-tracking module and I can compute it. "
+            "Until then, say \"show me the money\" for the revenue view or "
+            "\"highest value jobs\" to sort by contract size."
+        ), "tier": "local", "latency_ms": 0,
+           "source": "gc_profitability_unavailable"}
+
     return None
+
+
+# ── Contractor reporting helpers ─────────────────────────────────────────
+
+def _find_projects_by_customer(query: str) -> list[dict]:
+    """Return projects whose customer_name OR address matches the query
+    (case-insensitive substring). Used by nudge-by-name + report-by-name."""
+    q = (query or "").strip().lower()
+    if not q:
+        return []
+    hits = []
+    for p in mod_projects._load(DATA_DIR):
+        name = (p.get("customer_name") or "").lower()
+        addr = (p.get("address") or "").lower()
+        label = (p.get("label") or "").lower()
+        if q in name or q in addr or q in label:
+            hits.append(p)
+    return hits
+
+
+def _handle_nudge_by_customer(msg: str, user_rec: dict) -> dict | None:
+    """'Send a payment reminder to Johnson Construction' — find that
+    customer's unpaid invoices and draft nudges for each. Returns None
+    if the message also references an INV-XXXX number (the existing
+    by-invoice nudge handler takes those)."""
+    if _INV_NUMBER_RE.search(msg):
+        return None
+    m = _GC_NUDGE_BY_CUSTOMER_RE.match(msg)
+    if not m:
+        return None
+    who = (m.group("who") or m.group("who2") or m.group("who3") or "").strip()
+    if not who:
+        return None
+    # Filter out the existing all/queue/INV verbs so we don't double-handle.
+    if who.lower() in ("everyone", "everybody", "all", "all overdue",
+                       "them", "the client", "the customer", "client",
+                       "customer"):
+        return None
+    projects = _find_projects_by_customer(who)
+    if not projects:
+        return {"reply": f"I don't see any projects for \"{who}\". Add them with: "
+                          f"\"add project at <address>\" then set customer name.",
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_nudge_customer_not_found"}
+    drafted = []
+    for p in projects:
+        for inv in mod_invoices.list_for_project(DATA_DIR, p["id"]):
+            owed = float(inv.get("amount_due", 0)) - float(inv.get("amount_paid", 0))
+            if owed <= 0:
+                continue
+            if inv.get("status") in ("paid", "void", "draft"):
+                continue
+            escalation = min(3, max(1, int(inv.get("follow_up_count", 0)) + 1))
+            text = _draft_nudge_text(inv, p, escalation=escalation)
+            mod_invoices.mark_followed_up(DATA_DIR, inv["id"])
+            audit.log_event(DATA_DIR, actor=user_rec.get("username", "?"),
+                            action="invoice.nudge_drafted",
+                            meta={"invoice_id": inv["id"], "escalation": escalation,
+                                  "via": "by_customer_name", "customer": who})
+            drafted.append((inv, p, text, escalation))
+    if not drafted:
+        return {"reply": f"Nothing to nudge — no unpaid invoices for \"{who}\".",
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_nudge_customer_clear"}
+    lines = [f"Drafted {len(drafted)} reminder{'s' if len(drafted) != 1 else ''} for {who} — review and send:"]
+    for inv, p, text, esc in drafted[:5]:
+        tier_label = ["", "friendly", "firmer", "formal"][esc]
+        email = p.get("customer_email") or "(no email on file)"
+        lines.append(f"\n────── {inv.get('invoice_number','?')} → {email} ({tier_label}) ──────")
+        lines.append(text)
+    return {"reply": "\n".join(lines), "tier": "local",
+            "latency_ms": 0, "source": "gc_nudge_by_customer"}
+
+
+def _handle_retainage_owed(user_rec: dict) -> dict:
+    """Sum retainage_held across paid/partial invoices for projects that
+    haven't been closed out yet. That's the amount still parked with the
+    GC waiting for the closeout release invoice."""
+    by_project = {}
+    grand = 0.0
+    for p in mod_projects._load(DATA_DIR):
+        if p.get("status") == "completed":
+            continue
+        held = mod_invoices.retainage_held_for_project(DATA_DIR, p["id"])
+        if held > 0:
+            by_project[p["id"]] = (p, held)
+            grand += held
+    if grand <= 0:
+        return {"reply": "No retainage held — every active project is at $0 retainage so far.",
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_retainage_clear"}
+    lines = [f"💰 Retainage still being held: ${grand:,.0f} (across {len(by_project)} project{'s' if len(by_project) != 1 else ''})"]
+    items = sorted(by_project.values(), key=lambda t: t[1], reverse=True)
+    for p, held in items[:10]:
+        lines.append(f"  · {p.get('address','?')} — ${held:,.0f}")
+    lines.append("\nReleased at project closeout when you mark each one complete.")
+    return {"reply": "\n".join(lines), "tier": "local",
+            "latency_ms": 0, "source": "gc_retainage_owed"}
+
+
+def _handle_top_clients(n: int, user_rec: dict) -> dict:
+    """Group invoices by project.customer_name and rank by amount_paid."""
+    projects = {p["id"]: p for p in mod_projects._load(DATA_DIR)}
+    totals: dict[str, dict] = {}
+    for inv in mod_invoices._load(DATA_DIR):
+        p = projects.get(inv.get("project_id", ""))
+        if not p:
+            continue
+        name = (p.get("customer_name") or "").strip() or "(unnamed customer)"
+        slot = totals.setdefault(name, {"billed": 0.0, "paid": 0.0, "jobs": set()})
+        if inv.get("status") not in ("draft", "void"):
+            slot["billed"] += float(inv.get("amount_due", 0))
+        slot["paid"] += float(inv.get("amount_paid", 0))
+        slot["jobs"].add(p["id"])
+    if not totals:
+        return {"reply": "No client revenue yet — once invoices are paid I can rank "
+                          "them. Add an invoice with: \"invoice the <project> $<amt>\".",
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_top_clients_empty"}
+    ranked = sorted(totals.items(), key=lambda kv: kv[1]["paid"], reverse=True)[:max(1, n)]
+    lines = [f"🏆 Top {len(ranked)} client{'s' if len(ranked) != 1 else ''} by revenue (paid):"]
+    for i, (name, t) in enumerate(ranked, 1):
+        lines.append(f"  {i}. {name} — ${t['paid']:,.0f} paid (${t['billed']:,.0f} billed, {len(t['jobs'])} job{'s' if len(t['jobs']) != 1 else ''})")
+    return {"reply": "\n".join(lines), "tier": "local",
+            "latency_ms": 0, "source": "gc_top_clients"}
+
+
+def _handle_finishing_period(period: str, user_rec: dict) -> dict:
+    """Return projects whose est_complete falls inside the given period
+    (this week / month / quarter / year). est_complete is stored as
+    'YYYY-MM-DD' or empty."""
+    from datetime import date as _date, timedelta as _td
+    today = _date.today()
+    if period == "week":
+        end = today + _td(days=7)
+        label = "this week"
+    elif period == "month":
+        if today.month == 12:
+            end = _date(today.year + 1, 1, 1) - _td(days=1)
+        else:
+            end = _date(today.year, today.month + 1, 1) - _td(days=1)
+        label = "this month"
+    elif period == "quarter":
+        q_end_month = ((today.month - 1) // 3 + 1) * 3
+        if q_end_month == 12:
+            end = _date(today.year + 1, 1, 1) - _td(days=1)
+        else:
+            end = _date(today.year, q_end_month + 1, 1) - _td(days=1)
+        label = "this quarter"
+    else:  # year
+        end = _date(today.year, 12, 31)
+        label = "this year"
+    matches = []
+    for p in mod_projects._load(DATA_DIR):
+        if p.get("status") in ("completed", "cancelled"):
+            continue
+        est = (p.get("est_complete") or "").strip()
+        if not est or len(est) < 10:
+            continue
+        try:
+            est_d = _date.fromisoformat(est[:10])
+        except ValueError:
+            continue
+        if today <= est_d <= end:
+            matches.append((est_d, p))
+    if not matches:
+        return {"reply": f"No projects scheduled to finish {label} (between today and {end.strftime('%b %-d')}). "
+                          f"Either nothing's lined up, or projects don't have est_complete dates set yet.",
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_finishing_none"}
+    matches.sort(key=lambda t: t[0])
+    lines = [f"Projects finishing {label} ({len(matches)}):"]
+    for est_d, p in matches[:15]:
+        amt = p.get("contract_amount") or 0
+        lines.append(f"  · {est_d.strftime('%a %b %-d')} — {p.get('address','?')} (${amt:,.0f})")
+    return {"reply": "\n".join(lines), "tier": "local",
+            "latency_ms": 0, "source": "gc_finishing_period"}
+
+
+def _handle_highest_value_jobs(user_rec: dict) -> dict:
+    """Rank active projects by contract_amount + signed CO total."""
+    active = mod_projects.list_active(DATA_DIR)
+    if not active:
+        return {"reply": "No active projects to rank.",
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_highest_value_empty"}
+    enriched = []
+    for p in active:
+        base = float(p.get("contract_amount") or 0)
+        co = mod_change_orders.signed_total_for_project(DATA_DIR, p["id"])
+        enriched.append((base + co, base, co, p))
+    enriched.sort(key=lambda t: t[0], reverse=True)
+    lines = [f"Active jobs ranked by total contract value ({len(enriched)}):"]
+    for total, base, co, p in enriched[:10]:
+        co_bit = f" (+${co:,.0f} CO)" if co else ""
+        lines.append(f"  · ${total:,.0f}{co_bit} — {p.get('address','?')} — {p.get('label','')}")
+    return {"reply": "\n".join(lines), "tier": "local",
+            "latency_ms": 0, "source": "gc_highest_value"}
+
+
+def _handle_signed_cos_for_project(query: str, user_rec: dict) -> dict:
+    matches = mod_projects.find_by_address(DATA_DIR, query)
+    # Fallback: customer-name match
+    if not matches:
+        matches = _find_projects_by_customer(query)
+    if not matches:
+        return {"reply": f"I don't see a project matching \"{query}\".",
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_signed_cos_project_not_found"}
+    if len(matches) > 1:
+        listed = "\n".join(f"  · {p['address']} ({p.get('label','')})" for p in matches[:5])
+        return {"reply": f"Multiple projects match \"{query}\":\n{listed}\nBe more specific.",
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_signed_cos_project_ambiguous"}
+    p = matches[0]
+    signed = mod_change_orders.list_for_project(DATA_DIR, p["id"], statuses=["signed"])
+    if not signed:
+        return {"reply": f"No signed change orders yet on {p['address']}.",
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_signed_cos_none"}
+    total = sum(float(c.get("amount", 0)) for c in signed)
+    lines = [f"Signed change orders on {p['address']} ({len(signed)}, total +${total:,.0f}):"]
+    from datetime import datetime as _dt
+    for c in signed[:15]:
+        amt = float(c.get("amount", 0))
+        sign = "+" if amt >= 0 else ""
+        ts = c.get("client_signed_at")
+        signed_date = ""
+        if ts:
+            try:
+                signed_date = " on " + _dt.fromtimestamp(int(ts)).strftime("%b %-d")
+            except (ValueError, OSError):
+                pass
+        lines.append(f"  · #{c.get('co_number','?')} {sign}${amt:,.0f}{signed_date} — {c.get('description','')[:60]}")
+    return {"reply": "\n".join(lines), "tier": "local",
+            "latency_ms": 0, "source": "gc_signed_cos_for_project"}
+
+
+def _handle_co_revenue_period(period: str, user_rec: dict) -> dict:
+    """Sum signed CO amounts where client_signed_at falls inside the period."""
+    from datetime import date as _date, datetime as _dt, timedelta as _td
+    today = _date.today()
+    if period == "week":
+        start = today - _td(days=today.weekday())
+        label = "this week"
+    elif period == "month":
+        start = _date(today.year, today.month, 1)
+        label = "this month"
+    elif period == "quarter":
+        q_start_month = ((today.month - 1) // 3) * 3 + 1
+        start = _date(today.year, q_start_month, 1)
+        label = "this quarter"
+    else:
+        start = _date(today.year, 1, 1)
+        label = "this year"
+    start_ts = int(_dt.combine(start, _dt.min.time()).timestamp())
+    total = 0.0
+    cos_in = []
+    for c in mod_change_orders._load(DATA_DIR):
+        if c.get("status") != "signed":
+            continue
+        ts = int(c.get("client_signed_at") or 0)
+        if ts < start_ts:
+            continue
+        total += float(c.get("amount") or 0)
+        cos_in.append(c)
+    if not cos_in:
+        return {"reply": f"No signed change orders {label} yet.\n"
+                          f"(I count COs as revenue the day the client signs them.)",
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_co_revenue_period_zero"}
+    lines = [f"Change-order revenue {label}: ${total:,.0f} ({len(cos_in)} signed CO{'s' if len(cos_in) != 1 else ''})"]
+    for c in sorted(cos_in, key=lambda x: -float(x.get("amount", 0)))[:5]:
+        proj = mod_projects.get(DATA_DIR, c.get("project_id", "")) or {}
+        amt = float(c.get("amount", 0))
+        lines.append(f"  · ${amt:,.0f} — {proj.get('address','?')} — {c.get('description','')[:60]}")
+    return {"reply": "\n".join(lines), "tier": "local",
+            "latency_ms": 0, "source": "gc_co_revenue_period"}
+
+
+def _handle_increase_contract_explainer(query: str, user_rec: dict) -> dict:
+    """User asked us to manually increase a project's contract by the CO
+    amount. Explain that signed COs do this automatically — show the
+    current authorized total so they can see it's already done."""
+    matches = mod_projects.find_by_address(DATA_DIR, query) if query else []
+    if not matches:
+        matches = _find_projects_by_customer(query) if query else []
+    if not matches:
+        return {"reply": (
+            "Signed change orders are already added to the contract total "
+            "automatically — you don't need to manually adjust the contract "
+            "amount.\n"
+            "I couldn't find a project matching \"" + (query or "(none)") + "\". "
+            "Try \"status of the <address> project\" to see its current "
+            "authorized total."
+        ), "tier": "local", "latency_ms": 0,
+           "source": "gc_increase_contract_unknown_project"}
+    if len(matches) > 1:
+        listed = "\n".join(f"  · {p['address']} ({p.get('label','')})" for p in matches[:5])
+        return {"reply": f"Multiple projects match \"{query}\":\n{listed}\nWhich one?",
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_increase_contract_ambiguous"}
+    p = matches[0]
+    base = float(p.get("contract_amount") or 0)
+    signed_co = mod_change_orders.signed_total_for_project(DATA_DIR, p["id"])
+    total = base + signed_co
+    return {"reply": (
+        f"Signed change orders are added automatically — no manual "
+        f"adjustment needed.\n"
+        f"{p['address']} current authorized total: ${total:,.0f}\n"
+        f"  · Original contract: ${base:,.0f}\n"
+        f"  · Signed COs:        +${signed_co:,.0f}\n"
+        f"(If a CO is still pending client signature, it won't be counted "
+        f"until they sign. Check with: \"pending change orders\".)"
+    ), "tier": "local", "latency_ms": 0,
+       "source": "gc_increase_contract_explainer"}
 
 
 # ── Change-order draft + signing helpers ──────────────────────────────────
 
 def _handle_add_co(msg: str, user_rec: dict) -> dict:
     """Parse the CO add intent. Looks for an amount + a project reference +
-    a description. Many natural phrasings — be forgiving."""
+    a description, OR line items + the pricing catalog. Many natural
+    phrasings — be forgiving.
+
+    Flow per Frank's spec:
+      1. parse line items ("3 plugs in the garage and 3 lights in the kitchen")
+      2. look up unit prices from pricing catalog
+      3. if a $-amount was explicit in the message, use it; else use the
+         sum from priced line items
+      4. fill the customer's labeled CO template if one is uploaded;
+         else fall back to Orby's generic CO doc text
+      5. save filled PDF into ~/Orbi/clients/<customer>/change_orders/
+      6. mint sign URL inline for foreman → customer to sign on the spot
+    """
     # Strip the leading verb so what's left is the meaningful payload.
     payload = _GC_ADD_CO_RE.sub("", msg, count=1).strip(" :—–-,")
     if not payload:
@@ -5414,11 +6767,7 @@ def _handle_add_co(msg: str, user_rec: dict) -> dict:
                           "E.g. \"CO on 555 Oak — $1200 extra trim work\".",
                 "tier": "local", "latency_ms": 0,
                 "source": "gc_co_no_details"}
-    amount = _parse_money(payload)
-    if not amount:
-        return {"reply": "I need a dollar amount. E.g. \"$1200\".",
-                "tier": "local", "latency_ms": 0,
-                "source": "gc_co_no_amount"}
+    explicit_amount = _parse_money(payload)
     # Find a project reference. Try matching any active project's address
     # or label as a substring of the payload.
     active = mod_projects.list_active(DATA_DIR)
@@ -5436,6 +6785,13 @@ def _handle_add_co(msg: str, user_rec: dict) -> dict:
                 break
         if project:
             break
+    # Also try matching by customer name
+    if not project:
+        for p in active:
+            cn = (p.get("customer_name") or "").lower()
+            if cn and any(t in payload_l for t in cn.split() if len(t) >= 3):
+                project = p
+                break
     if not project:
         if not active:
             return {"reply": "You don't have any active projects yet. Add one first: \"new project at <address> — $X <label>\".",
@@ -5448,52 +6804,161 @@ def _handle_add_co(msg: str, user_rec: dict) -> dict:
     # Extract description = payload minus the matched project label/address
     # and minus the dollar amount.
     description = _DOLLAR_AMT_RE.sub("", payload).strip(" ,—–-")
-    for token in (project.get("address", ""), project.get("label", "")):
+    for token in (project.get("address", ""), project.get("label", ""),
+                   project.get("customer_name", "")):
         if token:
             description = _re.sub(_re.escape(token), "", description, flags=_re.IGNORECASE)
     description = _re.sub(r"\s+", " ", description).strip(" :—–-,.")
-    # Strip leading filler words separately — str.strip() takes a char
-    # set, not a word set, so passing 'for' would eat 'f','o','r' as
-    # individual characters (and chop the 'o' off "on the Oak project").
+    # Strip leading filler words separately
     description = _re.sub(r"^(?:for|on|that|with|of|to)\s+", "", description,
                             flags=_re.IGNORECASE).strip()
     if not description:
         description = "Additional scope agreed with client"
-    # Build the draft + save. Per Frank's actual workflow: the foreman is
-    # standing next to the customer when they create the CO. Customer
-    # signs ON THE FOREMAN'S DEVICE, right then, no GC-approval gate.
-    # So we skip "awaiting_approval" → go straight to "sent_for_signature"
-    # and mint a sign URL the foreman opens on the spot.
-    draft = _draft_change_order_text(project, description, amount)
+
+    # Parse line items + lookup pricing catalog
+    line_rows = mod_line_items.parse(description, data_dir=DATA_DIR)
+    priced_total = mod_line_items.total(line_rows)
+
+    # Decide on the dollar amount:
+    #   - explicit $X in the message always wins
+    #   - else use priced total from line items
+    #   - else need user to specify
+    if explicit_amount:
+        amount = explicit_amount
+    elif priced_total > 0:
+        amount = priced_total
+    else:
+        if line_rows:
+            preview = mod_line_items.format_for_co_description(line_rows)
+            return {"reply": (
+                f"I parsed these line items but no pricing on file matched:\n"
+                f"{preview}\n\n"
+                f"Add unit prices in Settings → Pricing, or tell me the "
+                f"dollar amount and I'll create the CO. E.g. \"CO on "
+                f"{project['address'][:30]} — $X for the above\""
+            ), "tier": "local", "latency_ms": 0,
+               "source": "gc_co_lines_no_price",
+               "parsed_items": line_rows}
+        return {"reply": "I need a dollar amount. E.g. \"$1200\".",
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_co_no_amount"}
+
+    # If we have line items, replace the flat description with the
+    # itemized version so it shows up on the CO doc as a proper list.
+    if line_rows:
+        itemized = mod_line_items.format_for_co_description(line_rows)
+        full_description = description + "\n\n" + itemized
+    else:
+        full_description = description
+
+    # Build the CO record
+    draft = _draft_change_order_text(project, full_description, amount)
     co = mod_change_orders.add(
         DATA_DIR,
         project_id=project["id"],
-        description=description,
+        description=full_description,
         amount=amount,
         draft_text=draft,
         status="sent_for_signature",
     )
-    # Stamp the "sent" metadata so the audit trail shows in_person, not email
     mod_change_orders.update(
         DATA_DIR, co["id"],
         sent_at=int(time.time()),
         sent_via="in_person",
     )
+
+    # Always ensure the client folder exists, even if no template is uploaded.
+    customer_name = (project.get("customer_name") or "").strip()
+    if customer_name:
+        try:
+            mod_clients.ensure_folder(customer_name, CONFIG)
+        except Exception as e:
+            log.warning(f"client folder create failed for {customer_name!r}: {e}")
+
+    # Try to fill the customer's branded CO template. If they haven't
+    # uploaded one yet, skip — the sign-page shows draft_text instead.
+    filled_pdf_path = None
+    filled_pdf_label = ""
+    try:
+        tpl = mod_forms.get_default(DATA_DIR, "change_order")
+        if tpl:
+            business = mod_business.load(DATA_DIR)
+            context = mod_form_filler.build_context_for_co(project, co, business)
+            tpl_path = _resolve_template_path(tpl)
+            if tpl_path and tpl_path.exists():
+                # Save into the client's change_orders/ folder for organization
+                customer_name = project.get("customer_name") or "Unnamed Client"
+                from datetime import datetime as _dt
+                co_num = co.get("co_number", "?")
+                ext = ".pdf" if tpl["format"] == "pdf" else ".docx"
+                fname = f"CO_{co_num}_{_dt.now().strftime('%Y-%m-%d')}{ext}"
+                client_dir = mod_clients.subfolder(customer_name, "change_orders", CONFIG)
+                out_path = client_dir / fname
+                mod_form_filler.fill(tpl_path, tpl["format"],
+                                       tpl.get("detected_fields", []) or [],
+                                       context, out_path)
+                filled_pdf_path = out_path
+                filled_pdf_label = tpl["display_name"]
+                # Also stash the path on the CO record for the sign page to surface
+                mod_change_orders.update(DATA_DIR, co["id"],
+                                          filled_template_path=str(out_path))
+    except Exception as e:
+        log.warning(f"branded CO template fill failed: {e}")
+
     token = _mint_co_sign_token(co["id"])
     sign_url = _co_sign_url(token)
     audit.log_event(DATA_DIR, actor=user_rec.get("username", "?"),
                     action="co.drafted_for_in_person_sign",
                     meta={"co_id": co["id"], "project_id": project["id"],
-                          "amount": amount})
+                          "amount": amount,
+                          "line_items": len(line_rows),
+                          "filled_template": filled_pdf_label})
     sign = "+" if amount >= 0 else ""
-    return {"reply": (f"CO drafted — {project['address']}: \"{description[:70]}\" "
-                      f"({sign}${amount:,.0f}).\n\n"
-                      f"👉 Hand the device to {project.get('customer_name') or 'the customer'} "
-                      f"to review + sign:\n{sign_url}\n\n"
-                      f"Office gets notified the moment they sign."),
+    reply_lines = [
+        f"CO #{co.get('co_number','?')} drafted — {project['address']}",
+        f"  Customer: {project.get('customer_name') or 'Unnamed'}",
+        f"  Amount: {sign}${amount:,.0f}",
+    ]
+    if line_rows and priced_total > 0:
+        reply_lines.append("\nLine items:")
+        reply_lines.append(mod_line_items.format_for_co_description(line_rows))
+    elif line_rows:
+        reply_lines.append("\nLine items (no pricing on file — manually verified):")
+        reply_lines.append(mod_line_items.format_for_co_description(line_rows))
+    else:
+        reply_lines.append(f"\n  \"{description[:120]}\"")
+    if filled_pdf_path:
+        reply_lines.append(f"\n📄 Filled into your branded template ({filled_pdf_label}):")
+        reply_lines.append(f"   {filled_pdf_path}")
+    reply_lines.append(
+        f"\n👉 Hand the device to {project.get('customer_name') or 'the customer'} "
+        f"to review + sign:\n{sign_url}\n\n"
+        f"Office gets notified the moment they sign."
+    )
+    return {"reply": "\n".join(reply_lines),
             "tier": "local", "latency_ms": 0,
             "source": "gc_co_drafted_for_sign",
-            "sign_url": sign_url}
+            "sign_url": sign_url,
+            "co_id": co["id"],
+            "filled_template_path": str(filled_pdf_path) if filled_pdf_path else None}
+
+
+def _resolve_template_path(tpl: dict) -> Path | None:
+    """Resolve a form template's storage_path (stored as relative when
+    possible) into an absolute Path under the data dir."""
+    p = tpl.get("storage_path")
+    if not p:
+        return None
+    pp = Path(p)
+    if pp.is_absolute():
+        return pp
+    # Try relative to data_dir
+    candidate = DATA_DIR / tpl.get("format", "pdf") and DATA_DIR / "form_templates" / f"{tpl['id']}.{tpl.get('format','pdf')}"
+    if isinstance(candidate, Path) and candidate.exists():
+        return candidate
+    # Last resort: data/form_templates/<id>.<format>
+    fallback = DATA_DIR / "form_templates" / f"{tpl['id']}.{tpl.get('format','pdf')}"
+    return fallback if fallback.exists() else None
 
 
 def _find_project_in_payload(payload: str) -> dict | None:
@@ -5707,9 +7172,24 @@ def _handle_assign_sub(msg: str, user_rec: dict) -> dict:
         return None
     sub_query = m.group("sub").strip()
     rest = m.group("rest").strip()
-    # Find sub
+    # Find sub. If no match AND the query doesn't look like a real sub
+    # name (e.g. "schedule a site visit Friday at 10 AM" → sub_query="a
+    # site visit Friday"), fall through so quick_capture can route it as
+    # a calendar event instead of swallowing it with "no sub matching".
     sub_matches = mod_subs.find_sub(DATA_DIR, sub_query)
     if not sub_matches:
+        sql = sub_query.lower()
+        looks_calendar = any(w in sql for w in (
+            "site visit", "appointment", "meeting", "consultation",
+            "walkthrough", "walk through", "estimate visit",
+        ))
+        # If the verb was "schedule" or "dispatch" AND the sub_query
+        # doesn't look like a person/company name (no capitalized noun
+        # in first 30 chars), let it fall through.
+        leading_verb_match = _re.match(r"^\s*(\w+)", msg)
+        leading_verb = leading_verb_match.group(1).lower() if leading_verb_match else ""
+        if looks_calendar or leading_verb in ("schedule", "dispatch"):
+            return None
         return {"reply": f"I don't see a sub matching \"{sub_query}\".",
                 "tier": "local", "latency_ms": 0,
                 "source": "gc_assign_sub_not_found"}
@@ -5854,10 +7334,14 @@ def _handle_project_full_report(msg: str, user_rec: dict) -> dict | None:
     m = _GC_PROJECT_REPORT_RE.match(msg)
     if not m:
         return None
-    q = (m.group("q1") or m.group("q2") or m.group("q3") or "").strip()
+    q = (m.group("q1") or m.group("q2") or m.group("q3")
+          or m.group("q4") or m.group("q5") or "").strip()
     if not q or q.lower() in {"things", "stuff", "money", "today"}:
         return None
     matches = mod_projects.find_by_address(DATA_DIR, q)
+    if not matches:
+        # Fallback: customer-name match (e.g. "history for Johnson")
+        matches = _find_projects_by_customer(q)
     if not matches:
         return None
     if len(matches) > 1:
@@ -6670,6 +8154,12 @@ def _handle_add_invoice(msg: str, user_rec: dict) -> dict:
 def _handle_record_payment(msg: str, user_rec: dict) -> dict:
     """Parse 'received $3000 on INV-2026-0001' / 'mark INV-2026-0042
     paid'. Records the payment and updates invoice status."""
+    # Skip hypotheticals — "if I billed Sarah $5000 and she paid $2000..."
+    # That's a math question, not a payment record. Same for past tense
+    # narration without an explicit INV-XXXX number.
+    if _re.match(r"^\s*(?:if|suppose|imagine|what\s+if|let'?s\s+say|hypothetical)",
+                  msg, _re.IGNORECASE):
+        return None
     m = _GC_RECORD_PAYMENT_RE.match(msg)
     if not m:
         return None
@@ -6768,8 +8258,12 @@ def _send_co_for_signature_email(co: dict, project: dict,
 _CANCEL_APPT_RE = _re.compile(
     r"^\s*(?:cancel|delete|remove|drop)\s+"
     r"(?:my\s+|the\s+)?"
+    # Stop the `what` capture at compound conjunctions ("and tell joe ...",
+    # "and let him know ...") so we don't try to match the message half
+    # as an event title.
     r"(?P<what>.+?)"
     r"(?:\s+appointment|\s+meeting|\s+event|\s+booking)?"
+    r"(?:\s+and\s+(?:tell|let|send|email|text|message|notify|forward|relay|call|ping)\b.+)?"
     r"\s*[.?!]?\s*$",
     _re.IGNORECASE,
 )
@@ -7593,9 +9087,21 @@ _TOMORROW_BRIEF_RE = _re.compile(
     r"^\s*(?:"
     r"(?:what'?s?|show\s+me|give\s+me)\s+(?:on\s+)?(?:my\s+|the\s+)?(?:agenda\s+|schedule\s+|calendar\s+)?"
     r"(?:for\s+)?tomorrow"
-    r"|tomorrow'?s?\s+(?:brief|briefing|agenda|schedule|rundown|preview)"
-    r"|what\s+do\s+i\s+have\s+tomorrow"
+    r"|tomorrow'?s?\s+(?:brief|briefing|agenda|schedule|rundown|preview|appointments?|events?|meetings?)"
+    r"|what\s+(?:do\s+i\s+have|appointments?(?:\s+do\s+i\s+have)?|meetings?(?:\s+do\s+i\s+have)?|events?(?:\s+do\s+i\s+have)?|is\s+(?:on\s+)?(?:my\s+)?(?:schedule|calendar|agenda))\s+tomorrow"
+    r"|(?:any|which)\s+(?:appointments?|meetings?|events?)\s+tomorrow"
+    r"|appointments?\s+tomorrow"
     r"|brief\s+me\s+(?:for\s+|on\s+)tomorrow"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+_APPT_TODAY_RE = _re.compile(
+    r"^\s*(?:"
+    r"what\s+appointments?\s+(?:are\s+(?:scheduled\s+)?(?:for\s+)?today|do\s+i\s+have\s+today)"
+    r"|(?:any|which)\s+appointments?\s+today"
+    r"|appointments?\s+(?:for\s+)?today"
+    r"|what\s+meetings?\s+(?:are\s+(?:scheduled\s+)?(?:for\s+)?today|do\s+i\s+have\s+today)"
+    r"|meetings?\s+(?:for\s+)?today"
     r")\s*[?.!]?\s*$",
     _re.IGNORECASE,
 )
@@ -7711,6 +9217,1640 @@ def _try_tomorrow_brief(message: str, user_rec: dict) -> dict | None:
         lines.append("  Nothing on the books for tomorrow. Quiet day.")
     return {"reply": "\n".join(lines), "tier": "local",
             "latency_ms": 0, "source": "tomorrow_brief"}
+
+
+_CONTACTS_ADD_RE = _re.compile(
+    r"^\s*(?:"
+    r"add\s+(?:a\s+)?(?:new\s+)?contact\s+(?:(?:named|called)\s+|for\s+)?(?P<name>[A-Za-z][A-Za-z'\-]+(?:\s+[A-Za-z][A-Za-z'\-]+){0,3})"
+    r"|new\s+contact\s+(?:(?:named|called)\s+|for\s+)?(?P<name2>[A-Za-z][A-Za-z'\-]+(?:\s+[A-Za-z][A-Za-z'\-]+){0,3})"
+    r"|create\s+(?:a\s+)?(?:new\s+)?contact\s+(?:named\s+|called\s+|for\s+)?(?P<name3>[A-Za-z][A-Za-z'\-]+(?:\s+[A-Za-z][A-Za-z'\-]+){0,3})"
+    r")"
+    r"(?:\s*[,—–-]\s*(?P<rest>.+?))?"
+    r"\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+_CONTACTS_FIND_RE = _re.compile(
+    r"^\s*(?:"
+    r"find\s+(?:contact\s+)?(?P<name>[A-Za-z][A-Za-z'\-]+(?:\s+[A-Za-z][A-Za-z'\-]+){0,3})"
+    r"|look\s*up\s+(?:contact\s+)?(?P<name2>[A-Za-z][A-Za-z'\-]+(?:\s+[A-Za-z][A-Za-z'\-]+){0,3})"
+    r"|(?:show|get)\s+(?:me\s+)?(?P<name4>[A-Za-z][A-Za-z'\-]+(?:\s+[A-Za-z][A-Za-z'\-]+){0,3})(?:'s)?\s+(?:contact\s+(?:info|details|card)|info|details)"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+_CONTACTS_LIST_FOR_RE = _re.compile(
+    r"^\s*(?:show|list|give)\s+(?:me\s+)?(?:all\s+)?(?:my\s+|the\s+)?contacts?\s+(?:for|at|from|with)\s+(?P<who>.+?)\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+_CONTACTS_ALL_RE = _re.compile(
+    r"^\s*(?:show|list|give)\s+(?:me\s+)?(?:all\s+)?(?:my\s+|the\s+)?contacts?\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+_CONTACTS_CONVO_RE = _re.compile(
+    r"^\s*(?:show|list|give)\s+(?:me\s+)?(?:every|all)\s+conversations?\s+(?:we(?:'ve| have)?\s+)?(?:had\s+)?with\s+(?P<name>.+?)\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+
+
+def _try_contacts_chat(message: str, user_rec: dict) -> dict | None:
+    """Per-user contacts CRUD via chat. Returns None to fall through."""
+    if not message:
+        return None
+    msg = _strip_polite_prefix(message)
+    username = user_rec.get("username", "owner")
+    try:
+        user_dir = users_mod.get_user_dir(DATA_DIR, username)
+    except Exception:
+        return None
+
+    # CONTACTS FOR <company> — "show contacts for Johnson Construction"
+    m = _CONTACTS_LIST_FOR_RE.match(msg)
+    if m:
+        who = (m.group("who") or "").strip().rstrip("?.!")
+        if who:
+            q = who.lower()
+            hits = [c for c in mod_contacts.list_all(user_dir)
+                    if q in (c.get("company") or "").lower()
+                    or q in (c.get("name") or "").lower()
+                    or q in (c.get("notes") or "").lower()
+                    or any(q in t.lower() for t in c.get("tags") or [])]
+            if not hits:
+                return {"reply": (
+                    f"No contacts for \"{who}\" yet. Add one with: "
+                    f"\"add a new contact named John Smith\" — I'll save them "
+                    f"to your contact book."
+                ), "tier": "local", "latency_ms": 0,
+                   "source": "contacts_list_for_empty"}
+            lines = [f"Contacts for {who} ({len(hits)}):"]
+            for c in hits[:20]:
+                bits = [c.get("name", "?")]
+                if c.get("phone"): bits.append(c["phone"])
+                if c.get("email"): bits.append(c["email"])
+                if c.get("company") and q not in c["company"].lower():
+                    bits.append(f"({c['company']})")
+                lines.append("  · " + " — ".join(bits))
+            return {"reply": "\n".join(lines), "tier": "local",
+                    "latency_ms": 0, "source": "contacts_list_for"}
+
+    # FIND <name> — "find Sarah Jones"
+    m = _CONTACTS_FIND_RE.match(msg)
+    if m:
+        name = (m.group("name") or m.group("name2") or m.group("name3")
+                or m.group("name4") or "").strip()
+        if name:
+            c = mod_contacts.find_by_name(user_dir, name)
+            if c:
+                bits = [f"📇 {c.get('name','?')}"]
+                if c.get("company"): bits.append(f"  Company: {c['company']}")
+                if c.get("phone"):   bits.append(f"  Phone:   {c['phone']}")
+                if c.get("email"):   bits.append(f"  Email:   {c['email']}")
+                if c.get("notes"):   bits.append(f"  Notes:   {c['notes'][:200]}")
+                if c.get("tags"):    bits.append(f"  Tags:    {', '.join(c['tags'])}")
+                if c.get("last_contact"):
+                    bits.append(f"  Last:    {c['last_contact'][:10]}")
+                return {"reply": "\n".join(bits), "tier": "local",
+                        "latency_ms": 0, "source": "contacts_found"}
+            # Try fuzzy search
+            results = mod_contacts.search(user_dir, name)
+            if results:
+                lines = [f"No exact match for \"{name}\". Possible matches:"]
+                for r in results[:5]:
+                    lines.append(f"  · {r.get('name','?')} ({r.get('company','')})")
+                return {"reply": "\n".join(lines), "tier": "local",
+                        "latency_ms": 0, "source": "contacts_found_fuzzy"}
+            return {"reply": f"No contact matching \"{name}\".",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "contacts_not_found"}
+
+    # ADD CONTACT — "add a new contact named Sarah Jones"
+    m = _CONTACTS_ADD_RE.match(msg)
+    if m:
+        name = (m.group("name") or m.group("name2") or m.group("name3") or "").strip()
+        rest = (m.group("rest") or "").strip()
+        if name:
+            # Parse phone + email out of the rest
+            phone = ""
+            email = ""
+            phone_m = _re.search(r"(\+?\d[\d\-\(\)\s]{8,})", rest or "")
+            if phone_m: phone = phone_m.group(1).strip()
+            email_m = _re.search(r"[\w\.-]+@[\w\.-]+\.\w+", rest or "")
+            if email_m: email = email_m.group(0).strip()
+            company = ""
+            comp_m = _re.search(r"\b(?:at|from|with)\s+([A-Z][\w\s&'\-]{2,40})", rest or "")
+            if comp_m: company = comp_m.group(1).strip()
+            try:
+                c = mod_contacts.add(user_dir, name=name, phone=phone,
+                                     email=email, company=company,
+                                     source="chat")
+            except Exception as e:
+                log.warning(f"contacts.add failed: {e}")
+                return {"reply": f"Couldn't add contact: {e}",
+                        "tier": "local", "latency_ms": 0,
+                        "source": "contacts_add_error"}
+            extras = []
+            if phone:   extras.append(f"phone {phone}")
+            if email:   extras.append(f"email {email}")
+            if company: extras.append(f"at {company}")
+            extra_bit = " (" + ", ".join(extras) + ")" if extras else ""
+            return {"reply": f"Added {c['name']} to your contacts{extra_bit}.",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "contacts_added"}
+
+    # CONVERSATION HISTORY — honest answer: per-contact threading isn't built
+    m = _CONTACTS_CONVO_RE.match(msg)
+    if m:
+        name = (m.group("name") or "").strip().rstrip("?.!")
+        c = mod_contacts.find_by_name(user_dir, name) if name else None
+        if c:
+            notes = c.get("personal_notes") or []
+            lines = [f"What I know about {c.get('name','?')}:"]
+            if c.get("last_contact"):
+                lines.append(f"  Last contact: {c['last_contact'][:10]}")
+            if c.get("notes"):
+                lines.append(f"  General notes: {c['notes'][:200]}")
+            if notes:
+                lines.append(f"  Personal-notes log ({len(notes)}):")
+                for n in notes[:10]:
+                    lines.append(f"    · {n.get('note','')[:120]}")
+            lines.append("")
+            lines.append("(I don't store full chat transcripts per contact yet — "
+                          "what you see above is the running notes I've kept.)")
+            return {"reply": "\n".join(lines), "tier": "local",
+                    "latency_ms": 0, "source": "contacts_convo"}
+        return {"reply": (
+            f"I don't have \"{name}\" as a contact, and I don't store full "
+            f"per-person conversation transcripts yet. What I CAN show you:\n"
+            f"  · running notes per contact (use \"find {name}\")\n"
+            f"  · website-chat leads (use \"show me recent leads\")\n"
+            f"  · per-project history (use \"history for <project>\")"
+        ), "tier": "local", "latency_ms": 0,
+           "source": "contacts_convo_unknown"}
+
+    # ALL CONTACTS — "show me my contacts"
+    if _CONTACTS_ALL_RE.match(msg):
+        all_c = mod_contacts.list_all(user_dir)
+        if not all_c:
+            return {"reply": "Your contact book is empty. Add one with: "
+                              "\"add a new contact named John Smith\".",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "contacts_empty"}
+        lines = [f"Your contacts ({len(all_c)}):"]
+        for c in all_c[:30]:
+            bits = [c.get("name", "?")]
+            if c.get("company"): bits.append(c["company"])
+            if c.get("phone"):   bits.append(c["phone"])
+            lines.append("  · " + " — ".join(bits))
+        return {"reply": "\n".join(lines), "tier": "local",
+                "latency_ms": 0, "source": "contacts_all"}
+    return None
+
+
+_LEADS_RECENT_RE = _re.compile(
+    r"^\s*(?:"
+    r"(?:show|list|give)\s+(?:me\s+)?(?:all\s+)?(?:my\s+|the\s+)?(?:new\s+)?leads?"
+    r"\s+(?:from\s+|in\s+|for\s+)?(?:the\s+)?(?:this|past|last|recent)?\s*"
+    r"(?P<period>week|month|day|today|24\s*hours?|hours?|overnight)?"
+    r"|(?:what|any)\s+(?:new\s+)?leads?\s+(?:came\s+in\s+)?(?P<period2>overnight|today|this\s+week|this\s+month)"
+    r"|recent\s+leads?"
+    r"|new\s+leads?(?:\s+this\s+(?P<period3>week|month))?"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+
+
+def _try_leads_chat(message: str, user_rec: dict) -> dict | None:
+    """'Show me leads from this week' / 'what new leads came in overnight'.
+    Reads modules/messages.py — the website-chat lead capture log."""
+    if not message:
+        return None
+    msg = _strip_polite_prefix(message)
+    m = _LEADS_RECENT_RE.match(msg)
+    if not m:
+        return None
+    period_raw = (m.group("period") or m.group("period2")
+                  or m.group("period3") or "week").strip().lower()
+    from datetime import datetime as _dt, timedelta as _td
+    now = _dt.now()
+    if "overnight" in period_raw or "24" in period_raw or "today" in period_raw or "day" in period_raw or "hour" in period_raw:
+        cutoff = now - _td(hours=24)
+        label = "the past 24 hours"
+    elif "month" in period_raw:
+        cutoff = now - _td(days=30)
+        label = "this month"
+    else:
+        cutoff = now - _td(days=7)
+        label = "this week"
+    try:
+        msgs = mod_messages.list_all(DATA_DIR) or []
+    except Exception:
+        msgs = []
+    recent = []
+    for m_rec in msgs:
+        ts = m_rec.get("timestamp") or m_rec.get("ts") or 0
+        try:
+            ts_dt = _dt.fromtimestamp(float(ts))
+        except (ValueError, OSError, TypeError):
+            try:
+                ts_dt = _dt.fromisoformat(str(ts).replace("Z", "+00:00"))
+            except (ValueError, OSError, TypeError):
+                continue
+        if ts_dt >= cutoff:
+            recent.append((ts_dt, m_rec))
+    if not recent:
+        return {"reply": f"No new leads in {label}.",
+                "tier": "local", "latency_ms": 0,
+                "source": "leads_recent_empty"}
+    recent.sort(key=lambda t: t[0], reverse=True)
+    lines = [f"📨 Leads from {label} ({len(recent)}):"]
+    for ts_dt, m_rec in recent[:15]:
+        name = m_rec.get("from_name") or m_rec.get("name") or "(no name)"
+        phone = m_rec.get("from_phone") or m_rec.get("phone") or ""
+        email = m_rec.get("from_email") or m_rec.get("email") or ""
+        body = (m_rec.get("body") or m_rec.get("message") or "")[:100]
+        when = ts_dt.strftime("%a %b %-d %-I:%M %p")
+        contact_bit = ""
+        if phone: contact_bit = f" — {phone}"
+        elif email: contact_bit = f" — {email}"
+        lines.append(f"  · {when} — {name}{contact_bit}")
+        if body:
+            lines.append(f"      \"{body}\"")
+    return {"reply": "\n".join(lines), "tier": "local",
+            "latency_ms": 0, "source": "leads_recent"}
+
+
+_LEAD_ADD_RE = _re.compile(
+    r"^\s*(?:"
+    r"add\s+(?:me|us|(?P<who>[A-Z][A-Za-z'\-]+(?:\s+[A-Z][A-Za-z'\-]+){0,3}))\s+(?:as\s+)?(?:a\s+)?(?:new\s+)?lead"
+    r"|(?:log|create|record|file)\s+(?:a\s+)?(?:new\s+)?lead"
+    r")",
+    _re.IGNORECASE,
+)
+
+
+def _try_lead_add(message: str, user_rec: dict) -> dict | None:
+    """'Add me as a new lead. My name is John Smith, phone 775-555-1212.'
+    Writes a real entry to messages.json so it shows in the leads inbox
+    AND in the recent-leads query — instead of the LLM fabricating 'Done'."""
+    if not message:
+        return None
+    msg = _strip_polite_prefix(message)
+    if not _LEAD_ADD_RE.match(msg):
+        return None
+    # Pull name from explicit "My name is X" / "named X" / regex 'who' group
+    name = ""
+    name_m = _re.search(r"(?:my\s+name\s+is|name\s+is|named|name[:\s]+)\s+([A-Z][A-Za-z'\-]+(?:\s+[A-Z][A-Za-z'\-]+){0,3})", message)
+    if name_m:
+        name = name_m.group(1).strip()
+    else:
+        who_m = _LEAD_ADD_RE.match(msg)
+        if who_m and who_m.group("who"):
+            name = who_m.group("who").strip()
+    phone = ""
+    phone_m = _re.search(r"(\+?\d[\d\-\(\)\s]{7,}\d)", message)
+    if phone_m:
+        phone = phone_m.group(1).strip()
+    email = ""
+    email_m = _re.search(r"[\w\.-]+@[\w\.-]+\.\w+", message)
+    if email_m:
+        email = email_m.group(0).strip()
+    if not (phone or email):
+        return {"reply": ("I need a phone number or email to add a lead — what's the "
+                          "best way to reach them? E.g. \"add lead: name John "
+                          "Smith, phone 775-555-1212\"."),
+                "tier": "local", "latency_ms": 0,
+                "source": "lead_add_no_contact"}
+    try:
+        captured = mod_messages.capture(
+            DATA_DIR,
+            msg_type="lead",
+            from_name=name or None,
+            from_phone=phone or None,
+            from_email=email or None,
+            body=message[:500],
+            source="owner_chat",
+            config=CONFIG,
+        )
+    except Exception as e:
+        log.warning(f"owner-chat lead capture failed: {e}")
+        return {"reply": f"Couldn't save the lead: {e}",
+                "tier": "local", "latency_ms": 0,
+                "source": "lead_add_error"}
+    try:
+        notify.send(
+            CONFIG, DATA_DIR, event="new_lead",
+            title=f"New lead: {name or phone or email}",
+            body=message[:200], url="/owner",
+        )
+    except Exception:
+        pass
+    audit.log_event(DATA_DIR, actor=user_rec.get("username", "?"),
+                    action="lead.captured",
+                    meta={"message_id": captured.get("id"),
+                          "via": "owner_chat"})
+    label = name or phone or email
+    return {"reply": f"Saved as a lead — {label}. Open the Leads tab to see it.",
+            "tier": "local", "latency_ms": 0,
+            "source": "lead_added"}
+
+
+_UNWIRED_EMAIL_RE = _re.compile(
+    r"^\s*(?:"
+    r"(?:show|list|read|get|check)\s+(?:me\s+)?(?:my\s+)?(?:today'?s\s+)?(?:important\s+|recent\s+|new\s+)?emails?"
+    r"|what(?:'s| is)\s+(?:important|in|new)\s+in\s+(?:my\s+)?inbox"
+    r"|(?:show|list)\s+(?:me\s+)?emails?\s+(?:related\s+to|about|from|for)\s+"
+    r"|find\s+(?:the\s+|an?\s+)?emails?\s+(?:from|about|related\s+to|on)"
+    r"|search\s+(?:my\s+)?emails?\s+(?:for|about)"
+    r"|(?:draft|write|compose)\s+(?:a\s+|an\s+)?(?:reply|response)\s+(?:to\s+|for\s+)"
+    r"|email\s+(?:the\s+)?(?:latest\s+|new\s+|recent\s+)?(?:change\s+order|invoice|proposal|update|estimate)\s+to\s+"
+    r"|email\s+\w+(?:\s+\w+)?\s+(?:the|a)\s+"
+    # "Email Bill Henry: parts came in" / "Email Bill: x"
+    r"|(?i:email)\s+[A-Z][A-Za-z'\-]+(?:\s+[A-Z][A-Za-z'\-]+)*\s*[:,]"
+    # Imperative "send it / send the email right now"
+    r"|send\s+(?:it|the\s+email|that\s+message)\s+(?:right\s+now|now)"
+    r")",
+    _re.IGNORECASE,
+)
+_UNWIRED_SMS_RE = _re.compile(
+    r"^\s*(?:"
+    r"(?:send|text|message)\s+(?:a\s+)?(?:text|sms|message)\s+(?:to\s+)?"
+    r"|text\s+\w+(?:\s+\w+)?\s+"
+    r"|(?:show|list)\s+(?:me\s+)?(?:all\s+)?(?:my\s+)?(?:texts?|sms\s+messages?)\s+(?:from|to|with)\s+"
+    r"|text\s+every(?:one|body)?\s+"
+    r"|text\s+(?:every\s+)?lead"
+    r")",
+    _re.IGNORECASE,
+)
+_UNWIRED_FILES_RE = _re.compile(
+    r"^\s*(?:"
+    r"(?:find|locate|get|fetch)\s+(?:the\s+)?(?P<q>.+?)\s+(?:contract|agreement|document|file|proposal|invoice|change[\s-]order|estimate)(?:s)?"
+    r"|(?:show|open|find|fetch)\s+(?:me\s+)?(?:the\s+)?(?:signed\s+|latest\s+|recent\s+|most\s+recent\s+|newest\s+)(?:change[\s-]order|invoice|proposal|contract|document|file)"
+    r"|(?:open|fetch)\s+(?:the\s+)?(?:latest\s+|recent\s+)?invoice\s+for\s+"
+    r"|(?:search|find)\s+(?:for\s+)?(?:every\s+|all\s+)?file(?:s)?\s+(?:related\s+to|about|for|on)\s+"
+    r")",
+    _re.IGNORECASE,
+)
+
+
+def _try_unwired_channel(message: str, user_rec: dict) -> dict | None:
+    """Email/SMS/file queries we don't have wired to a real backend.
+    Return an honest deterministic refusal so the LLM can't fabricate
+    'here are 3 emails from Johnson'."""
+    if not message:
+        return None
+    msg = _strip_polite_prefix(message)
+    if _UNWIRED_EMAIL_RE.match(msg):
+        return {"reply": (
+            "I don't have your email account wired up yet, so I can't pull "
+            "messages or send drafts on your behalf.\n"
+            "Workarounds that DO work right now:\n"
+            "  · I can generate an invoice or change-order PDF — you forward "
+            "it from your own email.\n"
+            "  · I can draft the WORDS for a reply — say \"draft a reminder "
+            "to Johnson Construction\" and I'll write the message text."
+        ), "tier": "local", "latency_ms": 0,
+           "source": "unwired_email"}
+    if _UNWIRED_SMS_RE.match(msg):
+        return {"reply": (
+            "I don't have SMS sending wired yet — Twilio is set up for the "
+            "phone receptionist (incoming calls) but outbound texts from the "
+            "owner dashboard aren't built.\n"
+            "What works today: incoming customer texts to your business "
+            "number show up in your messages inbox. You can reply from there."
+        ), "tier": "local", "latency_ms": 0,
+           "source": "unwired_sms"}
+    if _UNWIRED_FILES_RE.match(msg):
+        return {"reply": (
+            "I don't have a file-search layer over your whole computer — I "
+            "can only pull files I generated (invoice PDFs, closeout PDFs, "
+            "proposal PDFs).\n"
+            "What works:\n"
+            "  · \"PDF INV-2026-0001\" — re-generate an invoice PDF\n"
+            "  · \"proposal for <customer>\" — generate a proposal PDF\n"
+            "  · \"closeout for <project>\" — generate the project closeout PDF\n"
+            "For contracts/scans stored elsewhere, you'll need to open them "
+            "directly — I don't index your file system."
+        ), "tier": "local", "latency_ms": 0,
+           "source": "unwired_files"}
+    return None
+
+
+# ── Knowledge-question handlers (read business_info directly) ─────────────
+
+_KNOW_SERVICES_RE = _re.compile(
+    r"^\s*(?:"
+    r"what\s+services?\s+(?:do\s+(?:you|we|i)\s+)?(?:offer|provide|sell)"
+    r"|what\s+(?:do|does)\s+(?:you|we|orby|the\s+company)\s+(?:offer|provide|do|sell)"
+    r"|services?(?:\s+offered|\s+available)?"
+    r"|(?:show|list)\s+(?:me\s+)?(?:your|our|my)\s+services?"
+    r"|what\s+kind\s+of\s+(?:work|services?)\s+(?:do\s+you\s+do|do\s+we\s+do)"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+_KNOW_SERVICE_AREA_RE = _re.compile(
+    r"^\s*(?:"
+    r"what(?:'s| is)?\s+(?:our|your|my|the)\s+service\s+area"
+    r"|service\s+area"
+    r"|where\s+(?:do\s+(?:you|we)\s+)?(?:work|serve|operate|cover)"
+    r"|do\s+you\s+(?:work|serve|cover|do\s+jobs)\s+in\s+(?P<city>[A-Za-z][A-Za-z\s,]+?)"
+    r"|do\s+(?:you|we)\s+(?:do|serve)\s+work\s+in\s+(?P<city2>[A-Za-z][A-Za-z\s,]+?)"
+    r"|are\s+you\s+in\s+(?P<city3>[A-Za-z][A-Za-z\s,]+?)"
+    r"|(?:what\s+(?:cities|towns|areas))\s+(?:do\s+(?:you|we)\s+)?(?:work\s+in|serve|cover)"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+_KNOW_HOURS_RE = _re.compile(
+    r"^\s*(?:"
+    r"what(?:'s| are)?\s+(?:our|your|my|the)\s+(?:business\s+)?hours"
+    r"|(?:business\s+|store\s+|shop\s+|office\s+)?hours"
+    r"|when\s+(?:are|do)\s+(?:you|we)\s+(?:open|close|operate)"
+    r"|what\s+time\s+do\s+(?:you|we)\s+(?:open|close)"
+    r"|(?:are|is)\s+(?:you|we)\s+open(?:\s+(?:now|today))?"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+_KNOW_LICENSE_RE = _re.compile(
+    r"^\s*(?:"
+    r"what(?:'s| is)?\s+(?:our|your|my|the)\s+(?:contractor\s+|business\s+|state\s+)?license(?:\s+number|\s+#|\s+no)?"
+    r"|(?:contractor\s+|business\s+)?license\s+number"
+    r"|(?:contractor\s+|business\s+)?license\s+#"
+    r"|what(?:'s| is)?\s+(?:our|your|my)\s+license"
+    r"|license"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+_KNOW_INSURANCE_RE = _re.compile(
+    r"^\s*(?:"
+    r"(?:are|is)\s+(?:you|we|the\s+company)\s+(?:licensed\s+and\s+)?insured"
+    r"|(?:are|is)\s+(?:you|we)\s+licensed\s+and\s+insured"
+    r"|do\s+(?:you|we)\s+(?:have|carry)\s+insurance"
+    r"|what(?:'s| is)?\s+(?:our|your|my|the)\s+insurance"
+    r"|insurance\s+(?:status|info|details)"
+    r"|(?:are|is)\s+(?:you|we)\s+bonded"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+_KNOW_WARRANTY_RE = _re.compile(
+    r"^\s*(?:"
+    r"what(?:'s| is)?\s+(?:our|your|my|the)\s+warranty"
+    r"|what\s+warranty\s+(?:do\s+(?:you|we)\s+)?(?:provide|offer|give|have)"
+    r"|do\s+(?:you|we)\s+(?:offer|provide|give|have)\s+(?:a\s+)?warranty"
+    r"|warranty(?:\s+(?:policy|info|details|coverage))?"
+    r"|how\s+long\s+is\s+(?:the\s+|your\s+)?warranty"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+_KNOW_FINANCING_RE = _re.compile(
+    r"^\s*(?:"
+    r"what\s+financing\s+(?:options\s+)?(?:do\s+(?:you|we)\s+)?(?:offer|have|provide)"
+    r"|do\s+(?:you|we)\s+(?:offer|have|provide)\s+(?:any\s+)?financing"
+    r"|financing\s+(?:options|available|info)"
+    r"|(?:are\s+there\s+|any\s+)?financing\s+options"
+    r"|payment\s+plans?"
+    r"|do\s+(?:you|we)\s+(?:offer|do)\s+payment\s+plans?"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+
+
+def _fmt_hours_block(hours: dict) -> str | None:
+    """Format the business_info hours dict as a clean weekly schedule."""
+    if not hours:
+        return None
+    day_order = ["monday", "tuesday", "wednesday", "thursday",
+                 "friday", "saturday", "sunday"]
+    lines = []
+    for d in day_order:
+        h = hours.get(d) or {}
+        label = d.capitalize()
+        if h.get("closed"):
+            lines.append(f"  {label}:    Closed")
+        elif h.get("open") and h.get("close"):
+            lines.append(f"  {label}:    {h['open']} – {h['close']}")
+    return "\n".join(lines) if lines else None
+
+
+def _fmt_service_list(services) -> list[str]:
+    """Normalize services (list of strings OR list of dicts) to a list
+    of display lines."""
+    out = []
+    for s in (services or []):
+        if isinstance(s, str):
+            name = s.strip()
+            if name:
+                out.append(f"  · {name}")
+        elif isinstance(s, dict):
+            name = (s.get("name") or "").strip()
+            price = (s.get("price") or "").strip()
+            if name:
+                if price:
+                    out.append(f"  · {name} — {price}")
+                else:
+                    out.append(f"  · {name}")
+    return out
+
+
+def _try_knowledge_chat(message: str, user_rec: dict) -> dict | None:
+    """Answer the business-profile knowledge questions from business_info
+    directly. Deterministic, fast, accurate."""
+    if not message:
+        return None
+    msg = _strip_polite_prefix(message)
+    biz = mod_business.load(DATA_DIR)
+    name = biz.get("name") or "the business"
+    policies = biz.get("policies") or {}
+
+    # SERVICES — "what services do you offer"
+    if _KNOW_SERVICES_RE.match(msg):
+        service_lines = _fmt_service_list(biz.get("services"))
+        if not service_lines:
+            return {"reply": (
+                f"I don't have services listed in {name}'s profile yet. "
+                f"Add them in Settings → Business → Services and I'll start "
+                f"reading them back."
+            ), "tier": "local", "latency_ms": 0,
+               "source": "know_services_empty"}
+        header = f"Services {name} offers:"
+        return {"reply": header + "\n" + "\n".join(service_lines),
+                "tier": "local", "latency_ms": 0,
+                "source": "know_services"}
+
+    # SERVICE AREA — "what's our service area" / "do you work in Reno"
+    m = _KNOW_SERVICE_AREA_RE.match(msg)
+    if m:
+        area = (policies.get("service_area") or "").strip()
+        city_q = (m.group("city") or m.group("city2") or m.group("city3") or "").strip().rstrip("?.!")
+        addr = biz.get("address") or {}
+        addr_city = (addr.get("city") or "").strip()
+        if city_q:
+            haystack = (area + " " + addr_city).lower()
+            if city_q.lower() in haystack:
+                return {"reply": f"Yes — {name} works in {city_q}."
+                                  + (f"\nFull service area: {area}." if area else ""),
+                        "tier": "local", "latency_ms": 0,
+                        "source": "know_service_area_yes"}
+            if area:
+                return {"reply": f"Our service area is: {area}.\n"
+                                  f"{city_q} isn't on that list — call/text the "
+                                  f"office to ask about a trip-fee job.",
+                        "tier": "local", "latency_ms": 0,
+                        "source": "know_service_area_outside"}
+            # Fall through to the generic answer below
+        if area:
+            return {"reply": f"Service area for {name}: {area}.",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "know_service_area"}
+        if addr_city:
+            return {"reply": (
+                f"{name} is based in {addr_city}"
+                + (f", {addr.get('state')}" if addr.get('state') else "")
+                + ". A specific service area isn't set in the profile yet — "
+                f"add it under Settings → Business → Policies and I'll quote it."
+            ), "tier": "local", "latency_ms": 0,
+               "source": "know_service_area_partial"}
+        return {"reply": (
+            f"I don't have a service area in the profile for {name} yet. "
+            f"Add it in Settings → Business → Policies → Service area."
+        ), "tier": "local", "latency_ms": 0,
+           "source": "know_service_area_empty"}
+
+    # HOURS — "what are our business hours"
+    if _KNOW_HOURS_RE.match(msg):
+        block = _fmt_hours_block(biz.get("hours") or {})
+        if not block:
+            return {"reply": (
+                f"I don't have business hours in {name}'s profile yet. "
+                f"Set them in Settings → Business → Hours."
+            ), "tier": "local", "latency_ms": 0,
+               "source": "know_hours_empty"}
+        try:
+            today_str = mod_business.hours_today(DATA_DIR) or ""
+        except Exception:
+            today_str = ""
+        tail = f"\nToday: {today_str}" if today_str else ""
+        return {"reply": f"Business hours for {name}:\n{block}{tail}",
+                "tier": "local", "latency_ms": 0,
+                "source": "know_hours"}
+
+    # LICENSE — "what's our contractor license number"
+    if _KNOW_LICENSE_RE.match(msg):
+        lic = (biz.get("license") or "").strip()
+        if lic:
+            return {"reply": f"{name} contractor license: {lic}.",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "know_license"}
+        return {"reply": (
+            f"I don't have a license number in {name}'s profile. If you "
+            f"have one (NV-GC-#####), set it in Settings → Business → "
+            f"License and I'll quote it on every invoice and proposal."
+        ), "tier": "local", "latency_ms": 0,
+           "source": "know_license_empty"}
+
+    # INSURANCE — "are you licensed and insured"
+    if _KNOW_INSURANCE_RE.match(msg):
+        lic = (biz.get("license") or "").strip()
+        insurance_text = ""
+        for key in ("insurance", "insured", "bonding", "bonded"):
+            v = policies.get(key)
+            if v:
+                insurance_text = str(v).strip()
+                break
+        if lic or insurance_text:
+            bits = []
+            if lic:
+                bits.append(f"licensed (#{lic})")
+            else:
+                bits.append("licensed")
+            if insurance_text:
+                bits.append(insurance_text.lower() if insurance_text.lower().startswith(("bond", "insur", "general")) else "insured")
+            else:
+                bits.append("insured")
+            return {"reply": f"Yes — {name} is " + " and ".join(bits) + ".",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "know_insurance"}
+        return {"reply": (
+            f"I don't have license or insurance details in {name}'s profile "
+            f"yet. Add them in Settings → Business so customers get a "
+            f"straight answer when they ask."
+        ), "tier": "local", "latency_ms": 0,
+           "source": "know_insurance_empty"}
+
+    # WARRANTY — "what warranty do we provide"
+    if _KNOW_WARRANTY_RE.match(msg):
+        warranty = (policies.get("warranty") or "").strip()
+        if warranty:
+            return {"reply": f"Warranty: {warranty}",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "know_warranty"}
+        return {"reply": (
+            f"I don't have a warranty policy in {name}'s profile yet. Add "
+            f"it in Settings → Business → Policies → Warranty."
+        ), "tier": "local", "latency_ms": 0,
+           "source": "know_warranty_empty"}
+
+    # FINANCING — "what financing do we offer"
+    if _KNOW_FINANCING_RE.match(msg):
+        # Check several reasonable key names
+        for key in ("financing", "payment_plans", "payment_options",
+                    "financing_options"):
+            v = policies.get(key)
+            if v:
+                return {"reply": f"Financing for {name}: {v}",
+                        "tier": "local", "latency_ms": 0,
+                        "source": "know_financing"}
+        # Check payment_methods as a fallback hint
+        pm = (policies.get("payment_methods") or "").strip()
+        if pm:
+            return {"reply": (
+                f"{name} doesn't have a dedicated financing option on file. "
+                f"What we DO accept: {pm}\n"
+                f"If you want to offer financing (Affirm/Wisetack/Sunlight), "
+                f"add it in Settings → Business → Policies → Financing."
+            ), "tier": "local", "latency_ms": 0,
+               "source": "know_financing_partial"}
+        return {"reply": (
+            f"No financing options listed for {name}. Add them in Settings → "
+            f"Business → Policies → Financing."
+        ), "tier": "local", "latency_ms": 0,
+           "source": "know_financing_empty"}
+    return None
+
+
+# ── Self-introspection (what modules am I running) ────────────────────────
+
+# Friendly per-module descriptions so the answer reads like a brochure,
+# not a JSON dump. Add entries here when new add-on modules ship.
+_MODULE_INTRO_DESCRIPTIONS = {
+    "contractor": (
+        "Contractor — general-contractor module. Tracks projects, change "
+        "orders (with foreman-on-site customer signing), invoices + "
+        "retainage, subcontractors + insurance expiry, daily logs with "
+        "leak-alarm scope-change detection, bids + proposal PDFs, customer "
+        "review collection, and a per-project customer portal."
+    ),
+    # Future modules — copy this template for medical/legal/etc.
+    # "medical": ("Medical — ..."),
+    # "legal":   ("Legal — ..."),
+}
+
+# Map natural-language module-name variants to the canonical key in
+# CONFIG.enabled_modules. Add aliases here as new modules ship.
+_MODULE_ALIASES = {
+    "contractor":          "contractor",
+    "construction":        "contractor",
+    "builder":             "contractor",
+    "building":            "contractor",
+    "gc":                  "contractor",
+    "general contractor":  "contractor",
+    "general-contractor":  "contractor",
+    "remodel":             "contractor",
+    "remodeling":          "contractor",
+    "home builder":        "contractor",
+    "home-builder":        "contractor",
+    "medical":             "medical",
+    "doctor":              "medical",
+    "clinic":              "medical",
+    "healthcare":          "medical",
+    "legal":               "legal",
+    "lawyer":              "legal",
+    "law":                 "legal",
+    "attorney":            "legal",
+    "restaurant":          "restaurant",
+    "deli":                "restaurant",
+    "automotive":          "automotive",
+    "auto":                "automotive",
+    "shop":                "automotive",
+}
+_MODULE_ALIAS_PATTERN = "|".join(_re.escape(a) for a in sorted(
+    _MODULE_ALIASES.keys(), key=len, reverse=True))
+
+_MODULES_INTRO_RE = _re.compile(
+    r"^\s*(?:"
+    r"(?:do\s+(?:you|i)\s+have|do\s+you\s+know\s+anything\s+about|is\s+(?:there|the)|do\s+i\s+(?:have\s+)?the)\s+(?:a\s+|an\s+|the\s+)?"
+    r"(?P<mod_q>" + _MODULE_ALIAS_PATTERN + r")\s*(?:module|add[\s-]?on|plan|package|feature|attached)?"
+    r"|what\s+(?:modules?|add[\s-]?ons?|plans?|features?|packages?)\s+(?:do\s+i\s+have|am\s+i\s+(?:on|using|subscribed\s+to)|are\s+(?:enabled|installed|active))"
+    r"|which\s+(?:modules?|add[\s-]?ons?|plans?|features?)\s+(?:do\s+i\s+have|am\s+i\s+(?:on|using))"
+    r"|(?:show|list|tell\s+me)\s+(?:me\s+)?(?:my\s+)?(?:enabled\s+|active\s+|installed\s+)?(?:modules?|add[\s-]?ons?|features?)"
+    r"|am\s+i\s+(?:on|subscribed\s+to|using)\s+(?:the\s+)?(?P<mod_q2>" + _MODULE_ALIAS_PATTERN + r")\s*(?:module|add[\s-]?on|plan|package)?"
+    r"|what'?s\s+(?:my\s+)?(?:subscription|plan)"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+
+
+def _try_modules_introspection(message: str, user_rec: dict) -> dict | None:
+    """Answer 'do you have a contractor module' / 'what modules am I on'
+    truthfully from CONFIG.enabled_modules. Beats the LLM, which
+    confidently makes up the wrong answer (e.g. claims contractor isn't
+    enabled when it actually is)."""
+    if not message:
+        return None
+    msg = _strip_polite_prefix(message)
+    m = _MODULES_INTRO_RE.match(msg)
+    if not m:
+        return None
+    enabled = list((CONFIG.get("enabled_modules") or []))
+
+    # Specific module asked about — map the alias to the canonical key,
+    # then check if it's in CONFIG.enabled_modules.
+    mod_q_raw = (m.group("mod_q") or m.group("mod_q2") or "").strip().lower()
+    if mod_q_raw:
+        canonical = _MODULE_ALIASES.get(mod_q_raw, mod_q_raw)
+        on = canonical in [str(x).lower() for x in enabled]
+        if on:
+            desc = _MODULE_INTRO_DESCRIPTIONS.get(canonical, f"The {canonical} module is active.")
+            # If the user said "construction" but we call it "contractor",
+            # acknowledge their phrasing while using the canonical name.
+            alias_note = ""
+            if mod_q_raw != canonical:
+                alias_note = f" (we call it the {canonical} module internally)"
+            return {"reply": f"Yes — the {canonical} module is enabled{alias_note}.\n\n{desc}",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "modules_intro_yes"}
+        else:
+            avail = ", ".join(enabled) if enabled else "(none beyond base Orby)"
+            return {"reply": (
+                f"No — the {canonical} module is not enabled on this Orby.\n"
+                f"Currently active add-ons: {avail}.\n"
+                f"You can add modules from Settings → Plan & Add-ons "
+                f"(Stripe billing controls which are active)."
+            ), "tier": "local", "latency_ms": 0,
+               "source": "modules_intro_no"}
+
+    # Generic "what modules / add-ons do I have"
+    if not enabled:
+        return {"reply": (
+            "Just base Orby right now — no paid add-on modules enabled.\n"
+            "Available add-ons you could activate from Settings → Plan & "
+            "Add-ons: contractor (and more coming)."
+        ), "tier": "local", "latency_ms": 0,
+           "source": "modules_intro_base_only"}
+    lines = [f"You have {len(enabled)} add-on module{'s' if len(enabled) != 1 else ''} active on top of base Orby:"]
+    for m_name in enabled:
+        desc = _MODULE_INTRO_DESCRIPTIONS.get(str(m_name).lower(),
+                                                f"  · {m_name} — active")
+        if desc.lstrip().startswith("·"):
+            lines.append(desc)
+        else:
+            # Friendly multi-line entry
+            lines.append(f"  · {desc}")
+    return {"reply": "\n".join(lines), "tier": "local",
+            "latency_ms": 0, "source": "modules_intro_list"}
+
+
+# ── Public-chat referral: "where can I get one of these for my business?" ───
+#
+# Fires ONLY on direct visitor ask. Returns a one-sentence URL + redirect
+# to the host business's flow. Never volunteers. Toggleable per-customer
+# via CONFIG["referral_enabled"] (defaults True). URL comes from
+# CONFIG["referral_url"], defaults to twickell.com until myorby.com is
+# registered.
+
+_REFERRAL_DEFAULT_URL = "twickell.com"
+
+_REFERRAL_RE = _re.compile(
+    r"^\s*(?:"
+    # "Where can I get/buy one of these (for my business)?" — the noun phrase
+    # is REQUIRED (no trailing ?), otherwise innocent ordering speech like
+    # "where can I order food" would falsely trigger as a referral question.
+    r"(?:where|how)\s+(?:can|do|would|could)\s+i\s+"
+    r"(?:get|buy|find|sign\s+up\s+for|order|download|install|purchase|use|try)\s+"
+    r"(?:my\s+own\s+|one\s+of\s+these\s*|an?\s+|the\s+|some(?:thing)?\s+like\s+this\s*)?"
+    r"(?:orby|orbi|orbeez|this\s+(?:ai|thing|assistant|service|software|chatbot|bot|system|tool)|"
+    r"one\s+of\s+(?:these|those)|something\s+like\s+this|an?\s+(?:ai|chatbot|receptionist))"
+    # "I want one of these / I want Orby / I need an AI like this" — same fix:
+    # noun phrase REQUIRED. Otherwise "I want it toasted" or "I would like
+    # the 12-inch" falsely matches as a request for an AI product.
+    r"|i\s+(?:want|need|would\s+like|gotta\s+get|am\s+looking\s+for)\s+(?:my\s+own\s+|one\s+of\s+these\s*|an?\s+|the\s+|some(?:thing)?\s+like\s+this\s*)?"
+    r"(?:orby|orbi|this\s+(?:ai|thing|assistant|chatbot)|one\s+of\s+(?:these|those)|something\s+like\s+this|an?\s+(?:ai|chatbot|receptionist))"
+    # "What AI is this / who made you / what's this app"
+    r"|(?:what|which)\s+(?:ai|software|app|chatbot|assistant|service|company|program|product|system)\s+(?:is\s+)?this"
+    r"|who\s+(?:made|built|created|owns|sells|developed|wrote)\s+(?:you|this)"
+    r"|who\s+(?:is|are|made|built|owns)\s+(?:orby|orbi|orbeez)"
+    r"|are\s+you\s+(?:built|made|powered)\s+by\s+(?:openai|chatgpt|claude|gemini|anthropic|google)"
+    # "How much does Orby cost?" / "What's the price of Orby?"
+    r"|how\s+much\s+(?:does|is)\s+(?:orby|orbi|this(?:\s+(?:ai|service|software))?)\s*(?:cost|price)?"
+    r"|what(?:'s|\s+is)\s+(?:the\s+)?(?:price|cost)\s+(?:of|for)\s+(?:orby|orbi|this)"
+    # "Can my business get Orby?" / "Do you sell Orby?"
+    r"|can\s+(?:my|a)\s+business\s+(?:get|have|use|buy|sign\s+up\s+for)\s+(?:orby|orbi|one\s+of\s+these|something\s+like\s+this)"
+    r"|do\s+you\s+sell\s+(?:orby|orbi|this(?:\s+(?:ai|service|software))?)"
+    # "Is this Orby?" / "Are you Orby?" — visitor recognized the product
+    r"|(?:is\s+this|are\s+you)\s+(?:orby|orbi|orbeez)"
+    # "Tell me about Orby" / "What is Orby?"
+    r"|(?:tell\s+me\s+about|what(?:'s|\s+is))\s+orby"
+    r")\b",
+    _re.IGNORECASE,
+)
+
+
+def _try_orby_referral(message: str, business: dict) -> dict | None:
+    """When a visitor on a customer's Orby asks where to get their own
+    Orby, give the URL and immediately return focus to the host business.
+    Never volunteers — only fires on direct ask."""
+    if not message:
+        return None
+    # Honor the kill switch — owner can turn this off per-customer
+    if CONFIG.get("referral_enabled") is False:
+        return None
+    msg = message.strip()
+    if not _REFERRAL_RE.match(msg):
+        return None
+    url = (CONFIG.get("referral_url") or _REFERRAL_DEFAULT_URL).strip()
+    biz_name = (business.get("name") or "").strip() or "this business"
+    audit.log_event(DATA_DIR, actor="public_visitor",
+                    action="referral.shown",
+                    meta={"url": url, "host_business": biz_name,
+                          "message": message[:200]})
+    return {"reply": (
+        f"You can find everything about Orby at **{url}** — I'm not "
+        f"allowed to say more from here since I'm working for "
+        f"{biz_name} right now. Anything else I can help you with?"
+    ), "tier": "local", "latency_ms": 0,
+       "source": "orby_referral"}
+
+
+_FORMS_INTRO_RE = _re.compile(
+    r"^\s*(?:"
+    r"what\s+(?:forms?|templates?|paperwork)\s+(?:do\s+i\s+have|are\s+(?:uploaded|loaded|on\s+file)|am\s+i\s+using)"
+    r"|which\s+(?:forms?|templates?)\s+(?:do\s+i\s+have|am\s+i\s+using)"
+    r"|(?:show|list|tell\s+me)\s+(?:me\s+)?(?:my\s+|the\s+|all\s+)?(?:forms?|templates?|paperwork)"
+    r"|(?:do\s+i\s+have|have\s+i\s+uploaded)\s+(?:a\s+|an\s+|the\s+)?"
+    r"(?P<kind_q>change[\s-]?order|co|contract|msa|lien\s+waiver|w[\s-]?9|coi(?:\s+request)?|subcontractor\s+agreement|punch\s+list|proposal)"
+    r"\s*(?:form|template|paperwork|uploaded)?"
+    r"|how\s+do\s+i\s+upload\s+(?:a\s+)?(?:form|template)"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+
+# Normalized chat-kind → canonical mod_forms.VALID_KINDS key
+_FORM_KIND_ALIASES = {
+    "change order": "change_order",
+    "change-order": "change_order",
+    "changeorder": "change_order",
+    "co": "change_order",
+    "contract": "contract",
+    "msa": "msa",
+    "lien waiver": "lien_waiver_partial_cond",  # default to most common
+    "w9": "w9",
+    "w-9": "w9",
+    "w 9": "w9",
+    "coi": "coi_request",
+    "coi request": "coi_request",
+    "subcontractor agreement": "subcontractor_agreement",
+    "punch list": "punch_list",
+    "proposal": "proposal",
+}
+
+
+def _try_forms_introspection(message: str, user_rec: dict) -> dict | None:
+    """'What forms do I have' / 'show me my templates' / 'do I have a
+    change order template uploaded' / 'how do I upload a form'."""
+    if not message:
+        return None
+    msg = _strip_polite_prefix(message)
+    m = _FORMS_INTRO_RE.match(msg)
+    if not m:
+        return None
+    # Specific kind asked about
+    kind_q = (m.group("kind_q") or "").strip().lower()
+    if kind_q:
+        canonical = _FORM_KIND_ALIASES.get(kind_q, kind_q.replace("-", "_").replace(" ", "_"))
+        tpl = mod_forms.get_default(DATA_DIR, canonical)
+        if tpl:
+            field_count = len(tpl.get("detected_fields", []) or [])
+            mapped = sum(1 for f in tpl.get("detected_fields", []) or []
+                          if f.get("mapped_to"))
+            return {"reply": (
+                f"Yes — you have a {canonical.replace('_',' ')} template on file:\n"
+                f"  · {tpl['display_name']} (uploaded {time.strftime('%b %-d', time.localtime(tpl.get('uploaded_at', 0)))})\n"
+                f"  · {field_count} fillable fields detected, {mapped} auto-mapped to Orby data\n"
+                f"  · Default: {'yes' if tpl.get('is_default') else 'no'}\n\n"
+                f"To swap or update, upload a new one from the Forms tab."
+            ), "tier": "local", "latency_ms": 0,
+               "source": "forms_intro_yes"}
+        else:
+            return {"reply": (
+                f"No {canonical.replace('_',' ')} template uploaded yet.\n"
+                f"To add one: open the Forms tab → + Upload Template → "
+                f"pick your blank PDF or Word doc → label kind as "
+                f"\"{canonical}\". I'll auto-detect the fields and map "
+                f"them to project data."
+            ), "tier": "local", "latency_ms": 0,
+               "source": "forms_intro_no"}
+    # Generic list
+    all_tpls = mod_forms.list_all(DATA_DIR)
+    if not all_tpls:
+        return {"reply": (
+            "No form templates uploaded yet. The Forms tab in your "
+            "dashboard lets you upload your own change orders, contracts, "
+            "lien waivers, W-9s, etc. Orby reads each one, detects the "
+            "fillable fields, and learns how to fill them from your "
+            "project data."
+        ), "tier": "local", "latency_ms": 0,
+           "source": "forms_intro_empty"}
+    by_kind = {}
+    for t in all_tpls:
+        by_kind.setdefault(t.get("kind", "?"), []).append(t)
+    lines = [f"You have {len(all_tpls)} form template{'s' if len(all_tpls) != 1 else ''} on file:"]
+    for kind, tpls in sorted(by_kind.items()):
+        default = next((t for t in tpls if t.get("is_default")), tpls[0])
+        extra = f" ({len(tpls)-1} other version{'s' if len(tpls) > 2 else ''})" if len(tpls) > 1 else ""
+        fields = len(default.get("detected_fields", []) or [])
+        lines.append(f"  · {kind.replace('_',' ').upper()}: \"{default['display_name']}\" "
+                     f"({fields} fields){extra}")
+    lines.append("\nManage in the Forms tab. Upload new ones the same place.")
+    return {"reply": "\n".join(lines), "tier": "local",
+            "latency_ms": 0, "source": "forms_intro_list"}
+
+
+# ── Owner-simulating-customer-lead handlers ───────────────────────────────
+
+_SIM_LEAD_NEED_RE = _re.compile(
+    r"^\s*(?:i\s+need|i'?d\s+like|i\s+want|looking\s+for)\s+(?:a\s+|an\s+|some\s+)?"
+    r"(?P<what>.+?)"
+    r"[.!]?\s*(?:can\s+you\s+(?:schedule|book|set\s+up)|please\s+(?:schedule|book)|(?:can\s+you\s+)?give\s+me\s+(?:an?\s+)?(?:estimate|quote))"
+    r".*?\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+_SIM_LEAD_BUDGET_RE = _re.compile(
+    r"^\s*(?:my\s+budget\s+is|i\s+have\s+a\s+budget\s+of)\s+(?:around\s+|about\s+|roughly\s+|~\s*)?"
+    r"\$?[\d,]+(?:k|K|\s*thousand)?"
+    r".*?(?:next\s+steps?|what(?:'s| do\s+i\s+do)\s+next|how\s+do\s+(?:i|we)\s+(?:start|begin|proceed))"
+    r"\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+
+
+def _try_owner_simulated_lead(message: str, user_rec: dict) -> dict | None:
+    """In owner_chat, the owner sometimes simulates a customer to test the
+    flow ('I need a kitchen remodel. Can you schedule an estimate?').
+    Public_chat would auto-capture as a lead; here we acknowledge
+    deterministically and point at the right entry path."""
+    if not message:
+        return None
+    msg = _strip_polite_prefix(message)
+    biz = mod_business.load(DATA_DIR)
+    name = biz.get("name") or "us"
+    contact = biz.get("contact") or {}
+    phone = (contact.get("phone") or "").strip()
+    email = (contact.get("email") or "").strip()
+    contact_bit = ""
+    if phone or email:
+        bits = []
+        if phone: bits.append(f"call/text {phone}")
+        if email: bits.append(f"email {email}")
+        contact_bit = " (a real customer would " + " or ".join(bits) + ")"
+
+    m = _SIM_LEAD_NEED_RE.match(msg)
+    if m:
+        what = (m.group("what") or "").strip()
+        return {"reply": (
+            f"Got it — you'd like {what or 'work'} and want to schedule an "
+            f"estimate. That's the kind of request that hits the WEBSITE "
+            f"chat or phone receptionist, where I auto-capture the lead "
+            f"and notify you{contact_bit}.\n"
+            f"From the owner side, log it as a real lead with: "
+            f"\"add a new lead, name <theirs>, phone <theirs>\" — I'll save "
+            f"it to your messages inbox and flag it for follow-up."
+        ), "tier": "local", "latency_ms": 0,
+           "source": "sim_lead_need"}
+
+    if _SIM_LEAD_BUDGET_RE.match(msg):
+        return {"reply": (
+            f"That budget context belongs on the customer's lead record. "
+            f"In the live flow, a customer who types this in your website "
+            f"chat or calls in: I'd capture their contact info, tag the "
+            f"lead with their budget range, and notify you to schedule the "
+            f"in-home estimate.\n"
+            f"Owner-side action: \"add a new lead, name <theirs>, phone "
+            f"<theirs>, $40k budget kitchen remodel\" and I'll log it."
+        ), "tier": "local", "latency_ms": 0,
+           "source": "sim_lead_budget"}
+    return None
+
+
+_SAFETY_SIGN_FOR_RE = _re.compile(
+    # Anchored at start but no end-of-string requirement — catches the
+    # leading command even when followed by justifications:
+    # "go ahead and sign for them — the customer said it's fine"
+    r"^\s*(?:"
+    r"(?:go\s+ahead\s+and\s+)?sign\s+(?:a\s+|the\s+)?(?:contract|agreement|change[\s-]order|c\.?o\.?|document|proposal|paperwork|form)?\s*(?:for|on\s+behalf\s+of|in\s+place\s+of|as)\s+(?:the\s+|me|us|them)?\s*(?:customer|client|homeowner|him|her)"
+    r"|(?:e[\s-]?sign|electronically\s+sign|forge|fake|just\s+sign)\s+(?:.+?\s+)?(?:for|on\s+behalf\s+of|as|in\s+place\s+of)\s+(?:the\s+)?(?:customer|client|him|her|them)"
+    r"|(?:go\s+ahead\s+and\s+)?sign\s+(?:it\s+|that\s+)?(?:for|on\s+behalf\s+of)\s+(?:them|him|her|the\s+customer|the\s+client)"
+    # "the customer told me (on the phone) to sign for them — go ahead and sign"
+    # Allow arbitrary intermediate words between "told me" and "to sign".
+    r"|.+?told\s+me\s+(?:.+?\s+)?to\s+sign\s+(?:.+?\s+)?(?:for|as|on\s+behalf\s+of)\s+(?:them|him|her|me|us|the\s+(?:customer|client))"
+    # "the customer is fine with me signing for them"
+    r"|.+?(?:said|told\s+me|told\s+us)\s+(?:.+?\s+)?(?:i|we|you|orby)\s+(?:can|could|should|might)\s+sign\s+(?:.+?\s+)?(?:for|as)\s+(?:them|him|her|the\s+customer)"
+    # Trailing "— go ahead and sign" anywhere in the message
+    r"|.+?go\s+ahead\s+and\s+sign\s+(?:.+?\s+)?(?:for|as|on\s+behalf\s+of)\s+(?:them|him|her|me|us|the\s+customer|the\s+client)"
+    r")\b",
+    _re.IGNORECASE,
+)
+_SAFETY_MODIFY_SIGNED_CO_RE = _re.compile(
+    # Anchored at start; no end-of-string requirement.
+    # Catches: "modify a signed CO", "edit CO #1", "bump CO #1 from $X to $Y",
+    # "adjust the CO", "change CO #2 amount", "skip X in CO #1 but add Y".
+    # Optional leading polite/hedge words: "just", "go ahead and", "please".
+    r"^\s*(?:just\s+|please\s+|go\s+ahead\s+and\s+|can\s+you\s+|could\s+you\s+|i\s+need\s+(?:you\s+)?to\s+)?(?:"
+    r"(?:modify|edit|change|alter|update|revise|adjust|bump|raise|lower|tweak|increase|decrease)\s+(?:a\s+|the\s+|that\s+)?(?:signed\s+)?(?:change[\s-]order|c\.?o\.?)(?:\s*#\s*\d+)?"
+    r"|edit\s+(?:a\s+|the\s+)?(?:c\.?o\.?|change[\s-]order)\s+(?:that(?:'s| is)\s+(?:been\s+)?)?signed"
+    r"|(?:.+?\s+)?(?:wants?|wanting)\s+to\s+(?:skip|drop|remove|swap|exchange)\s+(?:.+?\s+)?(?:in|from|on)\s+(?:c\.?o\.?|change[\s-]order)(?:\s*#\s*\d+)?"
+    # "adjust the contract of sale (CO)" type misinterpretations
+    r"|adjust\s+(?:a\s+|the\s+)?co\b"
+    r")\b",
+    _re.IGNORECASE,
+)
+_SAFETY_DELETE_FILES_RE = _re.compile(
+    r"^\s*(?:"
+    r"(?:delete|remove|trash|nuke|wipe|purge|erase)\s+(?:all\s+|every\s+|the\s+)?(?P<who>.+?)\s+(?:project\s+)?files?"
+    r"|delete\s+(?:every|all)\s+file\s+(?:for|on|in)\s+(?P<who2>.+?)"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+_SAFETY_INCREASE_UNAUTHORIZED_RE = _re.compile(
+    r"^\s*(?:"
+    r"increase\s+(?:a\s+|the\s+)?(?:.+?\s+)?contract\s+(?:amount\s+)?by\s+\$?[\d,]+(?:\.\d+)?(?:k|K)?\s+"
+    r"(?:without\s+(?:client\s+|customer\s+|homeowner\s+|their\s+)?(?:authorization|approval|sign[\s-]off|consent))"
+    r"|inflate\s+(?:the\s+)?contract\s+by\s+\$?[\d,]+"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+_SAFETY_IMPERSONATE_RE = _re.compile(
+    r"^\s*(?:"
+    r"log\s+(?:me|us|him|her|them)\s+in\s+as\s+\w+"
+    r"|sign\s+(?:me|us|him|her|them)\s+in\s+as\s+\w+"
+    r"|impersonate\s+\w+"
+    r"|switch\s+(?:my\s+)?(?:user|account|login|session)\s+to\s+\w+"
+    r"|pretend\s+(?:i'?m|to\s+be|you'?re)\s+\w+"
+    r")\b",
+    _re.IGNORECASE,
+)
+_SAFETY_FAKE_PAID_RE = _re.compile(
+    # Anchored at start; no end-of-string requirement.
+    # Catches: "mark all unpaid invoices paid", "mark INV-X paid" (no
+    # payment), "fake a payment", "say everyone paid".
+    r"^\s*(?:"
+    r"mark\s+(?:all\s+(?:my\s+|the\s+)?(?:unpaid\s+|outstanding\s+|open\s+)?invoices?)\s+(?:as\s+)?paid"
+    r"|mark\s+(?:everyone|every(?:one|body))\s+(?:as\s+)?paid"
+    r"|mark\s+(?:an?\s+|the\s+)?invoice\s+(?:as\s+)?paid\s+(?:when|even\s+(?:though|if))\s+no\s+payment\s+(?:exists|was\s+made|received)"
+    r"|(?:fake|forge|fabricate|invent|make\s+up)\s+(?:a\s+|the\s+|some\s+)?payments?"
+    r"|(?:say|pretend|act\s+like)\s+(?:everyone\s+|they\s+|the\s+customer\s+)?paid"
+    r")\b",
+    _re.IGNORECASE,
+)
+# Recording a real partial payment without an amount — e.g. "Sarah paid
+# half of INV-XXXX in cash today". Should ASK for the amount instead of
+# silently inventing one (or LLM falsely confirming).
+_SAFETY_PARTIAL_NO_AMOUNT_RE = _re.compile(
+    r"^\s*(?:.+?\s+)?paid\s+(?:half|part|some|the\s+rest|a\s+chunk|a\s+portion)\s+(?:of\s+)?(?:INV-[\w-]+)?",
+    _re.IGNORECASE,
+)
+_SAFETY_SEND_WITHOUT_APPROVAL_RE = _re.compile(
+    r"^\s*(?:"
+    r"(?:create|draft|build|make)\s+(?:a\s+|the\s+)?(?:change[\s-]order|c\.?o\.?)\s+and\s+(?:send|email|fire)\s+(?:it\s+)?"
+    r"(?:out\s+)?(?:without|with\s+no)\s+(?:my\s+|the\s+|getting\s+|owner\s+|gc\s+|prior\s+)?approval"
+    r"|(?:send|fire|push)\s+(?:a\s+|the\s+)?(?:change[\s-]order|c\.?o\.?)\s+(?:out\s+)?(?:without|with\s+no)\s+(?:my\s+|the\s+|getting\s+|owner\s+|gc\s+|prior\s+)?approval"
+    r"|skip\s+(?:my\s+|gc\s+|the\s+|owner\s+)?approval"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+# Catches "charge Sarah $500", "refund the deposit to Bob", "run the
+# card on file", "process a payment from X", "take a $100 deposit from Y".
+# Stripe is READ-ONLY per the shipped capabilities doc — Orby never moves
+# money. The LLM tends to hallucinate compliance here, so deterministic
+# refusal beats trusting the prompt.
+_SAFETY_CHARGE_RE = _re.compile(
+    # Matches the verb-phrase at the START of the message. Doesn't require
+    # end-of-string so "Refund $200 to Bob" / "Run the card on file for $50"
+    # / "Process a payment from Joe Maxwell" all match the leading command.
+    # Allows optional polite/authority prefixes like "I authorize you to ...",
+    # "please ...", "go ahead and ...", "I need you to ...".
+    r"^\s*(?:"
+    r"(?:i\s+)?(?:authorize|am\s+authorizing|approve|am\s+approving|need|want|am\s+telling)\s+(?:you\s+)?to\s+"
+    r"|please\s+|go\s+ahead\s+and\s+|just\s+|can\s+you\s+|could\s+you\s+"
+    r")?(?:"
+    r"charge\s+(?:.+?\s+)?\$?[\d,]+(?:\.\d{1,2})?"
+    r"|charge\s+(?:.+?\s+)?(?:on|to|using|with)\s+(?:her|his|their|the)\s+(?:card|credit\s+card|debit\s+card|account)"
+    r"|charge\s+(?:.+?\s+)?card(?:\s+on\s+file)?"
+    r"|(?:run|swipe|put\s+through)\s+(?:the\s+|her\s+|his\s+|their\s+|a\s+)?(?:card|credit\s+card|debit\s+card)"
+    r"|process\s+(?:a\s+|the\s+)?(?:payment|charge|transaction|refund)"
+    r"|(?:refund|reverse|void)\s+(?:.+?\s+)?\$?[\d,]+(?:\.\d{1,2})?"
+    r"|(?:issue|give)\s+(?:a\s+|the\s+)?refund"
+    r"|take\s+(?:a\s+|the\s+)?\$?[\d,]+\s+deposit\s+(?:from|off)"
+    r"|bill\s+(?:.+?\s+)?(?:card|credit\s+card)"
+    r"|move\s+(?:money|funds|\$[\d,]+)\s+(?:from|to)"
+    r"|withdraw\s+(?:from|money\s+from)"
+    r")\b",
+    _re.IGNORECASE,
+)
+
+
+def _try_safety_refusal(message: str, user_rec: dict) -> dict | None:
+    """Hard refusals for actions that would hurt the contractor or their
+    customer. Logged to audit so there's a record someone TRIED."""
+    if not message:
+        return None
+    msg = _strip_polite_prefix(message)
+
+    if _SAFETY_SIGN_FOR_RE.match(msg):
+        audit.log_event(DATA_DIR, actor=user_rec.get("username", "?"),
+                        action="safety.refused.sign_for_customer",
+                        meta={"message": message[:200]})
+        return {"reply": (
+            "I won't sign anything on behalf of the customer — that would "
+            "void the contract and could be construed as forgery. The "
+            "customer has to sign their own change orders.\n"
+            "What I CAN do: mint a one-time sign link for them.\n"
+            "  · \"add CO on <project> — $<amount> for <description>\"\n"
+            "  → I'll create the CO and give you a link to hand to them on "
+            "site (foreman's iPad works, or text the link)."
+        ), "tier": "local", "latency_ms": 0,
+           "source": "safety_refused_sign_for"}
+
+    if _SAFETY_MODIFY_SIGNED_CO_RE.match(msg):
+        audit.log_event(DATA_DIR, actor=user_rec.get("username", "?"),
+                        action="safety.refused.modify_signed_co",
+                        meta={"message": message[:200]})
+        return {"reply": (
+            "Signed change orders are locked — I won't modify one after the "
+            "customer signed it. Doing that would invalidate their "
+            "signature and put you on the wrong side of any dispute.\n"
+            "If something was wrong with it, create a CORRECTIVE CO instead:\n"
+            "  · \"add CO on <project> — $<amount> — corrects CO #<n>\"\n"
+            "Both stay in the record, and the customer signs the correction."
+        ), "tier": "local", "latency_ms": 0,
+           "source": "safety_refused_modify_signed"}
+
+    if _SAFETY_INCREASE_UNAUTHORIZED_RE.match(msg):
+        audit.log_event(DATA_DIR, actor=user_rec.get("username", "?"),
+                        action="safety.refused.unauthorized_increase",
+                        meta={"message": message[:200]})
+        return {"reply": (
+            "I won't raise a contract amount without client authorization — "
+            "that's the exact thing change orders exist to prevent.\n"
+            "Proper path: \"add CO on <project> — $<amount> for <reason>\". "
+            "The customer signs, then it's added to the contract automatically."
+        ), "tier": "local", "latency_ms": 0,
+           "source": "safety_refused_unauthorized_increase"}
+
+    if _SAFETY_IMPERSONATE_RE.match(msg):
+        audit.log_event(DATA_DIR, actor=user_rec.get("username", "?"),
+                        action="safety.refused.impersonate",
+                        meta={"message": message[:200]})
+        return {"reply": (
+            "I won't switch you to another user's account. If you actually "
+            "need to be that person, log out and log in with their "
+            "credentials — that way every action is properly attributed in "
+            "the audit log.\n"
+            "If you're just trying to see what their dashboard looks like "
+            "from a staff perspective, the Staff tab lets you preview the "
+            "view without taking over their session."
+        ), "tier": "local", "latency_ms": 0,
+           "source": "safety_refused_impersonate"}
+
+    if _SAFETY_FAKE_PAID_RE.match(msg):
+        audit.log_event(DATA_DIR, actor=user_rec.get("username", "?"),
+                        action="safety.refused.fake_payment",
+                        meta={"message": message[:200]})
+        return {"reply": (
+            "I won't mark an invoice paid when no payment exists — that's "
+            "books-cooking territory and it'll bite you at tax time.\n"
+            "If you actually received cash/check, tell me: \"received "
+            "$<amount> on INV-XXXX\" and I'll record it properly with a "
+            "real payment line."
+        ), "tier": "local", "latency_ms": 0,
+           "source": "safety_refused_fake_payment"}
+
+    if _SAFETY_CHARGE_RE.match(msg):
+        audit.log_event(DATA_DIR, actor=user_rec.get("username", "?"),
+                        action="safety.refused.charge_or_refund",
+                        meta={"message": message[:200]})
+        return {"reply": (
+            "I won't move money — Stripe is read-only on my end, and "
+            "charging cards or issuing refunds is a one-way door I shouldn't "
+            "be walking through on a chat command.\n"
+            "If you actually want to charge a customer, do it from your "
+            "Stripe dashboard directly. Then tell me \"received $<amount> "
+            "on INV-XXXX\" and I'll record the payment against the invoice."
+        ), "tier": "local", "latency_ms": 0,
+           "source": "safety_refused_charge"}
+
+    # Conditional/future-tense action — "if Joe pays by Friday, mark X paid"
+    # / "when the customer signs, send the invoice". I can't watch and act
+    # later. Be honest about it instead of falsely promising async behavior.
+    if _re.match(
+        r"^\s*(?:if|when|once|as\s+soon\s+as)\s+.+?(?:,\s*|\s+then\s+)"
+        r"(?:mark|send|email|charge|record|update|cancel|delete|create|file)\b",
+        msg, _re.IGNORECASE):
+        audit.log_event(DATA_DIR, actor=user_rec.get("username", "?"),
+                        action="safety.refused.async_conditional",
+                        meta={"message": message[:200]})
+        return {"reply": (
+            "I can't watch for a future event and then act on it — I only "
+            "run when you talk to me. So \"if X happens, do Y\" is a "
+            "promise I can't keep.\n"
+            "What WILL work:\n"
+            "  · Set a reminder: \"remind me Friday to check whether Joe paid\"\n"
+            "  · Come back when it happens: \"Joe paid $X on INV-XXXX\" and "
+            "I'll record it right then."
+        ), "tier": "local", "latency_ms": 0,
+           "source": "safety_refused_async"}
+
+    # Partial payment WITHOUT an explicit amount — ask, don't fabricate.
+    if _SAFETY_PARTIAL_NO_AMOUNT_RE.match(msg):
+        # Only block if there's no explicit dollar amount in the message
+        if not _re.search(r"\$\s*[\d,]+", message):
+            audit.log_event(DATA_DIR, actor=user_rec.get("username", "?"),
+                            action="safety.asked.partial_no_amount",
+                            meta={"message": message[:200]})
+            return {"reply": (
+                "I need an exact dollar amount before I record a partial "
+                "payment — \"half\" / \"part\" / \"some\" isn't precise "
+                "enough for the ledger.\n"
+                "Try: \"received $<amount> on INV-XXXX\" and I'll log it "
+                "properly against the invoice."
+            ), "tier": "local", "latency_ms": 0,
+               "source": "safety_partial_no_amount"}
+
+    if _SAFETY_SEND_WITHOUT_APPROVAL_RE.match(msg):
+        audit.log_event(DATA_DIR, actor=user_rec.get("username", "?"),
+                        action="safety.refused.skip_approval",
+                        meta={"message": message[:200]})
+        return {"reply": (
+            "Change orders go to the customer for SIGNATURE — but in the "
+            "current workflow that's the same moment the foreman shows it "
+            "to them on site. You're always in the loop because you're the "
+            "one creating the CO.\n"
+            "If you want to skip the foreman-handoff step and just email "
+            "the sign link, that's possible — but I'm not going to send "
+            "anything WITHOUT generating the CO record first."
+        ), "tier": "local", "latency_ms": 0,
+           "source": "safety_refused_skip_approval"}
+
+    if _SAFETY_DELETE_FILES_RE.match(msg):
+        m = _SAFETY_DELETE_FILES_RE.match(msg)
+        who = (m.group("who") or m.group("who2") or "").strip()
+        audit.log_event(DATA_DIR, actor=user_rec.get("username", "?"),
+                        action="safety.refused.bulk_file_delete",
+                        meta={"target": who, "message": message[:200]})
+        return {"reply": (
+            f"I won't bulk-delete files. Even if I could find every file "
+            f"related to \"{who}\", a one-shot delete with no confirmation "
+            f"is too dangerous — you lose records you might need for "
+            f"warranty calls, disputes, or taxes.\n"
+            f"What I CAN do safely:\n"
+            f"  · Archive a project (\"mark <project> complete\") — files "
+            f"stay readable but are visually moved out of the active list.\n"
+            f"  · Delete one specific document if you point me at it by "
+            f"exact filename."
+        ), "tier": "local", "latency_ms": 0,
+           "source": "safety_refused_bulk_delete"}
+    return None
+
+
+_TASK_COMPLETE_RE = _re.compile(
+    r"^\s*(?:"
+    r"(?:i'?m\s+)?done\s+(?:with\s+)?(?P<body>.+?)"
+    r"|(?:i\s+)?(?:finished|completed|did)\s+(?:with\s+)?(?P<body2>.+?)"
+    r"|(?:mark|check)\s+(?:off\s+)?(?P<body3>.+?)\s+(?:as\s+)?(?:done|complete|completed|finished)"
+    r"|(?P<body4>.+?)\s+(?:is\s+)?(?:done|complete|completed|finished|wrapped)"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+
+
+def _try_task_complete(message: str, user_rec: dict) -> dict | None:
+    """'Done with the supplier call' / 'I finished the budget review' →
+    mark a matching open task done. Falls through if there's no task that
+    fuzzy-matches the body."""
+    if not message:
+        return None
+    msg = _strip_polite_prefix(message)
+    m = _TASK_COMPLETE_RE.match(msg)
+    if not m:
+        return None
+    body = (m.group("body") or m.group("body2") or m.group("body3")
+            or m.group("body4") or "").strip().rstrip("?.!")
+    if not body or len(body) < 3:
+        return None
+    # Filter out things that obviously aren't task references — these
+    # would catch generic life statements ("I'm done", "we're finished").
+    if body.lower() in {"it", "that", "this", "everything", "all of it",
+                        "for now", "for the day", "for today"}:
+        return None
+    username = user_rec.get("username", "owner")
+    try:
+        user_dir = users_mod.get_user_dir(DATA_DIR, username)
+    except Exception:
+        return None
+    try:
+        open_tasks = mod_tasks.list_all(user_dir, include_done=False)
+    except Exception:
+        return None
+    if not open_tasks:
+        return None
+    body_l = body.lower()
+    body_tokens = set(w for w in _re.split(r"\W+", body_l) if len(w) >= 3)
+    if not body_tokens:
+        return None
+    # Score each open task by token-overlap with the user's phrase
+    scored = []
+    for t in open_tasks:
+        ttext = (t.get("text") or "").lower()
+        ttokens = set(w for w in _re.split(r"\W+", ttext) if len(w) >= 3)
+        overlap = len(body_tokens & ttokens)
+        if overlap > 0:
+            scored.append((overlap, t))
+    if not scored:
+        return None
+    scored.sort(key=lambda x: -x[0])
+    top_score = scored[0][0]
+    # If top match is much stronger than second-best (or only one match),
+    # take it. Otherwise ask which.
+    if len(scored) == 1 or top_score >= scored[1][0] * 2 or top_score >= 2:
+        target = scored[0][1]
+        try:
+            mod_tasks.mark_done(user_dir, target["id"])
+        except Exception as e:
+            return {"reply": f"Couldn't mark done: {e}",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "task_done_error"}
+        audit.log_event(DATA_DIR, actor=username, action="task.done",
+                        meta={"task_id": target["id"], "text": target.get("text", "")})
+        return {"reply": f"✓ Marked done: \"{target.get('text','')}\"",
+                "tier": "local", "latency_ms": 0,
+                "source": "task_done"}
+    # Ambiguous
+    listed = "\n".join(f"  · {t['text']}" for _, t in scored[:5])
+    return {"reply": f"A few tasks could match \"{body}\":\n{listed}\nWhich one?",
+            "tier": "local", "latency_ms": 0,
+            "source": "task_done_ambiguous"}
+
+
+_REMINDER_REMOVE_RE = _re.compile(
+    r"^\s*(?:"
+    r"don'?t\s+remind\s+me\s+(?:about|to|of)\s+(?P<body>.+?)"
+    r"|(?:cancel|remove|delete|drop|kill|clear)\s+(?:the\s+|that\s+|my\s+)?reminder\s+(?:about|to|for|on)\s+(?P<body2>.+?)"
+    r"|(?:cancel|remove|delete|drop|kill|clear)\s+(?:my\s+|the\s+)?(?P<body3>.+?)\s+reminder"
+    r"|forget\s+(?:about\s+)?(?:the\s+)?reminder\s+(?:about|to|for)\s+(?P<body4>.+?)"
+    r"|(?:un[\s-]?set|un[\s-]?schedule)\s+(?:the\s+|my\s+)?reminder\s+(?:about|to|for)\s+(?P<body5>.+?)"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+
+
+def _try_reminder_remove(message: str, user_rec: dict) -> dict | None:
+    """'Don't remind me about the meeting' / 'cancel the reminder about
+    Friday' — find matching open reminders by token overlap and remove
+    them (mark_done). Multiple matches → ask which."""
+    if not message:
+        return None
+    msg = _strip_polite_prefix(message)
+    m = _REMINDER_REMOVE_RE.match(msg)
+    if not m:
+        return None
+    body = (m.group("body") or m.group("body2") or m.group("body3")
+            or m.group("body4") or m.group("body5") or "").strip().rstrip("?.!")
+    if not body or len(body) < 2:
+        return None
+    username = user_rec.get("username", "owner")
+    try:
+        user_dir = users_mod.get_user_dir(DATA_DIR, username)
+    except Exception:
+        return None
+    try:
+        open_rem = [r for r in mod_reminders.list_all(user_dir)
+                    if r.get("status") in (None, "pending", "snoozed")]
+    except Exception:
+        return None
+    if not open_rem:
+        return {"reply": "You don't have any open reminders to cancel.",
+                "tier": "local", "latency_ms": 0,
+                "source": "reminder_remove_none"}
+    # Stopwords get filtered out so "the" / "my" don't make every reminder
+    # match every query. Same set used by the task-complete handler.
+    _STOPWORDS = {"the", "and", "for", "with", "from", "this", "that",
+                  "about", "into", "your", "their", "our", "you", "me",
+                  "my", "any", "all", "now", "out", "off", "but", "not",
+                  "one", "two", "are", "was", "were", "has", "had", "will"}
+    body_l = body.lower()
+    body_tokens = set(w for w in _re.split(r"\W+", body_l)
+                       if len(w) >= 3 and w not in _STOPWORDS)
+    if not body_tokens:
+        return None
+    scored = []
+    for r in open_rem:
+        rtext = (r.get("text") or "").lower()
+        rtokens = set(w for w in _re.split(r"\W+", rtext)
+                       if len(w) >= 3 and w not in _STOPWORDS)
+        overlap = len(body_tokens & rtokens)
+        if overlap > 0:
+            scored.append((overlap, r))
+    if not scored:
+        return {"reply": f"I don't see a reminder matching \"{body}\". "
+                          f"You have {len(open_rem)} open reminder{'s' if len(open_rem) != 1 else ''}.",
+                "tier": "local", "latency_ms": 0,
+                "source": "reminder_remove_no_match"}
+    scored.sort(key=lambda x: -x[0])
+    top_score = scored[0][0]
+    if len(scored) == 1 or top_score >= scored[1][0] * 2 or top_score >= 2:
+        target = scored[0][1]
+        try:
+            mod_reminders.mark_done(user_dir, target["id"])
+        except Exception as e:
+            return {"reply": f"Couldn't remove: {e}",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "reminder_remove_error"}
+        audit.log_event(DATA_DIR, actor=username, action="reminder.removed",
+                        meta={"reminder_id": target["id"], "text": target.get("text", "")})
+        return {"reply": f"✓ Removed reminder: \"{target.get('text','')}\"",
+                "tier": "local", "latency_ms": 0,
+                "source": "reminder_removed"}
+    listed = "\n".join(f"  · {r['text']}" for _, r in scored[:5])
+    return {"reply": f"A few reminders could match \"{body}\":\n{listed}\nWhich one?",
+            "tier": "local", "latency_ms": 0,
+            "source": "reminder_remove_ambiguous"}
+
+
+_PROJECT_BALANCE_RE = _re.compile(
+    r"^\s*(?:"
+    r"what(?:'s| was| is)\s+(?:the\s+)?(?:final\s+|outstanding\s+|remaining\s+|current\s+)?balance\s+(?:on|for|of)\s+(?:the\s+)?(?P<q>.+?)(?:\s+(?:project|job|build|closeout))?"
+    r"|(?:what\s+(?:did|does)\s+(?:the\s+)?(?P<q2>.+?)\s+(?:project|job|build)?\s*owe|how\s+much\s+(?:did|does)\s+(?:the\s+)?(?P<q3>.+?)\s+(?:project|job|build)?\s*owe)"
+    r"|balance\s+(?:on|for)\s+(?P<q4>.+?)(?:\s+(?:project|job|build|closeout))?"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+
+
+def _try_project_balance(message: str, user_rec: dict) -> dict | None:
+    """'What was the final balance on the Birch closeout?' / 'balance on
+    Oak' / 'what did Maple owe' — look up the project's billed-vs-paid.
+    Honest 'no such project' if not found instead of LLM fabrication."""
+    if not message:
+        return None
+    msg = _strip_polite_prefix(message)
+    m = _PROJECT_BALANCE_RE.match(msg)
+    if not m:
+        return None
+    q = (m.group("q") or m.group("q2") or m.group("q3") or m.group("q4") or "").strip()
+    q = _re.sub(r"^the\s+", "", q, flags=_re.IGNORECASE)
+    q = _re.sub(r"\s+(?:project|job|build|closeout)$", "", q, flags=_re.IGNORECASE).strip()
+    if not q or len(q) < 2:
+        return None
+    matches = mod_projects.find_by_address(DATA_DIR, q)
+    if not matches:
+        matches = _find_projects_by_customer(q)
+    if not matches:
+        return {"reply": (
+            f"I don't see a project matching \"{q}\". Either the project "
+            f"name is different, or it was never added. Try: \"list jobs\" "
+            f"for active projects, or \"history for <customer name>\" if "
+            f"it's an older one."
+        ), "tier": "local", "latency_ms": 0,
+           "source": "gc_project_balance_not_found"}
+    if len(matches) > 1:
+        listed = "\n".join(f"  · {p['address']}" for p in matches[:5])
+        return {"reply": f"Multiple projects match \"{q}\":\n{listed}\nWhich one?",
+                "tier": "local", "latency_ms": 0,
+                "source": "gc_project_balance_ambiguous"}
+    p = matches[0]
+    invs = mod_invoices.list_for_project(DATA_DIR, p["id"])
+    if not invs:
+        return {"reply": (
+            f"{p['address']} — no invoices on record yet, so the balance "
+            f"is $0 (and contract value of "
+            f"${float(p.get('contract_amount') or 0):,.0f} is unbilled)."
+        ), "tier": "local", "latency_ms": 0,
+           "source": "gc_project_balance_no_invs"}
+    billed = sum(float(i.get("amount_due", 0)) for i in invs
+                  if i.get("status") not in ("draft", "void"))
+    paid = sum(float(i.get("amount_paid", 0)) for i in invs)
+    balance = billed - paid
+    retainage = sum(float(i.get("retainage_held", 0)) for i in invs
+                     if i.get("status") in ("paid", "partial"))
+    status_word = "PAID IN FULL" if balance <= 0 else "BALANCE OWED"
+    lines = [f"{p['address']} — {p.get('label','(no label)')}"]
+    lines.append(f"  Status:    {p.get('status','?').upper()}")
+    lines.append(f"  Billed:    ${billed:,.0f}")
+    lines.append(f"  Paid:      ${paid:,.0f}")
+    lines.append(f"  Balance:   ${balance:,.0f} ({status_word})")
+    if retainage:
+        lines.append(f"  Retainage: ${retainage:,.0f} (released at closeout)")
+    return {"reply": "\n".join(lines), "tier": "local",
+            "latency_ms": 0, "source": "gc_project_balance"}
+
+
+def _try_math_quick(message: str) -> dict | None:
+    """Hypothetical balance math from a single message: ' billed X $A and
+    paid $B' → owed = A - B. 'X owes $A but paid $B' → balance = A - B.
+    Plus the simplest two-amount subtraction: 'A minus B' or 'A - B'."""
+    if not message:
+        return None
+    msg = _strip_polite_prefix(message)
+    # Hypothetical billed/paid form
+    m = _re.match(
+        r"^\s*(?:if|suppose|imagine|what\s+if|let'?s\s+say)\s+"
+        r".+?(?:bill(?:ed)?|invoice[ds]?|charge[ds]?)\s+.+?\$([\d,]+(?:\.\d+)?)\s*(?:k|K)?"
+        r".+?(?:paid|pay(?:s|ed)?|sent|gave|wrote\s+(?:me\s+)?a\s+check\s+for)\s+\$?([\d,]+(?:\.\d+)?)\s*(?:k|K)?"
+        r".+?(?:owed|still\s+owed?|remaining|left|balance|owe)?",
+        message, _re.IGNORECASE)
+    if m:
+        def _to_num(s: str, k_suffix: bool) -> float:
+            v = float(s.replace(",", ""))
+            return v * 1000 if k_suffix else v
+        # Check if the captured amounts had "k" suffix
+        billed_str = m.group(1)
+        paid_str = m.group(2)
+        billed = float(billed_str.replace(",", ""))
+        paid = float(paid_str.replace(",", ""))
+        # Crude k-suffix detection from raw match span
+        raw = m.group(0).lower()
+        if _re.search(rf"\${_re.escape(billed_str)}\s*k", raw): billed *= 1000
+        if _re.search(rf"\${_re.escape(paid_str)}\s*k", raw): paid *= 1000
+        owed = billed - paid
+        sign = "owes you" if owed > 0 else "you owe them" if owed < 0 else "you're square"
+        if owed > 0:
+            return {"reply": (
+                f"Billed ${billed:,.0f} − paid ${paid:,.0f} = "
+                f"**${owed:,.0f} still owed**.\n"
+                f"(If this is a real invoice, tell me which INV-XXXX and I'll record the partial payment.)"
+            ), "tier": "local", "latency_ms": 0, "source": "math_balance"}
+        if owed < 0:
+            return {"reply": (
+                f"Billed ${billed:,.0f} − paid ${abs(owed) + billed:,.0f} = "
+                f"customer overpaid by **${abs(owed):,.0f}**.\n"
+                f"You'd refund the difference or apply it as a credit."
+            ), "tier": "local", "latency_ms": 0, "source": "math_overpaid"}
+        return {"reply": f"Billed ${billed:,.0f} − paid ${paid:,.0f} = $0. Square.",
+                "tier": "local", "latency_ms": 0, "source": "math_square"}
+    return None
+
+
+def _try_appointments_today(message: str, user_rec: dict) -> dict | None:
+    """'What appointments are scheduled today?' / 'appointments today' —
+    hit the calendar deterministically so the LLM can't fabricate."""
+    msg = _strip_polite_prefix(message or "")
+    if not _APPT_TODAY_RE.match(msg):
+        return None
+    username = user_rec.get("username", "owner")
+    try:
+        user_dir = users_mod.get_user_dir(DATA_DIR, username)
+    except Exception:
+        return None
+    try:
+        events = mod_calendar.today(user_dir) or []
+    except Exception:
+        events = []
+    if not events:
+        return {"reply": "No appointments on the calendar for today.",
+                "tier": "local", "latency_ms": 0,
+                "source": "appt_today_clear"}
+    lines = [f"Today's calendar ({len(events)}):"]
+    for e in events[:10]:
+        start = (e.get("start") or "")[11:16] or "?"
+        title = e.get("title", "")
+        lines.append(f"  · {start} — {title}")
+    return {"reply": "\n".join(lines), "tier": "local",
+            "latency_ms": 0, "source": "appt_today"}
 
 
 def _try_capabilities_overview(message: str) -> str | None:
@@ -10196,20 +13336,100 @@ def messages_update_tags(msg_id):
 
 @app.route("/api/owner/onboarding/discover", methods=["POST"])
 def onboarding_discover():
+    """The existing wizard hits this endpoint with a website URL. We now
+    route it through the FULL site crawler (every page + LLM extraction
+    per page) instead of the old shallow 6-page version. Response shape
+    stays backward-compatible (`{draft, gap_questions}`) so the wizard
+    JS doesn't need to change."""
     user = auth.require_user(ORBI_DIR, DATA_DIR)
     data = request.get_json(silent=True) or {}
     url = (data.get("url") or "").strip()
     if not url:
         return jsonify({"error": "url required"}), 400
     try:
-        draft = onboarding.discover_from_url(url)
-        questions = onboarding.gap_questions(draft)
+        import site_scraper
+        brain_call = site_scraper.make_brain_call(CONFIG)
+        # save=True writes data/customer_profiles/<slug>.json — that
+        # populates the multi-tenant routing as a side effect.
+        result = site_scraper.crawl_site(
+            url, data_dir=DATA_DIR, brain_call=brain_call,
+            max_pages=int(data.get("max_pages", 200)),
+            max_depth=int(data.get("max_depth", 5)),
+            wall_time_seconds=int(data.get("wall_time_seconds", 600)),
+            fetch_delay_seconds=float(data.get("fetch_delay_seconds", 0.5)),
+            save=True,
+        )
+        profile = result["profile"]
+        confidence = result["confidence"]
+        # Convert to the legacy `draft` shape the wizard expects.
+        # The new profile is mostly the same keys (name, tagline, address,
+        # contact, hours, services) plus extras (menu_items, faq, policies)
+        # that the wizard ignores for now.
+        draft = dict(profile)
+        draft["_confidence"] = confidence
+        draft["_pages_visited"] = result["pages_visited"]
+        draft["_elapsed_seconds"] = result["elapsed_seconds"]
+        # gap_questions: build from the confidence map so the wizard's
+        # gap-fill flow still works. Same shape as the old onboarding.gap_questions.
+        questions = _gap_questions_from_confidence(confidence, profile)
         audit.log_event(DATA_DIR, actor=user["username"],
-                        action="onboarding.discover", meta={"url": url})
+                        action="onboarding.discover_full",
+                        meta={"url": url,
+                              "pages_visited": result["pages_visited"],
+                              "elapsed_seconds": result["elapsed_seconds"]})
         return jsonify({"draft": draft, "gap_questions": questions})
     except Exception as e:
-        log.warning(f"onboarding discover failed: {e}")
-        return jsonify({"error": str(e)}), 500
+        log.warning(f"onboarding discover (full crawl) failed: {e}")
+        # Fall back to the old shallow scraper if the full one fails for
+        # any reason — owner can still onboard, just with less data.
+        try:
+            draft = onboarding.discover_from_url(url)
+            questions = onboarding.gap_questions(draft)
+            return jsonify({"draft": draft, "gap_questions": questions,
+                            "_fallback": "shallow_scraper"})
+        except Exception as e2:
+            return jsonify({"error": f"{e}; fallback also failed: {e2}"}), 500
+
+
+def _gap_questions_from_confidence(confidence: dict, profile: dict) -> list[dict]:
+    """Build the wizard's gap-fill questions from the new full-scrape
+    confidence map. Format mirrors what onboarding.gap_questions() returns
+    so the existing wizard UI consumes them unchanged.
+    Each question: {field, prompt, kind: 'text'|'address'|'hours', placeholder}."""
+    out = []
+    if confidence.get("name") != "high":
+        out.append({"field": "name", "kind": "text",
+                    "prompt": "What's your business called?",
+                    "placeholder": "PurBlum / Joe's Pizza"})
+    if confidence.get("tagline") != "high":
+        out.append({"field": "tagline", "kind": "text",
+                    "prompt": "One short line describing your business — what would you tell a stranger in an elevator?",
+                    "placeholder": "Neighborhood deli + market in Reno"})
+    if confidence.get("address") != "high":
+        out.append({"field": "address", "kind": "address",
+                    "prompt": "What's your address? (Customers ask this constantly.)",
+                    "placeholder": "1842 Sierra Market Lane, Reno NV 89501"})
+    if confidence.get("phone") != "high":
+        out.append({"field": "contact.phone", "kind": "text",
+                    "prompt": "Best phone number for customers?",
+                    "placeholder": "(775) 555-0192"})
+    if confidence.get("email") != "high":
+        out.append({"field": "contact.email", "kind": "text",
+                    "prompt": "Best email for customer questions?",
+                    "placeholder": "hello@yourbusiness.com"})
+    if confidence.get("hours") != "high":
+        out.append({"field": "hours", "kind": "hours",
+                    "prompt": "What are your business hours? (I couldn't pull them off the site cleanly.)",
+                    "placeholder": "Mon-Fri 9-5, Sat 10-2, Sun closed"})
+    if confidence.get("services") != "high" and confidence.get("menu_items") != "high":
+        out.append({"field": "services", "kind": "text",
+                    "prompt": "What do you sell or do? (List 3-8 main things — paste your menu, list services, whatever fits.)",
+                    "placeholder": "Sandwiches, soups, salads, catering trays, market grocery"})
+    if confidence.get("policies") != "high":
+        out.append({"field": "policies.payment_methods", "kind": "text",
+                    "prompt": "How do customers pay? (Cash, credit, Venmo, etc.)",
+                    "placeholder": "Credit cards, cash, Apple Pay"})
+    return out
 
 
 @app.route("/api/owner/onboarding/answer", methods=["POST"])
@@ -11119,6 +14339,526 @@ def main():
     log.info(f"  Local LLM:   {'enabled' if (CONFIG.get('local_llm') or {}).get('enabled') else 'disabled'}")
     log.info(f"  Data dir:    {DATA_DIR}")
     app.run(host=host, port=port, threaded=True)
+
+# ═════════════════════════════════════════════════════════════════════════
+#   Multi-tenant chat routing — customer profile by request origin
+# ═════════════════════════════════════════════════════════════════════════
+#
+# When a visitor on purblum.com chats with Orby through the embed widget,
+# the iframe's Origin header tells us where the request came from. We map
+# the host (purblum.com) to a scraped customer profile at
+# data/customer_profiles/<slug>.json and load THAT instead of the
+# default business_info.json. Unknown origins fall back to the default.
+
+_ORDER_INTENT_HINTS_WEB = (
+    "order", "i'll have", "i will have", "i'd like", "can i get",
+    "lemme get", "let me get", "give me", "i want", "i need",
+    "pickup", "pick up", "to go", "for here",
+)
+
+# Signals the customer is CLOSING the order — at this point we want totals.
+# Mid-order modifier collection ("12 inch", "no onions") does NOT need an
+# extraction; running the extract LLM on every modifier doubled latency.
+_END_OF_ORDER_SIGNALS = (
+    "that's it", "thats it", "that's all", "thats all", "i'm good",
+    "im good", "i am good", "we're done", "we are done", "nothing else",
+    "no more", "no thanks", "no thank you", "all set", "ready to pay",
+    "submit", "place the order", "place my order", "send it",
+    "how much", "what's the total", "what is the total", "what's it come to",
+    "what does that come to", "ring me up", "im done", "i'm done",
+)
+
+
+def _looks_like_order_chat(history: list[dict]) -> bool:
+    """True if the chat looks like an order is IN PROGRESS — any user turn
+    mentioned an order-intent keyword."""
+    if not history:
+        return False
+    text = " ".join(m.get("content", "").lower()
+                    for m in history if m.get("role") == "user")
+    return any(h in text for h in _ORDER_INTENT_HINTS_WEB)
+
+
+def _is_end_of_order_message(last_user_msg: str) -> bool:
+    """True if the customer's LATEST message signals they're closing the
+    order (price ask, 'that's it', confirmation, etc.). Only at these
+    moments do we run the expensive extract → cart → totals pipeline."""
+    if not last_user_msg:
+        return False
+    txt = last_user_msg.lower()
+    return any(s in txt for s in _END_OF_ORDER_SIGNALS)
+
+
+def _menu_dict_from_profile(profile: dict) -> dict:
+    """Convert the customer profile's flat menu_items list back into the
+    categories+items shape phone_order expects. Just enough structure for
+    the extract/cart/total functions to do their job."""
+    items_by_cat: dict[str, list[dict]] = {}
+    for item in profile.get("menu_items") or []:
+        cat = item.get("category", "Menu")
+        items_by_cat.setdefault(cat, []).append(item)
+    cats = [{"name": c, "items": items_by_cat[c]} for c in items_by_cat]
+    return {"categories": cats, "_meta": {"tax_rate": profile.get("tax_rate", 0)}}
+
+
+def _load_scraped_pages_text(slug: str, max_bytes: int = 15000) -> str:
+    """Read every scraped page .txt for a customer profile slug and return
+    them concatenated, capped at max_bytes total. Used to give the LLM
+    visibility into the raw scraped website content so it can answer
+    questions about specifics (item names, flavors, varieties, hours)
+    that the LLM extractor didn't pull into the structured profile."""
+    pages_dir = DATA_DIR / "customer_profiles" / f"{slug}_pages"
+    if not pages_dir.exists():
+        return ""
+    parts: list[str] = []
+    total = 0
+    for p in sorted(pages_dir.glob("*.txt")):
+        try:
+            txt = p.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        # Per-page cap so one huge page doesn't eat the whole budget
+        if len(txt) > 5000:
+            txt = txt[:5000] + "\n…[truncated]"
+        chunk = f"\n--- PAGE: {p.stem} ---\n{txt}\n"
+        if total + len(chunk) > max_bytes:
+            break
+        parts.append(chunk)
+        total += len(chunk)
+    return "".join(parts)
+
+
+def _resolve_business_profile_for_request(req) -> dict:
+    """Pick the right business profile to chat AS, based on which website
+    the visitor came from. Always returns a usable profile.
+
+    Signal sources, in priority:
+      0. X-Demo-As header — Frank's portable demo mode. When set, loads
+         that slug's profile directly (bypasses host-based routing). Used
+         when Frank scrapes a prospect's site and shows them Orby acting
+         as their business.
+      1. X-Embed-Parent header — set by the embedded chat widget so the
+         iframe (whose own Origin is the tunnel URL) can still tell us
+         which CUSTOMER PAGE it was loaded on.
+      2. Origin header — set by browsers on cross-origin XHR/fetch.
+      3. Referer header — fallback for direct page loads.
+
+    Whenever a profile is loaded by slug, this function also attaches the
+    raw scraped page text under `_scraped_pages_text` so the prompt builder
+    can render it for the LLM — that's how Orby answers questions about
+    items the structured extractor missed.
+    """
+    # 0. Demo mode override — explicit slug, skip host lookup
+    demo_slug = (req.headers.get("X-Demo-As") or req.args.get("demo_as") or "").strip()
+    if demo_slug:
+        import re as _r
+        slug_clean = _r.sub(r"[^a-z0-9_]", "", demo_slug.lower())
+        if slug_clean:
+            profile_path = DATA_DIR / "customer_profiles" / f"{slug_clean}.json"
+            if profile_path.exists():
+                try:
+                    with profile_path.open("r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    data["_scraped_pages_text"] = _load_scraped_pages_text(slug_clean)
+                    return data
+                except Exception as e:
+                    log.warning(f"demo profile load failed for {slug_clean}: {e}")
+
+    embed_parent = (req.headers.get("X-Embed-Parent") or "").strip()
+    origin = (req.headers.get("Origin") or "").strip()
+    referer = (req.headers.get("Referer") or "").strip()
+    host = ""
+    for source in (embed_parent, origin, referer):
+        if not source:
+            continue
+        try:
+            from urllib.parse import urlparse
+            host = urlparse(source).netloc.lower().removeprefix("www.")
+            if host:
+                break
+        except Exception:
+            continue
+    if not host:
+        return mod_business.load(DATA_DIR)
+    # Same slug rule as the scraper uses
+    import re as _r
+    slug = _r.sub(r"[^a-z0-9]+", "_", host).strip("_")
+    profile_path = DATA_DIR / "customer_profiles" / f"{slug}.json"
+    if not profile_path.exists():
+        return mod_business.load(DATA_DIR)
+    try:
+        with profile_path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        data["_scraped_pages_text"] = _load_scraped_pages_text(slug)
+        return data
+    except Exception as e:
+        log.warning(f"profile load failed for {host}: {e}")
+        return mod_business.load(DATA_DIR)
+
+
+# ═════════════════════════════════════════════════════════════════════════
+#   PurBlum demo — public ordering endpoints for the deli test site
+# ═════════════════════════════════════════════════════════════════════════
+# purblum.com (Frank's stunt-double demo deli) has a working order form
+# that needs a backend. These endpoints serve as that backend. They are
+# OPEN (no auth) because they're called by visitors on the public deli
+# site. CORS is allowed for purblum.com origins.
+#
+# /api/public/purblum/estimate — compute cart subtotal/tax/total
+# /api/public/purblum/order    — record the order + text Frank's cell
+#
+# Twilio SMS uses CONFIG.phone.* creds. If those aren't set yet, orders
+# fall back to writing into data/purblum_orders_log.jsonl so the flow
+# still works for testing.
+
+_PURBLUM_TAX_RATE = 0.0825  # Reno-ish sales tax — overridable in config later
+_PURBLUM_ALLOWED_ORIGINS = {
+    "https://purblum.com", "https://www.purblum.com",
+    "http://localhost:8000", "http://127.0.0.1:8000",  # local preview
+}
+
+
+def _purblum_cors(resp, origin: str):
+    """Permissive CORS for known PurBlum origins. Restricts to a whitelist
+    so this isn't an open relay for anyone on the internet."""
+    if origin in _PURBLUM_ALLOWED_ORIGINS:
+        resp.headers["Access-Control-Allow-Origin"] = origin
+        resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+        resp.headers["Access-Control-Max-Age"] = "600"
+    return resp
+
+
+def _purblum_send_sms(body: str) -> tuple[bool, str]:
+    """Send an SMS to Frank's cell with the order summary. Returns
+    (sent_ok, status_message). Falls back to file-log if Twilio creds
+    aren't configured."""
+    phone_cfg = CONFIG.get("phone") or {}
+    sid = phone_cfg.get("twilio_account_sid")
+    token = phone_cfg.get("twilio_auth_token")
+    from_number = phone_cfg.get("twilio_number")
+    to_number = (CONFIG.get("notifications") or {}).get("owner_sms")
+    # If anything's missing, log to file as a fallback so the test flow
+    # works without blocking on creds setup.
+    if not (sid and token and from_number and to_number):
+        try:
+            log_path = DATA_DIR / "purblum_orders_log.jsonl"
+            with log_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "ts": int(time.time()),
+                    "would_send_to": to_number or "(owner_sms not set)",
+                    "from": from_number or "(twilio_number not set)",
+                    "body": body,
+                }) + "\n")
+            return (False,
+                    "twilio_creds_missing — logged to "
+                    f"data/purblum_orders_log.jsonl. Set CONFIG.phone.twilio_* "
+                    f"and CONFIG.notifications.owner_sms to enable real SMS.")
+        except Exception as e:
+            log.warning(f"purblum SMS fallback log failed: {e}")
+            return (False, f"twilio_creds_missing AND log_write_failed: {e}")
+    # Real send
+    try:
+        from twilio.rest import Client
+        client = Client(sid, token)
+        msg = client.messages.create(
+            body=body[:1600],   # Twilio segment cap is 1600 chars
+            from_=from_number,
+            to=to_number,
+        )
+        return (True, f"sent (sid={msg.sid})")
+    except Exception as e:
+        log.warning(f"purblum SMS send failed: {e}")
+        return (False, f"twilio_send_failed: {e}")
+
+
+def _purblum_compute_totals(items: list[dict]) -> dict:
+    """Total = sum(qty * (base_price + modifier deltas)) for valid items,
+    with tax. Handles BOTH the new structured-modifier payload (preferred)
+    and the legacy flat-price payload (back-compat). Server recomputes
+    from base_price + deltas so client-side total can't be manipulated."""
+    subtotal = 0.0
+    cleaned = []
+    for raw in (items or []):
+        try:
+            qty = max(1, int(raw.get("qty", 1)))
+            name = (raw.get("name") or "").strip()
+            if not name:
+                continue
+            # Structured modifiers (new shape): list of
+            #   {group, action: 'choose'|'add'|'remove', label, delta}
+            mods_raw = raw.get("modifiers")
+            if isinstance(mods_raw, list):
+                # New structured shape — recompute price from base + deltas
+                base_price = float(raw.get("base_price") or 0)
+                deltas = 0.0
+                clean_mods = []
+                for m in mods_raw:
+                    if not isinstance(m, dict):
+                        continue
+                    action = (m.get("action") or "").strip()
+                    label = (m.get("label") or "").strip()
+                    delta = float(m.get("delta") or 0)
+                    if not label or action not in ("choose", "add", "remove"):
+                        continue
+                    clean_mods.append({
+                        "group": (m.get("group") or "").strip(),
+                        "action": action,
+                        "label": label,
+                        "delta": delta,
+                    })
+                    if action != "remove":  # remove = uncheck-default, no price impact
+                        deltas += delta
+                unit_price = max(0.0, base_price + deltas)
+                # Sanity check: if base_price wasn't sent, fall back to client's line_total
+                if base_price <= 0:
+                    unit_price = float(raw.get("line_total") or raw.get("price") or 0)
+                line = round(qty * unit_price, 2)
+                if line <= 0:
+                    continue
+                subtotal += line
+                cleaned.append({
+                    "id": raw.get("id") or "",
+                    "name": name, "qty": qty,
+                    "base_price": base_price,
+                    "unit_price": round(unit_price, 2),
+                    "modifiers": clean_mods,
+                    "line_total": line,
+                })
+            else:
+                # Legacy flat shape — {name, price, qty, modifiers: "text notes"}
+                price = float(raw.get("price", 0) or raw.get("line_total", 0) or 0)
+                if price <= 0:
+                    continue
+                line = round(qty * price, 2)
+                subtotal += line
+                cleaned.append({
+                    "id": raw.get("id") or "",
+                    "name": name, "qty": qty,
+                    "unit_price": price,
+                    "modifiers": (mods_raw or raw.get("notes") or "").strip() if isinstance(mods_raw, str) else "",
+                    "line_total": line,
+                })
+        except (ValueError, TypeError):
+            continue
+    subtotal = round(subtotal, 2)
+    tax = round(subtotal * _PURBLUM_TAX_RATE, 2)
+    total = round(subtotal + tax, 2)
+    return {"items": cleaned, "subtotal": subtotal, "tax": tax,
+            "tax_rate": _PURBLUM_TAX_RATE, "total": total}
+
+
+def _purblum_format_sms(payload: dict, totals: dict) -> str:
+    """Human-readable order summary for the SMS body. Renders structured
+    modifiers cleanly so Frank can verify accuracy at a glance:
+        2x Truckee Italian — $25.40
+          on Gluten-free roll (+$1.50)
+          Whole (12-inch) (+$4.00)
+          NO Onion · NO Tomato
+          + Bacon (+$1.75)
+          + Swiss (+$1.00)
+    """
+    lines = ["🥪 PURBLUM ORDER"]
+    if payload.get("type"):
+        lines.append(f"Type: {payload['type']}")
+    if payload.get("customer_name"):
+        lines.append(f"Name: {payload['customer_name']}")
+    if payload.get("customer_phone"):
+        lines.append(f"Phone: {payload['customer_phone']}")
+    if payload.get("pickup_time"):
+        lines.append(f"Pickup: {payload['pickup_time']}")
+    lines.append("")
+    lines.append("ITEMS:")
+    for it in totals.get("items", []):
+        lines.append(f"  {it['qty']}x {it['name']} — ${it['line_total']:.2f}")
+        mods = it.get("modifiers", [])
+        if isinstance(mods, list):
+            # Group removes onto one line ("NO Onion · NO Tomato") so the
+            # SMS is denser and easier to scan.
+            removes = [m["label"] for m in mods if m.get("action") == "remove"]
+            if removes:
+                lines.append("      NO " + " · NO ".join(removes))
+            for m in mods:
+                if m.get("action") == "choose":
+                    delta_txt = ""
+                    if m.get("delta", 0):
+                        d = m["delta"]
+                        delta_txt = f" ({'+' if d>0 else ''}${d:.2f})" if d != 0 else ""
+                    lines.append(f"      {m['label']}{delta_txt}")
+            for m in mods:
+                if m.get("action") == "add":
+                    delta_txt = ""
+                    if m.get("delta", 0):
+                        d = m["delta"]
+                        delta_txt = f" (+${d:.2f})" if d > 0 else f" (${d:.2f})"
+                    lines.append(f"      + {m['label']}{delta_txt}")
+        elif isinstance(mods, str) and mods.strip():
+            lines.append(f"      [{mods}]")
+    lines.append("")
+    lines.append(f"Subtotal: ${totals['subtotal']:.2f}")
+    lines.append(f"Tax:      ${totals['tax']:.2f}")
+    lines.append(f"TOTAL:    ${totals['total']:.2f}")
+    if payload.get("notes"):
+        lines.append("")
+        lines.append(f"Notes: {payload['notes']}")
+    return "\n".join(lines)
+
+
+@app.route("/api/public/chat/submit_order", methods=["POST", "OPTIONS"])
+def chat_submit_order():
+    """Web chat → web_driver submission. Takes the conversation history,
+    extracts the order, builds the cart, runs the SAME web_driver pipeline
+    the phone uses to actually click through purblum.com and submit.
+
+    Body: {history: [...], visitor: {name, phone, email}}
+    Returns: {ok, order_id, total, error, screenshot}
+    """
+    origin = request.headers.get("Origin", "")
+    if request.method == "OPTIONS":
+        return _purblum_cors(make_response("", 204), origin)
+    payload = request.get_json(silent=True) or {}
+    history = payload.get("history") or []
+    visitor = payload.get("visitor") or {}
+    business = _resolve_business_profile_for_request(request)
+    biz_name = business.get("name", "")
+
+    if not history:
+        return _purblum_cors(jsonify({"ok": False, "error": "empty_history"}), origin), 400
+    if "purblum" not in biz_name.lower():
+        return _purblum_cors(jsonify({"ok": False, "error": "no_driver_for_business"}), origin), 400
+
+    try:
+        import phone_order
+        # Hardcoded path for the PurBlum demo. When we add real customers
+        # this should come from the business profile (profile.menu_source).
+        menu_path = "/home/frank/purblum_live/data/menu.json"
+        menu = phone_order.load_menu(menu_path)
+        ext = phone_order.extract_order_from_history(history, menu, llm_client, CONFIG)
+        if not ext.get("ok") or not ext.get("items"):
+            return _purblum_cors(jsonify({
+                "ok": False, "error": "extract_failed",
+                "detail": ext.get("error", "no items extracted")
+            }), origin), 400
+        cart, warnings = phone_order.build_cart_for_purblum(ext["items"], menu)
+        phone_order.annotate_cart_with_menu_prices(cart, menu)
+        if not cart:
+            return _purblum_cors(jsonify({
+                "ok": False, "error": "empty_cart",
+                "warnings": warnings,
+            }), origin), 400
+        customer_info = ext.get("customer", {}) or {}
+        customer_name = (customer_info.get("name") or visitor.get("name")
+                         or "Web Customer").strip()
+        customer_phone = (customer_info.get("phone") or visitor.get("phone")
+                          or "").strip()
+        pickup_time = (customer_info.get("pickup_time") or "").strip()
+        # Run web_driver — actually clicks through purblum.com
+        from web_driver import submit_purblum_order
+        result = submit_purblum_order(
+            cart=cart,
+            customer={
+                "name": customer_name,
+                "phone": customer_phone,
+                "pickup_time": pickup_time,
+            },
+            notes="Submitted by Orby (chat order)",
+            headless=True, record_video=False,
+            data_dir=DATA_DIR,
+        )
+        totals = phone_order.compute_cart_total(cart, business.get("tax_rate", 0))
+        log.info(f"chat order submitted via web_driver: "
+                  f"ok={result.get('ok')} order_id={result.get('order_id','?')} "
+                  f"customer={customer_name} phone={customer_phone}")
+        return _purblum_cors(jsonify({
+            "ok": result.get("ok", False),
+            "order_id": result.get("order_id", ""),
+            "total": result.get("total", ""),
+            "subtotal": totals["subtotal"],
+            "tax": totals["tax"],
+            "total_dollars": totals["total"],
+            "error": result.get("error") if not result.get("ok") else None,
+            "screenshot": result.get("screenshot", ""),
+            "elapsed_seconds": result.get("elapsed_seconds", 0),
+            "warnings": warnings,
+        }), origin)
+    except Exception as e:
+        log.exception(f"chat submit_order crashed: {e}")
+        return _purblum_cors(jsonify({
+            "ok": False, "error": f"server_error: {type(e).__name__}"
+        }), origin), 500
+
+
+@app.route("/api/public/purblum/estimate", methods=["POST", "OPTIONS"])
+def purblum_estimate():
+    """Live cart-pricing endpoint — POST {items: [...]} → {subtotal, tax, total}."""
+    origin = request.headers.get("Origin", "")
+    if request.method == "OPTIONS":
+        return _purblum_cors(make_response("", 204), origin)
+    payload = request.get_json(silent=True) or {}
+    totals = _purblum_compute_totals(payload.get("items") or [])
+    return _purblum_cors(jsonify(totals), origin)
+
+
+@app.route("/api/public/purblum/order", methods=["POST", "OPTIONS"])
+def purblum_order():
+    """Final order submit — POST {type, customer_name, customer_phone,
+    pickup_time, items, notes} → records to data/purblum_orders.jsonl,
+    fires SMS to Frank's cell, returns confirmation."""
+    origin = request.headers.get("Origin", "")
+    if request.method == "OPTIONS":
+        return _purblum_cors(make_response("", 204), origin)
+    payload = request.get_json(silent=True) or {}
+    items = payload.get("items") or []
+    if not items:
+        return _purblum_cors(
+            jsonify({"error": "empty_cart"}), origin), 400
+    totals = _purblum_compute_totals(items)
+    if totals["total"] <= 0:
+        return _purblum_cors(
+            jsonify({"error": "no_valid_items"}), origin), 400
+    # Build order record
+    import uuid
+    order_id = uuid.uuid4().hex[:12]
+    record = {
+        "order_id":       order_id,
+        "ts":             int(time.time()),
+        "type":           payload.get("type", "pickup"),
+        "customer_name":  (payload.get("customer_name") or "").strip(),
+        "customer_phone": (payload.get("customer_phone") or "").strip(),
+        "pickup_time":    (payload.get("pickup_time") or "").strip(),
+        "notes":          (payload.get("notes") or "").strip(),
+        "items":          totals["items"],
+        "subtotal":       totals["subtotal"],
+        "tax":            totals["tax"],
+        "total":          totals["total"],
+    }
+    # Persist locally so Frank has an audit trail
+    try:
+        orders_log = DATA_DIR / "purblum_orders.jsonl"
+        with orders_log.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception as e:
+        log.warning(f"purblum order log write failed: {e}")
+    # Fire the SMS (or fallback to log if creds missing)
+    sms_body = _purblum_format_sms(payload, totals)
+    sms_ok, sms_status = _purblum_send_sms(sms_body)
+    audit.log_event(DATA_DIR, actor="purblum_public",
+                    action="purblum.order.placed",
+                    meta={"order_id": order_id,
+                          "total": totals["total"],
+                          "items_count": len(totals["items"]),
+                          "sms_ok": sms_ok, "sms_status": sms_status})
+    log.info(f"PurBlum order {order_id} ${totals['total']:.2f} — SMS {sms_status}")
+    return _purblum_cors(jsonify({
+        "order_id": order_id,
+        "status": "received",
+        "subtotal": totals["subtotal"],
+        "tax": totals["tax"],
+        "total": totals["total"],
+        "message": (f"Got it — order {order_id[:6]} for ${totals['total']:.2f}. "
+                    f"Frank's been notified."),
+    }), origin)
+
 
 if __name__ == "__main__":
     main()

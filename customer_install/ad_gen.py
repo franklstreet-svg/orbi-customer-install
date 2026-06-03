@@ -133,7 +133,7 @@ AD_DESIGNER_SYSTEM = (
     "CRITICAL — RESPECT THE BRIEF SUBJECT:\n"
     "The OWNER BRIEF tells you what THIS ad is about. The BUSINESS PROFILE "
     "tells you who the business IS. These can disagree — e.g., a business "
-    "named 'My Orby AI Solutions' might ask you for an ad about 'weekend "
+    "named 'myOrbi' might ask you for an ad about 'weekend "
     "brunch.' That's not a contradiction — they're promoting a SPECIFIC "
     "offering (the brunch), not their whole business. Always design the ad "
     "about THE SUBJECT IN THE BRIEF, not the business name. The business "
