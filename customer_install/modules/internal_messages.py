@@ -409,8 +409,18 @@ _INTENT_PATTERNS = [
 ]
 
 
+_NOT_A_STAFF_NAME = {
+    "me", "myself", "us", "you", "yourself", "him", "her", "them", "it",
+    "everyone", "everybody", "anyone", "anybody", "someone", "somebody",
+    "myself", "ourselves", "themselves",
+}
+
+
 def detect_send_intent(message: str) -> dict | None:
-    """Return {recipient_name, body} if message is an internal-send intent."""
+    """Return {recipient_name, body} if message is an internal-send intent.
+    Drops pronouns as recipients — "tell me about my wife" was being
+    parsed as recipient='me' and producing "I don't see a staff member
+    named 'me'". Pronouns are never staff identities."""
     msg = (message or "").strip()
     if not msg or len(msg) > 1000:
         return None
@@ -418,6 +428,8 @@ def detect_send_intent(message: str) -> dict | None:
         m = pat.match(msg)
         if m:
             name = m.group("name").strip()
+            if name.lower() in _NOT_A_STAFF_NAME:
+                continue  # pronoun — not a staff recipient
             body = m.group("body").strip().rstrip(".?!")
             if len(body) < 2:
                 continue

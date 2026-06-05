@@ -9,3 +9,19 @@ openpyxl>=3.1
 google-auth>=2.16
 google-auth-oauthlib>=1.0
 google-api-python-client>=2.80
+# Document + image generation. Required at orbi.py import time
+# because modules/invoice_pdf.py, image_gen.py, etc. import these at
+# module load. Missing any of them = ImportError = orbi service never
+# starts on a fresh customer install (smoke test caught this).
+reportlab>=4.0
+Pillow>=10.0
+python-pptx>=0.6.21
+matplotlib>=3.8
+requests>=2.31
+# Phone / payment integrations
+stripe>=8.0
+twilio>=9.0
+# Thermal printer dispatch (web_driver/print_dispatch.py)
+python-escpos>=3.0
+# Misc utilities
+qrcode>=7.0

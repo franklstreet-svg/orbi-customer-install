@@ -585,6 +585,42 @@ def extract_file_request(message: str) -> dict | None:
         "give you a", "give you the",
     )):
         return None
+    # Reminder / task / message-to-staff verbs — these contain "send" or
+    # "email" inside a command that isn't asking us to fetch a file.
+    # "Remind me to send the schedule" → reminder, not file search.
+    # "Tell Cathi to email the report" → internal message, not file search.
+    if re.match(
+        r"^\s*(?:remind|nudge|ping|tell|ask|let|have)\s+",
+        text, re.IGNORECASE):
+        return None
+    # Conversational / future-tense statements about emailing — not a fetch.
+    # "I'm going to email my mom later" / "I emailed Bob yesterday" /
+    # "I might email her tomorrow" — all describe activity, not requests.
+    if re.match(
+        r"^\s*(?:i'?m|i\s+am|i\s+will|i'?ll|i\s+might|i\s+may|i'?ve|i\s+have|i\s+just|i\s+already)\s+"
+        r"(?:going\s+to\s+|gonna\s+|gunna\s+)?"
+        r"(?:email|emailed|emailing|text|texted|texting|message|messaged|messaging|send|sent|sending|call|called|calling)",
+        text, re.IGNORECASE):
+        return None
+    # "Add a task to call Joe and a reminder to email Sarah Friday" —
+    # compound command starts with add/create/new + task/reminder/note.
+    if re.match(
+        r"^\s*(?:add|create|new|set|make|put|file|log)\s+(?:me\s+)?(?:a\s+|an\s+|some\s+)?"
+        r"(?:task|reminder|note|todo|to[\s-]?do|entry|item)",
+        text, re.IGNORECASE):
+        return None
+    # Email/text compose with colon or "to <name>" pattern:
+    # "Email Bill Henry: parts came in" → compose, not file fetch
+    # "Email Bill: ..." / "Email Cathi the update" / "Text Sarah that ..."
+    # case-insensitive verb, case-sensitive name (Capitalized recipient).
+    if re.match(
+        r"^\s*(?i:email|text|message|sms)\s+[A-Z][A-Za-z'\-]+(?:\s+[A-Z][A-Za-z'\-]+)*\s*[:,]",
+        text):
+        return None
+    if re.match(
+        r"^\s*(?:email|text|message|sms)\s+\w+(?:\s+\w+)?\s+(?:that|the|a)\s+",
+        text, re.IGNORECASE):
+        return None
     # COMPOSITION requests — owner wants Orby to WRITE something, not
     # search for an existing file. Two patterns to catch:
     #   1) Message starts with a writing verb: draft/write/compose/reply/respond
@@ -614,6 +650,19 @@ def extract_file_request(message: str) -> dict | None:
         return None
     # If the message contains a URL, that's definitively a url-fetch case
     if re.search(r"https?://", text, re.IGNORECASE):
+        return None
+    # QUESTIONS ABOUT what data Orby holds — not file fetches.
+    # "what email of mine do you have" / "which email do you have on file"
+    # / "any email saved" / "do you have my email" — these are queries
+    # about stored info, not requests to fetch files.
+    if re.match(
+        r"^\s*(?:what|which|any|do\s+you\s+have)\b.*\b"
+        r"(?:email|phone|address|number|info|information|name)\b",
+        text, re.IGNORECASE):
+        return None
+    if re.search(
+        r"\b(?:do|did)\s+you\s+(?:have|store|save|keep|know)\b",
+        text, re.IGNORECASE):
         return None
 
     for pat in _INTENT_PATTERNS:

@@ -52,27 +52,64 @@ def _save(user_dir: Path, reminders: list[dict]) -> None:
     tmp.replace(p)
 
 
+def _dedup_key(r: dict) -> tuple[str, str]:
+    """Two reminders are "same enough" if they share normalized text AND
+    a due timestamp within the same 15-minute bucket. Collapses the
+    8-copies-of-the-same-reminder problem without merging genuinely
+    distinct alerts scheduled close together."""
+    text = " ".join((r.get("text") or "").lower().strip().split())
+    due  = (r.get("due") or "")[:16]
+    try:
+        mm = int(due[14:16])
+        bucket = (mm // 15) * 15
+        due = f"{due[:14]}{bucket:02d}"
+    except (ValueError, IndexError):
+        pass
+    return (text, due)
+
+
 def list_all(user_dir: Path, include_done: bool = False) -> list[dict]:
     with _LOCK:
         rem = _load(user_dir)
     if not include_done:
         rem = [r for r in rem if r.get("status") not in ("done", "fired")]
-    return sorted(rem, key=lambda r: r.get("due", ""))
+    # Dedup near-duplicates on read so old dirty data shows clean. Keep
+    # the OLDEST instance of each (text, due-bucket) group so downstream
+    # snooze/done operations target a stable id.
+    seen: set = set()
+    deduped: list = []
+    for r in sorted(rem, key=lambda x: x.get("ts", 0)):
+        k = _dedup_key(r)
+        if k in seen:
+            continue
+        seen.add(k)
+        deduped.append(r)
+    return sorted(deduped, key=lambda r: r.get("due", ""))
 
 
 def add(user_dir: Path, text: str, due: str, channel: str = "in_app") -> dict:
-    """due is ISO-8601 ("2026-05-30T09:00:00Z"). channel = sms / email / in_app."""
-    reminder = {
-        "id":      uuid.uuid4().hex[:12],
-        "text":    (text or "").strip(),
-        "due":     due,
-        "status":  "pending",
-        "fired_at": None,
-        "channel": channel,
-        "ts":      time.time(),
-    }
+    """due is ISO-8601 ("2026-05-30T09:00:00Z"). channel = sms / email / in_app.
+    If a pending reminder with the same text+due-bucket already exists,
+    returns it instead of creating a duplicate — prevents the 8× dup
+    issue Frank hit during testing."""
+    new_text = (text or "").strip()
+    incoming_key = _dedup_key({"text": new_text, "due": due})
     with _LOCK:
         rem = _load(user_dir)
+        for existing in rem:
+            if existing.get("status") in ("done", "fired"):
+                continue
+            if _dedup_key(existing) == incoming_key:
+                return existing
+        reminder = {
+            "id":      uuid.uuid4().hex[:12],
+            "text":    new_text,
+            "due":     due,
+            "status":  "pending",
+            "fired_at": None,
+            "channel": channel,
+            "ts":      time.time(),
+        }
         rem.append(reminder)
         _save(user_dir, rem)
     return reminder

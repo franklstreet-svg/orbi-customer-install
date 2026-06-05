@@ -255,6 +255,16 @@ def _aggregate(messages: list[dict]) -> tuple[dict, dict]:
 def get_message(config: dict, user_dir: Path, message_id: str) -> dict:
     """Fetch the full body of a specific message."""
     provider, raw_id = _split_id(message_id)
+    # IMAP doesn't go through connectors.base — it lives in imap_smtp.
+    # raw_id format: '<account_id>-<uid>' where account_id may itself
+    # contain hyphens, so split on the LAST hyphen.
+    if provider == "imap":
+        import imap_smtp
+        if "-" in raw_id:
+            account_id, _, uid = raw_id.rpartition("-")
+        else:
+            account_id, uid = "", raw_id
+        return imap_smtp.fetch_one_body(user_dir, account_id, uid)
     from connectors.base import get_instance
     inst = get_instance(provider, config, user_dir)
     if inst is None or not inst.is_connected():

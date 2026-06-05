@@ -48,6 +48,22 @@ DEFAULT_PREFS = {
 _LOCK = threading.Lock()
 
 
+def _iso_to_local_when(iso: str) -> str:
+    """ISO timestamp → "MM/DD HH:MM" in system local TZ. Avoids the
+    UTC string-slice bug where stored '...T16:00:00Z' rendered as
+    '16:00' for a 9 AM Pacific meeting."""
+    if not iso:
+        return ""
+    try:
+        s = iso.strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone().strftime("%m/%d %H:%M")
+    except (ValueError, TypeError):
+        return iso[:16].replace("T", " ")
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -95,7 +111,7 @@ def build_briefing(config: dict, data_dir: Path, username: str) -> dict:
             items.append({
                 "kind":     "event",
                 "title":    e.get("title", ""),
-                "when":     (e.get("start", "") or "")[:16].replace("T", " "),
+                "when":     _iso_to_local_when(e.get("start", "")),
                 "location": e.get("location", "") or "",
             })
     except Exception as exc:    # noqa: BLE001
@@ -113,7 +129,7 @@ def build_briefing(config: dict, data_dir: Path, username: str) -> dict:
             items.append({
                 "kind":  "reminder",
                 "text":  r.get("text", ""),
-                "when":  (r.get("due", "") or "")[:16].replace("T", " "),
+                "when":  _iso_to_local_when(r.get("due", "")),
             })
     except Exception as exc:    # noqa: BLE001
         log.warning("briefing[%s] reminders failed: %s", username, exc)
@@ -482,7 +498,7 @@ def build_eod_summary(config: dict, data_dir: Path, username: str) -> dict:
             items.append({
                 "kind":     "tomorrow_event",
                 "title":    e.get("title", ""),
-                "when":     (e.get("start", "") or "")[:16].replace("T", " "),
+                "when":     _iso_to_local_when(e.get("start", "")),
             })
         today_events = mod_calendar.today(user_dir) or []
         stats["events_today_count"] = len(today_events)

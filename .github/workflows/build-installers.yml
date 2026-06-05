@@ -53,6 +53,14 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install pyinstaller
+          # Install the customer app's own deps so the smoke test can
+          # actually import orbi.py — reportlab, flask, etc. Skip pinned
+          # constraints quietly: CI just needs to load the modules, not
+          # match prod versions exactly.
+          if [ -f customer_install/requirements.txt ]; then
+            pip install -r customer_install/requirements.txt || true
+          fi
+        shell: bash
 
       - name: Build installer (${{ matrix.target }})
         run: python customer_install/installer/build_orbi_installer.py --target ${{ matrix.target }}

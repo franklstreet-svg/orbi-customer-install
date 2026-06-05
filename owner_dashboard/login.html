@@ -176,6 +176,36 @@
     const errorEl = document.getElementById('error');
     const submitBtn = document.getElementById('submit-btn');
 
+    // ── First-run bootstrap prefill ───────────────────────────────────
+    // The installer hands off the new owner's temp password by linking
+    // them to /owner/login?u=<user>&bootstrap=<temp_pw>. Prefill both
+    // fields so the customer just has to click "Sign in" — the "double-
+    // click and done" promise depends on this.
+    (function prefillFromBootstrap() {
+      try {
+        const params = new URLSearchParams(window.location.search);
+        const u = params.get('u');
+        const pw = params.get('bootstrap');
+        if (u) {
+          document.getElementById('username').value = u;
+        }
+        if (pw) {
+          document.getElementById('password').value = pw;
+          // Make it clear this is auto-filled for first run.
+          const note = document.createElement('p');
+          note.style.cssText = 'color:#4ade80;font-size:13px;margin-top:8px;text-align:center';
+          note.textContent = '✓ Welcome — your temp password is filled in. ' +
+                              'Click "Sign in" to continue, then set a permanent one.';
+          form.parentNode.insertBefore(note, form);
+          // Strip the password out of the URL bar so it won't show in
+          // browser history.
+          const cleanUrl = window.location.pathname +
+                            (u ? `?u=${encodeURIComponent(u)}` : "");
+          window.history.replaceState({}, '', cleanUrl);
+        }
+      } catch (_e) { /* ignore — non-fatal */ }
+    })();
+
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
       errorEl.classList.remove('show');

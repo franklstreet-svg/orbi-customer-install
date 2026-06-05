@@ -746,6 +746,22 @@ def _evict_old_scrape_jobs() -> None:
 def _run_scrape_job(job_id: str, url: str, payload: dict) -> None:
     """Background worker — does the actual scrape and updates the job dict.
     Catches every exception so the polling status endpoint can report it."""
+    # Public sales scrapes route the result to <slug>_prospect.json and
+    # restore any canonical <slug>.json that already existed. This keeps
+    # carefully-curated customer data (e.g. purblum_com.json) safe from
+    # being clobbered when Frank tests the sales flow against that URL.
+    is_public_sales = payload.get("_source") == "public_sales"
+    canonical_backup = None
+    if is_public_sales:
+        try:
+            from site_scraper.storage import domain_from_url
+            pre_slug = domain_from_url(url)
+            pre_path = DATA_DIR / "customer_profiles" / f"{pre_slug}.json"
+            if pre_path.exists():
+                canonical_backup = pre_path.read_bytes()
+        except Exception as _be:
+            log.warning(f"sales-scrape pre-backup failed: {_be}")
+
     try:
         import site_scraper
         brain_call = site_scraper.make_brain_call(CONFIG)
@@ -758,6 +774,28 @@ def _run_scrape_job(job_id: str, url: str, payload: dict) -> None:
         )
         slug = result.get("slug") or result.get("domain", "").replace(".", "_")
         profile_path = DATA_DIR / "customer_profiles" / f"{slug}.json"
+
+        # For public sales scrapes: move scrape result to <slug>_prospect.json
+        # and restore any pre-existing canonical <slug>.json that we backed
+        # up before the scrape ran.
+        if is_public_sales and profile_path.exists():
+            prospect_path = DATA_DIR / "customer_profiles" / f"{slug}_prospect.json"
+            try:
+                if prospect_path.exists():
+                    prospect_path.unlink()
+                profile_path.rename(prospect_path)
+                if canonical_backup:
+                    profile_path.write_bytes(canonical_backup)
+                    log.info(f"sales-scrape: restored canonical {profile_path.name}; "
+                             f"prospect data at {prospect_path.name}")
+                else:
+                    log.info(f"sales-scrape: result saved to {prospect_path.name}")
+                # Update slug downstream so /chat handler uses the prospect path
+                slug = f"{slug}_prospect"
+                profile_path = prospect_path
+            except Exception as _me:
+                log.warning(f"sales-scrape rename failed: {_me}")
+
         biz_name, menu_items = "", 0
         if profile_path.exists():
             try:
@@ -891,15 +929,155 @@ def api_owner_demo_delete(slug):
     return jsonify({"ok": True, "deleted": deleted})
 
 
+# ── Public visitor-driven scrape (sales bot on twickell.com) ──────────────
+#
+# When a prospect on twickell.com tells Orby their business URL, the SALES
+# bot triggers this endpoint to scrape their site so it can pitch tailored
+# to their actual business. Public (no auth) but rate-limited per-IP and
+# strictly URL-validated to prevent SSRF + abuse.
+
+_SALES_SCRAPE_IP_LOG: dict = {}  # ip -> last_scrape_ts
+_SALES_SCRAPE_IP_LOCK = _scrape_threading.Lock()
+_SALES_SCRAPE_COOLDOWN_SEC = 600  # one scrape per IP per 10 minutes
+
+def _validate_public_url(raw: str) -> tuple[bool, str]:
+    """Returns (ok, normalized_url_or_error). Rejects non-HTTP(S), localhost,
+    private IPs, malformed URLs. Defends against SSRF + obvious abuse."""
+    if not raw or not isinstance(raw, str):
+        return False, "empty"
+    raw = raw.strip()
+    # Add http:// if scheme missing so urlparse works on bare "example.com"
+    if not raw.lower().startswith(("http://", "https://")):
+        raw = "https://" + raw
+    if len(raw) > 200:
+        return False, "url_too_long"
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(raw)
+    except Exception:
+        return False, "bad_url"
+    if parsed.scheme not in ("http", "https"):
+        return False, "scheme_not_http"
+    host = (parsed.hostname or "").lower()
+    if not host or "." not in host:
+        return False, "bad_host"
+    if host in ("localhost", "127.0.0.1", "0.0.0.0", "::1"):
+        return False, "host_local"
+    # Reject private IP ranges (RFC 1918 + link-local + loopback)
+    import ipaddress
+    try:
+        ip = ipaddress.ip_address(host)
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+            return False, "host_private"
+    except ValueError:
+        pass  # not an IP, it's a hostname — that's fine
+    # Block obvious internal-only TLDs
+    bad_tlds = (".local", ".internal", ".lan", ".intranet")
+    if any(host.endswith(t) for t in bad_tlds):
+        return False, "host_internal"
+    return True, raw
+
+
+@app.route("/api/public/sales_scrape", methods=["POST"])
+def api_public_sales_scrape():
+    """Visitor-driven scrape from the sales chat on twickell.com. Public
+    but rate-limited (10 min cooldown per IP) and SSRF-validated."""
+    payload = request.get_json(silent=True) or {}
+    url = payload.get("url") or ""
+    ok, result = _validate_public_url(url)
+    if not ok:
+        return jsonify({"ok": False, "error": f"url_invalid:{result}"}), 400
+    url = result
+
+    visitor_ip = (request.headers.get("CF-Connecting-IP")
+                  or request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+                  or request.remote_addr or "unknown")
+    now = _scrape_time.time()
+    with _SALES_SCRAPE_IP_LOCK:
+        last = _SALES_SCRAPE_IP_LOG.get(visitor_ip, 0)
+        if now - last < _SALES_SCRAPE_COOLDOWN_SEC:
+            wait_s = int(_SALES_SCRAPE_COOLDOWN_SEC - (now - last))
+            return jsonify({"ok": False, "error": "rate_limited",
+                            "retry_after_seconds": wait_s}), 429
+        _SALES_SCRAPE_IP_LOG[visitor_ip] = now
+        # Trim old entries to keep dict small
+        if len(_SALES_SCRAPE_IP_LOG) > 1000:
+            cutoff = now - 86400
+            for k in [k for k, v in _SALES_SCRAPE_IP_LOG.items() if v < cutoff]:
+                _SALES_SCRAPE_IP_LOG.pop(k, None)
+
+    _evict_old_scrape_jobs()
+    job_id = _scrape_uuid.uuid4().hex[:16]
+    scrape_payload = {
+        "url": url,
+        # Conservative knobs — sales-bot scrape should be FAST (<60s) so
+        # the visitor doesn't bail. Trade some depth for speed.
+        "max_pages": 8,
+        "max_depth": 1,
+        "_source": "public_sales",
+    }
+    with _SCRAPE_JOBS_LOCK:
+        _SCRAPE_JOBS[job_id] = {
+            "status": "running",
+            "started_at": now,
+            "url": url,
+            "source": "public_sales",
+        }
+    t = _scrape_threading.Thread(
+        target=_run_scrape_job, args=(job_id, url, scrape_payload), daemon=True
+    )
+    t.start()
+    audit.log_event(DATA_DIR, actor=f"visitor:{visitor_ip}",
+                    action="sales.scrape.start",
+                    meta={"url": url, "job_id": job_id})
+    return jsonify({"ok": True, "job_id": job_id, "status": "running"})
+
+
+@app.route("/api/public/sales_scrape_status/<job_id>", methods=["GET"])
+def api_public_sales_scrape_status(job_id):
+    """Poll endpoint for visitor-driven scrapes. Only returns status for
+    jobs tagged source=public_sales — admin/owner scrape jobs return 404
+    here (use the admin endpoint for those)."""
+    with _SCRAPE_JOBS_LOCK:
+        job = _SCRAPE_JOBS.get(job_id)
+    if not job or job.get("source") != "public_sales":
+        return jsonify({"ok": False, "error": "job_not_found"}), 404
+    elapsed = int(_scrape_time.time() - job.get("started_at", _scrape_time.time()))
+    out = dict(job)
+    out["elapsed_seconds_so_far"] = elapsed
+    return jsonify(out)
+
+
 @app.route("/")
 def index():
     # In Phase 1 we serve a single chat shell. Phase 2 adds branding per customer.
     chat_shell = STATIC_DIR / "chat.html"
     if chat_shell.exists():
-        resp = send_from_directory(STATIC_DIR, "chat.html")
-        # No-cache so widget updates land immediately when the embed iframe
-        # reloads — otherwise browsers serve a stale chat shell that
-        # references old chat.js / chat.css and customer never sees fixes.
+        # Cache-bust chat.js / chat.css by file mtime. The script tag's
+        # query string changes whenever we edit the file → the browser
+        # treats it as a new URL and MUST fetch fresh, regardless of
+        # how aggressive its disk cache is. Cache-Control: no-cache on
+        # the shell itself was not enough — some browsers still served
+        # a stale script ref.
+        html = chat_shell.read_text(encoding="utf-8")
+        for fname in ("chat.js", "chat.css"):
+            p = STATIC_DIR / fname
+            if p.exists():
+                v = int(p.stat().st_mtime)
+                # Replace any plain `/static/<fname>` reference with the
+                # versioned one. Idempotent — re-applying with the same
+                # mtime is a no-op.
+                html = html.replace(
+                    f'src="/static/{fname}"',
+                    f'src="/static/{fname}?v={v}"',
+                )
+                html = html.replace(
+                    f'href="/static/{fname}"',
+                    f'href="/static/{fname}?v={v}"',
+                )
+        from flask import make_response as _mr
+        resp = _mr(html)
+        resp.headers["Content-Type"] = "text/html; charset=utf-8"
         resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
         resp.headers["Pragma"] = "no-cache"
         resp.headers["Expires"] = "0"
@@ -924,6 +1102,49 @@ def static_files(filename):
         resp.headers["Pragma"] = "no-cache"
         resp.headers["Expires"] = "0"
     return resp
+
+# ---------------------------------------------------------------------------
+# Installer downloads — the URL the post-payment install email links to.
+# Customer pays → Stripe webhook → email lands → customer clicks
+#     https://orbi.twickell.com/installers/orbi-windows.zip
+# → this route streams the built installer zip from cross_platform/dist/.
+# ---------------------------------------------------------------------------
+
+_INSTALLER_DIR = Path("/home/frank/orbi_web/cross_platform/dist")
+_INSTALLER_ALLOWED = {
+    "orbi-windows.zip", "orbi-mac.zip", "orbi-linux.zip",
+    "orbi-windows.exe", "orbi-mac.pkg", "orbi-linux.sh",
+}
+
+@app.route("/installers/<path:filename>")
+def installer_download(filename: str):
+    """Serve the built installer artifacts. Customer pays Stripe → install
+    email lands → customer clicks the download link → this route streams
+    the matching zip. Strict allowlist so only built installer files are
+    served (no path traversal). Streams via send_file with a sensible
+    Content-Disposition so the browser downloads instead of trying to
+    display 2GB of binary."""
+    if filename not in _INSTALLER_ALLOWED:
+        return "Not found", 404
+    target = _INSTALLER_DIR / filename
+    if not target.exists() or not target.is_file():
+        return (
+            "<h1>Installer not yet built</h1>"
+            f"<p>The {filename} build hasn't landed in "
+            f"<code>cross_platform/dist/</code> yet. If you paid for "
+            f"Orby and were expecting this, email orbiaisolutions@gmail.com "
+            f"and we'll send the file directly while we get the build "
+            f"pipeline polished.</p>"
+        ), 503
+    from flask import send_file
+    # Force a download dialog (not inline render) and set the right MIME.
+    return send_file(
+        str(target),
+        as_attachment=True,
+        download_name=filename,
+        mimetype="application/zip" if filename.endswith(".zip")
+                 else "application/octet-stream",
+    )
 
 @app.route("/favicon.ico")
 def favicon():
@@ -2183,11 +2404,92 @@ def public_chat():
     if not user_msg:
         return jsonify({"error": "empty message"}), 400
 
+    # ─── PRIVACY GUARD ───────────────────────────────────────────────────
+    # Public visitors must NOT be able to fish for owner-only data —
+    # calendar, tasks, contacts, email, memory, staff list, file search,
+    # or document generation. The owner's chat is at /api/owner/chat and
+    # requires login; this endpoint is for visitors only and must refuse
+    # any of those intents instead of letting the LLM hallucinate an
+    # answer that could leak (or fabricate) personal info.
+    _PERSONAL_INTENT_RE = _re.compile(
+        r"\b("
+        r"my\s+(?:calendar|schedule|agenda|todo|task|tasks|inbox|email|emails|"
+            r"contacts?|reminders?|staff|employees|team|notes?|memory|"
+            r"day|files?|folder|orbi\s+folder|workspace)"
+        r"|what(?:'s| is)?\s+(?:on\s+)?(?:my\s+)?(?:calendar|schedule|inbox|todo)"
+        r"|show\s+me\s+(?:my\s+)?(?:calendar|inbox|emails?|tasks?|reminders?|"
+            r"contacts?|files?|day|staff|employees|todo)"
+        r"|find\s+(?:emails?\s+(?:from|about)|the\s+file\s+about)"
+        r"|search\s+(?:my\s+)?(?:emails?|inbox|files?|everything)"
+        r"|email\s+[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)?[\s:,]"
+        r"|reply\s+to\s+(?:the\s+)?(?:last\s+)?(?:email|message)\s+from"
+        r"|(?:remind|nudge)\s+me\b"
+        r"|task:\s|todo:\s"
+        r"|appointment\s+with\s+|book\s+(?:a\s+)?(?:meeting|appointment)"
+        r"|add\s+[A-Z][a-z]+\s+[A-Z][a-z]+,"
+        r"|change\s+\w+'s\s+(?:phone|email|address)"
+        r"|(?:what\s+do\s+you\s+(?:remember|know)\s+about)"
+        r"|(?:write|draft|build|make|create|generate|compose)\s+(?:me\s+)?"
+            r"(?:a\s+|an\s+)?(?:letter|spreadsheet|sheet|chart|deck|"
+            r"powerpoint|presentation|ad|advertisement|invoice|proposal|"
+            r"flyer|brief|report|document|doc|essay)"
+        r"|(?:who'?s|who\s+is)\s+on\s+(?:my\s+)?(?:staff|team)"
+        r"|morning\s+brief|show\s+me\s+my\s+day"
+        r"|what'?s\s+(?:coming\s+up\s+)?(?:tomorrow|next\s+week)"
+        r"|search\s+everything"
+        r")\b",
+        _re.IGNORECASE,
+    )
+    if _PERSONAL_INTENT_RE.search(user_msg):
+        biz_name_for_refusal = "this business"
+        try:
+            biz_for_refusal = _resolve_business_profile_for_request(request)
+            biz_name_for_refusal = biz_for_refusal.get("name") or biz_name_for_refusal
+        except Exception:
+            pass
+        return jsonify({
+            "reply": (
+                f"I can only help with questions about {biz_name_for_refusal} "
+                f"— hours, services, ordering, location, or leaving a "
+                f"message for the owner. Anything personal (calendar, "
+                f"contacts, files, emails) is for the owner only — "
+                f"if you're the owner, you'd need to sign in at "
+                f"`/owner/login` to access that."
+            ),
+            "tier": "local",
+            "source": "personal_intent_blocked",
+        }), 200
+
     # Multi-tenant routing: if the visitor came from a customer's website
     # (purblum.com, joes-pizza.com, etc.), load THEIR scraped profile so
     # Orby answers as their business — not as the default Orby owner.
     business = _resolve_business_profile_for_request(request)
     scope    = (CONFIG.get("scope") or {})
+
+    # SALES BOT prospect attachment — when the visitor on twickell.com told
+    # Orby their business URL and the client already triggered a scrape,
+    # `prospect_url` is forwarded here. We load the freshly-scraped profile
+    # and stash it on the business dict so prompts.py can inject a PROSPECT
+    # BUSINESS section. Orby stays as myOrbi (the sales bot) but now KNOWS
+    # the prospect's business.
+    prospect_url_raw = (data.get("prospect_url") or "").strip()
+    if prospect_url_raw:
+        try:
+            from site_scraper.storage import domain_from_url
+            prospect_slug = domain_from_url(prospect_url_raw)
+            # Prefer the dedicated sales scrape result (<slug>_prospect.json)
+            # over any canonical customer profile (<slug>.json). This lets
+            # us test the sales flow against URLs we already have curated
+            # data for (purblum.com) without conflating the two.
+            prospect_path = DATA_DIR / "customer_profiles" / f"{prospect_slug}_prospect.json"
+            if not prospect_path.exists():
+                prospect_path = DATA_DIR / "customer_profiles" / f"{prospect_slug}.json"
+            if prospect_path.exists():
+                with prospect_path.open("r", encoding="utf-8") as _pf:
+                    business["_prospect_business"] = json.load(_pf)
+                    business["_prospect_url"] = prospect_url_raw
+        except Exception as _e:
+            log.warning(f"prospect_url load failed for {prospect_url_raw!r}: {_e}")
 
     # REFERRAL — "where can I get one of these for my business?"
     # Single-sentence URL + redirect to host business. Only fires on direct
@@ -2424,6 +2726,50 @@ def public_chat():
 
     resp = llm_client.generate(CONFIG, system, messages)
 
+    # SALES SCRAPE marker — when the SALES MODE OVERRIDE prompt has the bot
+    # ask for the visitor's URL and the visitor provides one, the LLM emits
+    # `<<SCRAPE:url>>` in its reply. Strip it from the user-visible text and
+    # forward the URL to the client so chat.js can fire /api/public/sales_scrape.
+    _sales_scrape_request = None
+    if resp and resp.text and "<<SCRAPE:" in resp.text:
+        try:
+            _m = _re.search(r"<<SCRAPE:\s*(.+?)\s*>>", resp.text)
+            if _m:
+                _scrape_url = _m.group(1).strip()
+                _sales_scrape_request = {"url": _scrape_url}
+                # Strip the marker (and any whitespace around it) from the
+                # user-facing reply text so the visitor never sees the raw tag.
+                resp.text = _re.sub(
+                    r"\s*<<SCRAPE:\s*.+?\s*>>\s*", " ", resp.text
+                ).strip()
+        except Exception as _e:
+            log.warning(f"SCRAPE marker parse failed: {_e}")
+
+    # SALES NAV marker — at the end of the sales flow the LLM emits
+    # `<<NAV:url>>` so the chat client navigates the visitor's browser
+    # directly to the legal-acceptance + checkout page. Strip the marker
+    # from the visible text and surface the URL.
+    _sales_nav_request = None
+    if resp and resp.text and "<<NAV:" in resp.text:
+        try:
+            _m = _re.search(r"<<NAV:\s*(.+?)\s*>>", resp.text)
+            if _m:
+                _nav_url = _m.group(1).strip()
+                # Light validation: must be HTTPS and on our own domains
+                # (billing.twickell.com or twickell.com proper) so a
+                # confused LLM can't redirect visitors off-site.
+                _ok_hosts = (
+                    "https://billing.twickell.com/",
+                    "https://twickell.com/",
+                )
+                if any(_nav_url.startswith(h) for h in _ok_hosts):
+                    _sales_nav_request = {"url": _nav_url}
+                resp.text = _re.sub(
+                    r"\s*<<NAV:\s*.+?\s*>>\s*", " ", resp.text
+                ).strip()
+        except Exception as _e:
+            log.warning(f"NAV marker parse failed: {_e}")
+
     # LEARNING-LOOP TRIGGER — if Orby's reply reads like "I don't know"
     # AND the visitor was actually asking a question, kick off the
     # learning loop: capture the question for the owner to answer, ask
@@ -2577,6 +2923,15 @@ def public_chat():
         # gets a live cart breakdown to render alongside Orby's reply.
         # Math is server-computed (deterministic) — the widget just displays.
         "order_summary": _injected_totals,
+        # Sales-bot signal: when the LLM emitted <<SCRAPE:url>>, the client
+        # picks this up and fires /api/public/sales_scrape on the URL, then
+        # auto-sends a follow-up /chat with prospect_url set.
+        "scrape_request": _sales_scrape_request,
+        # Sales-bot signal: when the LLM emitted <<NAV:url>>, the client
+        # navigates the visitor's browser DIRECTLY to that URL (legal
+        # acceptance page → Stripe checkout). No hyperlink for the
+        # visitor to click — the chat just sends them there.
+        "navigate_request": _sales_nav_request,
     })
 
 def _detect_capture(user_msg: str, scope: dict) -> str | None:
@@ -4252,30 +4607,89 @@ def owner_chat():
     if gc_resp is not None:
         return jsonify(gc_resp)
 
-    # Contacts CRUD — "add contact X", "find Sarah", "show contacts for
-    # Johnson Construction", "every conversation with Sarah". Per-user
-    # contact book (modules/contacts.py).
+    # Memory recall — "what do you remember about my wife/suppliers?"
+    # Hits mod_memory.recall() deterministically so the LLM can't
+    # hallucinate facts that aren't actually saved. Runs early so it
+    # beats every other handler that might fall to the LLM.
+    memory_recall_resp = _try_memory_recall(user_msg, user_rec)
+    if memory_recall_resp is not None:
+        return jsonify(memory_recall_resp)
+
+    # "I'm worried about X" / "remember I'm stressed about Y" —
+    # deterministic capture into the concerns tier (companion_mode-gated
+    # inside the handler). Surfaces with more weight than regular facts.
+    concern_resp = _try_concern_capture(user_msg, user_rec)
+    if concern_resp is not None:
+        return jsonify(concern_resp)
+
+    # "Tell me about my wife / my daughter / Bill Henry / suppliers" —
+    # deterministic memory + contacts lookup so the LLM can't add
+    # invented details on top. Was hallucinating "supportive of business"
+    # / "good with the kids" / etc.
+    tell_about_resp = _try_tell_me_about(user_msg, user_rec)
+    if tell_about_resp is not None:
+        return jsonify(tell_about_resp)
+
+    # Ambiguous "widen the search" / "tell me more" / "search harder"
+    # with no explicit topic — the LLM happily fabricates extra detail
+    # to "satisfy" the request. Intercept and demand a target instead.
+    vague_more_resp = _try_vague_followup(user_msg, user_rec)
+    if vague_more_resp is not None:
+        return jsonify(vague_more_resp)
+
+    # Email handlers FIRST — must beat the contacts regex which can
+    # match "find emails from <Name>" by greedy name-matching the
+    # "from <Name>" tail. Email intent is more specific.
+    email_check_resp = _try_email_check_inbox(user_msg, user_rec)
+    if email_check_resp is not None:
+        return jsonify(email_check_resp)
+    email_search_resp = _try_email_search(user_msg, user_rec)
+    if email_search_resp is not None:
+        return jsonify(email_search_resp)
+    email_compose_resp = _try_email_compose(user_msg, user_rec)
+    if email_compose_resp is not None:
+        return jsonify(email_compose_resp)
+    email_reply_resp = _try_email_reply(user_msg, user_rec)
+    if email_reply_resp is not None:
+        return jsonify(email_reply_resp)
+
+    # Email BODY-READ — "what does the email from Frank Street say" /
+    # "read the email from McAfee" — pull the actual body via IMAP
+    # instead of bouncing to the LLM which would hallucinate contents.
+    email_read_resp = _try_email_read(user_msg, user_rec)
+    if email_read_resp is not None:
+        return jsonify(email_read_resp)
+
+    # Contacts ADD — "add Bill Henry, billh@example.com, 555-0142, electrician".
+    # Was previously falling to the LLM which faked the confirmation
+    # without ever calling mod_contacts.add(). Real handler ensures the
+    # contact actually gets written.
+    contact_add_resp = _try_contact_add(user_msg, user_rec)
+    if contact_add_resp is not None:
+        return jsonify(contact_add_resp)
+
+    # Union search — "find anything about plumbing" / "search everything
+    # for joe" MUST fire BEFORE _try_contacts_chat which would otherwise
+    # eat it and return "no contact matching anything about X".
+    search_everything_resp = _try_search_everything(user_msg, user_rec)
+    if search_everything_resp is not None:
+        return jsonify(search_everything_resp)
+
+    # Contacts CRUD — "find Sarah", "show contacts for Johnson Construction"
     contacts_resp = _try_contacts_chat(user_msg, user_rec)
     if contacts_resp is not None:
         return jsonify(contacts_resp)
 
-    # Leads / lead-list queries — "show me leads from this week",
-    # "what new leads came in overnight". Reads modules/messages.py.
+    # Leads / lead-list queries
     leads_resp = _try_leads_chat(user_msg, user_rec)
     if leads_resp is not None:
         return jsonify(leads_resp)
 
-    # Lead CAPTURE from chat — "add me as a new lead, name John Smith,
-    # phone 775-...", "log a new lead: name X phone Y". Writes to
-    # messages.json so it shows up in the leads inbox + recent-leads
-    # query. Otherwise the LLM fakes "Done — added you."
+    # Lead CAPTURE from chat
     lead_add_resp = _try_lead_add(user_msg, user_rec)
     if lead_add_resp is not None:
         return jsonify(lead_add_resp)
 
-    # Channel queries we can't honestly answer — email/SMS/files. Return a
-    # deterministic refusal so the LLM doesn't fabricate "here are 3 emails
-    # from Johnson." Honest > confident-wrong.
     unwired_resp = _try_unwired_channel(user_msg, user_rec)
     if unwired_resp is not None:
         return jsonify(unwired_resp)
@@ -4315,6 +4729,29 @@ def owner_chat():
     cancel_resp = _try_cancel_appointment(user_msg, user_dir)
     if cancel_resp is not None:
         return jsonify(cancel_resp)
+
+    # Contact UPDATE — "change Bill's phone to 555-1234" / "update
+    # Cathleen's email to ..." MUST fire BEFORE _try_reschedule_appointment
+    # because the reschedule regex also starts with "change ... to" and
+    # was eating contact-edit commands.
+    contact_update_resp = _try_contact_update(user_msg, user_rec)
+    if contact_update_resp is not None:
+        return jsonify(contact_update_resp)
+
+    # Staff user ADD — "add a new staff user named Lisa Smith" — was
+    # being faked by the LLM (no actual user created) and the fake
+    # confirmation was being saved to memory.json as a "fact". Now
+    # actually creates the account via users_mod.add_user().
+    add_staff_resp = _try_add_staff_user(user_msg, user_rec)
+    if add_staff_resp is not None:
+        return jsonify(add_staff_resp)
+
+    # "What email/phone/address do you have for me / of mine / on file"
+    # — deterministic profile lookup so the LLM doesn't return the
+    # BUSINESS email when the owner asked about their OWN email.
+    profile_info_resp = _try_profile_info(user_msg, user_rec)
+    if profile_info_resp is not None:
+        return jsonify(profile_info_resp)
 
     # Calendar RESCHEDULE — "move my haircut from Tuesday to Friday" —
     # actually updates the event start (was also faking it via the LLM).
@@ -4434,6 +4871,11 @@ def owner_chat():
     if office_result is not None:
         return jsonify(office_result)
 
+    # DOCUMENT GENERATION — letter (.docx) + spreadsheet (.xlsx)
+    doc_gen_result = _try_doc_gen(user_msg, username)
+    if doc_gen_result is not None:
+        return jsonify(doc_gen_result)
+
     # CREATE patterns: route through quick_capture which classifies and files.
     qc_result = _try_quick_capture(user_msg, user_dir)
     if qc_result is not None:
@@ -4445,23 +4887,94 @@ def owner_chat():
     business = mod_business.load(DATA_DIR)
     system = prompts.build_owner_prompt(business)
     tone = ((business.get("personality") or {}).get("tone") or "friend").lower()
+    # companion_mode gates the personal-EI features (mood detection,
+    # concerns tier, emotional context block). Defaults to "personal"
+    # for friend-tone owners (the typical individual-Orby buyer) and
+    # "business" otherwise. Owner can flip it in Settings.
+    companion_mode = (
+        (business.get("personality") or {}).get("companion_mode")
+        or ("personal" if tone == "friend" else "business")
+    ).lower()
 
     # Owner mode gets memory + notes + workspace + per-user PA as extra context
     extras = []
 
-    # ── FRIEND-MODE personal context block (top priority) ──────────────
-    # When tone == "friend", combine notes + long-term memory + owner
-    # business info into ONE high-prominence block labeled as "what you
-    # know about this person." Pushes the friend prompt's "weave naturally"
-    # instruction onto real personal data instead of generic memory pulls.
-    if tone == "friend":
+    # ── EMOTIONAL INTELLIGENCE LAYER (companion_mode == "personal") ────
+    # Runs only for the owner's personal Orby and only when explicitly
+    # enabled. NEVER fires for public chat / voice receptionist (those
+    # are separate endpoints that never reach this code).
+    if companion_mode == "personal":
+        try:
+            from modules import mood as mod_mood
+            signal = mod_mood.detect(user_msg)
+            if signal:
+                mod_mood.log(user_dir, signal, source_msg=user_msg)
+                # Crisis signal — surface the redirect rule prominently
+                if signal.get("kind") == "crisis":
+                    extras.append(
+                        "⚠️ The owner just sent a CRISIS-level signal "
+                        "(words like 'kill myself', 'can't take it anymore'). "
+                        "Drop everything else. Be present. Acknowledge "
+                        "what they said. Gently mention 988 (Suicide & "
+                        "Crisis Lifeline) — say it's free, confidential, "
+                        "24/7 — without lecturing or pivoting to tasks."
+                    )
+            mood_ctx = mod_mood.context_block(user_dir)
+            if mood_ctx:
+                extras.append(mood_ctx)
+            # Active concerns — surface as background so she can connect
+            # the current message to ongoing worries naturally.
+            try:
+                concerns = mod_memory.recall_concerns(user_dir, limit=5)
+                if concerns:
+                    lines = ["ACTIVE CONCERNS the owner has shared "
+                             "(weave in naturally only when relevant):"]
+                    for c in concerns:
+                        lines.append(f"  · {c.get('content', '')}")
+                    extras.append("\n".join(lines))
+            except Exception:
+                log.exception("concerns recall failed")
+            # Check-in due — if a strong neg signal sits unresolved from
+            # 1-3 days ago, prompt the LLM to gently follow up.
+            checkin = mod_mood.check_in_due(user_dir)
+            if checkin:
+                snippet = checkin.get("snippet") or checkin.get("kind", "rough")
+                extras.append(
+                    f"FOLLOW-UP CUE: a day or two ago they mentioned "
+                    f"\"{snippet}\". If the current message doesn't already "
+                    f"reference it, a brief gentle check-in is welcome — "
+                    f"\"hey, you mentioned X the other day, how's that "
+                    f"now?\" Don't force it if they're clearly on a "
+                    f"different topic."
+                )
+        except Exception:
+            log.exception("EI layer failed (non-fatal)")
+
+    # Is this an OPERATIONAL query (search/fetch/list/read) or a
+    # CONVERSATIONAL one? For ops queries, skip the personal-context
+    # block entirely — memory facts about Frank's wife are not relevant
+    # to "widen the search" or "what email of mine do you have", and
+    # injecting them caused the LLM to bleed Cathleen / favorite-color
+    # into unrelated answers.
+    msg_lower_for_intent = user_msg.lower()
+    _OPS_HINTS = (
+        "search", "find", "look for", "list", "show me", "what email",
+        "what file", "what's in", "what do you have", "widen",
+        "broaden", "check my", "read the", "open the", "fetch",
+        "download", "any new", "do i have", "where is", "show all",
+    )
+    is_ops_query = any(h in msg_lower_for_intent for h in _OPS_HINTS)
+
+    # ── FRIEND-MODE personal context block (conversational only) ──────
+    # When tone == "friend" AND this is a conversational message, combine
+    # notes + long-term memory + owner business info. Skipped for ops
+    # queries to prevent context bleed.
+    if tone == "friend" and not is_ops_query:
         personal = _friend_personal_context(business, user_dir)
         if personal:
             extras.append(personal)
         # Past-wins recall — if the current message has stress cues, pull
-        # a relevant past win for the LLM to weave in naturally. Real
-        # friend behavior: remind you that you've been here before and
-        # came out the other side.
+        # a relevant past win for the LLM to weave in naturally.
         try:
             from modules import wins as mod_wins
             wins_block = mod_wins.context_block(user_dir, user_msg)
@@ -4470,10 +4983,10 @@ def owner_chat():
         except Exception:
             log.exception("wins context_block failed")
 
-        # Client-context surfacing — if a known contact's name appears in
-        # the current message, surface what Orby knows about them. The
-        # owner mentioning "Maxwell" should remind Orby that Maxwell's
-        # daughter graduated last month, etc.
+        # Client-context surfacing — surface what Orby knows about a
+        # contact when the owner mentions them by name. Safe even for
+        # conversational queries because it keys on the actual name
+        # appearing in the message.
         try:
             cc = _contact_context_for_message(user_msg, user_dir)
             if cc:
@@ -4486,8 +4999,10 @@ def owner_chat():
     cap_ctx = _capabilities_context_block(user_msg)
     if cap_ctx:
         extras.append(cap_ctx)
-    # Skip the generic notes/memory blocks when friend-mode already pulled them
-    if tone != "friend":
+    # Skip the generic notes/memory blocks when friend-mode already pulled
+    # them, AND when this is an ops query — same bleed prevention as the
+    # friend-mode block above.
+    if tone != "friend" and not is_ops_query:
         notes_ctx = mod_notes.context_block(DATA_DIR)
         if notes_ctx:
             extras.append(notes_ctx)
@@ -4575,7 +5090,46 @@ def owner_chat():
     if extras:
         system += "\n\n" + "\n\n".join(extras)
 
-    messages = [m for m in history if m.get("role") in ("user", "assistant")][-20:]
+    # Scrub offline-mode failures from history before passing to the
+    # LLM. When the prior turn ended with "I'm offline right now",
+    # leaving the user's request in history caused the LLM to "continue"
+    # the failed task on the NEXT message — e.g. Frank's failed "reply
+    # to last email" + new "my wife's name is Cathleen" → LLM drafted an
+    # email anyway. Drop the user+assistant pair when the assistant
+    # reply was an offline-error placeholder.
+    def _is_offline_placeholder(content: str) -> bool:
+        if not content:
+            return False
+        low = content.lower()
+        return ("i'm offline right now" in low
+                or "i couldn't reach any ai tier" in low
+                or low.strip().startswith("— offline mode —")
+                or low.strip().endswith("— offline mode —"))
+
+    # Two passes:
+    # 1. Find the LAST offline-placeholder assistant turn in history.
+    #    Everything at or before that index gets dropped — we treat an
+    #    offline failure as a session reset, because the most common
+    #    bleed pattern is "user asked for X, X failed, user says
+    #    something unrelated, LLM 'continues' X with the unrelated
+    #    content." Cutting EVERYTHING before the offline mark prevents
+    #    Cathleen-email turns from 10 messages earlier from poisoning a
+    #    'favorite color is blue' message.
+    # 2. Build the message list from whatever survives.
+    cut_idx = -1
+    for i, m in enumerate(history):
+        if (m.get("role") == "assistant"
+                and _is_offline_placeholder(m.get("content", ""))):
+            cut_idx = i
+    survivors = [m for m in history[cut_idx + 1:]
+                 if m.get("role") in ("user", "assistant")]
+    # Debug log: what the LLM is about to see (one line for spotting bleed)
+    log.info(f"owner_chat history: in={len(history)} cut_at={cut_idx} "
+             f"survivors={len(survivors)} current={user_msg[:60]!r}")
+    if survivors:
+        log.info(f"  last survivor: {survivors[-1].get('role')}: "
+                 f"{(survivors[-1].get('content') or '')[:80]!r}")
+    messages = survivors[-20:]
     messages.append({"role": "user", "content": user_msg})
 
     # Owner/staff rate limit — per-user daily cap protects the HF budget.
@@ -4600,11 +5154,103 @@ def owner_chat():
         except Exception as e:
             log.warning(f"auto-note add failed: {e}")
 
+    # Auto-memory fact extraction — fire a background LLM call to extract
+    # any durable personal/business facts from this exchange and save them
+    # to mod_memory.long_term. Runs after the user has the response so it
+    # adds zero perceived latency. Skips trivial messages.
+    try:
+        if len(user_msg.strip()) >= 8:
+            threading.Thread(
+                target=_auto_extract_facts_to_memory,
+                args=(user_msg, resp.text or "", user_dir),
+                daemon=True,
+            ).start()
+    except Exception as e:
+        log.warning(f"auto-memory thread launch failed: {e}")
+
+    fallback_msg = (
+        "I couldn't reach any AI tier just now — that usually means a "
+        "brief internet hiccup or HuggingFace is rate-limiting. Wait "
+        "30 seconds and try again. If it keeps happening, restart Orbi "
+        "from Settings → Restart, or check `systemctl --user status "
+        "orbi.service` from the terminal."
+    )
     return jsonify({
-        "reply": resp.text or "I couldn't reach any AI tier just now. Please try again.",
+        "reply": resp.text or fallback_msg,
         "tier": resp.tier,
         "latency_ms": resp.latency_ms,
     })
+
+
+def _auto_extract_facts_to_memory(user_msg: str, assistant_reply: str,
+                                    user_dir: Path) -> None:
+    """Background fact extractor. After each owner-chat exchange, ask the
+    LLM to pull any DURABLE facts about the user (name, family, business,
+    suppliers, preferences, schedule, relationships) and persist them to
+    `memory.long_term` so future turns have that context automatically.
+
+    Designed to be silent on trivial messages — the extraction prompt is
+    explicit that questions, greetings, casual chat should return []."""
+    try:
+        from modules import memory as mod_memory
+        import json as _json
+        system = (
+            "You are a memory-extractor. From the user's message ONLY, "
+            "pull any DURABLE facts the USER EXPLICITLY STATED about "
+            "themselves — family/relationships, business, suppliers, "
+            "preferences, schedule, context.\n\n"
+            "RULES (strict):\n"
+            "- Output ONLY a JSON array of short factual strings, "
+            "third-person, e.g. [\"User's wife is Kathy\", \"User runs a deli called PurBlum\"].\n"
+            "- One fact per array entry. Each <= 200 chars.\n"
+            "- Skip greetings, casual chat, questions, requests for help.\n"
+            "- ONLY save facts that are LITERALLY stated in the user's "
+            "message. Do NOT infer, paraphrase, embellish, or add details. "
+            "If the user did not state it, do NOT save it.\n"
+            "- If nothing factual was stated, output exactly: []\n"
+            "- No prose, no explanation, no markdown. Just the JSON array."
+        )
+        # CRITICAL: we deliberately do NOT pass the assistant_reply to the
+        # extractor. If we did, hallucinations in the assistant's response
+        # ("your wife is supportive of your business" — never said by the
+        # user) would be saved as "facts", which the next turn would then
+        # treat as real history. This was a real bug Frank caught.
+        messages = [{
+            "role": "user",
+            "content": f"User said: {user_msg}",
+        }]
+        resp = llm_client.generate(CONFIG, system, messages)
+        text = (resp.text or "").strip()
+        # Tolerate code fences
+        if text.startswith("```"):
+            text = text.strip("`").lstrip("json").strip()
+        if not text.startswith("["):
+            return
+        try:
+            facts = _json.loads(text)
+        except Exception:
+            return
+        if not isinstance(facts, list) or not facts:
+            return
+        saved = 0
+        for fact in facts:
+            if not isinstance(fact, str):
+                continue
+            f = fact.strip()
+            if 6 < len(f) < 300:
+                try:
+                    mod_memory.remember(
+                        user_dir, f, tier="long_term",
+                        meta={"source": "auto_extracted",
+                              "from_msg": user_msg[:200]},
+                    )
+                    saved += 1
+                except Exception as e:
+                    log.warning(f"memory.remember failed: {e}")
+        if saved:
+            log.info(f"auto-memory saved {saved} fact(s) for user_dir={user_dir.name}")
+    except Exception as e:
+        log.warning(f"auto-memory extraction failed: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -4959,13 +5605,45 @@ _NAME_AFTER_FILLER = (
 # owner per install). Once business_info.name is real, this entire
 # block no-ops and Orby behaves normally.
 
-ONBOARDING_STEPS = [
-    ("name",        "What's your business called?"),
-    ("phone",       "What's the main phone number for your business?"),
-    ("services",    "What services do you offer? (one line, comma-separated is fine)"),
-    ("address",     "What's your street address?"),
-    ("license",     "What's your contractor license number? (Type 'skip' if you don't have one yet.)"),
+# Onboarding is dual-track: Personal vs Restaurant. Q0 routes based on
+# what the user says ("just for me" / "for my business as an assistant"
+# → personal; "restaurant" / "cafe" / "deli" → restaurant). Each track
+# has its own follow-up questions appropriate to the use case.
+ONBOARDING_STEPS_PERSONAL = [
+    ("track",       "Welcome! Quick setup — under a minute.\n\n"
+                     "First: how are you planning to use me?\n"
+                     "  · Type 'personal' if you want me as your own AI "
+                     "assistant (calendar, tasks, contacts, email, files, "
+                     "memory).\n"
+                     "  · Type 'restaurant' if you run a restaurant and need "
+                     "me to answer phones, take orders, and chat with website "
+                     "visitors.\n"
+                     "  · Type 'both' if you want both."),
+    ("display_name", "What's your name? (Just first name is fine.)"),
+    ("tone",         "What vibe do you want from me?\n"
+                     "  · 'friend' — casual, warm, like a friend who also "
+                     "helps run things (recommended)\n"
+                     "  · 'professional' — efficient and crisp, less chitchat\n"
+                     "  · 'playful' — light energy, banter\n"
+                     "  · 'formal' — strictly professional"),
+    ("companion_mode", "Should I notice and remember your moods, concerns, "
+                       "and check in on you over time? Or stay strictly "
+                       "transactional?\n"
+                       "  · 'personal' — yes, notice my emotional state and "
+                       "follow up (recommended for solo use)\n"
+                       "  · 'business' — no, keep things task-focused only"),
 ]
+ONBOARDING_STEPS_RESTAURANT = [
+    # Track + display_name + tone are shared above; restaurant adds:
+    ("name",     "What's the restaurant called?"),
+    ("phone",    "What's the main phone number for the restaurant?"),
+    ("services", "What kind of food do you serve? (e.g. 'New York-style "
+                  "pizza, calzones, salads')"),
+    ("address",  "What's the restaurant's address?"),
+]
+# Backward-compat: legacy callers might import this name. Default to the
+# personal flow which is the most common Orby-buyer.
+ONBOARDING_STEPS = ONBOARDING_STEPS_PERSONAL
 
 
 def _onboarding_state_path() -> "Path":
@@ -5027,72 +5705,135 @@ def _try_onboarding(message: str, user_rec: dict) -> dict | None:
         return None
     step_idx = int(state.get("step", -1))
     collected = state.get("collected") or {}
-    # First-ever message: greet + ask question #0, bump state to "waiting
-    # for answer to step 0". Next call sees step 0 + waiting → saves the
-    # answer there + advances.
+
+    # Compose the steps list lazily based on the chosen track so the
+    # length is right for the routing math below. Q0 = track. After Q0,
+    # the personal-only steps run, then if track in {'restaurant','both'}
+    # the restaurant-only steps run.
+    def _steps_for_track(track: str) -> list[tuple[str, str]]:
+        steps = list(ONBOARDING_STEPS_PERSONAL)
+        if track in ("restaurant", "both"):
+            steps.extend(ONBOARDING_STEPS_RESTAURANT)
+        return steps
+
+    track = (collected.get("track") or "").lower().strip()
+    steps = _steps_for_track(track)
+
+    # First-ever message: greet + ask question #0, bump state.
     if step_idx < 0:
         state["step"] = 0
         state["collected"] = {}
         _save_onboarding_state(state)
-        first_q = ONBOARDING_STEPS[0][1]
-        return {"reply": ("👋 Welcome! Quick setup before we take any calls — "
-                          "5 questions, 60 seconds.\n\n"
-                          f"{first_q}"),
-                "tier": "local", "latency_ms": 0,
+        first_q = steps[0][1]
+        return {"reply": first_q, "tier": "local", "latency_ms": 0,
                 "source": "onboarding_start"}
+
     # Save the answer to the current step
     answer = (message or "").strip()
-    if step_idx < len(ONBOARDING_STEPS):
-        key, _q = ONBOARDING_STEPS[step_idx]
-        if answer.lower() in {"skip", "none", "n/a"} and key in ("license",):
-            collected[key] = ""
+    if step_idx < len(steps):
+        key, _q = steps[step_idx]
+        if key == "track":
+            # Normalize free-form to one of the recognized tracks
+            low = answer.lower()
+            if any(t in low for t in ("restaurant", "deli", "cafe", "pizza",
+                                       "diner", "food truck", "bar")):
+                answer = "both" if "both" in low or "and" in low else "restaurant"
+            elif any(t in low for t in ("personal", "just me", "assistant",
+                                          "for myself", "solo")):
+                answer = "personal"
+            elif "both" in low:
+                answer = "both"
+            # Anything else: assume personal (the safe default)
+            else:
+                answer = "personal"
+            collected["track"] = answer
+            # Recompute steps now that the track is known
+            steps = _steps_for_track(answer)
+        elif key in ("tone",):
+            tone_map = {"friend":  "friend", "casual": "friend",
+                         "professional": "friendly_professional",
+                         "playful": "playful", "formal": "formal"}
+            collected["tone"] = tone_map.get(answer.lower(), "friend")
+        elif key == "companion_mode":
+            mode = answer.lower()
+            collected["companion_mode"] = (
+                "business" if "business" in mode or "transactional" in mode
+                else "personal"
+            )
         else:
             collected[key] = answer
     step_idx += 1
     state["step"] = step_idx
     state["collected"] = collected
     _save_onboarding_state(state)
+
     # If more steps remain, ask the next
-    if step_idx < len(ONBOARDING_STEPS):
-        _next_key, next_q = ONBOARDING_STEPS[step_idx]
-        return {"reply": f"Got it.\n\n{next_q}",
-                "tier": "local", "latency_ms": 0,
+    if step_idx < len(steps):
+        _next_key, next_q = steps[step_idx]
+        return {"reply": next_q, "tier": "local", "latency_ms": 0,
                 "source": "onboarding_step"}
-    # All done — save to business_info, mark complete
+
+    # All done — save into business_info
     try:
         biz = mod_business.load(DATA_DIR) or {}
-        biz["name"] = collected.get("name", "")
+        # Business name: prefer the explicit restaurant name; for
+        # personal-only, fall back to "{display_name}'s Workspace".
+        biz_name = (collected.get("name") or "").strip()
+        if not biz_name and collected.get("display_name"):
+            biz_name = f"{collected['display_name'].strip()}'s Workspace"
+        if biz_name:
+            biz["name"] = biz_name
         contact = biz.get("contact") or {}
         if collected.get("phone"):
             contact["phone"] = collected["phone"]
         biz["contact"] = contact
+        # Services
         services = [s.strip() for s in (collected.get("services") or "").split(",")
                      if s.strip()]
         if services:
             biz["services"] = services
         if collected.get("address"):
-            # Store as a string for simplicity — the address field accepts
-            # either string or dict per business_info.py handling.
             biz["address"] = collected["address"]
-        if collected.get("license"):
-            biz["license"] = collected["license"]
+        # Personality block — tone + companion_mode + owner display name
+        personality = biz.get("personality") or {}
+        if collected.get("tone"):
+            personality["tone"] = collected["tone"]
+        if collected.get("companion_mode"):
+            personality["companion_mode"] = collected["companion_mode"]
+        if collected.get("display_name"):
+            personality["owner_name"] = collected["display_name"]
+        biz["personality"] = personality
+        # Track persisted for diagnostics + later add-on enablement
+        biz["track"] = collected.get("track", "personal")
         mod_business.save(DATA_DIR, biz)
         state["complete"] = True
         _save_onboarding_state(state)
         audit.log_event(DATA_DIR, actor=user_rec.get("username", "?"),
                         action="onboarding.completed",
-                        meta={"business_name": collected.get("name")})
+                        meta={"business_name": biz_name,
+                              "track": collected.get("track")})
     except Exception as e:
         log.exception("onboarding save failed")
-        return {"reply": f"Almost — but saving failed: {e}. You can fill in your "
-                          f"business info under the Settings tab instead.",
-                "tier": "local", "latency_ms": 0,
+        return {"reply": (
+            f"Almost done — but saving failed: {e}. You can fill in the "
+            f"details under Settings instead, no harm done."
+        ), "tier": "local", "latency_ms": 0,
                 "source": "onboarding_save_error"}
-    biz_name = collected.get("name", "your business")
-    return {"reply": (f"🎉 Setup complete. {biz_name} is ready to take calls "
-                      f"and chats. Try asking me anything — \"what's on my "
-                      f"calendar today\" or \"morning brief\" — or jump into "
-                      f"Settings to add staff, hours, payment methods, etc."),
+    nice_name = collected.get("display_name") or "there"
+    track_kind = collected.get("track", "personal")
+    if track_kind == "restaurant":
+        ready_line = (f"the restaurant is ready to take calls and chats. "
+                      f"Try \"morning brief\" or jump to Settings → Hours "
+                      f"+ Menu to finish the basics.")
+    elif track_kind == "both":
+        ready_line = (f"both sides are ready. Personal: try \"what's on my "
+                      f"calendar.\" Restaurant: head to Settings → Hours + "
+                      f"Menu and we're live for calls.")
+    else:
+        ready_line = (f"I'm ready. Try \"what's on my calendar,\" "
+                      f"\"remind me tomorrow at 9,\" or \"tell me about "
+                      f"my wife\" (after you add some memories).")
+    return {"reply": f"🎉 All set, {nice_name} — {ready_line}",
             "tier": "local", "latency_ms": 0,
             "source": "onboarding_complete"}
 
@@ -9025,8 +9766,20 @@ def _friend_personal_context(business: dict, user_dir: Path) -> str:
     owner_role = personality.get("owner_role") or "owner"
     biz_name = business.get("name") or ""
 
-    lines = [f"WHO YOU'RE TALKING TO — use this naturally, don't recite "
-             "it like trivia or a database lookup:"]
+    lines = [
+        "WHAT YOU KNOW ABOUT THE OWNER:",
+        "",
+        "Use these facts to answer when the owner asks about themselves, "
+        "their people (wife, kids, suppliers, etc.), or topics named "
+        "below. Quote specific facts (names, places, details) when they're "
+        "relevant — don't be vague when you have the real answer.",
+        "",
+        "But DO NOT fold these facts into UNRELATED operational queries "
+        "(file search, listing emails, calendar lookups, fetching files). "
+        "If the user asks \"widen the search\" or \"what files do you "
+        "have\", answer from actual tool results — not from this block.",
+        "",
+    ]
     if owner_full:
         if biz_name:
             lines.append(f"- Name: {owner_full} ({owner_role} of {biz_name})")
@@ -9039,15 +9792,19 @@ def _friend_personal_context(business: dict, user_dir: Path) -> str:
     if personal_text:
         lines.append(f"- Personal context: {personal_text}")
 
-    # Long-term memory entries (lasting facts about the owner)
+    # Long-term memory entries (lasting facts about the owner). Memory
+    # lives PER-USER at <user_dir>/memory.json — passing DATA_DIR here
+    # (the global path) was a latent bug that made the LLM see zero
+    # facts about the owner. Cathleen, suppliers, preferences — all
+    # absent from the system prompt until this fix.
     try:
-        mem_data = mod_memory._load_raw(DATA_DIR)
-        lt = [e.get("content", "") for e in (mem_data.get("long_term") or [])][-12:]
-        if lt:
+        facts = mod_memory.recall(user_dir, limit=15) or []
+        if facts:
             lines.append("- Things you remember about them (long-term):")
-            for item in lt:
-                if item:
-                    lines.append(f"  · {item}")
+            for f in facts:
+                content = (f.get("content") or "").strip()
+                if content:
+                    lines.append(f"  · {content}")
     except Exception:
         pass
 
@@ -9067,10 +9824,11 @@ def _friend_personal_context(business: dict, user_dir: Path) -> str:
     # If we only got the header line, return empty (nothing useful to share)
     if len(lines) <= 1:
         return ""
-    lines.append("\nWeave this in naturally when context invites it — "
-                 "asking about a partner by name, referencing a struggle "
-                 "they mentioned last week, celebrating a win you remember. "
-                 "Don't dump it back at them.")
+    lines.append("\nRule of thumb: if the user asks ABOUT a person or topic "
+                 "in this list (by name OR by relationship like \"my wife\"), "
+                 "tell them what you actually know — names, places, details, "
+                 "specifics. Don't be evasive when you have the answer. "
+                 "Just don't volunteer this stuff in unrelated workflows.")
     return "\n".join(lines)
 
 
@@ -9080,6 +9838,11 @@ _MORNING_BRIEF_RE = _re.compile(
     r"(?:morning|daily|today'?s?)\s+(?:brief|briefing|update|rundown|recap)"
     r"|brief\s+me(?:\s+(?:on\s+)?today)?"
     r"|(?:my\s+)?(?:brief|briefing)\s+(?:now|for\s+today)?"
+    # "show me my day" / "what's my day look like" — route to the brief
+    # too so we don't bounce to the LLM (which hallucinates times because
+    # earlier chat history contained UTC values).
+    r"|(?:show\s+me\s+|what'?s?\s+|how(?:'s|\s+is)\s+)?my\s+day"
+    r"(?:\s+look\s+like)?"
     r")\s*[?.!]?\s*$",
     _re.IGNORECASE,
 )
@@ -9120,10 +9883,27 @@ def _try_morning_brief(message: str, user_rec: dict) -> dict | None:
         log.warning(f"morning brief build failed: {e}")
         return None  # Let LLM take it as fallback
     reply = brief.get("summary_text") or "Nothing to brief on yet."
+    items = brief.get("items") or []
+    # Today's calendar events with LOCAL times so Frank sees "9:00 am",
+    # not "16:00" (raw UTC) and not the LLM's hallucinated mix.
+    events_today = [i for i in items if i.get("kind") == "event"]
+    if events_today:
+        reply += "\n\nToday's calendar:"
+        for ev in events_today[:8]:
+            when_raw = (ev.get("when") or "").strip()
+            # briefing._iso_to_local_when returns 'MM/DD HH:MM' — keep
+            # just the HH:MM and convert to 12-hr local time.
+            when_hhmm = when_raw[6:] if len(when_raw) > 6 else when_raw
+            try:
+                from datetime import datetime as _dt
+                t = _dt.strptime(when_hhmm.strip(), "%H:%M")
+                when_disp = t.strftime("%-I:%M %p").lower()
+            except (ValueError, TypeError):
+                when_disp = when_hhmm or "?"
+            reply += f"\n  · {when_disp} — {ev.get('title', '')}"
     # If contractor sections fired, append the key item details so the
     # GC sees specific CO #s and invoice #s in the chat without having
     # to open the dashboard.
-    items = brief.get("items") or []
     pending = [i for i in items if i.get("kind") == "co_pending"]
     awaiting = [i for i in items if i.get("kind") == "co_awaiting_sig"]
     overdue = [i for i in items if i.get("kind") == "invoice_overdue"]
@@ -9174,7 +9954,7 @@ def _try_tomorrow_brief(message: str, user_rec: dict) -> dict | None:
     if events:
         lines.append(f"  {len(events)} appointment{'s' if len(events) != 1 else ''}:")
         for e in events[:8]:
-            start = (e.get("start") or "")[11:16] or "?"
+            start = _fmt_iso_local_time(e.get("start") or "")
             title = e.get("title", "")
             lines.append(f"    · {start} — {title}")
     else:
@@ -9249,6 +10029,829 @@ _CONTACTS_CONVO_RE = _re.compile(
     r"^\s*(?:show|list|give)\s+(?:me\s+)?(?:every|all)\s+conversations?\s+(?:we(?:'ve| have)?\s+)?(?:had\s+)?with\s+(?P<name>.+?)\s*[?.!]?\s*$",
     _re.IGNORECASE,
 )
+
+
+_VAGUE_MORE_RE = _re.compile(
+    r"^\s*(?:"
+    r"widen\s+(?:the\s+|my\s+|that\s+)?search"
+    r"|search\s+(?:harder|wider|deeper|broader|more)"
+    r"|look\s+(?:harder|wider|deeper|broader|more)"
+    r"|tell\s+me\s+more"
+    r"|more\s+details?"
+    r"|(?:show|give)\s+me\s+more"
+    r"|broaden\s+(?:the\s+|my\s+)?search"
+    r"|dig\s+(?:in\s+)?deeper"
+    r")\s*[.?!]?\s*$",
+    _re.IGNORECASE,
+)
+
+
+def _try_vague_followup(message: str, user_rec: dict) -> dict | None:
+    """Catch 'widen search' / 'tell me more' / 'dig deeper' with no
+    target. These were falling to the LLM, which hallucinated invented
+    details (Bill's wiring projects, your wife's busy schedule, etc.)
+    because it couldn't tell what to widen. Now we demand a target."""
+    if not message:
+        return None
+    if not _VAGUE_MORE_RE.match(_strip_polite_prefix(message)):
+        return None
+    return {"reply": (
+        "What should I look deeper on? I can search your files, "
+        "contacts, memory, emails, and calendar — just name the topic.\n"
+        "Try: \"tell me more about Bill Henry\" or "
+        "\"search everything for plumbing\" or "
+        "\"what do you remember about my suppliers\"."
+    ), "tier": "local", "latency_ms": 0, "source": "vague_followup"}
+
+
+_TELL_ME_ABOUT_RE = _re.compile(
+    r"^\s*(?:"
+    r"(?:tell|say|show|give)\s+me\s+"
+    r"(?:everything|all|more|what\s+you\s+know|some\s+more|anything)?\s*"
+    r"(?:about|on|regarding)\s+(?:my\s+)?(?P<topic1>.+?)"
+    r"|what(?:'s| do you know| can you tell me)\s+(?:more\s+)?"
+    r"(?:about|on)\s+(?:my\s+)?(?P<topic2>.+?)"
+    r"|who\s+is\s+(?:my\s+)?(?P<topic3>.+?)"
+    r"|more\s+(?:about|on)\s+(?:my\s+)?(?P<topic4>.+?)"
+    r")\s*[.?!]?\s*$",
+    _re.IGNORECASE,
+)
+
+
+def _try_tell_me_about(message: str, user_rec: dict) -> dict | None:
+    """Deterministic 'tell me about X' lookup. Pulls matching items from
+    memory + contacts. Returns ONLY what's stored — no LLM call, no
+    fabrication. Was previously letting the LLM invent details (wife is
+    "supportive of business" / "good with kids") that were never said
+    by the user."""
+    if not message:
+        return None
+    msg = _strip_polite_prefix(message)
+    m = _TELL_ME_ABOUT_RE.match(msg)
+    if not m:
+        return None
+    topic_raw = next(
+        (m.group(g) for g in ("topic1", "topic2", "topic3", "topic4")
+         if m.group(g)),
+        "",
+    ).strip().rstrip("?.!").strip()
+    if not topic_raw:
+        return None
+
+    username = user_rec.get("username", "owner")
+    try:
+        user_dir = users_mod.get_user_dir(DATA_DIR, username)
+    except Exception:
+        return None
+
+    # Token stems — singular/plural-friendly match (suppliers → supplier)
+    def _stems(t: str) -> set[str]:
+        t = t.lower().strip()
+        out = {t}
+        if t.endswith("ies") and len(t) > 4: out.add(t[:-3] + "y")
+        if t.endswith("es")  and len(t) > 3: out.add(t[:-2])
+        if t.endswith("s")   and len(t) > 2: out.add(t[:-1])
+        if t.endswith("'s"):                  out.add(t[:-2])
+        return out
+
+    # Memory hits
+    try:
+        from modules import memory as mod_memory
+        mem_hits: list = []
+        for stem in _stems(topic_raw):
+            mem_hits = mod_memory.recall(user_dir, query=stem, limit=20)
+            if mem_hits:
+                break
+    except Exception:
+        mem_hits = []
+
+    # Contacts hits — if topic_raw is a name, surface the contact record
+    contact_hits: list = []
+    try:
+        from modules import contacts as mod_contacts
+        contact_hits = mod_contacts.search(user_dir, topic_raw) or []
+    except Exception:
+        pass
+
+    if not mem_hits and not contact_hits:
+        return {"reply": (
+            f"I don't have anything saved about \"{topic_raw}\" yet. "
+            f"Tell me a fact and I'll remember next time. "
+            f"For example: \"remember that {topic_raw} is …\"."
+        ), "tier": "local", "latency_ms": 0,
+           "source": "tell_about_empty"}
+
+    out = [f"Here's what I have on {topic_raw}:"]
+    if mem_hits:
+        out.append("\nFrom your saved memory:")
+        seen_low: set = set()
+        kept: list = []
+        for h in mem_hits:
+            c = (h.get("content") or "").strip()
+            key = " ".join(c.lower().split())
+            if not c or key in seen_low:
+                continue
+            seen_low.add(key)
+            kept.append(h)
+        for h in kept[:12]:
+            line = f"  · {h.get('content', '').strip()}"
+            # Append a date if we know when this was saved — proves
+            # provenance (matches the "no fabrication" theme).
+            when = _format_fact_date(h.get("ts"))
+            if when:
+                line += f"  _(saved {when})_"
+            out.append(line)
+    if contact_hits:
+        out.append("\nFrom your contacts:")
+        for c in contact_hits[:5]:
+            bits = [c.get("name", "?")]
+            if c.get("phone"): bits.append(c["phone"])
+            if c.get("email"): bits.append(c["email"])
+            if c.get("tags"):  bits.append(", ".join(c["tags"]))
+            out.append(f"  · {' — '.join(bits)}")
+    out.append("\n(That's everything I have stored. Nothing else, no "
+               "guesses. Tell me more if you want me to remember it.)")
+    return {"reply": "\n".join(out), "tier": "local",
+            "latency_ms": 0, "source": "tell_about"}
+
+
+def _format_fact_date(ts) -> str:
+    """Format a stored timestamp as 'Jun 4' / 'May 27' for citation lines."""
+    if not ts:
+        return ""
+    try:
+        from datetime import datetime, timezone
+        dt = datetime.fromtimestamp(float(ts), tz=timezone.utc).astimezone()
+        return dt.strftime("%b %-d")
+    except (ValueError, TypeError):
+        return ""
+
+
+_CONCERN_CAPTURE_RE = _re.compile(
+    r"^\s*(?:"
+    r"(?:i'?m|i am)\s+(?:really\s+|super\s+|kinda\s+|kind\s+of\s+)?"
+    r"(?:worried|stressed|anxious|concerned|nervous|freaking\s+out)\s+"
+    r"(?:about|over|because\s+of)\s+(?P<topic1>.+?)"
+    r"|(?:remember\s+(?:that\s+)?)?"
+    r"i'?m\s+(?:really\s+)?worried\s+about\s+(?P<topic2>.+?)"
+    r"|(?:something|the\s+thing)\s+(?:that'?s\s+)?"
+    r"(?:bothering|worrying|stressing)\s+me\s+is\s+(?P<topic3>.+?)"
+    r"|(?:keep|can'?t\s+stop)\s+(?:worrying|thinking)\s+about\s+"
+    r"(?P<topic4>.+?)"
+    r")\s*[.?!]?\s*$",
+    _re.IGNORECASE,
+)
+_CONCERN_RESOLVE_RE = _re.compile(
+    r"^\s*(?:"
+    r"(?:the\s+)?(?P<topic1>.+?)\s+(?:thing\s+)?(?:is\s+)?"
+    r"(?:sorted|resolved|fixed|done|over|behind\s+me|handled)"
+    r"|stop\s+worrying\s+about\s+(?P<topic2>.+?)"
+    r"|(?:i'?m\s+)?(?:no\s+longer|not)\s+worried\s+about\s+(?P<topic3>.+?)"
+    r")\s*[.?!]?\s*$",
+    _re.IGNORECASE,
+)
+
+
+def _try_concern_capture(message: str, user_rec: dict) -> dict | None:
+    """Detect 'I'm worried about X' and save to the concerns memory
+    tier — companion_mode-gated. Also detects 'X is sorted' and resolves
+    the matching concern. No LLM call. Skipped silently if companion_mode
+    is 'business' so it doesn't surprise transactional-only owners."""
+    if not message:
+        return None
+    msg = _strip_polite_prefix(message)
+    # Gate: only fire when this owner has personal mode enabled.
+    try:
+        business = mod_business.load(DATA_DIR)
+        mode = ((business.get("personality") or {}).get("companion_mode")
+                or ("personal" if (business.get("personality") or {})
+                    .get("tone", "friend") == "friend" else "business")).lower()
+    except Exception:
+        mode = "personal"
+    if mode != "personal":
+        return None
+    username = user_rec.get("username", "owner")
+    try:
+        user_dir = users_mod.get_user_dir(DATA_DIR, username)
+    except Exception:
+        return None
+
+    # Try resolve first ("the ChemPro thing is sorted") so "X is sorted"
+    # doesn't accidentally trigger capture as a new concern.
+    rm = _CONCERN_RESOLVE_RE.match(msg)
+    if rm:
+        topic = next((rm.group(g) for g in ("topic1", "topic2", "topic3")
+                      if rm.group(g)), "").strip().rstrip(".?!")
+        if topic and len(topic) > 2:
+            try:
+                n = mod_memory.resolve_concern(user_dir, topic)
+            except Exception:
+                n = 0
+            if n > 0:
+                return {"reply": (
+                    f"Glad to hear that. I'll stop bringing up "
+                    f"\"{topic}\" — let me know if it comes back."
+                ), "tier": "local", "latency_ms": 0,
+                   "source": "concern_resolved"}
+            # No matching concern found — fall through to LLM
+
+    m = _CONCERN_CAPTURE_RE.match(msg)
+    if not m:
+        return None
+    topic = next((m.group(g) for g in ("topic1", "topic2", "topic3", "topic4")
+                  if m.group(g)), "").strip().rstrip(".?!")
+    if not topic or len(topic) < 3:
+        return None
+    # Frame the saved concern in third person to match the rest of memory
+    # ("User is worried about ChemPro's delivery delays").
+    saved_text = f"User is worried about {topic}"
+    try:
+        mod_memory.add_concern(user_dir, saved_text, weight=0.7,
+                                meta={"source": "explicit_capture",
+                                      "from_msg": (msg or "")[:200]})
+    except Exception as e:
+        log.warning(f"add_concern failed: {e}")
+        return None
+    # Also log a mood signal so the EI layer surfaces it next turn
+    try:
+        from modules import mood as mod_mood
+        mod_mood.log(user_dir, {
+            "kind": "worried", "intensity": 0.65,
+            "valence": "neg", "snippet": f"worried about {topic}",
+        }, source_msg=msg)
+    except Exception:
+        pass
+    return {"reply": (
+        f"Got it — I'll hold onto that. \"{topic}\" is on my mind too "
+        f"now. I'll bring it up gently when it seems relevant, and "
+        f"check in if it's been a few days. When it's sorted, just "
+        f"say so and I'll let it go."
+    ), "tier": "local", "latency_ms": 0, "source": "concern_captured"}
+
+
+_MEMORY_RECALL_RE = _re.compile(
+    r"^\s*(?:"
+    r"what\s+do\s+you\s+(?:remember|know)\s+about\s+(?:my\s+)?(?P<topic>.+?)"
+    r"|do\s+you\s+remember\s+(?P<topic2>.+?)"
+    r"|what\s+have\s+I\s+told\s+you\s+about\s+(?P<topic3>.+?)"
+    r"|recall\s+(?:everything\s+about\s+)?(?P<topic4>.+?)"
+    r"|show\s+(?:me\s+)?(?:my\s+)?memory"
+    r"|what\s+(?:do\s+you|do\s+I)\s+remember"
+    r")\s*[.?!]?\s*$",
+    _re.IGNORECASE,
+)
+
+
+def _try_memory_recall(message: str, user_rec: dict) -> dict | None:
+    """Deterministic memory recall — when the owner asks "what do you
+    remember about X", hit `mod_memory.recall()` and list the saved
+    facts. Bypasses the LLM so it can't hallucinate Acme-Plumbing-style
+    inventions. Returns None to fall through."""
+    if not message:
+        return None
+    msg = _strip_polite_prefix(message)
+    m = _MEMORY_RECALL_RE.match(msg)
+    if not m:
+        return None
+    topic = ""
+    for key in ("topic", "topic2", "topic3", "topic4"):
+        try:
+            v = m.group(key)
+            if v:
+                topic = v.strip().rstrip("?.!")
+                break
+        except IndexError:
+            continue
+    try:
+        from modules import memory as mod_memory
+    except Exception:
+        return None
+    username = user_rec.get("username", "owner")
+    try:
+        user_dir = users_mod.get_user_dir(DATA_DIR, username)
+    except Exception:
+        return None
+
+    # Pull from all tiers; filter by topic if given. Tolerate
+    # singular/plural mismatch ("suppliers" → "supplier", "kids" →
+    # "kid", etc.) by trying multiple stems.
+    def _stems(t):
+        t = (t or "").strip().lower()
+        out = {t}
+        if t.endswith("ies") and len(t) > 4:
+            out.add(t[:-3] + "y")
+        if t.endswith("es") and len(t) > 3:
+            out.add(t[:-2])
+        if t.endswith("s") and len(t) > 2:
+            out.add(t[:-1])
+        if t.endswith("'s"):
+            out.add(t[:-2])
+        return out
+
+    facts: list = []
+    if topic:
+        for stem in _stems(topic):
+            hits = mod_memory.recall(user_dir, query=stem, limit=30)
+            if hits:
+                # Dedup by content while preserving order
+                seen = set()
+                for h in hits:
+                    c = h.get("content", "")
+                    if c not in seen:
+                        seen.add(c)
+                        facts.append(h)
+                break  # first matching stem wins
+    else:
+        facts = mod_memory.recall(user_dir, query=None, limit=30)
+    if not facts:
+        if topic:
+            return {"reply": (
+                f"I don't have anything saved about \"{topic}\" yet. "
+                f"Tell me a fact about it and I'll remember next time."
+            ), "tier": "local", "latency_ms": 0,
+               "source": "memory_recall_empty"}
+        return {"reply": (
+            "Your long-term memory is empty so far. As we chat, I'll "
+            "automatically save durable facts about you, your business, "
+            "your people, and your preferences."
+        ), "tier": "local", "latency_ms": 0,
+           "source": "memory_recall_empty"}
+    header = (f"From your saved memory"
+              f"{' about ' + topic if topic else ''} "
+              f"({len(facts)} fact{'s' if len(facts) != 1 else ''}):")
+    lines = [header]
+    for f in facts[:15]:
+        line = f"  · {(f.get('content') or '').strip()[:200]}"
+        when = _format_fact_date(f.get("ts"))
+        if when:
+            line += f"  _(saved {when})_"
+        lines.append(line)
+    if len(facts) > 15:
+        lines.append(f"  …and {len(facts) - 15} more older fact(s).")
+    lines.append("\n(These are the only facts I have. If something's "
+                  "missing, tell me and I'll remember.)")
+    return {"reply": "\n".join(lines), "tier": "local",
+            "latency_ms": 0, "source": "memory_recall"}
+
+
+_CONTACT_ADD_RE = _re.compile(
+    # "add Bill Henry, billh@example.com, 555-0142, electrician"
+    # "save contact Sarah Jones 775-555-1234 sarah@gmail.com supplier"
+    # "new contact: name=X email=Y phone=Z"
+    r"^\s*(?:add|save|new|create|store)\s+"
+    r"(?:a\s+new\s+|new\s+|the\s+)?contact[\s:]+|"
+    r"^\s*(?:add|save|store)\s+(?P<rest>[A-Z][a-zA-Z'\-]+(?:\s+[A-Z][a-zA-Z'\-]+)?[\s,]+.+)$",
+    _re.IGNORECASE,
+)
+
+
+def _try_contact_add(message: str, user_rec: dict) -> dict | None:
+    """Parse "add Bill Henry, billh@example.com, 555-0142, electrician"
+    and actually call `mod_contacts.add()`. Was previously falling to the
+    LLM which would fake the confirmation without persisting anything."""
+    if not message:
+        return None
+    msg = _strip_polite_prefix(message)
+    # First-pass: must start with one of the add verbs AND contain a
+    # capitalized name (so "add the bills to my calendar" doesn't match).
+    m = _re.match(
+        r"^\s*(?:add|save|store|new|create)\s+(?:a\s+new\s+|new\s+|the\s+)?"
+        r"(?:contact\s+(?:named\s+|called\s+|for\s+)?)?"
+        r"(?P<rest>.+)$",
+        msg, _re.IGNORECASE,
+    )
+    if not m:
+        return None
+    rest = m.group("rest").strip()
+    # The first thing in `rest` must look like a proper name (2 capitalized
+    # words OR 1 capitalized word with at least 3 chars). Otherwise this
+    # is probably "add a task" / "add a meeting" / etc.
+    name_m = _re.match(
+        r"^(?P<name>[A-Z][a-zA-Z'\-]{1,30}"
+        r"(?:\s+[A-Z][a-zA-Z'\-]{1,30}){0,2})"
+        r"[,\s]",
+        rest,
+    )
+    if not name_m:
+        return None
+    name = name_m.group("name").strip()
+    # Reject obvious false positives — words that LOOK capitalized but
+    # are actually verbs/nouns at the start of a sentence (e.g., "Add"
+    # following a polite prefix won't trip this because we already
+    # consumed the verb).
+    if name.lower() in {"a", "the", "my", "his", "her", "their", "your"}:
+        return None
+    # Parse the rest of the line for email / phone / role
+    tail = rest[name_m.end():].strip(" ,;")
+    email_m = _re.search(
+        r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", tail,
+    )
+    # Two phone formats: 10-digit (555-555-1234, +1 555 555 1234, (555)
+    # 555-1234) and 7-digit local (555-1234). 7-digit is common in
+    # one-area-code small towns and when a user types fast.
+    phone_m = _re.search(
+        r"\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b"
+        r"|\b\d{3}[-.\s]\d{4}\b",
+        tail,
+    )
+    email = email_m.group(0).lower() if email_m else ""
+    phone = phone_m.group(0).strip() if phone_m else ""
+    # Remaining tokens (after stripping email/phone) become the role/notes
+    role_tail = tail
+    if email:
+        role_tail = role_tail.replace(email_m.group(0), " ", 1)
+    if phone:
+        role_tail = role_tail.replace(phone_m.group(0), " ", 1)
+    role_tail = _re.sub(r"[,;]+", " ", role_tail).strip()
+    # Pull a single "tag" word from the remainder (electrician, plumber,
+    # supplier, lawyer, etc.) — first non-empty token.
+    tag_tokens = [t for t in role_tail.split() if len(t) > 2]
+    tags = [tag_tokens[0].lower()] if tag_tokens else []
+    notes = " ".join(tag_tokens[1:]).strip() if len(tag_tokens) > 1 else ""
+
+    try:
+        from modules import contacts as mod_contacts
+    except Exception:
+        return None
+    username = user_rec.get("username", "owner")
+    try:
+        user_dir = users_mod.get_user_dir(DATA_DIR, username)
+    except Exception:
+        return None
+    # Skip if contact already exists by name
+    existing = mod_contacts.find_by_name(user_dir, name)
+    if existing:
+        return {"reply": (
+            f"You already have a contact named {existing.get('name', name)}. "
+            f"Want me to update their info instead? Try "
+            f"\"change {name.split()[0]}'s phone to 555-1234\"."
+        ), "tier": "local", "latency_ms": 0,
+           "source": "contact_add_duplicate"}
+    saved = mod_contacts.add(
+        user_dir, name=name, email=email, phone=phone,
+        tags=tags, notes=notes,
+    )
+    lines = [f"📇 Added {saved.get('name', name)} to your contacts:"]
+    if email: lines.append(f"  Email: {email}")
+    if phone: lines.append(f"  Phone: {phone}")
+    if tags:  lines.append(f"  Tags:  {', '.join(tags)}")
+    if notes: lines.append(f"  Notes: {notes}")
+    return {"reply": "\n".join(lines), "tier": "local",
+            "latency_ms": 0, "source": "contact_add"}
+
+
+# Field alternatives — longest first so the regex captures "phone number"
+# not just "phone".
+_PROFILE_FIELD_RE = (
+    r"(?:phone\s+number|email\s+address|email|phone|"
+    r"address|number)"
+)
+_PROFILE_INFO_RE = _re.compile(
+    r"^\s*(?:"
+    # "what {field} (of mine | for me | on file ...) do you have ..."
+    r"(?:what|which)(?:'s| is)?\s+(?P<field1>" + _PROFILE_FIELD_RE + r")"
+    r"(?:\s+(?:of\s+mine|for\s+me|on\s+file|saved|stored))?"
+    r"\s+(?:do\s+you\s+(?:have|got|know)|is\s+(?:saved|on\s+file|stored))"
+    r"(?:\s+(?:of\s+mine|for\s+me|on\s+file|saved|stored))*"
+    # OR "do you have my email"
+    r"|do\s+you\s+have\s+(?:(?:my|an?|the)\s+)?(?P<field2>" + _PROFILE_FIELD_RE + r")"
+    r"(?:\s+(?:of\s+mine|for\s+me|on\s+file|saved|stored))*"
+    # OR "any email saved for me"
+    r"|any\s+(?P<field3>" + _PROFILE_FIELD_RE + r")\s+"
+    r"(?:saved|stored|on\s+file)\s+(?:for\s+me|of\s+mine)"
+    r")\s*[.?!]?\s*$",
+    _re.IGNORECASE,
+)
+
+
+def _try_profile_info(message: str, user_rec: dict) -> dict | None:
+    """Answer "what email/phone/address do you have for me" deterministically
+    from the user record + IMAP accounts. Distinguishes the OWNER's
+    personal contact info from the BUSINESS profile (Orby was returning
+    orbiaisolutions@gmail.com — the business email — when Frank asked
+    for his own)."""
+    if not message:
+        return None
+    m = _PROFILE_INFO_RE.match(_strip_polite_prefix(message))
+    if not m:
+        return None
+    field = next((m.group(g) for g in ("field1", "field2", "field3")
+                  if m.group(g)), "").lower()
+    if not field:
+        return None
+    field_norm = "email" if "email" in field else \
+                 "phone" if ("phone" in field or "number" in field) else \
+                 "address" if "address" in field else field
+
+    username = user_rec.get("username", "owner")
+    try:
+        user_dir = users_mod.get_user_dir(DATA_DIR, username)
+    except Exception:
+        return None
+
+    # Per-user owner profile (the user record itself)
+    profile_val = (user_rec.get(field_norm) or "").strip()
+
+    # Business profile — for owners, this counts too. Frank uses
+    # orbiaisolutions@gmail.com (his business email) as a real working
+    # mailbox, so listing it here gives the full picture rather than
+    # only the IMAP-connected one.
+    business_val = ""
+    try:
+        business = mod_business.load(DATA_DIR)
+        contact = business.get("contact") or {}
+        business_val = (contact.get(field_norm) or "").strip()
+    except Exception:
+        pass
+
+    # For email: also list IMAP-connected mailboxes
+    connected_mailboxes: list = []
+    if field_norm == "email":
+        try:
+            import imap_smtp
+            accts = imap_smtp.list_accounts(user_dir)
+            connected_mailboxes = [a.get("email") for a in accts if a.get("email")]
+        except Exception:
+            pass
+
+    parts = []
+    label = {"email": "Email", "phone": "Phone",
+             "address": "Address"}.get(field_norm, field_norm.title())
+    if profile_val:
+        parts.append(f"{label} on your owner profile: {profile_val}")
+    if business_val:
+        parts.append(f"Business {field_norm}: {business_val}")
+    if connected_mailboxes:
+        # Avoid printing the same address twice if it matches business/profile
+        already = {profile_val.lower(), business_val.lower()}
+        extras = [a for a in connected_mailboxes if a.lower() not in already]
+        if extras:
+            parts.append("Connected mailbox" + ("es" if len(extras) > 1 else "") +
+                         ": " + ", ".join(extras))
+    if not parts:
+        parts.append(f"I don't have a {field_norm} stored for you yet. "
+                     f"Add it in Settings → Profile.")
+    return {"reply": "\n".join(parts), "tier": "local", "latency_ms": 0,
+            "source": "profile_info"}
+
+
+_ADD_STAFF_RE = _re.compile(
+    # "add a new staff user named Lisa Smith"
+    # "add Lisa Smith as staff"
+    # "hire Lisa Smith"
+    # "create a staff account for Lisa Smith"
+    r"^\s*(?:"
+    r"add\s+(?:a\s+)?(?:new\s+)?staff\s+(?:user|member|account)\s+"
+    r"(?:named\s+|called\s+|for\s+)?(?P<n1>[A-Z][a-zA-Z'\-]+(?:\s+[A-Z][a-zA-Z'\-]+){0,2})"
+    r"|hire\s+(?P<n2>[A-Z][a-zA-Z'\-]+(?:\s+[A-Z][a-zA-Z'\-]+){0,2})"
+    r"|add\s+(?P<n3>[A-Z][a-zA-Z'\-]+(?:\s+[A-Z][a-zA-Z'\-]+){0,2})\s+(?:as|to)\s+(?:my\s+)?staff"
+    r"|create\s+(?:a\s+)?staff\s+(?:account|user)\s+for\s+(?P<n4>[A-Z][a-zA-Z'\-]+(?:\s+[A-Z][a-zA-Z'\-]+){0,2})"
+    r")\s*[.?!]?\s*$",
+    _re.IGNORECASE,
+)
+
+
+def _try_add_staff_user(message: str, user_rec: dict) -> dict | None:
+    """Real staff-user add — was being faked by the LLM, which would
+    cheerfully say "I've added Lisa Smith" without calling
+    users_mod.add_user(), and then the fact extractor would save the
+    LLM's lie to memory as a "fact". Now actually creates the account."""
+    if not message:
+        return None
+    # Only owners can add users
+    if user_rec.get("role") != "owner":
+        return None
+    msg = _strip_polite_prefix(message)
+    m = _ADD_STAFF_RE.match(msg)
+    if not m:
+        return None
+    name = next((m.group(g) for g in ("n1", "n2", "n3", "n4")
+                 if m.group(g)), "").strip()
+    if not name:
+        return None
+    # Generate the username from the first name (lowercased). If taken,
+    # append a counter.
+    base = _re.sub(r"[^a-z]", "", name.split()[0].lower()) or "staff"
+    username = base
+    existing = users_mod.load_users(DATA_DIR)
+    counter = 2
+    while username in existing:
+        username = f"{base}{counter}"
+        counter += 1
+    # Temp password — owner reads it once, employee changes it on first login
+    import secrets, string
+    alphabet = string.ascii_letters + string.digits
+    temp_pw = "".join(secrets.choice(alphabet) for _ in range(10))
+    try:
+        rec = users_mod.add_user(
+            DATA_DIR, username=username, password=temp_pw,
+            display_name=name, role="staff",
+        )
+    except Exception as e:
+        log.warning(f"add_staff_user failed: {e}")
+        return {"reply": f"Couldn't add {name}: {e}",
+                "tier": "local", "latency_ms": 0,
+                "source": "add_staff_failed"}
+    return {"reply": (
+        f"✓ Added staff user {name} (username: `{username}`).\n"
+        f"Temporary password: `{temp_pw}`\n"
+        f"Share this with them — they should change it on first login at "
+        f"`/owner/login`."
+    ), "tier": "local", "latency_ms": 0,
+       "source": "add_staff_user"}
+
+
+_CONTACT_UPDATE_RE = _re.compile(
+    # "change Bill's phone to 555-1234"
+    # "update Bill Henry's email to bill@new.com"
+    # "set Cathleen's phone number to (775) 555-9876"
+    # "change Bill's address to 123 Main St"
+    r"^\s*(?:change|update|set|edit|modify)\s+"
+    r"(?P<name>[A-Z][A-Za-z'\-]+(?:\s+[A-Z][A-Za-z'\-]+){0,2}?)'s\s+"
+    r"(?P<field>phone(?:\s+number)?|email(?:\s+address)?|address|notes?|"
+    r"name|tags?)"
+    r"\s+(?:to|=|:)\s+"
+    r"(?P<value>.+?)\s*[.?!]?\s*$",
+    _re.IGNORECASE,
+)
+
+
+def _try_contact_update(message: str, user_rec: dict) -> dict | None:
+    """Parse "change Bill's phone to 555-1234" and actually call
+    `mod_contacts.update()`. Was being eaten by the reschedule-appointment
+    regex which also starts with "change ... to ...".
+
+    Note: 'change Bill's phone to ...' could ALSO be a calendar
+    reschedule of an event named "Bill's phone" — but that's an
+    extremely unlikely event title, so we route to contacts."""
+    if not message:
+        return None
+    msg = _strip_polite_prefix(message)
+    m = _CONTACT_UPDATE_RE.match(msg)
+    if not m:
+        return None
+    name  = m.group("name").strip()
+    field = m.group("field").lower()
+    value = m.group("value").strip().strip("\"'").rstrip(".")
+
+    # Map the spoken field name to the contacts JSON key.
+    field_key = {
+        "phone": "phone", "phone number": "phone",
+        "email": "email", "email address": "email",
+        "address": "address",
+        "note": "notes", "notes": "notes",
+        "name": "name",
+        "tag": "tags", "tags": "tags",
+    }.get(field)
+    if not field_key:
+        return None
+
+    try:
+        from modules import contacts as mod_contacts
+    except Exception:
+        return None
+    username = user_rec.get("username", "owner")
+    try:
+        user_dir = users_mod.get_user_dir(DATA_DIR, username)
+    except Exception:
+        return None
+
+    # Find by name OR first name only (so "change Bill's phone" works
+    # even when stored as "Bill Henry").
+    target = mod_contacts.find_by_name(user_dir, name)
+    if not target:
+        all_c = mod_contacts.list_all(user_dir)
+        first = name.split()[0].lower()
+        matches = [c for c in all_c
+                   if c.get("name", "").lower().split()[:1] == [first]]
+        if len(matches) == 1:
+            target = matches[0]
+        elif len(matches) > 1:
+            names = ", ".join(c.get("name", "?") for c in matches[:5])
+            return {"reply": (
+                f"I have multiple contacts named {name.split()[0]}: "
+                f"{names}. Which one? Try the full name."
+            ), "tier": "local", "latency_ms": 0,
+               "source": "contact_update_ambiguous"}
+    if not target:
+        return {"reply": (
+            f"I don't have a contact named {name}. Want me to add them? "
+            f"Try \"add {name}, [email], [phone], [role]\"."
+        ), "tier": "local", "latency_ms": 0,
+           "source": "contact_update_not_found"}
+
+    # tags field expects a list
+    if field_key == "tags":
+        value = [t.strip().lower() for t in _re.split(r"[,;]", value) if t.strip()]
+    updated = mod_contacts.update(user_dir, target["id"], **{field_key: value})
+    if not updated:
+        return {"reply": f"Couldn't update {target.get('name', name)} — "
+                         f"maybe an internal error. Try again.",
+                "tier": "local", "latency_ms": 0,
+                "source": "contact_update_failed"}
+    return {"reply": (
+        f"✓ Updated {updated.get('name', name)}'s {field_key} to "
+        f"{updated.get(field_key, value)!s}."
+    ), "tier": "local", "latency_ms": 0, "source": "contact_update"}
+
+
+_SEARCH_EVERYTHING_RE = _re.compile(
+    r"^\s*(?:"
+    r"search\s+(?:everything|all|across\s+everything)\s+(?:for\s+)?"
+    r"|find\s+(?:anything|everything)\s+(?:about|on|for|matching|with)\s+"
+    r"|look\s+(?:everywhere|across\s+everything)\s+for\s+"
+    r")(?P<q>.+?)\s*[.?!]?\s*$",
+    _re.IGNORECASE,
+)
+
+
+def _try_search_everything(message: str, user_rec: dict) -> dict | None:
+    """Union search: workspace files + contacts + emails + memory. The
+    user said "find anything about plumbing" — should hit ALL stores,
+    not get eaten by contacts.search alone."""
+    if not message:
+        return None
+    msg = _strip_polite_prefix(message)
+    m = _SEARCH_EVERYTHING_RE.match(msg)
+    if not m:
+        return None
+    query = m.group("q").strip().strip("\"'")
+    if not query:
+        return None
+
+    username = user_rec.get("username", "owner")
+    try:
+        user_dir = users_mod.get_user_dir(DATA_DIR, username)
+    except Exception:
+        return None
+
+    sections: list[str] = []
+    total = 0
+
+    # Workspace files
+    try:
+        from modules import workspace as mod_workspace
+        files = mod_workspace.search(user_dir, query, limit=5) or []
+        if files:
+            total += len(files)
+            sections.append(f"📁 Files ({len(files)}):")
+            for f in files[:5]:
+                sections.append(f"  · {f.get('name', '')}")
+    except Exception as e:
+        log.debug(f"search_everything workspace: {e}")
+
+    # Contacts
+    try:
+        from modules import contacts as mod_contacts
+        hits = mod_contacts.search(user_dir, query) or []
+        if hits:
+            total += len(hits)
+            sections.append(f"📇 Contacts ({len(hits)}):")
+            for c in hits[:5]:
+                bits = [c.get("name", "?")]
+                if c.get("phone"): bits.append(c["phone"])
+                if c.get("email"): bits.append(c["email"])
+                sections.append(f"  · {' — '.join(bits)}")
+    except Exception as e:
+        log.debug(f"search_everything contacts: {e}")
+
+    # Emails
+    try:
+        from modules import email as mod_email
+        emails = mod_email.search(user_dir, query, limit=5) or []
+        if emails:
+            total += len(emails)
+            sections.append(f"📧 Emails ({len(emails)}):")
+            for e in emails[:5]:
+                subj = (e.get("subject") or "")[:60]
+                frm  = (e.get("from") or e.get("sender") or "")[:40]
+                sections.append(f"  · {frm} — {subj}")
+    except Exception as e:
+        log.debug(f"search_everything emails: {e}")
+
+    # Memory
+    try:
+        from modules import memory as mod_memory
+        mhits = mod_memory.recall(user_dir, query=query, limit=5) or []
+        if mhits:
+            total += len(mhits)
+            sections.append(f"🧠 Memory ({len(mhits)}):")
+            for h in mhits[:5]:
+                sections.append(f"  · {(h.get('content') or '')[:140]}")
+    except Exception as e:
+        log.debug(f"search_everything memory: {e}")
+
+    if total == 0:
+        return {"reply": (
+            f"Nothing in your files, contacts, emails, or memory matched "
+            f"\"{query}\"."
+        ), "tier": "local", "latency_ms": 0,
+           "source": "search_everything_empty"}
+
+    header = f"Found {total} result(s) across everything for \"{query}\":"
+    return {"reply": header + "\n" + "\n".join(sections),
+            "tier": "local", "latency_ms": 0,
+            "source": "search_everything"}
 
 
 def _try_contacts_chat(message: str, user_rec: dict) -> dict | None:
@@ -9552,6 +11155,470 @@ def _try_lead_add(message: str, user_rec: dict) -> dict | None:
             "source": "lead_added"}
 
 
+# ---------------------------------------------------------------------------
+# Email chat handlers — wire chat intents to email_inbox + safe_send.
+# These run BEFORE the "unwired email" fallback so chat can actually
+# read, search, compose, and reply via the user's connected accounts.
+# Gmail + Outlook OAuth and IMAP/SMTP are all supported under the hood.
+# ---------------------------------------------------------------------------
+
+_EMAIL_CHECK_RE = _re.compile(
+    r"^\s*(?:"
+    r"(?:show|list|read|get|check)\s+(?:me\s+)?(?:my\s+)?"
+    r"(?:today'?s\s+)?(?:important\s+|recent\s+|new\s+|unread\s+)?emails?\b"
+    r"|what(?:'s| is)\s+(?:important|in|new)\s+in\s+(?:my\s+)?(?:inbox|email)"
+    r"|any(?:thing)?\s+important\s+in\s+(?:my\s+)?(?:inbox|email)"
+    r"|read\s+(?:me\s+)?(?:my\s+)?inbox"
+    r"|inbox\s+summary"
+    r")\b",
+    _re.IGNORECASE,
+)
+
+_EMAIL_SEARCH_RE = _re.compile(
+    r"^\s*(?:"
+    r"(?:find|search|look\s+for|locate)\s+(?:the\s+|an?\s+)?"
+    r"emails?\s+(?:from|about|related\s+to|on|for|with|containing)\s+(?P<q>.+?)"
+    r"|search\s+(?:my\s+)?(?:emails?|inbox)\s+(?:for|about)\s+(?P<q2>.+?)"
+    r")\s*[.?!]?\s*$",
+    _re.IGNORECASE,
+)
+
+_EMAIL_COMPOSE_RE = _re.compile(
+    r"^\s*(?:"
+    r"email\s+(?P<who1>[A-Z][A-Za-z .'\-]{1,40}?)[\s,:]\s*"
+    r"(?:saying|that|and\s+(?:say|tell\s+them)|—|-)\s*(?P<body1>.+?)"
+    r"|email\s+(?P<who2>[A-Z][A-Za-z .'\-]{1,40}?):\s*(?P<body2>.+?)"
+    r"|send\s+(?P<who3>[A-Z][A-Za-z .'\-]{1,40}?)\s+(?:an\s+)?email\s+"
+    r"(?:saying|that)\s+(?P<body3>.+?)"
+    r"|compose\s+(?:an?\s+)?email\s+to\s+(?P<who4>[A-Z][A-Za-z .'\-]{1,40}?)\s+"
+    r"(?:saying|about|that)\s+(?P<body4>.+?)"
+    r")\s*[.?!]?\s*$",
+)
+
+_EMAIL_REPLY_RE = _re.compile(
+    r"^\s*(?:"
+    r"(?:draft|write|compose)\s+(?:a\s+|an\s+)?(?:reply|response)\s+"
+    r"to\s+(?:the\s+(?:latest\s+|recent\s+)?(?:email|message)\s+from\s+)?"
+    r"(?P<who1>[A-Z][A-Za-z .'\-]{1,40}?)\s+"
+    r"(?:saying|that|with|—|-)\s*(?P<body1>.+?)"
+    r"|reply\s+to\s+(?P<who2>[A-Z][A-Za-z .'\-]{1,40}?)\s+"
+    r"(?:saying|that|—|-)\s*(?P<body2>.+?)"
+    r"|reply\s+to\s+(?P<who3>[A-Z][A-Za-z .'\-]{1,40}?):\s*(?P<body3>.+?)"
+    r")\s*[.?!]?\s*$",
+)
+
+
+def _try_email_check_inbox(message: str, user_rec: dict) -> dict | None:
+    """Triage: "what's important in my inbox" / "show me my email" — fetches
+    the inbox, lists top unread + flagged messages with sender + subject +
+    snippet. Returns None if no match."""
+    if not message:
+        return None
+    msg = _strip_polite_prefix(message)
+    if not _EMAIL_CHECK_RE.match(msg):
+        return None
+    try:
+        import email_inbox
+    except Exception:
+        return None
+    username = user_rec.get("username", "owner")
+    try:
+        user_dir = users_mod.get_user_dir(DATA_DIR, username)
+    except Exception:
+        return None
+    try:
+        result = email_inbox.fetch_inbox(CONFIG, user_dir,
+                                          source="all", limit=10)
+    except Exception as e:
+        log.warning(f"email fetch failed: {e}")
+        return {"reply": (
+            "I couldn't reach your email right now. Check your "
+            "connection or reconnect your account in Settings → Integrations."
+        ), "tier": "local", "latency_ms": 0, "source": "email_fetch_error"}
+
+    msgs = result.get("messages") or []
+    if not msgs:
+        # No connector or empty inbox
+        if result.get("errors"):
+            errs = ", ".join(result["errors"].keys())
+            return {"reply": (
+                f"I don't have an email account connected yet — go to "
+                f"Settings → Integrations and connect Gmail or Outlook, "
+                f"then ask me again. (Tried: {errs})"
+            ), "tier": "local", "latency_ms": 0, "source": "email_no_connector"}
+        return {"reply": "Your inbox is empty — nothing to triage.",
+                "tier": "local", "latency_ms": 0, "source": "email_empty"}
+
+    # Prioritize flagged + unread
+    flagged = [m for m in msgs if m.get("flagged")]
+    unread  = [m for m in msgs if m.get("unread") and not m.get("flagged")]
+    others  = [m for m in msgs if not m.get("flagged") and not m.get("unread")]
+
+    lines = [f"📬 Inbox — {len(msgs)} message(s), "
+             f"{result.get('by_category', {}).get('lead', 0)} lead(s), "
+             f"{len(unread) + len(flagged)} unread."]
+    section = lambda title, items: (
+        [f"\n{title}:"] + [
+            f"  · {m.get('from','?').split('<')[0].strip()} — "
+            f"{(m.get('subject') or '(no subject)')[:80]}\n"
+            f"    {(m.get('snippet') or '')[:140]}"
+            for m in items[:5]
+        ]
+    ) if items else []
+    lines.extend(section("Flagged",  flagged))
+    lines.extend(section("Unread",   unread))
+    if not flagged and not unread:
+        lines.extend(section("Recent", others))
+    return {"reply": "\n".join(lines), "tier": "local",
+            "latency_ms": 0, "source": "email_check_inbox"}
+
+
+def _try_email_search(message: str, user_rec: dict) -> dict | None:
+    """Search: "find emails from Bob about the lease" — pulls the last
+    100 messages and filters in Python so the same handler works
+    against Gmail / Outlook / IMAP without each needing its own
+    sender-vs-subject query language. Matches sender, subject, and the
+    cached snippet (case-insensitive)."""
+    if not message:
+        return None
+    msg = _strip_polite_prefix(message)
+    m = _EMAIL_SEARCH_RE.match(msg)
+    if not m:
+        return None
+    query = (m.group("q") or m.group("q2") or "").strip().rstrip("?.!")
+    if not query or len(query) < 2:
+        return None
+    try:
+        import email_inbox
+    except Exception:
+        return None
+    username = user_rec.get("username", "owner")
+    try:
+        user_dir = users_mod.get_user_dir(DATA_DIR, username)
+    except Exception:
+        return None
+    try:
+        # Pull a wider net than before — no provider-specific query, just
+        # the recent 100 messages. We'll filter in Python so the result
+        # actually matches what the user asked for (the previous code
+        # ran an IMAP SUBJECT search which missed sender hits entirely).
+        result = email_inbox.fetch_inbox(CONFIG, user_dir,
+                                          source="all", limit=100,
+                                          force_refresh=False)
+    except Exception as e:
+        log.warning(f"email search failed: {e}")
+        return {"reply": (
+            "I couldn't reach your email to search. Two things to check:\n"
+            "  · Is your Yahoo/Gmail/Outlook connection still active? "
+            "Open Settings → Email Accounts and look for a red status.\n"
+            "  · If it's marked active, the IMAP server may be slow right "
+            "now — wait a minute and try again.\n"
+            "If neither works, click \"Test connection\" in Email Accounts "
+            "to see the exact error."
+        ), "tier": "local", "latency_ms": 0, "source": "email_search_error"}
+    all_msgs = result.get("messages") or []
+    q_low = query.lower()
+    def _matches(item: dict) -> bool:
+        return (q_low in (item.get("from") or "").lower()
+                or q_low in (item.get("subject") or "").lower()
+                or q_low in (item.get("snippet") or "").lower())
+    msgs = [x for x in all_msgs if _matches(x)]
+    if not msgs:
+        return {"reply": f"No emails found matching \"{query}\" "
+                          f"(searched the last {len(all_msgs)} messages).",
+                "tier": "local", "latency_ms": 0,
+                "source": "email_search_empty"}
+    lines = [f"📧 Found {len(msgs)} email(s) matching \"{query}\":"]
+    for m_ in msgs[:8]:
+        lines.append(
+            f"  · {m_.get('from','?').split('<')[0].strip()} — "
+            f"{(m_.get('subject') or '(no subject)')[:70]} "
+            f"({(m_.get('date') or '')[:10]})"
+        )
+    return {"reply": "\n".join(lines), "tier": "local",
+            "latency_ms": 0, "source": "email_search"}
+
+
+def _try_email_compose(message: str, user_rec: dict) -> dict | None:
+    """Compose: "email Bill Henry: parts came in" — looks up the contact,
+    sends via safe_send (or drafts if not whitelisted). Returns None if
+    no match."""
+    if not message:
+        return None
+    msg = _strip_polite_prefix(message)
+    m = _EMAIL_COMPOSE_RE.match(msg)
+    if not m:
+        return None
+    who  = (m.group("who1") or m.group("who2") or m.group("who3")
+            or m.group("who4") or "").strip()
+    body = (m.group("body1") or m.group("body2") or m.group("body3")
+            or m.group("body4") or "").strip()
+    if not who or not body:
+        return None
+    try:
+        import safe_send
+        from modules import contacts as mod_contacts
+    except Exception:
+        return None
+    username = user_rec.get("username", "owner")
+    try:
+        user_dir = users_mod.get_user_dir(DATA_DIR, username)
+    except Exception:
+        return None
+    contact = mod_contacts.find_by_name(user_dir, who)
+    if not contact or not contact.get("email"):
+        return {"reply": (
+            f"I couldn't find an email address for \"{who}\" in your "
+            f"contacts. Add one with: \"add {who}, their-email@example.com\" "
+            f"and then I can send."
+        ), "tier": "local", "latency_ms": 0, "source": "email_no_contact"}
+
+    # Generate a clean subject from the body (first 8 words, capitalized)
+    words = body.split()
+    subject = " ".join(words[:8]).rstrip(".,!?")
+    if len(words) > 8:
+        subject += "..."
+
+    res = safe_send.send_email(
+        CONFIG, user_dir,
+        to_email=contact["email"],
+        subject=subject or "(message from Orby)",
+        body=body,
+        category="general",  # default — owner can whitelist categories in prefs
+    )
+    # If no Gmail/Outlook is connected, fall back to IMAP/SMTP. Yahoo +
+    # other custom mailboxes go through imap_smtp.send_email which uses
+    # the user's stored SMTP credentials.
+    if res.get("action") == "error" and res.get("reason") == "no_connector":
+        import imap_smtp
+        accts = imap_smtp.list_accounts(user_dir)
+        if accts:
+            account_id = accts[0]["id"]
+            smtp_res = imap_smtp.send_email(
+                user_dir, account_id,
+                to=contact["email"],
+                subject=subject or "(message from Orby)",
+                body=body,
+            )
+            if smtp_res.get("ok"):
+                return {"reply": (
+                    f"✓ Sent to {contact.get('name', who)} ({contact['email']}) "
+                    f"via {accts[0].get('email','your mailbox')}.\n"
+                    f"Subject: {subject}"
+                ), "tier": "local", "latency_ms": 0, "source": "email_sent"}
+            return {"reply": (
+                f"I couldn't send to {who}: {smtp_res.get('error','SMTP error')}."
+            ), "tier": "local", "latency_ms": 0, "source": "email_send_failed"}
+    if res.get("action") == "sent":
+        return {"reply": (
+            f"✓ Sent to {contact.get('name', who)} ({contact['email']}).\n"
+            f"Subject: {subject}\n"
+            f"Sent via {res.get('via', '?')}."
+        ), "tier": "local", "latency_ms": 0, "source": "email_sent"}
+    elif res.get("action") == "drafted":
+        return {"reply": (
+            f"📝 Drafted to {contact.get('name', who)} ({contact['email']}) — "
+            f"saved to your {res.get('via','?')} Drafts folder for review. "
+            f"({res.get('reason', '')}.)\nSubject: {subject}"
+        ), "tier": "local", "latency_ms": 0, "source": "email_drafted"}
+    else:
+        return {"reply": (
+            f"I couldn't send to {who}: {res.get('error', 'unknown error')}. "
+            f"Connect Gmail or Outlook in Settings → Integrations, or "
+            f"add an IMAP/SMTP account."
+        ), "tier": "local", "latency_ms": 0, "source": "email_send_failed"}
+
+
+_EMAIL_READ_RE = _re.compile(
+    r"^\s*(?:"
+    r"(?:what(?:'s| does| do| is)|tell\s+me\s+what)\s+(?:the\s+)?"
+    r"(?:latest\s+|recent\s+|new\s+)?email\s+from\s+(?P<who1>[A-Za-z][A-Za-z .'\-@]{1,60}?)"
+    r"\s+(?:say|says|contains?|is\s+about)"
+    r"|(?:read|open|show\s+me)\s+(?:the\s+)?(?:latest\s+|recent\s+|new\s+)?"
+    r"email\s+from\s+(?P<who2>[A-Za-z][A-Za-z .'\-@]{1,60}?)"
+    r"|(?:show|read)\s+me\s+(?P<who3>[A-Za-z][A-Za-z .'\-@]{1,60}?)'s\s+(?:latest\s+)?email"
+    r")\s*[.?!]?\s*$",
+    _re.IGNORECASE,
+)
+
+
+def _try_email_read(message: str, user_rec: dict) -> dict | None:
+    """'what does the email from Frank Street say' — find the latest
+    email matching the sender, fetch its full body via IMAP, return
+    subject + from + date + body excerpt. No LLM call so the body is
+    real, not invented."""
+    if not message:
+        return None
+    msg = _strip_polite_prefix(message)
+    m = _EMAIL_READ_RE.match(msg)
+    if not m:
+        return None
+    who = next((m.group(g) for g in ("who1", "who2", "who3")
+                if m.group(g)), "").strip()
+    if not who:
+        return None
+    try:
+        import email_inbox
+    except Exception:
+        return None
+    username = user_rec.get("username", "owner")
+    try:
+        user_dir = users_mod.get_user_dir(DATA_DIR, username)
+    except Exception:
+        return None
+    # Pull the inbox (cached if recent) and find the newest msg from `who`
+    try:
+        result = email_inbox.fetch_inbox(CONFIG, user_dir, source="all",
+                                          limit=50, force_refresh=False)
+    except Exception as e:
+        log.warning(f"email_read fetch failed: {e}")
+        return {"reply": (
+            f"I couldn't reach your inbox to pull that message.\n"
+            f"Error: {str(e)[:100]}\n"
+            f"Try again in a moment — IMAP servers stall sometimes. If "
+            f"this keeps happening, open Settings → Email Accounts and "
+            f"click \"Test connection\" to see the exact failure."
+        ), "tier": "local", "latency_ms": 0,
+            "source": "email_read_fetch_error"}
+    msgs = result.get("messages") or []
+    who_low = who.lower()
+    matches = [m for m in msgs
+               if who_low in (m.get("from") or "").lower()]
+    if not matches:
+        return {"reply": (
+            f"I don't see a recent email from \"{who}\" in your inbox. "
+            f"Try a different spelling or the sender's email address."
+        ), "tier": "local", "latency_ms": 0, "source": "email_read_no_match"}
+    target = matches[0]  # newest first
+    body_res = email_inbox.get_message(CONFIG, user_dir, target["id"])
+    if body_res.get("error"):
+        return {"reply": (
+            f"I found the email from {target.get('from', who).split('<')[0].strip()} "
+            f"(\"{target.get('subject', '?')}\") but couldn't fetch the body: "
+            f"{body_res['error']}."
+        ), "tier": "local", "latency_ms": 0, "source": "email_read_body_error"}
+    body = (body_res.get("body") or "").strip()
+    if not body:
+        body = "(empty body — likely an image-only or HTML-only message)"
+    return {"reply": (
+        f"📧 From: {target.get('from', who)}\n"
+        f"Subject: {target.get('subject', '(no subject)')}\n"
+        f"Date: {target.get('date', '')[:16]}\n"
+        f"\n{body[:2000]}"
+        + ("\n\n…(body trimmed at 2000 chars)" if len(body) > 2000 else "")
+    ), "tier": "local", "latency_ms": 0, "source": "email_read"}
+
+
+def _extract_email_addr(from_field: str) -> str:
+    """Pull just the email out of a "Name <email@host>" From: header."""
+    if not from_field:
+        return ""
+    import email.utils as _eu
+    _name, addr = _eu.parseaddr(from_field)
+    return (addr or "").strip()
+
+
+def _try_email_reply(message: str, user_rec: dict) -> dict | None:
+    """Reply: "reply to Pam saying I'll be there at 4" — find the latest
+    message from the named person, send the reply via the correct
+    provider (Gmail / Outlook draft, OR IMAP/SMTP if that's what's
+    connected). Returns None if no match."""
+    if not message:
+        return None
+    msg = _strip_polite_prefix(message)
+    m = _EMAIL_REPLY_RE.match(msg)
+    if not m:
+        return None
+    who  = (m.group("who1") or m.group("who2") or m.group("who3") or "").strip()
+    body = (m.group("body1") or m.group("body2") or m.group("body3") or "").strip()
+    if not who or not body:
+        return None
+    try:
+        import email_inbox
+    except Exception:
+        return None
+    username = user_rec.get("username", "owner")
+    try:
+        user_dir = users_mod.get_user_dir(DATA_DIR, username)
+    except Exception:
+        return None
+    # Find the latest message from this person — pull all recent and
+    # filter in Python so we hit IMAP/Gmail/Outlook with a SINGLE round
+    # trip instead of a sender-specific SEARCH that only works on some
+    # providers.
+    try:
+        result = email_inbox.fetch_inbox(CONFIG, user_dir,
+                                          source="all", limit=100,
+                                          force_refresh=False)
+    except Exception as e:
+        log.warning(f"reply search failed: {e}")
+        return {"reply": (
+            f"I couldn't reach your email to find that message.\n"
+            f"Error: {str(e)[:100]}\n"
+            f"Wait a moment and try again, or open Settings → Email "
+            f"Accounts and click \"Test connection\" to see what's wrong."
+        ), "tier": "local", "latency_ms": 0,
+            "source": "email_reply_search_error"}
+    msgs = result.get("messages") or []
+    who_low = who.lower()
+    matches = [m for m in msgs
+               if who_low in (m.get("from") or "").lower()]
+    if not matches:
+        return {"reply": (
+            f"I couldn't find a recent email from \"{who}\". "
+            f"Maybe try the full name or a different spelling?"
+        ), "tier": "local", "latency_ms": 0, "source": "email_reply_no_match"}
+    target = matches[0]
+    # IMAP path — send the reply via SMTP using imap_smtp.send_email.
+    # Gmail/Outlook still take the legacy draft_reply path (drafts in
+    # the Gmail/Outlook UI, owner sends from there).
+    if (target.get("provider") or "").lower() == "imap":
+        import imap_smtp
+        to_addr = _extract_email_addr(target.get("from", ""))
+        if not to_addr:
+            return {"reply": f"I couldn't parse a reply-to address from "
+                              f"{target.get('from', who)}.",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "email_reply_no_address"}
+        # Pull the IMAP account id from the cached message id
+        # ('imap-<account_id>-<uid>')
+        try:
+            account_id = target["id"].split("-", 1)[1].rsplit("-", 1)[0]
+        except Exception:
+            account_id = ""
+        # Pull the original Message-ID (now in the cache) for threading
+        in_reply_to = target.get("message_id") or ""
+        subj = (target.get("subject") or "").strip()
+        re_subj = subj if subj.lower().startswith("re:") else f"Re: {subj}"
+        res = imap_smtp.send_email(
+            user_dir, account_id,
+            to=to_addr, subject=re_subj or "(no subject)",
+            body=body, in_reply_to=in_reply_to or None,
+        )
+        if not res.get("ok"):
+            return {"reply": (
+                f"I couldn't send that reply: {res.get('error', 'unknown')}."
+            ), "tier": "local", "latency_ms": 0, "source": "email_reply_send_failed"}
+        return {"reply": (
+            f"✓ Replied to {target.get('from', who).split('<')[0].strip()} "
+            f"at {to_addr}.\n"
+            f"Subject: {re_subj}\n"
+            f"Body: {body[:200]}{'...' if len(body) > 200 else ''}"
+        ), "tier": "local", "latency_ms": 0, "source": "email_replied"}
+    # Gmail/Outlook fallback — old draft path
+    res = email_inbox.draft_reply(CONFIG, user_dir, target["id"], body)
+    if res.get("error"):
+        return {"reply": (
+            f"I couldn't draft that reply: {res['error']}."
+        ), "tier": "local", "latency_ms": 0, "source": "email_reply_failed"}
+    return {"reply": (
+        f"📝 Drafted reply to {target.get('from','?').split('<')[0].strip()} — "
+        f"saved to your Drafts folder for review and send.\n"
+        f"Re: {(target.get('subject') or '(no subject)')[:70]}\n"
+        f"Reply: {body[:140]}{'...' if len(body) > 140 else ''}"
+    ), "tier": "local", "latency_ms": 0, "source": "email_reply_drafted"}
+
+
 _UNWIRED_EMAIL_RE = _re.compile(
     r"^\s*(?:"
     r"(?:show|list|read|get|check)\s+(?:me\s+)?(?:my\s+)?(?:today'?s\s+)?(?:important\s+|recent\s+|new\s+)?emails?"
@@ -9618,18 +11685,59 @@ def _try_unwired_channel(message: str, user_rec: dict) -> dict | None:
         ), "tier": "local", "latency_ms": 0,
            "source": "unwired_sms"}
     if _UNWIRED_FILES_RE.match(msg):
-        return {"reply": (
-            "I don't have a file-search layer over your whole computer — I "
-            "can only pull files I generated (invoice PDFs, closeout PDFs, "
-            "proposal PDFs).\n"
-            "What works:\n"
-            "  · \"PDF INV-2026-0001\" — re-generate an invoice PDF\n"
-            "  · \"proposal for <customer>\" — generate a proposal PDF\n"
-            "  · \"closeout for <project>\" — generate the project closeout PDF\n"
-            "For contracts/scans stored elsewhere, you'll need to open them "
-            "directly — I don't index your file system."
-        ), "tier": "local", "latency_ms": 0,
-           "source": "unwired_files"}
+        # Workspace search IS wired — mod_workspace indexes ~/Orby/ files
+        # (PDFs, DOCX, TXT, CSV) and supports keyword search. Extract the
+        # query from the user's phrasing and hit workspace.search() instead
+        # of returning the stale "I don't have file search" refusal.
+        query = msg.strip().rstrip(".?!")
+        for prefix in ("find the file about ", "find the file ",
+                       "find files about ", "find files ",
+                       "search files for ", "search my files for ",
+                       "search files about ", "what files do i have ",
+                       "what's in my orbi folder", "what's in my folder",
+                       "show me files about ", "show me my files",
+                       "look for ", "locate "):
+            if query.lower().startswith(prefix):
+                query = query[len(prefix):].strip()
+                break
+        try:
+            hits = mod_workspace.search(CONFIG, DATA_DIR, query, limit=8) if query else []
+        except Exception as e:
+            log.warning(f"workspace.search failed: {e}")
+            hits = []
+        if hits:
+            lines = [f"Found {len(hits)} file(s) matching \"{query}\":"]
+            for h in hits[:8]:
+                fn = h.get("filename") or h.get("path","").split("/")[-1]
+                snippet = (h.get("snippet") or h.get("chunk") or "")[:140].strip()
+                lines.append(f"  · {fn}")
+                if snippet:
+                    lines.append(f"      …{snippet}…")
+            return {"reply": "\n".join(lines), "tier": "local",
+                    "latency_ms": 0, "source": "workspace_search"}
+        # Empty query OR no matches → list folder contents
+        try:
+            ws_path = mod_workspace.workspace_path(CONFIG)
+            if ws_path.exists():
+                files = sorted(p.name for p in ws_path.iterdir()
+                               if p.is_file() and not p.name.startswith("."))
+                if files:
+                    lines = [f"Files in `{ws_path}`:"]
+                    for f in files[:25]:
+                        lines.append(f"  · {f}")
+                    if len(files) > 25:
+                        lines.append(f"  …and {len(files) - 25} more")
+                    return {"reply": "\n".join(lines), "tier": "local",
+                            "latency_ms": 0, "source": "workspace_list"}
+                return {"reply": f"Your Orby folder (`{ws_path}`) is empty — "
+                        f"drop documents in it and ask me to find them.",
+                        "tier": "local", "latency_ms": 0,
+                        "source": "workspace_empty"}
+        except Exception:
+            pass
+        return {"reply": f"No files matching \"{query}\" in your Orby folder.",
+                "tier": "local", "latency_ms": 0,
+                "source": "workspace_no_match"}
     return None
 
 
@@ -11103,6 +13211,30 @@ _PA_INBOX_INCLUDE_ALL_RE = _re.compile(
 def _fmt_email_date(iso: str) -> str:
     """Turn the email's Date header into a friendly local-time string the
     owner can compare against what they see in their inbox UI."""
+    return _format_iso_friendly(iso)
+
+
+def _fmt_iso_local_time(iso: str) -> str:
+    """ISO timestamp → just "9:00 am" / "2:30 pm" in the system's local
+    TZ. For day/brief summaries where the date is already implied. Falls
+    back to the raw [11:16] slice for malformed inputs."""
+    if not iso:
+        return "?"
+    from datetime import datetime as _dt, timezone as _tz
+    try:
+        s = iso.rstrip().replace("Z", "+00:00")
+        dt = _dt.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=_tz.utc)
+        return dt.astimezone().strftime("%-I:%M %p").lower()
+    except (ValueError, TypeError):
+        return (iso or "")[11:16] or "?"
+
+
+def _format_iso_friendly(iso: str) -> str:
+    """Friendly local-time renderer used for email dates AND any other
+    place we render an ISO timestamp to the owner. Was previously inlined
+    in `_format_email_date`."""
     if not iso:
         return ""
     from datetime import datetime as _dt, timedelta as _td, timezone as _tz
@@ -12141,9 +14273,14 @@ def _try_office_gen(message: str, username: str) -> dict | None:
                     png = image_gen.generate(CONFIG, prompt, kind=kind)
             except RuntimeError as e:
                 if "image_service_unavailable" in str(e):
-                    return {"reply": ("The image service is busy — your refinement "
-                                       "didn't go through. Try again in a few seconds."),
-                            "tier": "local", "latency_ms": 0,
+                    return {"reply": (
+                        "I couldn't render that image — the free image "
+                        "generator (Pollinations) is queueing requests "
+                        "behind paid users right now.\n\n"
+                        "Wait 30-60 seconds and try again, or describe "
+                        "what you want and I'll write a detailed image "
+                        "brief you can paste into Canva / Midjourney."
+                    ), "tier": "local", "latency_ms": 0,
                             "source": "image_gen_busy"}
                 raise
             caption = _extract_caption(msg)
@@ -12269,10 +14406,18 @@ def _try_office_gen(message: str, username: str) -> dict | None:
                         data_dir=DATA_DIR)
             except RuntimeError as e:
                 if "image_service_unavailable" in str(e):
-                    return {"reply": ("The image service is busy — couldn't "
-                                       "render the ad background. Try again in "
-                                       "a few seconds."),
-                            "tier": "local", "latency_ms": 0,
+                    return {"reply": (
+                        "I couldn't render the ad image right now. The free "
+                        "image generator (Pollinations) is queueing requests "
+                        "to paid users — common during peak hours.\n\n"
+                        "Options:\n"
+                        "  · Try again in 30-60 seconds — the queue usually "
+                        "moves fast.\n"
+                        "  · Or I can write the ad text + image brief without "
+                        "the rendered visual, and you can hand the brief to "
+                        "Canva / a designer. Just ask: \"write the brief "
+                        "without the image.\""
+                    ), "tier": "local", "latency_ms": 0,
                             "source": "image_gen_busy"}
                 log.exception("ad_gen failed")
                 return {"reply": (f"I couldn't build the ad: {e}. "
@@ -13615,6 +15760,175 @@ def email_imap_test(account_id: str):
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Letter (.docx) + spreadsheet (.xlsx) generation from chat
+# ---------------------------------------------------------------------------
+# "Write me a letter to the Smith family thanking them for their order" →
+# real Word document saved to ~/Orby/.
+# "Build me a spreadsheet of last month's expenses" → real .xlsx with a
+# generated table.
+# Both flows: LLM produces the content; we save it as a real Office file
+# in the workspace so the owner can open, edit, email it. The download
+# URL is returned in the chat reply for instant access.
+
+_LETTER_TRIGGER_RE = _re.compile(
+    r"^\s*(?:(?:can|could|please)\s+(?:you\s+)?)?"
+    r"(?:write|draft|compose|create|make|prepare)\s+"
+    r"(?:me\s+)?(?:a\s+|an\s+)?(?:formal\s+|business\s+|thank[- ]you\s+|"
+    r"follow[- ]up\s+|complaint\s+|sales\s+|short\s+|brief\s+|nice\s+)*"
+    r"letter\s+(?:to|for|about|regarding)\s+(?P<subject>.+?)"
+    r"\s*[.?!]?\s*$",
+    _re.IGNORECASE,
+)
+
+_SPREADSHEET_TRIGGER_RE = _re.compile(
+    r"^\s*(?:(?:can|could|please)\s+(?:you\s+)?)?"
+    r"(?:build|make|create|generate|prepare|put\s+together|give\s+me)\s+"
+    r"(?:me\s+)?(?:a\s+|an\s+)?(?:spreadsheet|excel(?:\s+sheet)?|xlsx|"
+    r"table|csv)\s+"
+    r"(?:of|for|with|about|showing|listing|that\s+(?:has|contains|shows))\s+"
+    r"(?P<topic>.+?)"
+    r"\s*[.?!]?\s*$",
+    _re.IGNORECASE,
+)
+
+
+def _try_doc_gen(message: str, username: str) -> dict | None:
+    """Detect "write me a letter" / "build me a spreadsheet" intents and
+    produce a real .docx / .xlsx file in the workspace folder. Returns a
+    chat-shaped reply, or None to fall through to the LLM."""
+    msg = (message or "").strip()
+    if not msg:
+        return None
+    msg = msg.lstrip("\"'`“”‘’*-•—> \t")
+    first_line = msg.split("\n", 1)[0].strip()
+
+    # ── LETTER (.docx) ────────────────────────────────────────────────
+    m = _LETTER_TRIGGER_RE.match(first_line)
+    if m:
+        subject = m.group("subject").strip()
+        try:
+            from docx import Document
+        except ImportError:
+            return {"reply": "I need python-docx installed to draft letters.",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "letter_gen_missing_dep"}
+
+        biz = mod_business.load(DATA_DIR)
+        biz_name = biz.get("name", "")
+        owner_name = ((biz.get("personality") or {}).get("owner_name")
+                      or biz.get("owner", {}).get("name")
+                      or "")
+
+        system = (
+            f"You are writing a formal business letter"
+            + (f" for {owner_name}" if owner_name else "")
+            + (f" at {biz_name}" if biz_name else "")
+            + ". Format with a sender block (name + business), the date, "
+            "recipient block, greeting, 2-4 paragraph body, closing, and "
+            "signature line. Output ONLY the letter text — no markdown, no "
+            "preamble, no commentary."
+        )
+        messages = [{"role": "user", "content": f"Write a letter to {subject}"}]
+        resp = llm_client.generate(CONFIG, system, messages)
+        text = (resp.text or "").strip()
+        if not text:
+            return {"reply": (
+                "I couldn't draft that letter — all AI tiers are "
+                "currently unreachable. Wait 30 seconds and ask again. "
+                "If it keeps failing, check your internet, or restart "
+                "Orbi (Settings → Restart)."
+            ),
+                    "tier": "none", "latency_ms": 0,
+                    "source": "letter_gen_no_llm"}
+
+        # Build the Word doc — each blank-line-separated chunk = paragraph
+        doc = Document()
+        for para in text.split("\n\n"):
+            doc.add_paragraph(para.strip())
+        import io as _io
+        buf = _io.BytesIO()
+        doc.save(buf)
+        slug = _re.sub(r"[^A-Za-z0-9]+", "_", subject)[:40].strip("_") or "letter"
+        fname = f"letter_{slug}_{int(time.time())}.docx"
+        saved = _save_and_token(buf.getvalue(), fname,
+                                  mime_hint="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        audit.log_event(DATA_DIR, actor=username, action="letter.via_chat",
+                        meta={"subject": subject[:120], "file": fname})
+        return {"reply": (
+            f"📄 Drafted a letter to {subject} — saved to your Files tab as "
+            f"`{fname}`. Open it in Word or your viewer to review and edit."
+        ), "tier": "local", "latency_ms": 0, "source": "letter_gen",
+           "download_url": saved.get("download_url")}
+
+    # ── SPREADSHEET (.xlsx) ───────────────────────────────────────────
+    m = _SPREADSHEET_TRIGGER_RE.match(first_line)
+    if m:
+        topic = m.group("topic").strip()
+        try:
+            import openpyxl
+        except ImportError:
+            return {"reply": "I need openpyxl installed to write Excel files.",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "spreadsheet_gen_missing_dep"}
+
+        system = (
+            "You are generating tabular data as CSV. Output ONLY CSV — "
+            "first row = column headers (e.g. \"Date,Vendor,Category,Amount\"), "
+            "subsequent rows = data. No markdown, no explanation, no preamble. "
+            "Generate 12-40 rows of REALISTIC sample data if no specific "
+            "data is provided. Quote any field containing commas."
+        )
+        messages = [{"role": "user", "content": f"Build a spreadsheet of {topic}"}]
+        resp = llm_client.generate(CONFIG, system, messages)
+        text = (resp.text or "").strip()
+        if not text or "," not in text:
+            return {"reply": (
+                "I couldn't generate that spreadsheet — the AI returned "
+                "something that wasn't tabular data. Try being more "
+                "specific about the columns and rows you want, like: "
+                "\"build a spreadsheet of last month's expenses with "
+                "columns Date, Category, Vendor, Amount.\""
+            ),
+                    "tier": "none", "latency_ms": 0,
+                    "source": "spreadsheet_gen_no_csv"}
+        if text.startswith("```"):
+            text = text.strip("`").lstrip("csv").strip()
+
+        wb = openpyxl.Workbook()
+        ws_sheet = wb.active
+        ws_sheet.title = "Data"
+        import csv as _csv, io as _io2
+        rows_added = 0
+        for row in _csv.reader(_io2.StringIO(text)):
+            ws_sheet.append(row)
+            rows_added += 1
+
+        # Bold the first row as headers
+        from openpyxl.styles import Font as _Font
+        if rows_added > 0:
+            for cell in ws_sheet[1]:
+                cell.font = _Font(bold=True)
+
+        buf2 = _io2.BytesIO()
+        wb.save(buf2)
+        slug = _re.sub(r"[^A-Za-z0-9]+", "_", topic)[:40].strip("_") or "data"
+        fname = f"spreadsheet_{slug}_{int(time.time())}.xlsx"
+        saved = _save_and_token(buf2.getvalue(), fname,
+                                  mime_hint="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        audit.log_event(DATA_DIR, actor=username, action="spreadsheet.via_chat",
+                        meta={"topic": topic[:120], "file": fname,
+                              "rows": rows_added})
+        return {"reply": (
+            f"📊 Built a spreadsheet of {topic} — saved to your Files tab as "
+            f"`{fname}`. {rows_added} rows, {ws_sheet.max_column} columns. "
+            f"Open in Excel to review and edit."
+        ), "tier": "local", "latency_ms": 0, "source": "spreadsheet_gen",
+           "download_url": saved.get("download_url")}
+
+    return None
+
+
 def _save_and_token(file_bytes: bytes, filename: str, mime_hint: str = "") -> dict:
     """Save bytes into the workspace, scan, mint a download token, return
     {filename, workspace_path, download_url}."""
@@ -14724,23 +17038,47 @@ def chat_submit_order():
 
     if not history:
         return _purblum_cors(jsonify({"ok": False, "error": "empty_history"}), origin), 400
-    if "purblum" not in biz_name.lower():
-        return _purblum_cors(jsonify({"ok": False, "error": "no_driver_for_business"}), origin), 400
+
+    # Determine if this business has a submission method configured. If
+    # neither a slug-matched web_driver nor an email path exists, bail
+    # early — Orby doesn't pretend to submit an order she can't actually
+    # deliver. (Old behavior: hard-block anything not named "purblum.")
+    submission_cfg = (business.get("order_submission") or {})
+    has_submission = bool(
+        submission_cfg.get("method") or submission_cfg.get("kitchen_email")
+        or "purblum" in biz_name.lower()
+    )
+    if not has_submission:
+        return _purblum_cors(jsonify({
+            "ok": False, "error": "no_driver_for_business",
+            "hint": "Add order_submission.kitchen_email to the customer "
+                    "profile, or build a web_driver for this restaurant."
+        }), origin), 400
 
     try:
         import phone_order
-        # Hardcoded path for the PurBlum demo. When we add real customers
-        # this should come from the business profile (profile.menu_source).
-        menu_path = "/home/frank/purblum_live/data/menu.json"
-        menu = phone_order.load_menu(menu_path)
+        # Menu source — for PurBlum use the canonical local file; for any
+        # other restaurant pull from the profile's own menu_items list.
+        if "purblum" in biz_name.lower():
+            menu_path = "/home/frank/purblum_live/data/menu.json"
+            menu = phone_order.load_menu(menu_path)
+        else:
+            menu = {"items": business.get("menu_items") or []}
         ext = phone_order.extract_order_from_history(history, menu, llm_client, CONFIG)
         if not ext.get("ok") or not ext.get("items"):
             return _purblum_cors(jsonify({
                 "ok": False, "error": "extract_failed",
                 "detail": ext.get("error", "no items extracted")
             }), origin), 400
-        cart, warnings = phone_order.build_cart_for_purblum(ext["items"], menu)
-        phone_order.annotate_cart_with_menu_prices(cart, menu)
+        # Cart builder is still PurBlum-shaped — for other restaurants we
+        # pass the extracted items through directly. (When we add a 2nd
+        # restaurant we'll generalize build_cart_for_purblum.)
+        if "purblum" in biz_name.lower():
+            cart, warnings = phone_order.build_cart_for_purblum(ext["items"], menu)
+            phone_order.annotate_cart_with_menu_prices(cart, menu)
+        else:
+            cart = ext["items"]
+            warnings = []
         if not cart:
             return _purblum_cors(jsonify({
                 "ok": False, "error": "empty_cart",
@@ -14752,20 +17090,42 @@ def chat_submit_order():
         customer_phone = (customer_info.get("phone") or visitor.get("phone")
                           or "").strip()
         pickup_time = (customer_info.get("pickup_time") or "").strip()
-        # Run web_driver — actually clicks through purblum.com
-        from web_driver import submit_purblum_order
-        result = submit_purblum_order(
+        totals = phone_order.compute_cart_total(cart, business.get("tax_rate", 0))
+
+        # Route through the generic dispatch layer — picks web_driver
+        # (PurBlum today, more later) or email-the-order based on the
+        # customer profile's order_submission.method field.
+        from web_driver import dispatch_order
+        # Stamp the slug on the business dict so dispatch_order can route
+        from site_scraper.storage import domain_from_url
+        try:
+            host = business.get("contact", {}).get("website") or ""
+            business["_slug"] = domain_from_url(host) if host else (
+                "purblum_com" if "purblum" in biz_name.lower() else ""
+            )
+        except Exception:
+            business["_slug"] = "purblum_com" if "purblum" in biz_name.lower() else ""
+        # Owner user_dir → SMTP fallback inside email_dispatch
+        try:
+            owner_users = users_mod.list_users(DATA_DIR, include_archived=False)
+            owner = next((u for u in owner_users
+                          if (u.get("role") or "").lower() == "owner"), None)
+            if owner:
+                business["_owner_user_dir"] = str(
+                    users_mod.get_user_dir(DATA_DIR, owner["username"]))
+        except Exception:
+            pass
+        result = dispatch_order(
             cart=cart,
             customer={
                 "name": customer_name,
                 "phone": customer_phone,
                 "pickup_time": pickup_time,
+                "email": visitor.get("email") or "",
             },
-            notes="Submitted by Orby (chat order)",
-            headless=True, record_video=False,
-            data_dir=DATA_DIR,
+            totals=totals,
+            profile=business,
         )
-        totals = phone_order.compute_cart_total(cart, business.get("tax_rate", 0))
         log.info(f"chat order submitted via web_driver: "
                   f"ok={result.get('ok')} order_id={result.get('order_id','?')} "
                   f"customer={customer_name} phone={customer_phone}")

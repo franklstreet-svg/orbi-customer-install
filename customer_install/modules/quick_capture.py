@@ -48,10 +48,15 @@ _REMIND_RE = re.compile(
     r"(?:on\s+|at\s+|by\s+|in\s+)(?P<when>.+)$",
     re.IGNORECASE,
 )
-# Reversed order: "remind me at 5:45 to call Bill"
+# Reversed order: "remind me at 5:45 to call Bill" /
+# "remind me tomorrow at 5pm to send the schedule".
+# Day-words ('tomorrow', weekday names) MUST be left in the `when`
+# capture so they reach `_parse_when()` — previously 'tomorrow at' was
+# being eaten by the optional prefix and the reminder fell back to
+# today.
 _REMIND_AT_FIRST_RE = re.compile(
     r"^(?:remind|nudge|ping)\s+me\s+"
-    r"(?:on\s+|at\s+|by\s+|in\s+|tomorrow\s+at\s+|today\s+at\s+)?(?P<when>.+?)\s+"
+    r"(?:on\s+|at\s+|by\s+|in\s+)?(?P<when>.+?)\s+"
     r"(?:to\s+)(?P<body>.+)$",
     re.IGNORECASE,
 )
@@ -174,18 +179,43 @@ def capture(user_dir: Path, text: str) -> dict:
     if m:
         title = m.group(1).strip()
         when_phrase = m.group(2).strip()
-        # Same body-absorption fix as reminders: 'book a meeting with Joe
-        # tomorrow at 2pm' captures title='a meeting with Joe tomorrow'
-        # when_phrase='2pm' — but we want title='meeting with Joe' and
-        # when='tomorrow at 2pm'. Move the trailing day-word out of title.
-        for day_word in ("tomorrow", "today", "tonight"):
-            if title.lower().endswith(" " + day_word):
+        # Move trailing day-word out of title into the front of when_phrase.
+        # Tolerate both relative ('tomorrow') AND weekday names ('friday'),
+        # because "appointment with Joe Friday at 2pm" parses with
+        # title='with Joe Friday' / when='2pm' and we want title='with Joe'
+        # and when='friday at 2pm'.
+        day_words = ("tomorrow", "today", "tonight",
+                     "monday", "tuesday", "wednesday", "thursday",
+                     "friday", "saturday", "sunday")
+        title_low = title.lower()
+        for day_word in day_words:
+            if title_low.endswith(" " + day_word):
                 title = title[: -(len(day_word) + 1)].strip()
                 when_phrase = day_word + " at " + when_phrase
                 break
-        # Drop leading article 'a/an/the' that the regex includes
+        # Also absorb a trailing clock time the regex left in the title:
+        # 'with Joe Friday 10am' should become title='with Joe' +
+        # when_phrase='friday at 10am'. Done AFTER the day-word pass so
+        # they stack.
+        time_tail = re.search(
+            r"\s+(?P<t>\d{1,2}(?::\d{2})?\s*(?:am|pm))\s*$",
+            title, re.IGNORECASE,
+        )
+        if time_tail:
+            title = title[: time_tail.start()].strip()
+            when_phrase = (when_phrase + " " + time_tail.group("t")).strip()
+        # Drop leading article 'a/an/the' the regex includes
         title = re.sub(r"^(?:a|an|the)\s+", "", title, flags=re.IGNORECASE)
+        # Calendar event dedup: same title + same start within 30 min →
+        # return the existing event instead of stacking duplicates.
         start_iso = _parse_when(when_phrase) or _default_tomorrow_9am()
+        existing_event = _find_duplicate_event(user_dir, title, start_iso)
+        if existing_event:
+            return {"kind": "calendar", "item": existing_event,
+                    "summary": (
+                        f"You already have \"{existing_event['title']}\" "
+                        f"at {_iso_to_local_display(existing_event['start'])}. "
+                        f"No duplicate created.")}
         item = mod_calendar.add(user_dir, title, start_iso)
         return {"kind": "calendar", "item": item,
                 "summary": f"Added to your calendar: \"{item['title']}\" at {_iso_to_local_display(start_iso)}"}
@@ -238,6 +268,35 @@ def remove_quick_note(user_dir: Path, note_id: str) -> bool:
 
 
 # ── Internal helpers ────────────────────────────────────────────────────
+
+
+def _find_duplicate_event(user_dir: Path, title: str, start_iso: str) -> dict | None:
+    """Return an existing calendar event with the same normalized title
+    and a start within 30 minutes of `start_iso`, or None if no near-
+    duplicate exists. Prevents the "add appointment with Joe Friday at
+    2pm" tap from stacking duplicates when accidentally said twice."""
+    norm_title = " ".join((title or "").lower().strip().split())
+    if not norm_title or not start_iso:
+        return None
+    try:
+        target = datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    try:
+        events = mod_calendar.list_all(user_dir) or []
+    except Exception:
+        return None
+    for e in events:
+        existing_title = " ".join((e.get("title") or "").lower().strip().split())
+        if existing_title != norm_title:
+            continue
+        try:
+            es = datetime.fromisoformat((e.get("start") or "").replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            continue
+        if abs((es - target).total_seconds()) <= 30 * 60:
+            return e
+    return None
 
 
 def _save_quick_note(user_dir: Path, text: str) -> dict:

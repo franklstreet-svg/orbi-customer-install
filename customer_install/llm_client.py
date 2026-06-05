@@ -36,16 +36,19 @@ class LLMResponse:
 # ---------------------------------------------------------------------------
 
 def call_brain(config: dict, system: str, messages: list[dict]) -> LLMResponse:
-    cfg = config["brain"]
+    cfg = (config or {}).get("brain")
+    if not cfg or not cfg.get("url") or not cfg.get("api_key"):
+        # Brain not configured for this caller — skip without crashing.
+        return LLMResponse("", "brain", 0, "brain_not_configured")
     url = cfg["url"].rstrip("/") + "/v1/chat/completions"
     payload = {
         "model": "llama-3.1-8b-instruct",
         "messages": [{"role": "system", "content": system}] + messages,
-        "temperature": 0.6,
+        "temperature": 0.25,
         # 2048 covers ~1500 words — enough for marketing campaigns,
         # multi-section letters, blog drafts. 512 was cutting long
         # responses off mid-list.
-        "max_tokens": 4096,
+        "max_tokens": _GEN_OVERRIDES.get("max_tokens") or 4096,
         "stream": False,
     }
     headers = {
@@ -63,7 +66,7 @@ def call_brain(config: dict, system: str, messages: list[dict]) -> LLMResponse:
 def call_huggingface(config: dict, system: str, messages: list[dict]) -> LLMResponse:
     """Try router first (best models), fall back to direct api-inference
     (works on free/older accounts)."""
-    cfg = config["huggingface"]
+    cfg = config.get("huggingface") or {}
     if not cfg.get("enabled") or not cfg.get("api_key"):
         return LLMResponse("", "huggingface", 0, "disabled")
     model = cfg.get("model", "meta-llama/Llama-3.1-8B-Instruct")
@@ -80,8 +83,8 @@ def call_huggingface(config: dict, system: str, messages: list[dict]) -> LLMResp
     payload = {
         "model": model,
         "messages": [{"role": "system", "content": system}] + messages,
-        "temperature": 0.6,
-        "max_tokens": 4096,
+        "temperature": 0.25,
+        "max_tokens": _GEN_OVERRIDES.get("max_tokens") or 4096,
         "stream": False,
     }
     resp = _http_chat("https://router.huggingface.co/v1/chat/completions",
@@ -100,7 +103,7 @@ def call_huggingface(config: dict, system: str, messages: list[dict]) -> LLMResp
 # ---------------------------------------------------------------------------
 
 def call_local(config: dict, system: str, messages: list[dict]) -> LLMResponse:
-    cfg = config["local_llm"]
+    cfg = config.get("local_llm") or {}
     if not cfg.get("enabled"):
         return LLMResponse("", "local", 0, "disabled")
     port = cfg.get("port", 11435)
@@ -108,10 +111,10 @@ def call_local(config: dict, system: str, messages: list[dict]) -> LLMResponse:
     payload = {
         "model": "llama-3.2-3b-instruct",
         "messages": [{"role": "system", "content": system}] + messages,
-        "temperature": 0.5,
+        "temperature": 0.25,
         # Local 3B is slow — keep its cap lower (~750 words) so
         # offline-mode fallback doesn't hang the browser for 2 min.
-        "max_tokens": 1024,
+        "max_tokens": _GEN_OVERRIDES.get("max_tokens") or 1024,
         "stream": False,
     }
     headers = {"Content-Type": "application/json"}
@@ -161,22 +164,63 @@ def _http_chat(url: str, payload: dict, headers: dict,
 # Tier orchestrator
 # ---------------------------------------------------------------------------
 
-def generate(config: dict, system: str, messages: list[dict]) -> LLMResponse:
+# Circuit breaker — once brain has failed N times in a row, skip it for the
+# next COOLDOWN seconds. Brain DNS lookup costs ~50-100ms even when it fails;
+# avoiding the dead tier saves real latency on every call.
+_TIER_FAIL_STREAK: dict[str, int] = {"brain": 0, "huggingface": 0}
+_TIER_SKIP_UNTIL: dict[str, float] = {"brain": 0.0, "huggingface": 0.0}
+# Per-call overrides set by generate() before dispatching to a tier.
+# Cleared after the call completes. Used to thread max_tokens through to
+# the tier-specific call functions without adding it to every signature.
+_GEN_OVERRIDES: dict = {}
+_FAIL_THRESHOLD = 3            # trip after this many consecutive failures
+_SKIP_COOLDOWN_SECONDS = 300   # then skip the tier for 5 min before retry
+
+
+def generate(config: dict, system: str, messages: list[dict],
+              max_tokens: int | None = None) -> LLMResponse:
     """
     Try each tier in order, return the first successful response.
     Returns an empty LLMResponse with tier='none' if all tiers fail.
+
+    Circuit breaker: a tier that has failed 3+ times in a row gets skipped
+    for the next 5 minutes. Massive latency win when brain DNS is dead —
+    we don't pay the 50-100ms DNS lookup on every call anymore.
+
+    max_tokens (optional): cap the response length. Used by voice to
+    force <=60-token replies so phone callers don't sit through 12-second
+    LLM streams.
     """
+    now = time.time()
+    # Stash on a thread-local so the tier callers can read it without
+    # threading the param through every signature.
+    _GEN_OVERRIDES["max_tokens"] = max_tokens
     for tier_fn, tier_name in (
         (call_brain,       "brain"),
         (call_huggingface, "huggingface"),
         (call_local,       "local"),
     ):
+        # Skip tiers we've tripped the circuit-breaker on
+        if _TIER_SKIP_UNTIL.get(tier_name, 0) > now:
+            continue
         try:
             resp = tier_fn(config, system, messages)
             if resp:
+                # Reset streak on success
+                _TIER_FAIL_STREAK[tier_name] = 0
                 return resp
+            # Failed but didn't crash — bump the streak
+            _TIER_FAIL_STREAK[tier_name] = _TIER_FAIL_STREAK.get(tier_name, 0) + 1
+            if _TIER_FAIL_STREAK[tier_name] >= _FAIL_THRESHOLD:
+                _TIER_SKIP_UNTIL[tier_name] = now + _SKIP_COOLDOWN_SECONDS
+                log.warning(f"tier={tier_name} tripped circuit breaker — "
+                              f"skipping for {_SKIP_COOLDOWN_SECONDS}s "
+                              f"(after {_FAIL_THRESHOLD} consecutive failures)")
         except Exception as e:
             log.exception(f"tier {tier_name} crashed")
+            _TIER_FAIL_STREAK[tier_name] = _TIER_FAIL_STREAK.get(tier_name, 0) + 1
+            if _TIER_FAIL_STREAK[tier_name] >= _FAIL_THRESHOLD:
+                _TIER_SKIP_UNTIL[tier_name] = now + _SKIP_COOLDOWN_SECONDS
     return LLMResponse("", "none", 0, "all_tiers_failed")
 
 

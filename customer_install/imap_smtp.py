@@ -323,9 +323,12 @@ def _pull_one(account: dict, limit: int, query: str) -> list[dict]:
     """Pull the most recent `limit` messages from INBOX.
 
     Strategy:
-      - SEARCH (not SORT) — fast on Yahoo, returns sequence numbers in
-        arrival order (newest is typically the last UID).
-      - Take the last N IDs and reverse so we fetch newest first.
+      - UID SEARCH (not SEQ-based) so the id we cache for each message
+        survives new arrivals, deletions, or another client moving
+        things around. SEQ numbers reshuffle whenever the mailbox state
+        changes — that caused Frank's iCloud test email body to show up
+        under the McAfee header (the labels and bodies were paired off
+        the wrong SEQ positions).
       - PEEK headers only (FROM, TO, SUBJECT, DATE) — much faster than
         full RFC822 and doesn't mark messages as read.
       - Final ordering by Date header is done in email_inbox.fetch_inbox
@@ -346,17 +349,14 @@ def _pull_one(account: dict, limit: int, query: str) -> list[dict]:
         try:
             m.select("INBOX", readonly=True)
             criteria = f'(SUBJECT "{query}")' if query else "ALL"
-            typ, data = m.search(None, criteria)
+            typ, data = m.uid("search", None, criteria)
             if typ != "OK" or not data or not data[0]:
                 return []
-            ids = data[0].split()
-            ids = list(reversed(ids))[:limit]  # newest seq-nums are at the end
-            for seq in ids:
-                # PEEK keeps unread state intact; fetch only the header fields
-                # we need (snippet drops out, but we don't display snippets
-                # in the chat list so this is fine).
-                typ, msg_data = m.fetch(
-                    seq,
+            uids = data[0].split()
+            uids = list(reversed(uids))[:limit]  # highest UIDs are newest
+            for uid in uids:
+                typ, msg_data = m.uid(
+                    "fetch", uid,
                     "(FLAGS BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE MESSAGE-ID)])",
                 )
                 if typ != "OK" or not msg_data:
@@ -366,13 +366,58 @@ def _pull_one(account: dict, limit: int, query: str) -> list[dict]:
                 if not raw:
                     continue
                 msg = email.message_from_bytes(raw)
-                out.append(_format_message(account, seq, msg, flags_raw))
+                # uid here is bytes (e.g. b'12345'); _format_message stores
+                # it as the message id so fetch_one_body can re-fetch it.
+                out.append(_format_message(account, uid, msg, flags_raw))
         finally:
             try: m.logout()
             except Exception: pass
     except Exception as e:
         log.warning(f"_pull_one {account['email']}: {e}")
     return out
+
+
+def fetch_one_body(user_dir: Path, account_id: str, uid,
+                    max_chars: int = 4000) -> dict:
+    """Fetch the full plain-text body of a specific message. Used by the
+    "what does the email from X say" / "read X's email" fast-path so the
+    LLM never has to guess the contents."""
+    accounts = _read_accounts(user_dir)
+    account = next((a for a in accounts if a["id"] == account_id), None)
+    if not account:
+        return {"error": "account_not_found"}
+    m = None
+    try:
+        m = imaplib.IMAP4_SSL(account["imap_host"], int(account["imap_port"]),
+                              timeout=40) \
+            if account.get("imap_ssl", True) \
+            else imaplib.IMAP4(account["imap_host"], int(account["imap_port"]),
+                               timeout=40)
+        if not account.get("imap_ssl", True):
+            m.starttls()
+        m.login(account["email"], account["password"])
+        m.select("INBOX", readonly=True)
+        uid_b = str(uid).encode() if not isinstance(uid, bytes) else uid
+        typ, data = m.uid("fetch", uid_b, "(BODY.PEEK[])")
+        if typ != "OK" or not data:
+            return {"error": "fetch_failed"}
+        raw = next((x[1] for x in data if isinstance(x, tuple)), None)
+        if not raw:
+            return {"error": "no_body"}
+        msg = email.message_from_bytes(raw)
+        return {
+            "subject":    _decode_header(msg.get("Subject")),
+            "from":       _decode_header(msg.get("From")),
+            "date":       msg.get("Date") or "",
+            "body":       _extract_text(msg, max_chars=max_chars),
+            "message_id": _decode_header(msg.get("Message-ID")) or "",
+        }
+    except Exception as e:
+        return {"error": f"imap_error: {e}"}
+    finally:
+        if m is not None:
+            try: m.logout()
+            except Exception: pass
 
 
 def _decode_header(value) -> str:
@@ -467,6 +512,7 @@ def _format_message(account: dict, uid: bytes, msg: email.message.Message,
         "tags":          [],
         "flagged":       False,
         "flag_reason":   "",
+        "message_id":    _decode_header(msg.get("Message-ID")) or "",
     }
 
 

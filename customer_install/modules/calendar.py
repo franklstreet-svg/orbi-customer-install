@@ -54,9 +54,61 @@ def _save(user_dir: Path, events: list[dict]) -> None:
     tmp.replace(p)
 
 
+def _dedup_event_key(e: dict) -> tuple[str, str]:
+    """Normalized title + same 30-min bucket of start = same event.
+    Collapses pre-existing duplicate events on read so old dirty data
+    (from before the write-side dedup landed in quick_capture) doesn't
+    surface as multiple lines in chat."""
+    # Strip trailing time/day debris that old write paths left in titles
+    # ("with Joe Friday 10am" → "with joe")
+    import re as _re
+    raw = (e.get("title") or "").lower().strip()
+    raw = _re.sub(r"\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)\s*$", "", raw)
+    raw = _re.sub(
+        r"\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\s*$",
+        "", raw,
+    )
+    title = " ".join(raw.split())
+    start = (e.get("start") or "")[:16]
+    try:
+        mm = int(start[14:16])
+        bucket = (mm // 30) * 30
+        start = f"{start[:14]}{bucket:02d}"
+    except (ValueError, IndexError):
+        pass
+    return (title, start)
+
+
+def _clean_title_on_read(t: str) -> str:
+    """Strip trailing weekday word + trailing clock-time debris from
+    titles that older write paths left dirty (e.g. "with Joe Friday 10am"
+    → "with Joe"). Read-only — leaves the stored field untouched so
+    nothing downstream that expects the original title breaks."""
+    import re as _re
+    out = (t or "").strip()
+    out = _re.sub(r"\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)\s*$", "", out, flags=_re.IGNORECASE)
+    out = _re.sub(
+        r"\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\s*$",
+        "", out, flags=_re.IGNORECASE,
+    )
+    return out.strip()
+
+
 def list_all(user_dir: Path) -> list[dict]:
     with _LOCK:
-        return _load(user_dir)
+        events = _load(user_dir)
+    seen: set = set()
+    deduped: list = []
+    for e in sorted(events, key=lambda x: x.get("ts", 0)):
+        k = _dedup_event_key(e)
+        if k in seen:
+            continue
+        seen.add(k)
+        # Display-clean the title without mutating storage
+        copy = dict(e)
+        copy["title"] = _clean_title_on_read(copy.get("title", ""))
+        deduped.append(copy)
+    return deduped
 
 
 def add(user_dir: Path, title: str, start: str, end: str | None = None,
