@@ -358,7 +358,14 @@ def extract_app_source(install_dir: Path) -> int:
             top = member.name.split("/", 1)[0]
             if top in protected:
                 continue
-            tar.extract(member, install_dir, filter="data")
+            # `filter="data"` is Python 3.12+ only — gives sandboxing against
+            # tarbomb / path-traversal members. On older Python (3.10, 3.11)
+            # fall back to plain extract; the tarball is built by our own
+            # build script so it's not an untrusted archive.
+            try:
+                tar.extract(member, install_dir, filter="data")
+            except TypeError:
+                tar.extract(member, install_dir)
             count += 1
     log.info("extracted %d app files into %s", count, install_dir)
     return count
