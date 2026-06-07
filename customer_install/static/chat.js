@@ -44,7 +44,35 @@
   // ------------------------------------------------------------------
   // Conversation state (in-memory only, never persisted)
   // ------------------------------------------------------------------
-  let history = [];
+  // Chat history is keyed only by parent-page origin so the conversation
+  // continues as the visitor navigates between pages of a multi-page site
+  // (purblum.com /menu → /order → /contact …). sessionStorage is per-tab,
+  // so:
+  //   • Same tab, any page on the same site → history persists ✓
+  //   • Tab closes (or browser restart) → sessionStorage wiped → fresh
+  //     greeting on next visit ✓
+  //
+  // Earlier this key also included `_=<timestamp>` from embed.js's cache-
+  // buster, which inadvertently rotated on every page load and made Orby
+  // re-greet from the top on every navigation. Removed 2026-06-03.
+  //
+  // Visitor profile (name + phone) lives separately in localStorage so
+  // Orby still recognizes the visitor on their next visit.
+  const _qs = new URLSearchParams(window.location.search);
+  const HIST_KEY = 'orbi_chat_history__' +
+    (_qs.get('parent') || window.location.origin);
+  function _loadHistory() {
+    try {
+      const raw = sessionStorage.getItem(HIST_KEY);
+      if (!raw) return [];
+      const arr = JSON.parse(raw);
+      return Array.isArray(arr) ? arr.slice(-40) : [];
+    } catch { return []; }
+  }
+  function _saveHistory(h) {
+    try { sessionStorage.setItem(HIST_KEY, JSON.stringify(h.slice(-40))); } catch {}
+  }
+  let history = _loadHistory();
   let visitor = loadVisitorInfo();
   let unread  = 0;
 
@@ -68,6 +96,21 @@
   // Boot
   // ------------------------------------------------------------------
   document.addEventListener('DOMContentLoaded', () => {
+    // Mobile audio gate — any direct tap inside the iframe is a user-
+    // gesture context, which is what mobile browsers need to start audio.
+    // If we have a queued first speech (the proactive greeting from before
+    // the user interacted), drain it here.
+    const _drainOnFirstTap = () => {
+      _unlockMobileAudio();
+      if (_pendingFirstSpeech && prefs.speakerOn) {
+        const txt = _pendingFirstSpeech;
+        _pendingFirstSpeech = null;
+        try { speak(txt); } catch {}
+      }
+    };
+    document.addEventListener('click', _drainOnFirstTap, { once: true });
+    document.addEventListener('touchstart', _drainOnFirstTap, { once: true });
+
     // Visiting / directly OR in embed iframe — both get the full-page chat.
     // The floating launcher + landing card only exist for the demo embed-host page.
     launcher.style.display = 'none';
@@ -91,6 +134,23 @@
     setupNetworkWatch();
     loadBusinessGreeting();
     applyPrefs();
+    // If we restored history from localStorage (visitor navigating to a
+    // new page on the same site), re-render the past bubbles so the
+    // conversation visually continues instead of looking like a fresh start.
+    if (history.length > 0) {
+      document.getElementById('welcome')?.remove();
+      history.forEach((m) => {
+        if (m.role === 'user' || m.role === 'assistant') addBubble(m.role, m.content);
+      });
+    }
+    // Auto-enable speaker + mic — in embed mode the chat panel auto-opens
+    // here (DOMContentLoaded), bypassing openPanel(), so this is where
+    // mic/speaker need to turn on for the embed widget. We do it slightly
+    // after applyPrefs() so the toggle states are settled first.
+    setTimeout(() => {
+      if (!prefs.speakerOn) setSpeakerOn(true);
+      if (!prefs.micOn) setMicOn(true);
+    }, 100);
   });
 
   function setupClearButton() {
@@ -98,6 +158,7 @@
       if (history.length === 0) return;
       if (!confirm('Clear this conversation?')) return;
       history = [];
+      _saveHistory(history);  // also clear localStorage so it doesn't rehydrate
       chatArea.innerHTML = '';
       const welcome = document.createElement('div');
       welcome.className = 'welcome';
@@ -182,7 +243,99 @@
     updateBadge();
     setTimeout(() => input.focus(), 200);
     if (persist) { prefs.panelOpen = true; savePrefs(); }
+    // Auto-enable speaker + mic when the chat opens so the visitor can
+    // immediately speak and hear Orby. Users who don't want voice can
+    // toggle off; the prefs are sticky so the OFF state persists.
+    if (!prefs.speakerOn) setSpeakerOn(true);
+    if (!prefs.micOn) setMicOn(true);
+    // iOS/mobile audio unlock — mobile browsers block audio playback unless
+    // the FIRST Audio.play() call happens directly inside a user-gesture
+    // handler. We're inside one right now (the launcher click triggered
+    // this), so prime a silent audio element to unlock the audio context.
+    // After this, subsequent speak() calls (which run async after fetch)
+    // can play audio without being silenced.
+    _unlockMobileAudio();
   }
+
+  // Mobile audio unlock — two-pronged approach:
+  //
+  //   1. A persistent HTMLAudioElement that gets unlocked ONCE in a
+  //      gesture handler via a silent-WAV play. iOS keys audio unlock
+  //      to specific elements — once THIS element is unlocked, we
+  //      keep reusing it (swap .src instead of creating new Audio).
+  //
+  //   2. A Web Audio API AudioContext kept resumed as a backup for
+  //      replies that arrive while the mic recognition was running
+  //      (iOS PlayAndRecord mode can otherwise route audio to the
+  //      receiver/earpiece or silently fail).
+  //
+  // The persistent-element path is the primary; WebAudio is fallback.
+  let _audioCtx = null;
+  let _audioUnlocked = false;
+  let _currentSource = null;  // active WebAudio BufferSource (so stopSpeaking can cancel)
+  const _audioEl = new Audio();
+  _audioEl.preload = 'auto';
+  // CRITICAL on iOS Safari:
+  //  - playsInline = true: without this, iOS tries to go fullscreen
+  //    (treats it as video) and silently refuses to play.
+  //  - in-DOM: detached <audio> elements (created with `new Audio()`
+  //    but never appended) are blocked on iOS. Append to body, but
+  //    keep it visually hidden.
+  _audioEl.setAttribute('playsinline', '');
+  _audioEl.setAttribute('webkit-playsinline', '');
+  _audioEl.playsInline = true;
+  _audioEl.style.cssText = 'position:absolute;width:0;height:0;visibility:hidden;pointer-events:none;';
+  if (document.body) {
+    document.body.appendChild(_audioEl);
+  } else {
+    // Body not parsed yet; attach as soon as it is
+    document.addEventListener('DOMContentLoaded',
+      () => document.body.appendChild(_audioEl), { once: true });
+  }
+
+  function _unlockMobileAudio() {
+    if (_audioUnlocked) return;
+    try {
+      // (1) Persistent <audio> element: prime with silent WAV in the
+      // current gesture context. Once this play succeeds, the element
+      // stays unlocked for the page lifetime no matter how many src
+      // swaps we do.
+      // Use the server's TTS endpoint with a single-character silent input
+// instead of a tiny base64 WAV — iOS sometimes refuses to commit the
+// audio unlock from a 36-byte WAV but accepts it from a real streaming
+// MP3 of any duration. The space-only text produces near-silent audio.
+_audioEl.src = '/tts?text=%20&silent=1';
+      _audioEl.volume = 0;
+      const p = _audioEl.play();
+      if (p && typeof p.then === 'function') {
+        p.catch(() => {});
+      }
+
+      // (2) AudioContext fallback path.
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (Ctx) {
+        if (!_audioCtx) _audioCtx = new Ctx();
+        if (_audioCtx.state === 'suspended') {
+          _audioCtx.resume().catch(() => {});
+        }
+        const buffer = _audioCtx.createBuffer(1, 1, 22050);
+        const source = _audioCtx.createBufferSource();
+        source.buffer = buffer;
+        source.connect(_audioCtx.destination);
+        try { source.start(0); } catch {}
+      }
+
+      _audioUnlocked = true;
+    } catch {}
+  }
+
+  // Mobile audio gate — Orby's first message (the proactive greeting) is
+  // generated BEFORE the user has clicked anything inside the iframe, so
+  // mobile browsers block the playback. We queue the text here; the next
+  // time we get a user-gesture context (the mic permission "Allow" click
+  // firing recognition.onstart, OR any direct tap inside the iframe), we
+  // play the queued text from THAT context.
+  let _pendingFirstSpeech = null;
 
   function closePanel(persist = true) {
     panel.classList.remove('open');
@@ -209,8 +362,35 @@
   // Mic + Speaker toggles (sticky)
   // ------------------------------------------------------------------
   function setupToggles() {
-    micToggle.addEventListener('click', () => setMicOn(!prefs.micOn));
-    speakerToggle.addEventListener('click', () => setSpeakerOn(!prefs.speakerOn));
+    // CRITICAL on iOS: both toggle taps are direct user gestures — the
+    // ONLY windows during which we can prime the audio element so iOS
+    // Safari trusts it to play unattended later. We unlock here even
+    // when the user is turning the toggle OFF, because the next tap to
+    // turn it back on still benefits from already-unlocked audio.
+    micToggle.addEventListener('click', () => {
+      _unlockMobileAudio();   // gesture-time unlock
+      setMicOn(!prefs.micOn);
+    });
+    speakerToggle.addEventListener('click', () => {
+      _unlockMobileAudio();   // gesture-time unlock
+      setSpeakerOn(!prefs.speakerOn);
+      // After unlock + speaker on, play a tiny inaudible chirp through
+      // the persistent audio element so iOS records "this element has
+      // been allowed to play audio." All subsequent speak() calls reuse
+      // the same element via src-swap and ride that permission.
+      if (prefs.speakerOn) {
+        try {
+          // Use the server's TTS endpoint with a single-character silent input
+// instead of a tiny base64 WAV — iOS sometimes refuses to commit the
+// audio unlock from a 36-byte WAV but accepts it from a real streaming
+// MP3 of any duration. The space-only text produces near-silent audio.
+_audioEl.src = '/tts?text=%20&silent=1';
+          _audioEl.volume = 0;
+          const p = _audioEl.play();
+          if (p && typeof p.then === 'function') p.catch(() => {});
+        } catch {}
+      }
+    });
   }
 
   function setMicOn(on, persist = true) {
@@ -263,7 +443,12 @@
         send(input.value);
       }
     });
-    sendBtn.addEventListener('click', () => send(input.value));
+    sendBtn.addEventListener('click', () => {
+      // Send button is a guaranteed user gesture — opportune moment to
+      // unlock audio so Orby's reply will actually play on iOS.
+      _unlockMobileAudio();
+      send(input.value);
+    });
 
     // Keyboard shortcuts
     document.addEventListener('keydown', (e) => {
@@ -289,33 +474,72 @@
   // Send a message (text or transcribed voice) and play TTS reply if speaker on
   // ------------------------------------------------------------------
   let isSending = false;
+  // Sales-bot scrape orchestration: when the LLM emits <<SCRAPE:url>>,
+  // we kick off /api/public/sales_scrape, poll for completion, then send
+  // a silent "continue" turn carrying prospect_url. From then on, every
+  // /chat in this session forwards prospect_url so the LLM keeps the
+  // prospect's business in its context.
+  let _pendingProspectUrl = null;
 
-  async function send(text) {
+  async function send(text, opts) {
+    opts = opts || {};
     text = (text || '').trim();
     if (!text || isSending) return;
+    // We're inside a user-gesture handler here (sendBtn click or Enter
+    // keydown). Unlock mobile audio BEFORE the async fetch below so the
+    // TTS playback on the reply can sound. After the await, we'd be out
+    // of gesture context and any first-time unlock would be too late.
+    _unlockMobileAudio();
     isSending = true;
     sendBtn.disabled = true;
 
     welcomeEl?.remove();
     clearInterim();
-    addBubble('user', text);
+    // In silent mode (sales-scrape continuation), skip the user-bubble so
+    // the visitor never sees "(continue)" — but DO push to history so the
+    // LLM sees the conversation continuing.
+    if (!opts.silent) {
+      addBubble('user', text);
+    }
     history.push({ role: 'user', content: text });
+    _saveHistory(history);
 
-    input.value = '';
-    input.style.height = 'auto';
+    if (!opts.silent) {
+      input.value = '';
+      input.style.height = 'auto';
+    }
 
     setStateBar('Thinking...', 'thinking');
     const thinkingEl = addThinking();
 
     try {
+      // If this chat shell was loaded inside an embed iframe, the parent
+      // page's origin was passed as ?parent=... — forward it to the
+      // backend as X-Embed-Parent so it can route to the correct
+      // customer's profile (instead of defaulting to MOAS).
+      // Also forward ?demo_as=<slug> if present — that's Frank's demo
+      // mode where he scrapes a prospect's site and loads their profile.
+      const _params = new URLSearchParams(window.location.search);
+      const embedParent = _params.get('parent') || '';
+      const demoAs = _params.get('demo_as') || '';
+      const headers = { 'Content-Type': 'application/json' };
+      if (embedParent) headers['X-Embed-Parent'] = embedParent;
+      if (demoAs) headers['X-Demo-As'] = demoAs;
+      const body = {
+        message: text,
+        history: history.slice(-20),
+        visitor: visitor,
+      };
+      // Sales-bot context: once we've scraped a prospect's site, every
+      // subsequent /chat carries the URL so the server can attach the
+      // PROSPECT BUSINESS section to the system prompt.
+      if (_pendingProspectUrl) {
+        body.prospect_url = _pendingProspectUrl;
+      }
       const res = await fetch('/chat', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          message: text,
-          history: history.slice(-20),
-          visitor: visitor
-        })
+        headers: headers,
+        body: JSON.stringify(body)
       });
       const data = await res.json();
       thinkingEl.remove();
@@ -323,7 +547,54 @@
       const reply = data.reply || "I couldn't reach my AI right now. Please try again.";
       addBubble('assistant', reply, { tier: data.tier });
       history.push({ role: 'assistant', content: reply });
+      _saveHistory(history);
       updateConnectionPill(data.tier);
+
+      // SALES SCRAPE trigger — if the bot emitted <<SCRAPE:url>>, the
+      // server stripped the marker and surfaced the URL. Fire off the
+      // scrape + poll + silent continuation.
+      if (data.scrape_request && data.scrape_request.url) {
+        _orchestrateSalesScrape(data.scrape_request.url);
+      }
+
+      // SALES NAVIGATE trigger — bot emitted <<NAV:url>> at the end
+      // of the buy flow. The visitor must end up on a FULL-PAGE legal
+      // page (not the chat iframe), and then on Stripe's full-page
+      // checkout. Stripe refuses to render in iframes (X-Frame-Options:
+      // DENY), so a navigation that lands in the iframe is broken.
+      //
+      // Cross-origin nav: the iframe is on orbi.twickell.com and the
+      // parent is twickell.com / purblum.com / etc. window.top.location
+      // assignment can silently fail in some strict browsers, leaving
+      // the iframe to take the navigation instead. The reliable path
+      // is to postMessage to embed.js (which runs in the parent page
+      // and can navigate its own window with no cross-origin friction).
+      if (data.navigate_request && data.navigate_request.url) {
+        const navUrl = data.navigate_request.url;
+        // Give the bot's last sentence ~2.5s to speak before nav.
+        setTimeout(() => {
+          // Primary path: ask the parent embed.js to do the navigation.
+          // The parent listens for orbi:navigate and runs
+          // window.location.href = url in its own origin.
+          try {
+            notifyParent('orbi:navigate', { url: navUrl });
+          } catch {}
+          // Fallback for standalone (non-embed) chat — when there is
+          // no parent embed.js listener, the iframe IS the top window,
+          // so this just navigates the page normally.
+          if (window.top === window.self) {
+            try { window.top.location.assign(navUrl); } catch {}
+          }
+        }, 2500);
+      }
+
+      // Live cart panel — server returns order_summary when the chat
+      // looks like an order. Show items + subtotal + tax + total so the
+      // customer SEES what's being captured + the math, not just hears
+      // it from Orby.
+      if (data.order_summary && data.order_summary.subtotal > 0) {
+        _renderCartPanel(data.order_summary);
+      }
 
       if (!panel.classList.contains('open')) {
         unread += 1;
@@ -349,11 +620,18 @@
       }
     } catch (err) {
       thinkingEl.remove();
-      const fallback = "I'm offline right now — please check your connection or try again.";
-      addBubble('assistant', fallback, { tier: 'none' });
       setStateBar(null);
-      if (prefs.speakerOn) speak(fallback);
-      else if (prefs.micOn) startListening();
+      // Silent mode (sales-scrape continuation) — never surface an
+      // "I'm offline" bubble for the auto-fired (continue) message.
+      // It's a server-to-server hop the visitor shouldn't see.
+      if (opts.silent) {
+        console.warn('[Orbi] silent send failed (suppressed):', err);
+      } else {
+        const fallback = "I'm offline right now — please check your connection or try again.";
+        addBubble('assistant', fallback, { tier: 'none' });
+        if (prefs.speakerOn) speak(fallback);
+        else if (prefs.micOn) startListening();
+      }
     } finally {
       isSending = false;
       sendBtn.disabled = !input.value.trim();
@@ -362,6 +640,70 @@
       if (window.matchMedia('(min-width: 481px)').matches) {
         input.focus();
       }
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Sales-bot scrape orchestration (twickell.com only)
+  // ------------------------------------------------------------------
+  // Flow: bot emits <<SCRAPE:url>> in its reply (stripped server-side
+  // and surfaced as data.scrape_request). Client kicks off the public
+  // scrape endpoint, polls until done (~30-90s for a typical site),
+  // sets _pendingProspectUrl so subsequent /chat calls carry the URL,
+  // then triggers a silent "continue" turn so the bot can deliver its
+  // tailored pitch using the freshly-scraped PROSPECT BUSINESS context.
+  async function _orchestrateSalesScrape(url) {
+    try {
+      setStateBar('Scanning your site...', 'thinking');
+      const startRes = await fetch('/api/public/sales_scrape', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url }),
+      });
+      const startData = await startRes.json();
+      if (!startData.ok) {
+        setStateBar(null);
+        addBubble('assistant',
+          startData.error === 'rate_limited'
+            ? "I've already looked at one site recently — give me a few minutes before I scan another. Or tell me what kind of business you run and I'll recommend a fit."
+            : "I couldn't reach that site. Want to tell me what kind of business you run instead?",
+          { tier: 'local' });
+        return;
+      }
+      const jobId = startData.job_id;
+      // Poll every 3s for up to ~3 minutes
+      for (let i = 0; i < 60; i++) {
+        await new Promise(r => setTimeout(r, 3000));
+        let sData;
+        try {
+          const sRes = await fetch(`/api/public/sales_scrape_status/${jobId}`);
+          sData = await sRes.json();
+        } catch { continue; }
+        const status = sData && sData.status;
+        if (status === 'done') {
+          _pendingProspectUrl = url;
+          setStateBar(null);
+          // Silent continuation — server sees this in history but the
+          // visitor never sees "(continue)" in their chat panel.
+          send('(continue — scrape complete)', { silent: true });
+          return;
+        } else if (status === 'error') {
+          setStateBar(null);
+          addBubble('assistant',
+            "Sorry, I had trouble loading that site. Want to tell me what kind of business you run instead?",
+            { tier: 'local' });
+          return;
+        }
+        // still running, keep waiting
+      }
+      // Timeout after ~3 min
+      setStateBar(null);
+      addBubble('assistant',
+        "That's taking longer than I expected. Want to tell me what kind of business you run instead?",
+        { tier: 'local' });
+    } catch (e) {
+      console.error('[Orbi] sales scrape orchestration failed:', e);
+      setStateBar(null);
     }
   }
 
@@ -384,27 +726,51 @@
     }
     recognition = new Recognition();
     recognition.lang = 'en-US';
-    recognition.continuous = true;
+    // continuous=false is COUNTERINTUITIVE but more reliable. Chrome's
+    // continuous mode silently dies after ~30s of silence, or when the
+    // tab loses focus, or randomly — and the death doesn't reliably
+    // trigger onend on all builds. With continuous=false, recognition
+    // returns one utterance at a time, fires onend cleanly, and the
+    // restart loop below keeps a fresh recognizer running. Net effect:
+    // mic stays on far more reliably across long conversations.
+    recognition.continuous = false;
     recognition.interimResults = true;
+    // Ask the browser for top-3 alternative transcriptions. We use the
+    // most confident one — picks up better than the default top-1 when
+    // the audio is borderline (background noise, fast talkers).
+    recognition.maxAlternatives = 3;
 
     recognition.onstart = () => {
       isListening = true;
       micToggle.classList.add('listening');
       setStateBar('Listening — speak any time...', 'listening');
+      // Do NOT drain the speech queue here. speak() calls stopListening()
+      // as its anti-echo step — which would immediately kill the mic we
+      // JUST started. The document-level tap listener handles draining
+      // when the user taps inside the chat (input field, send button, etc.)
+      // — that's a safer gesture context that doesn't conflict with mic.
     };
 
     recognition.onend = () => {
       isListening = false;
-      micToggle.classList.remove('listening');
-      // Auto-restart if the user still wants listening and we're not in a
-      // speaking-mute window (Chrome stops recognition after silence).
+      // Keep the visual "listening" badge ON during the auto-restart gap
+      // so the user doesn't see flicker between utterances and think the
+      // mic is off. We'll genuinely remove it only when the user toggles
+      // mic off OR Orby starts speaking.
+      if (!wantsListening || isSpeaking) {
+        micToggle.classList.remove('listening');
+        setStateBar(null);
+      }
+      // Auto-restart with a 250ms gap. Chrome's recognition.start() will
+      // throw "already running" if called too quickly after stop() — 50ms
+      // wasn't enough on many builds. 250ms reliably works across
+      // Chrome / Edge / Brave / Safari and is still imperceptible to
+      // someone holding a normal conversation.
       if (wantsListening && !isSpeaking) {
         clearTimeout(restartTimer);
         restartTimer = setTimeout(() => {
           if (wantsListening && !isSpeaking) safeStart();
-        }, 300);
-      } else {
-        setStateBar(null);
+        }, 250);
       }
     };
 
@@ -422,7 +788,16 @@
       let interim = '';
       let finalText = '';
       for (let i = event.resultIndex; i < event.results.length; i++) {
-        const transcript = event.results[i][0].transcript;
+        // Pick the most CONFIDENT alternative from the top-3, not just
+        // the first one. Catches partial-drop cases where the second
+        // candidate has the full phrase.
+        let best = event.results[i][0];
+        for (let k = 1; k < event.results[i].length; k++) {
+          if ((event.results[i][k].confidence || 0) > (best.confidence || 0)) {
+            best = event.results[i][k];
+          }
+        }
+        const transcript = best.transcript;
         if (event.results[i].isFinal) finalText += transcript;
         else interim += transcript;
       }
@@ -506,29 +881,45 @@
     const cleanText = stripForSpeech(text);
 
     try {
-      const res = await fetch('/tts', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: cleanText })
-      });
-      if (!res.ok) throw new Error('tts http ' + res.status);
-      const blob = await res.blob();
-      currentAudioUrl = URL.createObjectURL(blob);
-      currentAudio = new Audio(currentAudioUrl);
-      currentAudio.preload = 'auto';
+      // STREAMING: point the audio element at the /tts GET URL. The
+      // server is already a streaming Flask Response (yields MP3
+      // chunks from edge_tts.stream()). When we use audio.src = url,
+      // the browser plays each chunk as it arrives — audio starts
+      // within ~1s. The prior fetch + blob path waited for the WHOLE
+      // synthesis to finish before play(), so long replies showed text
+      // for 30-60s before audio started.
+      //
+      // GET caps text at ~2000 chars (URL length safety); the server
+      // /tts handler also caps at 12000 internally. The LLM's replies
+      // are typically <500 chars so this is non-binding in practice.
+      const ttsUrl = '/tts?text=' + encodeURIComponent(cleanText.slice(0, 2000));
 
-      await new Promise((resolve) => {
-        const done = () => {
-          if (currentAudioUrl) {
-            URL.revokeObjectURL(currentAudioUrl);
-            currentAudioUrl = null;
-          }
-          resolve();
-        };
-        currentAudio.onended = done;
-        currentAudio.onerror = done;
-        currentAudio.play().catch(done);
-      });
+      if (_audioUnlocked) {
+        await new Promise((resolve) => {
+          const done = () => {
+            _audioEl.onended = null;
+            _audioEl.onerror = null;
+            resolve();
+          };
+          _audioEl.onended = done;
+          _audioEl.onerror = done;
+          _audioEl.src = ttsUrl;
+          _audioEl.volume = 1;
+          _audioEl.muted = false;
+          _audioEl.play().catch(done);
+        });
+      } else {
+        // Pre-gesture (rare — first reply before any tap inside chat).
+        // Fresh Audio() may fail to play on iOS; the persistent element
+        // path above handles every subsequent reply once the user taps.
+        currentAudio = new Audio(ttsUrl);
+        currentAudio.preload = 'auto';
+        await new Promise((resolve) => {
+          currentAudio.onended = resolve;
+          currentAudio.onerror = resolve;
+          currentAudio.play().catch(resolve);
+        });
+      }
     } catch (err) {
       console.warn('[Orbi] server TTS failed, falling back to browser voice:', err);
       // Last-resort fallback so the assistant still speaks something
@@ -549,15 +940,42 @@
     micToggle.classList.remove('muted-while-speaking');
     setStateBar(null);
 
-    // Anti-echo release: give the speaker a moment to settle, then re-arm mic
+    // Anti-echo release: give the speaker a moment to settle, then re-arm
+    // mic. 100ms was too tight — Chrome's SpeechRecognition can fail
+    // silently when the audio playback hasn't fully released the device.
+    // 400ms is the floor that reliably works across Chrome / Edge / Brave
+    // / Safari for both desktop and laptop mics.
+    //
+    // Plus: if the first attempt doesn't actually take (no onstart event
+    // within 600ms), retry once. Without the retry, a silently-failed
+    // start leaves the user staring at a dead mic with no signal.
     if (wasMicOn && prefs.micOn) {
-      setTimeout(() => {
-        if (prefs.micOn && !isSpeaking) startListening();
-      }, 350);
+      const armMic = () => {
+        if (!prefs.micOn || isSpeaking) return;
+        startListening();
+        // Watchdog: if startListening didn't actually start the mic
+        // within 600ms, try one more time. This catches the silent-fail
+        // case Chrome hits after long sessions.
+        setTimeout(() => {
+          if (prefs.micOn && !isSpeaking && !isListening && wantsListening) {
+            console.log('[Orbi] mic restart watchdog firing — retrying start');
+            try { recognition && recognition.stop(); } catch {}
+            setTimeout(() => {
+              if (prefs.micOn && !isSpeaking) startListening();
+            }, 350);
+          }
+        }, 600);
+      };
+      setTimeout(armMic, 400);
     }
   }
 
   function stopSpeaking() {
+    if (_currentSource) {
+      try { _currentSource.stop(); } catch {}
+      _currentSource = null;
+    }
+    try { _audioEl.pause(); } catch {}
     if (currentAudio) {
       try { currentAudio.pause(); currentAudio.currentTime = 0; } catch {}
       currentAudio = null;
@@ -684,7 +1102,15 @@
   // ------------------------------------------------------------------
   async function loadBusinessGreeting() {
     try {
-      const r = await fetch('/api/public/business_summary');
+      // Same X-Embed-Parent / X-Demo-As trick as the /chat fetch — so the
+      // backend loads the right customer profile for the widget header.
+      const _qs2 = new URLSearchParams(window.location.search);
+      const embedParent = _qs2.get('parent') || '';
+      const demoAs = _qs2.get('demo_as') || '';
+      const summaryHeaders = {};
+      if (embedParent) summaryHeaders['X-Embed-Parent'] = embedParent;
+      if (demoAs) summaryHeaders['X-Demo-As'] = demoAs;
+      const r = await fetch('/api/public/business_summary', { headers: summaryHeaders });
       if (r.ok) {
         const data = await r.json();
         if (data.name) {
@@ -698,6 +1124,14 @@
             `Hi! I'm Orbi at ${data.name}.`;
         }
         renderQuickActions(data.quick_actions || []);
+        // Proactive greeting — Orbi speaks first when the chat opens
+        // so the visitor knows she's awake and ready. _fireProactiveGreeting
+        // guards against double-greeting on widget reopen by checking
+        // history. Skip if conversation history already exists (visitor
+        // navigated to a new page on the same site).
+        if (history.length === 0) {
+          _fireProactiveGreeting(data.name || 'us');
+        }
       }
     } catch {
       renderQuickActions([]);
@@ -727,12 +1161,167 @@
   // ------------------------------------------------------------------
   // Visitor info
   // ------------------------------------------------------------------
+  // Live cart panel — renders inside the chat scroll area when the server
+  // returns order_summary. Math is server-computed (deterministic); the
+  // widget just displays. Stays at the top of the chat so the visitor can
+  // see what's been captured + the running total as the conversation goes.
+  function _renderCartPanel(summary) {
+    let panel = document.getElementById('orbi-cart-panel');
+    if (!panel) {
+      panel = document.createElement('div');
+      panel.id = 'orbi-cart-panel';
+      panel.style.cssText = `
+        position: sticky;
+        top: 0;
+        z-index: 10;
+        background: #fff;
+        border: 1px solid #d4d8e0;
+        border-radius: 10px;
+        margin: 8px 12px 12px;
+        padding: 10px 12px;
+        font-size: 13px;
+        line-height: 1.5;
+        color: #1a2240;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+      `;
+      // Insert at the TOP of the chat scroll area so it stays visible
+      chatArea.parentNode.insertBefore(panel, chatArea);
+    }
+    const rows = (summary.lines || []).map(li => {
+      const safeName = String(li.name).replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));
+      return `<div style="display:flex;justify-content:space-between;gap:8px">
+        <span>${li.qty}× ${safeName}</span>
+        <span style="color:#444">$${Number(li.line_total).toFixed(2)}</span>
+      </div>`;
+    }).join('');
+    const taxLine = summary.tax_rate_pct
+      ? `<div style="display:flex;justify-content:space-between;color:#666;font-size:12px;margin-top:2px">
+          <span>Tax (${summary.tax_rate_pct.toFixed(2)}%)</span>
+          <span>$${Number(summary.tax).toFixed(2)}</span>
+        </div>`
+      : '';
+    const totalLine = summary.tax_rate_pct
+      ? `<div style="display:flex;justify-content:space-between;font-weight:700;color:#1a2240;border-top:1px solid #e6e8ec;padding-top:6px;margin-top:6px">
+          <span>Total</span>
+          <span>$${Number(summary.total).toFixed(2)}</span>
+        </div>`
+      : '';
+    panel.innerHTML = `
+      <div style="font-weight:700;color:#666;font-size:11px;letter-spacing:0.5px;margin-bottom:6px">YOUR ORDER</div>
+      ${rows}
+      <div style="display:flex;justify-content:space-between;margin-top:6px;padding-top:6px;border-top:1px dashed #e6e8ec;color:#1a2240;font-weight:600">
+        <span>Subtotal</span>
+        <span>$${Number(summary.subtotal).toFixed(2)}</span>
+      </div>
+      ${taxLine}
+      ${totalLine}
+      <button id="orbi-cart-submit" style="
+        width:100%;
+        margin-top:10px;
+        padding:9px 12px;
+        background:#1a8e3a;
+        color:#fff;
+        border:none;
+        border-radius:6px;
+        font-size:13px;
+        font-weight:700;
+        cursor:pointer;
+        letter-spacing:0.3px;
+      ">Place Order</button>
+    `;
+    document.getElementById('orbi-cart-submit')?.addEventListener('click', _submitCartFromChat);
+  }
+
+  // Submit the current cart through web_driver — backend extracts order
+  // from the chat history, builds the cart, drives purblum.com, confirms.
+  async function _submitCartFromChat() {
+    const btn = document.getElementById('orbi-cart-submit');
+    if (!btn) return;
+    btn.disabled = true;
+    btn.style.opacity = '0.7';
+    btn.textContent = 'Submitting…';
+    const embedParent = new URLSearchParams(window.location.search).get('parent') || '';
+    const headers = { 'Content-Type': 'application/json' };
+    if (embedParent) headers['X-Embed-Parent'] = embedParent;
+    try {
+      const res = await fetch('/api/public/chat/submit_order', {
+        method: 'POST',
+        headers: headers,
+        body: JSON.stringify({
+          history: history.slice(-30),
+          visitor: visitor,
+        }),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        btn.textContent = `✓ Order ${data.order_id || 'placed'}`;
+        btn.style.background = '#136d2c';
+        // Echo a confirmation bubble in the chat
+        addBubble('assistant', `Order's in! Confirmation ${data.order_id || ''}. The kitchen has it.`);
+        history.push({role: 'assistant', content: `Order's in. Confirmation ${data.order_id || ''}.`});
+        _saveHistory(history);
+      } else {
+        btn.textContent = 'Couldn\'t submit — tap to retry';
+        btn.style.background = '#a02020';
+        btn.disabled = false;
+        addBubble('assistant', `Hit a snag submitting that — ${data.error || 'try again in a sec'}.`);
+      }
+    } catch (e) {
+      btn.textContent = 'Network error — tap to retry';
+      btn.style.background = '#a02020';
+      btn.disabled = false;
+    }
+  }
+
+  // Proactive greeting — Orby speaks first when the chat opens, instead
+  // of sitting silent waiting for the visitor to type. Personalized for
+  // returning visitors via the persisted visitor profile (name).
+  function _fireProactiveGreeting(businessName) {
+    // Guard: if a greeting already exists in history (e.g. user reopened
+    // the widget mid-session), don't double-greet.
+    if (history.some(m => m.role === 'assistant')) return;
+    const hr = new Date().getHours();
+    const tod = hr < 12 ? "Good morning" : hr < 17 ? "Good afternoon" : "Good evening";
+    const v = (typeof visitor === 'object' && visitor) ? visitor : {};
+    const name = (v.name || '').trim();
+    let greeting;
+    if (name) {
+      // Returning visitor — single short line so the mic re-arms fast
+      // for natural conversation. Long greetings = long anti-echo mute.
+      greeting = `Hi ${name}! What can I help with?`;
+    } else {
+      // First-time visitor — one short sentence. The avatar + business
+      // name in the header already shows who she is, so the greeting
+      // doesn't need to re-introduce.
+      greeting = `Hi! I'm Orbi at ${businessName} — how can I help?`;
+    }
+    // Remove the welcome bubble (replaced by Orby's actual first message)
+    document.getElementById('welcome')?.remove();
+    addBubble('assistant', greeting);
+    history.push({ role: 'assistant', content: greeting });
+    _saveHistory(history);
+    // Speak it aloud if speaker is on. On mobile, the playback will fail
+    // silently (no user gesture yet) — so ALSO queue it so a later gesture
+    // (mic "Allow" click → recognition.onstart, OR any tap inside the
+    // iframe) can drain the queue and play it then.
+    if (prefs.speakerOn) {
+      _pendingFirstSpeech = greeting;
+      try { speak(greeting); } catch {}
+    }
+  }
+
+  // Visitor profile (name + phone + email) lives in localStorage keyed per
+  // customer site so it PERSISTS across browser sessions. Chat history is
+  // wiped at tab-close, but Orby still recognizes returning visitors by
+  // their name + phone — same model as the phone-side caller recognition.
+  const VISITOR_KEY = 'orbi_visitor__' +
+    (new URLSearchParams(window.location.search).get('parent') || window.location.origin);
   function loadVisitorInfo() {
-    try { return JSON.parse(sessionStorage.getItem('orbi_visitor') || '{}'); }
+    try { return JSON.parse(localStorage.getItem(VISITOR_KEY) || '{}'); }
     catch { return {}; }
   }
   function saveVisitorInfo() {
-    try { sessionStorage.setItem('orbi_visitor', JSON.stringify(visitor)); } catch {}
+    try { localStorage.setItem(VISITOR_KEY, JSON.stringify(visitor)); } catch {}
   }
   function maybeCaptureContactInfo(text) {
     // Phone: 555-1234, (555) 555-1234, +1 555 555 1234, etc.

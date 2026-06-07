@@ -316,3 +316,96 @@ def current_connection_state(config: dict) -> str:
     except Exception:
         pass
     return "offline"
+
+
+# ---------------------------------------------------------------------------
+# IMAGE GENERATION — HuggingFace Inference for diffusion models
+# ---------------------------------------------------------------------------
+# Used by the marketing_image sub-module. Uses the same HF account that
+# powers the LLM tier, so no new credentials needed. FLUX.1-schnell is
+# the recommended default — fast (~5-10s/image) and cheap. SDXL or
+# FLUX.1-dev can be selected for higher quality at higher cost.
+
+def generate_image(config: dict, prompt: str,
+                    model: str = "black-forest-labs/FLUX.1-schnell",
+                    size: tuple[int, int] = (1024, 1024),
+                    timeout: int = 60) -> bytes:
+    """Generate one image. Returns raw PNG bytes on success, raises on
+    failure. The caller handles persistence + URL routing."""
+    cfg = config.get("huggingface") or {}
+    token = cfg.get("api_key")
+    if not token:
+        raise RuntimeError("HuggingFace API key not configured")
+    if not prompt or len(prompt.strip()) < 4:
+        raise ValueError("prompt is empty or too short")
+
+    width, height = size
+    # FLUX/SDXL accept width/height as ints divisible by 8.
+    width  = max(256, min(1792, int(width)  // 8 * 8))
+    height = max(256, min(1792, int(height) // 8 * 8))
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type":  "application/json",
+        "Accept":        "image/png",
+        "User-Agent":    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    }
+    body = {
+        "inputs": prompt[:4000],
+        "parameters": {
+            "width":  width,
+            "height": height,
+            # FLUX.1-schnell ignores extra params; SDXL respects them.
+            "num_inference_steps": 4 if "schnell" in model else 25,
+            "guidance_scale": 0.0 if "schnell" in model else 7.5,
+        },
+    }
+
+    # Primary: HF Inference router (Inference Providers — paid HF Pro)
+    # Provider-specific routing happens server-side based on the model.
+    primary_url = f"https://router.huggingface.co/hf-inference/models/{model}"
+    # Fallback: direct (older free tier; some models still live here)
+    fallback_url = f"https://api-inference.huggingface.co/models/{model}"
+
+    last_err: Exception | None = None
+    for url in (primary_url, fallback_url):
+        try:
+            req = urllib.request.Request(
+                url, method="POST",
+                data=json.dumps(body).encode("utf-8"),
+                headers=headers,
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                if resp.status != 200:
+                    last_err = RuntimeError(
+                        f"HF {url} returned HTTP {resp.status}")
+                    continue
+                content_type = resp.headers.get("Content-Type") or ""
+                payload = resp.read()
+                # Some HF endpoints wrap the image in JSON like
+                # {"image": "<base64>"} when the model loader is busy.
+                if "image" in content_type or content_type.startswith("image/"):
+                    return payload
+                if content_type.startswith("application/json"):
+                    try:
+                        data = json.loads(payload.decode("utf-8"))
+                    except Exception:
+                        last_err = RuntimeError("non-image, non-JSON response")
+                        continue
+                    # base64-encoded image fallback
+                    b64 = (data.get("image") if isinstance(data, dict) else "") or ""
+                    if b64:
+                        import base64
+                        return base64.b64decode(b64)
+                    # "model is loading" / queued response — surface a useful error
+                    err_msg = (data.get("error") if isinstance(data, dict) else "") or "unknown"
+                    last_err = RuntimeError(f"HF response: {err_msg}")
+                    continue
+                # Unknown content type — best effort, return as-is
+                return payload
+        except urllib.error.HTTPError as e:
+            last_err = RuntimeError(f"HTTP {e.code} from {url}: {e.reason}")
+        except (urllib.error.URLError, OSError, json.JSONDecodeError) as e:
+            last_err = e
+    raise RuntimeError(f"image generation failed: {last_err}")

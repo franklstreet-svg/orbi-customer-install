@@ -148,8 +148,30 @@ def due_now(user_dir: Path) -> list[dict]:
 
 
 def mark_fired(user_dir: Path, reminder_id: str) -> bool:
-    return _set_status(user_dir, reminder_id, "fired",
-                       extra={"fired_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")})
+    """Mark a reminder as fired — AND mark every duplicate twin in the
+    same dedup bucket fired too. Without this, the firing worker would
+    fire one duplicate per tick (every 60s) until the cluster drained,
+    creating a "buzz the user every minute for 8 minutes" loop when
+    historical duplicates exist in the file. Pre-write-side-dedup data
+    routinely has these clusters."""
+    fired_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    with _LOCK:
+        rem = _load(user_dir)
+        target = next((r for r in rem if r.get("id") == reminder_id), None)
+        if not target:
+            return False
+        target_key = _dedup_key(target)
+        count = 0
+        for r in rem:
+            if r.get("status") in ("done", "fired"):
+                continue
+            if _dedup_key(r) == target_key:
+                r["status"] = "fired"
+                r["fired_at"] = fired_at
+                count += 1
+        if count:
+            _save(user_dir, rem)
+        return count > 0
 
 
 def _set_status(user_dir: Path, reminder_id: str, status: str, extra: dict | None = None) -> bool:

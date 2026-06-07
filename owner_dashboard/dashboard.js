@@ -17,6 +17,7 @@
   document.addEventListener('DOMContentLoaded', () => {
     setupTabs();
     setupLogout();
+    setupReportIssue();
     setupMessageFilters();
     setupBusinessForm();
     setupSettingsForm();
@@ -106,6 +107,74 @@
     document.getElementById('logout-btn')?.addEventListener('click', async () => {
       try { await api('/api/owner/logout', { method: 'POST' }); } catch {}
       window.location.href = '/owner/login';
+    });
+  }
+
+  // ------------------------------------------------------------------
+  // Report-an-issue modal — POSTs the owner's description to /api/owner/report_issue
+  // which forwards it to the brain server's customer_error_report endpoint.
+  // ------------------------------------------------------------------
+  function setupReportIssue() {
+    const btn      = document.getElementById('report-issue-btn');
+    const modal    = document.getElementById('report-issue-modal');
+    const cancel   = document.getElementById('report-issue-cancel');
+    const send     = document.getElementById('report-issue-send');
+    const text     = document.getElementById('report-issue-text');
+    const result   = document.getElementById('report-issue-result');
+    if (!btn || !modal) return;
+
+    const open = () => {
+      result.textContent = '';
+      text.value = '';
+      modal.hidden = false;
+      modal.style.display = 'flex';
+      text.focus();
+    };
+    const close = () => {
+      modal.hidden = true;
+      modal.style.display = 'none';
+    };
+
+    btn.addEventListener('click', open);
+    cancel?.addEventListener('click', close);
+    modal.addEventListener('click', (e) => {
+      if (e.target === modal) close();
+    });
+
+    send?.addEventListener('click', async () => {
+      const description = (text.value || '').trim();
+      if (description.length < 5) {
+        result.style.color = '#fbbf24';
+        result.textContent = 'A few more words would help — what was Orby trying to do?';
+        text.focus();
+        return;
+      }
+      send.disabled = true;
+      send.textContent = 'Sending...';
+      try {
+        const res = await api('/api/owner/report_issue', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            description,
+            page_url: window.location.href,
+            user_agent: navigator.userAgent.slice(0, 200),
+          })
+        });
+        if (res && res.ok !== false) {
+          result.style.color = '#4ade80';
+          result.textContent = '✓ Sent. Frank usually responds within a few hours.';
+          setTimeout(close, 1800);
+        } else {
+          throw new Error(res?.error || 'unknown');
+        }
+      } catch (e) {
+        result.style.color = '#ef4444';
+        result.textContent = "Couldn't send right now — try again or email Frank directly.";
+      } finally {
+        send.disabled = false;
+        send.textContent = 'Send to Frank';
+      }
     });
   }
 
@@ -1074,6 +1143,8 @@
   let currentRole = null;
   let myDayLoaded = false, contactsLoaded = false, peopleLoaded = false;
 
+  let marketingLoaded = false;
+
   document.addEventListener('DOMContentLoaded', async () => {
     // Discover who's logged in (role determines People-tab visibility)
     try {
@@ -1085,9 +1156,22 @@
       }
     } catch {}
 
+    // Discover entitlements — show paid-add-on tabs / buttons if active.
+    try {
+      const health = await fetch('/health').then(r => r.json());
+      const mods = (health.enabled_modules || []).map(m => String(m).toLowerCase());
+      if (mods.includes('marketing')) {
+        document.querySelectorAll('.module-marketing').forEach(el => el.hidden = false);
+      }
+      if (mods.includes('marketing_image')) {
+        document.querySelectorAll('.module-marketing-image').forEach(el => el.hidden = false);
+      }
+    } catch {}
+
     wireMyDayForms();
     wireContacts();
     wirePeople();
+    wireMarketing();
 
     document.querySelectorAll('.tab').forEach(t => {
       t.addEventListener('click', () => {
@@ -1095,6 +1179,7 @@
         if (which === 'myday' && !myDayLoaded)     { loadMyDay();   myDayLoaded = true; }
         if (which === 'contacts' && !contactsLoaded) { loadContacts(); contactsLoaded = true; }
         if (which === 'people' && !peopleLoaded)   { loadPeople();  peopleLoaded = true; }
+        if (which === 'marketing' && !marketingLoaded) { loadMarketingLibrary(); marketingLoaded = true; }
       });
     });
   });
@@ -4975,5 +5060,565 @@
     setInterval(_teamRefreshSidebar, 30000);
   }
   document.addEventListener('DOMContentLoaded', _wireTeamChat);
+
+  // ════════════════════════════════════════════════════════════════════
+  //   FORMS TAB — upload labeled form templates, auto-detect fields
+  // ════════════════════════════════════════════════════════════════════
+
+  // Display labels for the canonical kinds (must match modules/forms.VALID_KINDS)
+  const _FORM_KIND_LABELS = {
+    change_order: 'Change Order',
+    contract: 'Contract',
+    msa: 'Master Service Agreement',
+    lien_waiver_partial_cond: 'Lien Waiver (Partial Conditional)',
+    lien_waiver_partial_uncond: 'Lien Waiver (Partial Unconditional)',
+    lien_waiver_final_cond: 'Lien Waiver (Final Conditional)',
+    lien_waiver_final_uncond: 'Lien Waiver (Final Unconditional)',
+    w9: 'W-9',
+    coi_request: 'COI Request',
+    subcontractor_agreement: 'Subcontractor Agreement',
+    punch_list: 'Punch List',
+    proposal: 'Proposal',
+    invoice_custom: 'Custom Invoice',
+    custom: 'Custom',
+  };
+
+  // The Orby data fields that can be mapped from template fields.
+  // Mirror of the synonym table in modules/forms.py.
+  const _MAPPED_TO_OPTIONS = [
+    ['', '— skip this field —'],
+    ['customer_name', 'Customer name'],
+    ['customer_phone', 'Customer phone'],
+    ['customer_email', 'Customer email'],
+    ['address', 'Project address'],
+    ['city', 'City'],
+    ['state', 'State'],
+    ['zip', 'ZIP'],
+    ['project_label', 'Project name / label'],
+    ['co_number', 'Change-order number'],
+    ['contract_amount', 'Original contract amount'],
+    ['amount', 'CO amount (this change)'],
+    ['new_contract_amount', 'New total after CO'],
+    ['description', 'Description / scope'],
+    ['today', 'Today\'s date'],
+    ['contracted_at', 'Contract date'],
+    ['started_at', 'Start date'],
+    ['est_complete', 'Estimated completion'],
+    ['biz_name', 'Contractor (your business) name'],
+    ['biz_license', 'Contractor license #'],
+    ['biz_address', 'Contractor address'],
+    ['biz_phone', 'Contractor phone'],
+    ['biz_email', 'Contractor email'],
+    ['signature_pad', 'Customer signature'],
+    ['biz_signature_pad', 'Contractor signature'],
+  ];
+
+  async function formsLoad() {
+    const listEl = document.getElementById('forms-list');
+    const emptyEl = document.getElementById('forms-empty-state');
+    if (!listEl) return;
+    try {
+      const r = await fetch('/api/owner/forms');
+      if (!r.ok) {
+        listEl.innerHTML = '<div class="empty-state-small">Failed to load. ' + r.status + '</div>';
+        return;
+      }
+      const { templates } = await r.json();
+      if (!templates || templates.length === 0) {
+        listEl.innerHTML = '';
+        if (emptyEl) emptyEl.hidden = false;
+        return;
+      }
+      if (emptyEl) emptyEl.hidden = true;
+      // Group by kind
+      const byKind = {};
+      templates.forEach((t) => { (byKind[t.kind] = byKind[t.kind] || []).push(t); });
+      const html = [];
+      Object.keys(byKind).sort().forEach((kind) => {
+        const label = _FORM_KIND_LABELS[kind] || kind;
+        html.push(`<div class="forms-group" style="margin-bottom:18px">
+          <h3 style="margin:0 0 6px;font-size:14px;color:#555">${label}</h3>`);
+        byKind[kind].forEach((t) => {
+          const fieldCount = (t.detected_fields || []).length;
+          const mappedCount = (t.detected_fields || []).filter((f) => f.mapped_to).length;
+          const isDefault = t.is_default;
+          const uploaded = new Date((t.uploaded_at || 0) * 1000).toLocaleDateString();
+          html.push(`
+            <div class="files-row" style="display:flex;align-items:center;gap:10px;padding:10px;border:1px solid #e6e6e6;border-radius:6px;margin-bottom:6px;background:#fafafa">
+              <div style="flex:1">
+                <div style="font-weight:600">${escapeHtml(t.display_name || t.filename)}
+                  ${isDefault ? '<span style="background:#daf3da;color:#28732e;border-radius:3px;font-size:11px;padding:2px 6px;margin-left:6px">DEFAULT</span>' : ''}
+                </div>
+                <div style="font-size:12px;color:#888;margin-top:2px">
+                  ${escapeHtml(t.filename)} · v${t.version} · uploaded ${uploaded} ·
+                  ${fieldCount} fields (${mappedCount} mapped)
+                </div>
+              </div>
+              <button class="secondary-btn" onclick="window.formsEditMapping('${t.id}')">Edit fields</button>
+              ${isDefault ? '' : `<button class="secondary-btn" onclick="window.formsSetDefault('${t.id}')">Make default</button>`}
+              <button class="secondary-btn" style="color:#a00" onclick="window.formsDelete('${t.id}', '${escapeHtml(t.display_name)}')">Delete</button>
+            </div>
+          `);
+        });
+        html.push(`</div>`);
+      });
+      listEl.innerHTML = html.join('');
+    } catch (e) {
+      listEl.innerHTML = '<div class="empty-state-small">Load failed: ' + (e.message || e) + '</div>';
+    }
+  }
+
+  function escapeHtml(s) {
+    return String(s || '').replace(/[&<>"']/g, (c) =>
+      ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  }
+
+  async function formsUpload(evt) {
+    evt.preventDefault();
+    const form = document.getElementById('forms-upload-form');
+    const goBtn = document.getElementById('forms-upload-go');
+    if (!form || !goBtn) return;
+    const fileInput = document.getElementById('forms-upload-file');
+    if (!fileInput.files || fileInput.files.length === 0) {
+      alert('Pick a PDF or .docx file first');
+      return;
+    }
+    goBtn.disabled = true;
+    goBtn.textContent = 'Uploading…';
+    const fd = new FormData();
+    fd.append('file', fileInput.files[0]);
+    fd.append('kind', document.getElementById('forms-upload-kind').value);
+    fd.append('display_name', document.getElementById('forms-upload-name').value || '');
+    fd.append('is_default', document.getElementById('forms-upload-default').checked ? '1' : '0');
+    try {
+      const r = await fetch('/api/owner/forms/upload', { method: 'POST', body: fd });
+      const j = await r.json();
+      if (!r.ok) {
+        alert('Upload failed: ' + (j.error || r.status));
+        return;
+      }
+      document.getElementById('forms-upload-dialog').close();
+      form.reset();
+      await formsLoad();
+      // Auto-open the mapping review so owner can fix any unmapped fields
+      if (j.template && j.template.id) {
+        formsEditMapping(j.template.id);
+      }
+    } catch (e) {
+      alert('Upload failed: ' + (e.message || e));
+    } finally {
+      goBtn.disabled = false;
+      goBtn.textContent = 'Upload & analyze';
+    }
+  }
+
+  window.formsEditMapping = async function (templateId) {
+    try {
+      const r = await fetch('/api/owner/forms/' + templateId);
+      if (!r.ok) { alert('Failed to load template'); return; }
+      const tpl = await r.json();
+      const dlg = document.getElementById('forms-mapping-dialog');
+      const titleEl = document.getElementById('forms-mapping-title');
+      const fieldsEl = document.getElementById('forms-mapping-fields');
+      titleEl.textContent = 'Field mapping — ' + (tpl.display_name || tpl.filename);
+      const fields = tpl.detected_fields || [];
+      if (fields.length === 0) {
+        fieldsEl.innerHTML = `<div class="empty-state-small">
+          No fillable fields found in this template. If you uploaded a flat
+          scanned PDF, Orby can\'t auto-fill it (needs PDF AcroForm fields
+          or Word {{placeholders}}). Recreate the form in Word with
+          placeholders like <code>{{customer_name}}</code> and re-upload.
+        </div>`;
+      } else {
+        const html = fields.map((f) => {
+          const opts = _MAPPED_TO_OPTIONS.map(([v, lbl]) =>
+            `<option value="${v}"${f.mapped_to === v ? ' selected' : ''}>${escapeHtml(lbl)}</option>`
+          ).join('');
+          return `
+            <div style="display:flex;gap:10px;align-items:center;margin-bottom:8px;padding:8px;background:#f7f7f9;border-radius:4px">
+              <div style="flex:1">
+                <div style="font-weight:600">${escapeHtml(f.name)}</div>
+                <div style="font-size:11px;color:#888">type: ${f.type || 'text'}</div>
+              </div>
+              <select style="flex:1;max-width:280px"
+                      data-template="${templateId}"
+                      data-field="${escapeHtml(f.name)}"
+                      onchange="window.formsSaveMapping(this)">
+                ${opts}
+              </select>
+            </div>`;
+        }).join('');
+        fieldsEl.innerHTML = html;
+      }
+      dlg.showModal();
+    } catch (e) {
+      alert('Failed: ' + (e.message || e));
+    }
+  };
+
+  window.formsSaveMapping = async function (selectEl) {
+    const templateId = selectEl.dataset.template;
+    const fieldName = selectEl.dataset.field;
+    const mappedTo = selectEl.value;
+    try {
+      await fetch('/api/owner/forms/' + templateId + '/mapping', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ field_name: fieldName, mapped_to: mappedTo }),
+      });
+      // Visual confirmation
+      selectEl.style.borderColor = '#28732e';
+      setTimeout(() => { selectEl.style.borderColor = ''; }, 1000);
+    } catch (e) {
+      alert('Save failed: ' + (e.message || e));
+    }
+  };
+
+  window.formsSetDefault = async function (templateId) {
+    try {
+      await fetch('/api/owner/forms/' + templateId + '/default', { method: 'POST' });
+      await formsLoad();
+    } catch (e) { alert('Failed: ' + e.message); }
+  };
+
+  window.formsDelete = async function (templateId, displayName) {
+    if (!confirm('Delete template "' + displayName + '"? Filled forms already saved are unaffected.')) return;
+    try {
+      await fetch('/api/owner/forms/' + templateId, { method: 'DELETE' });
+      await formsLoad();
+    } catch (e) { alert('Failed: ' + e.message); }
+  };
+
+  function _wireFormsTab() {
+    const formsTab = document.querySelector('.tab[data-tab="forms"]');
+    if (formsTab) formsTab.addEventListener('click', formsLoad);
+    const uploadBtn = document.getElementById('forms-upload-btn');
+    if (uploadBtn) uploadBtn.addEventListener('click', () => {
+      document.getElementById('forms-upload-dialog').showModal();
+    });
+    const form = document.getElementById('forms-upload-form');
+    if (form) form.addEventListener('submit', formsUpload);
+  }
+  document.addEventListener('DOMContentLoaded', _wireFormsTab);
+
+  // ==================================================================
+  // MARKETING module — multi-platform ad copy + image generation
+  // ==================================================================
+  let _currentCampaign = null;  // { id, title, brief, assets, images }
+  const _PLATFORM_LABELS = {
+    facebook_post:    'Facebook post',
+    instagram_post:   'Instagram caption',
+    tiktok_caption:   'TikTok caption',
+    linkedin_post:    'LinkedIn post',
+    google_search_ad: 'Google Search ad',
+    email_newsletter: 'Email newsletter',
+    print_flyer:      'Print flyer',
+  };
+
+  function _esc(s) {
+    return String(s || '')
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  function _copyButton(label, text) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'text-btn marketing-copy-btn';
+    btn.textContent = label || 'Copy';
+    btn.addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(text);
+        const orig = btn.textContent;
+        btn.textContent = '✓ Copied';
+        setTimeout(() => { btn.textContent = orig; }, 1400);
+      } catch {
+        btn.textContent = 'Copy failed';
+      }
+    });
+    return btn;
+  }
+
+  function _renderPlatformCard(key, payload) {
+    const card = document.createElement('div');
+    card.className = 'marketing-card';
+    const header = document.createElement('div');
+    header.className = 'marketing-card-header';
+    const h = document.createElement('h4');
+    h.textContent = _PLATFORM_LABELS[key] || key;
+    header.appendChild(h);
+
+    // Build the rendered text + plain text for clipboard
+    let plain = '';
+    const body = document.createElement('div');
+    body.className = 'marketing-card-body';
+
+    if (key === 'google_search_ad' && typeof payload === 'object') {
+      const lines = [];
+      ['headline_1','headline_2','headline_3'].forEach(k => {
+        if (payload[k]) lines.push(`Headline: ${payload[k]}`);
+      });
+      ['description_1','description_2'].forEach(k => {
+        if (payload[k]) lines.push(`Description: ${payload[k]}`);
+      });
+      plain = lines.join('\n');
+      body.innerHTML = lines.map(l => `<div>${_esc(l)}</div>`).join('');
+    } else if (key === 'email_newsletter' && typeof payload === 'object') {
+      const parts = [];
+      if (payload.subject)   parts.push(`Subject: ${payload.subject}`);
+      if (payload.preheader) parts.push(`Preheader: ${payload.preheader}`);
+      if (payload.body)      parts.push('', payload.body);
+      plain = parts.join('\n');
+      body.innerHTML = parts.map(p => `<div>${_esc(p).replace(/\n/g,'<br>')}</div>`).join('');
+    } else {
+      plain = String(payload || '');
+      body.innerHTML = _esc(plain).replace(/\n/g,'<br>');
+    }
+
+    header.appendChild(_copyButton('Copy', plain));
+    card.appendChild(header);
+    card.appendChild(body);
+    return card;
+  }
+
+  function _renderCampaignResults(title, assets, images) {
+    const root = document.getElementById('marketing-results');
+    if (!root) return;
+    root.hidden = false;
+    root.innerHTML = '';
+
+    const title_h = document.createElement('h3');
+    title_h.textContent = title || '(untitled campaign)';
+    root.appendChild(title_h);
+
+    // Save / new actions
+    const actions = document.createElement('div');
+    actions.className = 'marketing-actions';
+    const saveBtn = document.createElement('button');
+    saveBtn.type = 'button';
+    saveBtn.className = 'primary-btn';
+    saveBtn.textContent = _currentCampaign && _currentCampaign.id
+                            ? 'Update saved campaign' : 'Save campaign';
+    saveBtn.addEventListener('click', () => _saveCurrentCampaign());
+    actions.appendChild(saveBtn);
+    root.appendChild(actions);
+
+    // Platform cards
+    const grid = document.createElement('div');
+    grid.className = 'marketing-grid';
+    const order = ['facebook_post','instagram_post','tiktok_caption',
+                    'linkedin_post','google_search_ad','email_newsletter',
+                    'print_flyer'];
+    order.forEach(k => {
+      if (assets && assets[k]) {
+        grid.appendChild(_renderPlatformCard(k, assets[k]));
+      }
+    });
+    root.appendChild(grid);
+
+    // Images section (if any attached)
+    if (images && images.length) {
+      const ih = document.createElement('h3');
+      ih.textContent = `Images (${images.length})`;
+      ih.style.marginTop = '24px';
+      root.appendChild(ih);
+      const igrid = document.createElement('div');
+      igrid.className = 'marketing-image-grid';
+      images.forEach(img => {
+        const wrap = document.createElement('div');
+        wrap.className = 'marketing-image-wrap';
+        const i = document.createElement('img');
+        i.src = img.url;
+        i.alt = img.prompt || 'generated';
+        wrap.appendChild(i);
+        const cap = document.createElement('div');
+        cap.className = 'muted';
+        cap.style.fontSize = '12px';
+        cap.style.padding = '6px 4px';
+        cap.textContent = (img.platform || '') + (img.prompt ? ' — ' + img.prompt.slice(0,120) + (img.prompt.length>120?'…':'') : '');
+        wrap.appendChild(cap);
+        igrid.appendChild(wrap);
+      });
+      root.appendChild(igrid);
+    }
+  }
+
+  async function _saveCurrentCampaign() {
+    if (!_currentCampaign) return;
+    const status = document.getElementById('marketing-status');
+    if (status) status.textContent = 'Saving…';
+    try {
+      const r = await api('/api/owner/marketing/save', {
+        method: 'POST',
+        body: JSON.stringify({
+          id:     _currentCampaign.id || undefined,
+          brief:  _currentCampaign.brief || '',
+          title:  _currentCampaign.title || '',
+          assets: _currentCampaign.assets || {},
+        }),
+      });
+      _currentCampaign = r.campaign;
+      if (status) status.textContent = '✓ Saved';
+      setTimeout(() => { if (status) status.textContent = ''; }, 1600);
+      await loadMarketingLibrary();
+    } catch (e) {
+      if (status) status.textContent = 'Save failed';
+      console.error('marketing save failed', e);
+    }
+  }
+
+  async function _generateCampaign() {
+    const ta = document.getElementById('marketing-brief');
+    const status = document.getElementById('marketing-status');
+    const btn = document.getElementById('marketing-generate');
+    const brief = (ta && ta.value || '').trim();
+    if (brief.length < 8) {
+      if (status) status.textContent = 'Tell me a bit more about the campaign first.';
+      return;
+    }
+    if (status) status.textContent = 'Generating… (10-20 seconds)';
+    if (btn) btn.disabled = true;
+    try {
+      const r = await api('/api/owner/marketing/generate', {
+        method: 'POST',
+        body: JSON.stringify({ brief }),
+      });
+      _currentCampaign = {
+        id:     null,
+        title:  r.title || '',
+        brief:  r.brief || brief,
+        assets: r.assets || {},
+        images: [],
+      };
+      _renderCampaignResults(_currentCampaign.title,
+                              _currentCampaign.assets,
+                              _currentCampaign.images);
+      if (status) status.textContent = '';
+    } catch (e) {
+      console.error('marketing generate failed', e);
+      if (status) status.textContent = 'Generation failed — try again or rephrase.';
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
+  async function _generateImage() {
+    if (!_currentCampaign) {
+      const status = document.getElementById('marketing-status');
+      if (status) status.textContent = 'Generate copy first, then I can add an image.';
+      return;
+    }
+    const brief = _currentCampaign.brief || '';
+    const status = document.getElementById('marketing-status');
+    const btn = document.getElementById('marketing-image');
+    if (status) status.textContent = 'Painting image… (10-20 seconds)';
+    if (btn) btn.disabled = true;
+    try {
+      // Save the campaign first if not yet — image attaches to it.
+      if (!_currentCampaign.id) {
+        await _saveCurrentCampaign();
+      }
+      const r = await api('/api/owner/marketing/image', {
+        method: 'POST',
+        body: JSON.stringify({
+          brief, platform: 'instagram',
+          campaign_id: _currentCampaign.id,
+        }),
+      });
+      if (!_currentCampaign.images) _currentCampaign.images = [];
+      _currentCampaign.images.push(r.image);
+      _renderCampaignResults(_currentCampaign.title,
+                              _currentCampaign.assets,
+                              _currentCampaign.images);
+      if (status) status.textContent = '';
+    } catch (e) {
+      console.error('marketing image generation failed', e);
+      if (status) status.textContent = 'Image generation failed.';
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
+  async function loadMarketingLibrary() {
+    const lib = document.getElementById('marketing-library');
+    if (!lib) return;
+    lib.innerHTML = '<div class="muted" style="font-size:12px">Loading…</div>';
+    try {
+      const r = await api('/api/owner/marketing/campaigns');
+      const items = (r && r.campaigns) || [];
+      if (!items.length) {
+        lib.innerHTML = '<div class="muted" style="font-size:12px">No saved campaigns yet. Generate one to start a library.</div>';
+        return;
+      }
+      lib.innerHTML = '';
+      items.forEach(c => {
+        const row = document.createElement('div');
+        row.className = 'marketing-library-row';
+        row.dataset.id = c.id;
+        row.innerHTML = `
+          <div class="marketing-library-title">${_esc(c.title || '(untitled)')}</div>
+          <div class="muted" style="font-size:11px">${_esc((c.created_at || '').slice(0,10))} · ${c.image_count || 0} image${c.image_count===1?'':'s'}</div>
+        `;
+        row.addEventListener('click', () => _openCampaign(c.id));
+        const del = document.createElement('button');
+        del.type = 'button';
+        del.className = 'text-btn';
+        del.style.float = 'right';
+        del.style.fontSize = '11px';
+        del.textContent = '✕';
+        del.title = 'Delete';
+        del.addEventListener('click', async (ev) => {
+          ev.stopPropagation();
+          if (!confirm(`Delete "${c.title || 'this campaign'}"?`)) return;
+          try {
+            await api(`/api/owner/marketing/campaigns/${c.id}`, { method: 'DELETE' });
+            await loadMarketingLibrary();
+          } catch (e) { console.error('delete failed', e); }
+        });
+        row.appendChild(del);
+        lib.appendChild(row);
+      });
+    } catch (e) {
+      console.error('library load failed', e);
+      lib.innerHTML = '<div class="muted" style="font-size:12px;color:#a44">Could not load library.</div>';
+    }
+  }
+
+  async function _openCampaign(id) {
+    try {
+      const r = await api(`/api/owner/marketing/campaigns/${id}`);
+      const c = r.campaign;
+      _currentCampaign = {
+        id:     c.id,
+        title:  c.title,
+        brief:  c.brief,
+        assets: c.assets || {},
+        images: c.images || [],
+      };
+      const ta = document.getElementById('marketing-brief');
+      if (ta) ta.value = c.brief || '';
+      _renderCampaignResults(c.title, c.assets, c.images);
+    } catch (e) {
+      console.error('open failed', e);
+    }
+  }
+
+  function _newCampaign() {
+    _currentCampaign = null;
+    const ta = document.getElementById('marketing-brief');
+    if (ta) ta.value = '';
+    const root = document.getElementById('marketing-results');
+    if (root) { root.hidden = true; root.innerHTML = ''; }
+    const status = document.getElementById('marketing-status');
+    if (status) status.textContent = '';
+  }
+
+  function wireMarketing() {
+    const gen = document.getElementById('marketing-generate');
+    const img = document.getElementById('marketing-image');
+    const fresh = document.getElementById('marketing-new');
+    if (gen)   gen.addEventListener('click', _generateCampaign);
+    if (img)   img.addEventListener('click', _generateImage);
+    if (fresh) fresh.addEventListener('click', _newCampaign);
+  }
 
 })();

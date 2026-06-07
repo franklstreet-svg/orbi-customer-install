@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Orby Dashboard</title>
+  <title>Orbi Dashboard</title>
   <link rel="manifest" href="/pwa/manifest.json">
   <meta name="theme-color" content="#0b0f1a">
   <link rel="icon" type="image/png" sizes="32x32" href="/pwa/icons/icon-favicon.png">
@@ -32,9 +32,41 @@
 
     <div class="top-actions">
       <span class="status-pill" id="status-pill">● Online</span>
+      <button class="icon-btn" id="report-issue-btn" title="Report a problem to Frank">⚠️</button>
       <button class="icon-btn" id="logout-btn" title="Sign out">⏻</button>
     </div>
   </header>
+
+  <!-- Report Issue modal -->
+  <div id="report-issue-modal" hidden style="position:fixed;inset:0;background:rgba(0,0,0,0.75);z-index:9999;align-items:center;justify-content:center;padding:20px">
+    <div style="background:#131a2e;border:1px solid #1a2235;border-radius:14px;max-width:520px;width:100%;padding:24px;box-shadow:0 12px 40px rgba(0,0,0,0.4)">
+      <h2 style="margin:0 0 8px;color:#eaf0ff;font-size:20px">Report a problem</h2>
+      <p style="color:#94a3b8;font-size:13px;margin:0 0 16px">
+        Tell Frank what's broken or weird. This goes straight to his
+        admin dashboard — he checks it a few times a day.
+      </p>
+      <label style="font-size:13px;color:#cbd5e1;display:block;margin-bottom:6px">
+        What happened?
+      </label>
+      <textarea id="report-issue-text" rows="5"
+        placeholder="e.g. When I ask Orby to add a calendar event for next Tuesday, she puts it on this Tuesday instead. Started today, didn't happen yesterday."
+        style="width:100%;background:#0a0f1e;border:1px solid #1a2235;border-radius:8px;
+               color:#e6edf6;font-size:14px;padding:10px;box-sizing:border-box;font-family:inherit;
+               resize:vertical;min-height:100px"></textarea>
+      <div id="report-issue-result" style="margin-top:10px;font-size:13px;min-height:18px"></div>
+      <div style="display:flex;gap:8px;margin-top:16px;justify-content:flex-end">
+        <button id="report-issue-cancel" class="icon-btn"
+          style="background:transparent;color:#94a3b8;padding:8px 16px;border-radius:8px;cursor:pointer">
+          Cancel
+        </button>
+        <button id="report-issue-send" class="icon-btn"
+          style="background:linear-gradient(135deg,#4f8cff,#8b5cf6);color:#fff;
+                 padding:8px 18px;border-radius:8px;cursor:pointer;font-weight:600">
+          Send to Frank
+        </button>
+      </div>
+    </div>
+  </div>
 
   <nav class="tabs">
     <button class="tab" data-tab="messages">
@@ -46,7 +78,9 @@
     <button class="tab" data-tab="email">Email <span class="badge" id="email-count" hidden>0</span></button>
     <button class="tab" data-tab="contacts">Contacts</button>
     <button class="tab" data-tab="files">Files</button>
+    <button class="tab" data-tab="forms" title="Upload your own change-order, contract, lien-waiver templates">Forms</button>
     <button class="tab" data-tab="business">Business</button>
+    <button class="tab module-marketing" data-tab="marketing" hidden>Marketing</button>
     <button class="tab owner-only" data-tab="people" hidden>Staff</button>
     <button class="tab" data-tab="team">Team Chat <span class="badge" id="team-unread-badge" hidden>0</span></button>
     <button class="tab" data-tab="settings">Settings</button>
@@ -584,6 +618,97 @@
       </dialog>
     </section>
 
+    <!-- FORMS TAB — upload your own change-order, contract, lien-waiver, W-9 templates -->
+    <section class="tab-panel" id="tab-forms">
+      <div class="toolbar">
+        <h2 style="margin:0">Form templates</h2>
+        <button class="primary-btn" id="forms-upload-btn">+ Upload template</button>
+      </div>
+      <p class="muted" style="margin:4px 0 14px">
+        Upload your own change-order, contract, lien-waiver, W-9, etc. templates.
+        Orby reads each one, detects the fillable fields, and maps them to your
+        project data automatically. When the foreman says
+        <em>"CO for Johnson — 3 plugs in the garage"</em>, Orby fills out your
+        branded template and hands the customer a sign link on the spot.
+      </p>
+
+      <div id="forms-empty-state" class="empty-state-small" hidden>
+        No form templates uploaded yet. Click <strong>+ Upload template</strong> to get started.
+        Supported: PDF (with form fields) or Word (.docx with {{placeholder}} or [Bracket Name]).
+      </div>
+
+      <div id="forms-list" class="files-list">
+        <div class="empty-state-small">Loading…</div>
+      </div>
+
+      <!-- Upload dialog -->
+      <dialog id="forms-upload-dialog">
+        <form method="dialog" id="forms-upload-form">
+          <h2 style="margin:0 0 4px">Upload form template</h2>
+          <p class="muted" style="margin:0 0 14px;font-size:13px">
+            Upload your blank form. Orby auto-detects fields and maps them to project data.
+          </p>
+
+          <label>What kind of form is this?
+            <select name="kind" id="forms-upload-kind" required>
+              <option value="change_order">Change Order</option>
+              <option value="contract">Contract</option>
+              <option value="msa">Master Service Agreement (MSA)</option>
+              <option value="lien_waiver_partial_cond">Lien Waiver — Partial Conditional</option>
+              <option value="lien_waiver_partial_uncond">Lien Waiver — Partial Unconditional</option>
+              <option value="lien_waiver_final_cond">Lien Waiver — Final Conditional</option>
+              <option value="lien_waiver_final_uncond">Lien Waiver — Final Unconditional</option>
+              <option value="w9">W-9</option>
+              <option value="coi_request">COI Request</option>
+              <option value="subcontractor_agreement">Subcontractor Agreement</option>
+              <option value="punch_list">Punch List</option>
+              <option value="proposal">Proposal</option>
+              <option value="invoice_custom">Custom Invoice</option>
+              <option value="custom">Other / Custom</option>
+            </select>
+          </label>
+
+          <label style="margin-top:10px">Display name
+            <input type="text" name="display_name" id="forms-upload-name"
+                   placeholder="e.g. Acme Standard Change Order">
+          </label>
+
+          <label style="margin-top:10px">File (PDF or Word .docx)
+            <input type="file" name="file" id="forms-upload-file"
+                   accept=".pdf,.docx" required>
+          </label>
+
+          <label style="margin-top:10px;display:flex;align-items:center;gap:8px">
+            <input type="checkbox" name="is_default" id="forms-upload-default" checked
+                   style="width:auto;margin:0">
+            <span>Make this the default for its kind</span>
+          </label>
+
+          <div class="form-actions" style="margin-top:18px">
+            <button type="button" class="secondary-btn"
+                    onclick="document.getElementById('forms-upload-dialog').close()">Cancel</button>
+            <button type="submit" class="primary-btn" id="forms-upload-go">Upload &amp; analyze</button>
+          </div>
+        </form>
+      </dialog>
+
+      <!-- Field-mapping review dialog -->
+      <dialog id="forms-mapping-dialog">
+        <form method="dialog" id="forms-mapping-form">
+          <h2 style="margin:0 0 4px" id="forms-mapping-title">Review field mapping</h2>
+          <p class="muted" style="margin:0 0 14px;font-size:13px">
+            Orby detected these fields in your template. Confirm or change each mapping.
+            Leave blank to skip a field (it stays empty when the form is filled).
+          </p>
+          <div id="forms-mapping-fields" style="max-height:60vh;overflow:auto"></div>
+          <div class="form-actions" style="margin-top:18px">
+            <button type="button" class="secondary-btn"
+                    onclick="document.getElementById('forms-mapping-dialog').close()">Done</button>
+          </div>
+        </form>
+      </dialog>
+    </section>
+
     <!-- PEOPLE TAB (owner-only) -->
     <section class="tab-panel" id="tab-people">
       <div class="toolbar">
@@ -739,6 +864,37 @@
           <span class="save-status" id="save-status"></span>
         </div>
       </form>
+    </section>
+
+    <!-- MARKETING TAB — gated by enabled_modules: marketing -->
+    <section class="tab-panel" id="tab-marketing">
+      <div class="marketing-layout">
+        <div class="marketing-main">
+          <h2 style="margin-top:0">Create a campaign</h2>
+          <p class="muted" style="margin:4px 0 14px;font-size:13.5px">
+            Tell me what the campaign is — the offer, audience, budget, tone.
+            I'll generate copy for Facebook, Instagram, TikTok, LinkedIn, Google
+            Search ads, an email newsletter, and a print flyer. Each has a
+            Copy button so you can paste straight into your accounts.
+          </p>
+
+          <textarea id="marketing-brief" rows="5" placeholder="e.g. 'Mother's Day brunch promo, $100 budget, audience is local Reno families with kids, fun and warm tone, mention our weekend brunch hours 8-2.'" style="width:100%;border-radius:10px;padding:14px;font-size:14px;background:#0f1525;color:#eaf0ff;border:1px solid #2a3554;resize:vertical"></textarea>
+
+          <div style="display:flex;gap:10px;margin-top:12px;align-items:center;flex-wrap:wrap">
+            <button id="marketing-generate" class="primary-btn">Generate copy</button>
+            <button id="marketing-image" class="secondary-btn module-marketing-image" hidden>+ Image</button>
+            <span id="marketing-status" class="muted" style="font-size:13px"></span>
+          </div>
+
+          <div id="marketing-results" class="marketing-results" hidden></div>
+        </div>
+
+        <aside class="marketing-sidebar">
+          <h3 style="margin:0 0 10px">Saved campaigns</h3>
+          <button id="marketing-new" class="text-btn" style="font-size:13px;margin-bottom:10px">+ New campaign</button>
+          <div id="marketing-library" class="marketing-library"></div>
+        </aside>
+      </div>
     </section>
 
     <!-- SETTINGS TAB -->

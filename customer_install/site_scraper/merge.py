@@ -5,6 +5,14 @@ Single-value fields prefer non-empty across pages, with source tracking
 so we know which URL each fact came from. The merged profile is the
 shape `business_info.json` expects, plus extras under `_pages` and
 `_sources`.
+
+NAME PICKING: a separate post-merge step scores all candidate names
+(from per-page LLM extractions, plus org-shaped names mined out of the
+description / other fields) and replaces the merged name with the
+highest-scoring candidate. Earlier behavior was first-non-empty-wins,
+which baked in marketing taglines like "SCS | The Builders Exchange"
+when the real org name (Sierra Contractors Source) appeared further
+into the page body.
 """
 from __future__ import annotations
 
@@ -12,9 +20,91 @@ import re
 from collections import OrderedDict
 
 
+_NAME_SEPARATORS = (" | ", " — ", " - ", ": ")
+_CORPORATE_SUFFIX_TOKENS = (
+    "llc", "inc", "incorporated", "corp", "corporation", "co.", "co,",
+    "ltd", "limited", "group", "holdings", "source", "services",
+    "company", "associates", "partners", "enterprises", "industries",
+)
+
+# "Sierra Contractors Source, 'The Builders Exchange' is more than..."
+# → grab "Sierra Contractors Source" — 2-5 capitalized words at the start
+# of a sentence, followed by punctuation or a verb that introduces the
+# business.
+_NAME_FROM_SENTENCE_RE = re.compile(
+    r"^([A-Z][A-Za-z'&\-]+(?:\s+(?:&|and|of|the|de|la|el)?\s*[A-Z][A-Za-z'&\-]+){1,5})"
+    r"(?:[,.;]|\s+(?:is|are|was|were|provides|offers|specializes|has\s+been|"
+    r"serves|started|founded|operates))",
+    re.MULTILINE,
+)
+
+
+def _score_name_candidate(candidate: str, body_text: str) -> int:
+    """Score a business-name candidate. Higher = more likely the legal name.
+    Used to break ties when multiple candidate names appear across pages."""
+    if not candidate or not candidate.strip():
+        return -1000
+    cand = candidate.strip()
+    low = cand.lower()
+    score = 0
+    # Corporate suffix = strong signal this is a legal entity name.
+    if any(f" {tok}" in f" {low}" or low.endswith(tok)
+            for tok in _CORPORATE_SUFFIX_TOKENS):
+        score += 50
+    # Title with " | " or " - " separator = probably a page title, not a
+    # legal name. Heavy penalty.
+    if any(sep in cand for sep in _NAME_SEPARATORS):
+        score -= 30
+    # All-caps acronym (≤5 chars) = probably an abbreviation, not the
+    # spelled-out legal name.
+    if len(cand) <= 5 and cand.isupper():
+        score -= 20
+    # Occurrence count in body text = repetition boost (cap at +30).
+    if body_text:
+        count = body_text.lower().count(low)
+        score += min(count * 5, 30)
+    # Word count boost — legal names tend to be 2-5 words. Cap at +6.
+    score += min(len(cand.split()), 6)
+    return score
+
+
+def _mine_name_candidates_from_text(text: str) -> list[str]:
+    """Find org-shaped candidate names in body text (description, other)."""
+    if not text:
+        return []
+    found: list[str] = []
+    # Walk sentence by sentence so the start-of-sentence anchor works.
+    for sentence in re.split(r"(?<=[.!?])\s+", text):
+        m = _NAME_FROM_SENTENCE_RE.match(sentence.strip())
+        if m:
+            found.append(m.group(1).strip())
+    return found
+
+
+def _pick_best_name(candidates: list[str], body_text: str) -> str:
+    """From a list of candidate names, pick the highest-scoring one."""
+    cleaned = [c.strip() for c in candidates if c and c.strip()]
+    if not cleaned:
+        return ""
+    seen: set[str] = set()
+    unique = []
+    for c in cleaned:
+        key = c.lower()
+        if key not in seen:
+            seen.add(key)
+            unique.append(c)
+    scored = [(c, _score_name_candidate(c, body_text)) for c in unique]
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return scored[0][0]
+
+
 def merge_pages(extracts: list[dict]) -> dict:
     """`extracts` = [{url, signals, llm_data}, ...]. Returns a unified
     business profile dict."""
+    # Collected per-page name candidates (with source URLs). Used in the
+    # post-merge name-picking pass below.
+    name_candidates: list[tuple[str, str]] = []  # (candidate_name, source_url)
+
     out: dict = {
         "name": "",
         "tagline": "",
@@ -58,6 +148,10 @@ def merge_pages(extracts: list[dict]) -> dict:
             if val and not out[field]:
                 out[field] = val
                 out["_sources"][field] = url
+            # ALSO track every page's name candidate for the post-merge
+            # scoring pass (even if the field is already set on `out`).
+            if field == "name" and val:
+                name_candidates.append((val, url))
 
         # ── Owner — merge piecemeal (different pages may have name vs role
         # vs bio); first non-empty per sub-key wins.
@@ -184,6 +278,60 @@ def merge_pages(extracts: list[dict]) -> dict:
                     "zip":    m.group(4),
                 }
                 out["_sources"]["address"] = url
+
+    # ── Post-merge NAME pick ──────────────────────────────────────────
+    # The first-non-empty-wins logic above can lock in a marketing
+    # tagline (e.g. page title "SCS | The Builders Exchange") when the
+    # real legal name (e.g. "Sierra Contractors Source") is in the
+    # description or repeated in the body. Re-score all candidates +
+    # candidates mined from the merged description/other fields, then
+    # pick the best one.
+    body_text_parts = [out.get("description", "") or ""]
+    other_list = out.get("other") or []
+    if isinstance(other_list, list):
+        body_text_parts.extend([x for x in other_list if isinstance(x, str)])
+    body_text = " ".join(body_text_parts)
+
+    # Add candidates mined from description + other (org-style name patterns).
+    mined = _mine_name_candidates_from_text(body_text)
+    for m_name in mined:
+        name_candidates.append((m_name, "(mined from description/other)"))
+
+    # Also split any title-shaped candidates on separators so the parts
+    # get scored individually.
+    expanded: list[tuple[str, str]] = list(name_candidates)
+    for cand, src in name_candidates:
+        for sep in _NAME_SEPARATORS:
+            if sep in cand:
+                for half in cand.split(sep):
+                    half = half.strip()
+                    if half:
+                        expanded.append((half, src))
+
+    if expanded:
+        cand_strs = [c for c, _ in expanded]
+        best = _pick_best_name(cand_strs, body_text)
+        if best and best.lower() != (out.get("name") or "").lower():
+            old_name = out.get("name", "")
+            # Record source of the new name (mined or per-page extraction)
+            best_src = next(
+                (src for c, src in expanded if c.strip().lower() == best.lower()),
+                out["_sources"].get("name", "(post-merge name pick)")
+            )
+            out["name"] = best
+            out["_sources"]["name"] = best_src
+            # If the displaced name was a title with a separator, promote
+            # the non-name half into tagline (unless tagline already set).
+            if old_name and not out.get("tagline"):
+                for sep in _NAME_SEPARATORS:
+                    if sep in old_name:
+                        halves = [h.strip() for h in old_name.split(sep, 1)]
+                        non_best = [h for h in halves if h.lower() != best.lower()]
+                        if non_best:
+                            out["tagline"] = non_best[0]
+                            out["_sources"]["tagline"] = out["_sources"].get(
+                                "name", "(promoted from displaced name)")
+                        break
 
     return out
 

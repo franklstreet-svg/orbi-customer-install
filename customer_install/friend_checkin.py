@@ -135,8 +135,21 @@ def start_checkin_scheduler(config: dict, data_dir: Path,
                    or business.get("owner_name") or "")
     owner_first = owner_full.split()[0] if owner_full else "there"
 
-    # Use install_ts from config or fall back to "now" if missing
-    install_ts = int(config.get("installed_at") or time.time())
+    # Use install_ts from config or fall back to "now" if missing. Accept
+    # either a numeric epoch timestamp or an ISO date string like "2026-05-26"
+    # (older installs wrote the date, newer ones may write epoch).
+    _inst = config.get("installed_at")
+    if not _inst:
+        install_ts = int(time.time())
+    elif isinstance(_inst, (int, float)):
+        install_ts = int(_inst)
+    else:
+        try:
+            install_ts = int(datetime.fromisoformat(
+                str(_inst).replace("Z", "+00:00")
+            ).timestamp())
+        except (ValueError, TypeError):
+            install_ts = int(time.time())
 
     def loop():
         time.sleep(60)   # short startup delay

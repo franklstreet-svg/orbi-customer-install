@@ -160,6 +160,17 @@ def _send_web_push(data_dir: Path, payload: dict) -> int:
     subs = load_subscriptions(data_dir)
     if not subs:
         return 0
+    # Parse the PEM private key ONCE into a Vapid02 instance. Newer
+    # pywebpush refuses raw PEM strings with a cryptic "Could not
+    # deserialize key data" / "ASN.1 invalid length" — it expects either
+    # a Vapid02 instance or a file path. Was failing 46 times in the log
+    # before this fix.
+    try:
+        from py_vapid import Vapid
+        vapid_instance = Vapid.from_pem(keys["private_key"].encode("utf-8"))
+    except Exception as e:
+        log.warning(f"VAPID key parse failed — push delivery disabled: {e}")
+        return 0
     delivered = 0
     surviving = []
     for sub in subs:
@@ -167,7 +178,7 @@ def _send_web_push(data_dir: Path, payload: dict) -> int:
             webpush(
                 subscription_info=sub,
                 data=json.dumps(payload),
-                vapid_private_key=keys["private_key"],
+                vapid_private_key=vapid_instance,
                 vapid_claims={"sub": keys["subject"]},
                 timeout=10,
             )

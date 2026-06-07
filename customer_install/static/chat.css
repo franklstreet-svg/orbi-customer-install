@@ -75,8 +75,8 @@ body.fullpage-chat .orbi-panel.embed-mode {
   width: 64px; height: 64px;
   margin: 0 auto 18px;
   border-radius: 50%;
-  background: linear-gradient(135deg, #4f8cff 0%, #8b5cf6 100%);
-  box-shadow: 0 8px 32px rgba(79,140,255,0.3);
+  background: #fff url('/static/myorbi-icon.png') center/cover no-repeat;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.22);
 }
 .landing-card h1 {
   margin: 0 0 8px;
@@ -97,11 +97,13 @@ body.fullpage-chat .orbi-panel.embed-mode {
   bottom: 20px; right: 20px;
   width: 60px; height: 60px;
   border-radius: 50%;
-  background: linear-gradient(135deg, #4f8cff 0%, #8b5cf6 100%);
+  background: #fff url('/static/myorbi-icon.png') center/cover no-repeat;
   color: white;
   border: none;
   cursor: pointer;
-  box-shadow: 0 8px 24px rgba(79,140,255,0.35);
+  box-shadow: 0 8px 24px rgba(0,0,0,0.22);
+  overflow: hidden;
+  padding: 0;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -111,11 +113,16 @@ body.fullpage-chat .orbi-panel.embed-mode {
 }
 .orbi-launcher:hover {
   transform: scale(1.06);
-  box-shadow: 0 10px 30px rgba(79,140,255,0.45);
+  box-shadow: 0 10px 30px rgba(0,0,0,0.28);
 }
+/* The bundled chat-bubble svg lived ON TOP of the gradient. Now the
+   button background IS the Orbi logo — hide the chat icon by default
+   so only the logo shows. The close X still appears when .open. */
+.orbi-launcher .launcher-icon-chat { display: none; }
 .orbi-launcher .launcher-icon-close { display: none; }
+.orbi-launcher.open { background: #fff; }
 .orbi-launcher.open .launcher-icon-chat { display: none; }
-.orbi-launcher.open .launcher-icon-close { display: block; }
+.orbi-launcher.open .launcher-icon-close { display: block; color: #1a2236; }
 
 .launcher-badge {
   position: absolute;
@@ -194,9 +201,10 @@ body.fullpage-chat .orbi-panel.embed-mode {
 .avatar {
   width: 34px; height: 34px;
   border-radius: 50%;
-  background: linear-gradient(135deg, #4f8cff 0%, #8b5cf6 100%);
+  background: #fff url('/static/myorbi-icon.png') center/cover no-repeat;
   flex-shrink: 0;
   position: relative;
+  box-shadow: 0 1px 4px rgba(0,0,0,0.15);
 }
 .avatar.speaking::after {
   content: '';

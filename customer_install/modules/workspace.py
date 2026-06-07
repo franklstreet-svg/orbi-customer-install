@@ -87,6 +87,53 @@ def _save_index(data_dir: Path, index: dict) -> None:
     tmp.write_text(json.dumps(index, indent=2), encoding="utf-8")
     tmp.replace(p)
 
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff",
+                ".tif", ".webp", ".heic", ".heif"}
+
+
+def _ocr_image(path: Path) -> str:
+    """Tesseract OCR for a single image. Returns empty string if tesseract
+    isn't installed on the system. Lazy-imports so the module loads even
+    without tesseract."""
+    try:
+        import ocr as _ocr_mod  # the top-level ocr.py
+        return _ocr_mod.extract_text(path)[:MAX_FILE_CHARS]
+    except Exception as e:
+        log.warning(f"image OCR failed on {path.name}: {e}")
+        return ""
+
+
+def _ocr_scanned_pdf(path: Path, max_pages: int = 10) -> str:
+    """Convert PDF pages to images with poppler, then OCR each with
+    tesseract. Capped at max_pages so a 500-page scan doesn't pin the
+    box. Returns empty string if pdf2image / poppler / tesseract are
+    missing — caller falls back to whatever pypdf could extract."""
+    try:
+        from pdf2image import convert_from_path
+        import ocr as _ocr_mod
+        images = convert_from_path(str(path), dpi=200, first_page=1,
+                                     last_page=max_pages, fmt="png")
+        chunks = []
+        for i, img in enumerate(images, 1):
+            try:
+                tmp_path = path.with_suffix(f".scan_{i}.tmp.png")
+                img.save(str(tmp_path), "PNG")
+                text = _ocr_mod.extract_text(tmp_path)
+                tmp_path.unlink(missing_ok=True)
+                if text:
+                    chunks.append(f"## Page {i}\n{text}")
+                if sum(len(c) for c in chunks) > MAX_FILE_CHARS:
+                    break
+            except Exception as e:
+                log.warning(f"OCR page {i} of {path.name} failed: {e}")
+        return "\n\n".join(chunks)[:MAX_FILE_CHARS]
+    except ImportError:
+        return ""
+    except Exception as e:
+        log.warning(f"scanned-PDF OCR failed on {path.name}: {e}")
+        return ""
+
+
 def _extract_text(path: Path) -> str:
     suffix = path.suffix.lower()
     try:
@@ -111,7 +158,15 @@ def _extract_text(path: Path) -> str:
                         continue
                     if sum(len(t) for t in text) > MAX_FILE_CHARS:
                         break
-            return "\n".join(text)[:MAX_FILE_CHARS]
+            extracted = "\n".join(text)[:MAX_FILE_CHARS]
+            # If pypdf got <100 chars from a PDF with at least one page,
+            # it's almost certainly a scanned/image-only PDF. Fall back
+            # to OCR (returns empty if tesseract isn't installed).
+            if len(extracted.strip()) < 100 and len(reader.pages) > 0:
+                ocr_text = _ocr_scanned_pdf(path)
+                if ocr_text:
+                    return ocr_text
+            return extracted
         if suffix == ".docx" and HAS_DOCX:
             d = docx.Document(str(path))
             return "\n".join(p.text for p in d.paragraphs)[:MAX_FILE_CHARS]
@@ -129,6 +184,10 @@ def _extract_text(path: Path) -> str:
                 if sum(len(c) for c in chunks) > MAX_FILE_CHARS:
                     break
             return "\n".join(chunks)[:MAX_FILE_CHARS]
+        # Image files — OCR the visible text. Receipts, scanned documents,
+        # whiteboards, screenshots all become searchable text.
+        if suffix in _IMAGE_EXTS:
+            return _ocr_image(path)
     except Exception as e:
         log.warning(f"could not extract text from {path.name}: {e}")
     return ""

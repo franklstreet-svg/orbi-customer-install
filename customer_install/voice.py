@@ -188,7 +188,7 @@ def _audio_url(fname: str) -> str:
     return f"{base}/voice/audio/{fname}"
 
 
-def _say(text: str, voice: str = "Polly.Joanna-Generative") -> str:
+def _say(text: str, voice: str = "Polly.Joanna") -> str:
     """Speak text via Twilio's native Polly Generative voice — renders
     instantly server-side, no MP3 fetch round-trip. ~800ms faster per
     turn than the edge_tts approach we used before.
@@ -209,16 +209,14 @@ def _say(text: str, voice: str = "Polly.Joanna-Generative") -> str:
 
 
 def _gather(prompt_text: str, action_url: str,
-            voice: str = "Polly.Joanna-Generative", timeout: int = 8,
-            speech_timeout: str = "1",
+            voice: str = "Polly.Joanna", timeout: int = 10,
+            speech_timeout: str = "auto",
             hints: str = "") -> str:
-    """timeout=8s for the caller to START speaking.
-    speech_timeout=1 means Twilio submits 1 second after the caller stops
-    talking. Was "auto" — Twilio's auto-detection routinely sat for
-    15-25 seconds waiting for "silence," which made callers think Orby
-    had hung up. The fixed 1s value keeps the conversation snappy; the
-    speech_hints below bias recognition so short utterances still parse
-    correctly.
+    """timeout=10s for the caller to START speaking.
+    speech_timeout="auto" lets Twilio's recognizer decide when the caller
+    is done — safer than a fixed "1" which caused some carriers to flag
+    calls for unusual response patterns. Trade-off: slightly more lag,
+    but no carrier issues.
 
     hints: comma-separated menu items, modifiers, and common phrases the
     caller is likely to say (max 500 chars per hint, ~100 hints total).
@@ -245,7 +243,7 @@ def _gather(prompt_text: str, action_url: str,
 </Response>""".strip()
 
 
-def _hangup(text: str | None = None, voice: str = "Polly.Joanna-Generative") -> str:
+def _hangup(text: str | None = None, voice: str = "Polly.Joanna") -> str:
     parts = [_say(text, voice)] if text else []
     return f"<Response>{''.join(parts)}<Hangup/></Response>"
 

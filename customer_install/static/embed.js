@@ -48,11 +48,13 @@
       position: fixed; bottom: 20px; right: 20px;
       width: 60px; height: 60px;
       border-radius: 50%;
-      background: linear-gradient(135deg, #4f8cff 0%, #8b5cf6 100%);
+      background: #fff;
       color: white;
       border: none;
       cursor: pointer;
-      box-shadow: 0 8px 24px rgba(79,140,255,0.35);
+      box-shadow: 0 8px 24px rgba(0,0,0,0.22);
+      overflow: hidden;
+      padding: 0;
       display: flex; align-items: center; justify-content: center;
       z-index: 2147483646;
       transition: transform 0.2s ease, box-shadow 0.2s ease;
@@ -60,12 +62,18 @@
     }
     #orbi-embed-launcher:hover {
       transform: scale(1.06);
-      box-shadow: 0 10px 30px rgba(79,140,255,0.45);
+      box-shadow: 0 10px 30px rgba(0,0,0,0.28);
     }
-    #orbi-embed-launcher svg { width: 26px; height: 26px; fill: white; }
-    #orbi-embed-launcher.open .icon-chat { display: none; }
+    #orbi-embed-launcher .icon-orbi {
+      width: 100%; height: 100%;
+      object-fit: cover;
+      display: block;
+    }
+    #orbi-embed-launcher svg { width: 26px; height: 26px; fill: #1a2236; }
+    #orbi-embed-launcher.open .icon-orbi { display: none; }
     #orbi-embed-launcher .icon-close { display: none; }
     #orbi-embed-launcher.open .icon-close { display: block; }
+    #orbi-embed-launcher.open { background: #fff; }
     #orbi-embed-badge {
       position: absolute; top: -2px; right: -2px;
       background: #ff5555; color: white;
@@ -112,7 +120,7 @@
   launcher.id = 'orbi-embed-launcher';
   launcher.setAttribute('aria-label', 'Open chat with Orbi');
   launcher.innerHTML = `
-    <svg class="icon-chat"  viewBox="0 0 24 24"><path d="M20 2H4a2 2 0 0 0-2 2v16l4-4h14a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2zM7 9h10v2H7V9zm0 4h7v2H7v-2z"/></svg>
+    <img class="icon-orbi" src="${origin}/static/myorbi-icon.png" alt="Orbi" />
     <svg class="icon-close" viewBox="0 0 24 24"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
     <span id="orbi-embed-badge" style="display:none;">1</span>
   `;
@@ -155,13 +163,31 @@
   launcher.addEventListener('click', () => opened ? closeWidget() : openWidget());
 
   // Allow the chat shell inside the iframe to talk back to us
-  // (for unread badge updates and "close me" requests)
+  // (for unread badge updates, "close me" requests, full-page
+  // navigations at the end of the buy flow, etc.)
   window.addEventListener('message', (e) => {
     if (e.origin !== origin) return;
     const msg = e.data || {};
     if (msg.type === 'orbi:unread')  setBadge(Number(msg.count) || 0);
     if (msg.type === 'orbi:close')   closeWidget();
     if (msg.type === 'orbi:open')    openWidget();
+    if (msg.type === 'orbi:navigate' && msg.url) {
+      // Sales-bot end-of-flow navigation. The visitor needs a
+      // full-page legal page → full-page Stripe checkout (Stripe
+      // refuses to render inside an iframe). Validate the URL is
+      // on one of our own hosts before navigating away.
+      try {
+        const u = new URL(msg.url, window.location.href);
+        const okHosts = ['twickell.com', 'billing.twickell.com', 'orbi.twickell.com'];
+        if (u.protocol === 'https:' && okHosts.includes(u.host)) {
+          window.location.href = u.toString();
+        } else {
+          console.warn('[Orbi] navigate refused — host not whitelisted:', u.host);
+        }
+      } catch (err) {
+        console.warn('[Orbi] navigate refused — bad URL', err);
+      }
+    }
   });
 
   // Expose a tiny API for the host page

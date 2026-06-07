@@ -33,8 +33,8 @@ Return ONE JSON object (no prose, no markdown fence) with these keys, \
 omitting keys that have no findings on this page:
 
 {
-  "name":         "<business name if mentioned>",
-  "tagline":      "<short positioning line>",
+  "name":         "<the OFFICIAL business name — see NAME RULES below>",
+  "tagline":      "<short positioning line / marketing slogan — NOT the business name>",
   "description":  "<what the business does, 1-3 sentences>",
   "owner":        {"name":"<owner/founder full name>", "role":"<Owner|Founder|President|CEO|...>", "bio":"<short bio if available>"},
   "founded_year": "<year established>",
@@ -64,6 +64,41 @@ omitting keys that have no findings on this page:
 
 RULES:
 - If a field isn't mentioned on this page, OMIT it entirely. Don't invent.
+
+- 🚨 NAME RULES — this is the #1 thing receptionists get wrong, so be careful:
+  The "name" field MUST be the LEGAL / PARENT company name — what the business
+  is officially called. NOT a marketing tagline, NOT a product/service name,
+  NOT just the page title verbatim.
+
+  STRONG PREFERENCE for names that have ANY of these signals:
+    * Corporate suffixes (LLC, Inc., Corp., Co., Ltd., Source, Group, Services, Holdings)
+    * Appear in copyright footers ("© 2026 Acme Holdings LLC")
+    * Are introduced as the SUBJECT of a sentence describing the business
+      ("Acme Holdings is a Reno-based...", "Acme Holdings provides...")
+    * Are repeated multiple times in the body text
+    * Are SPELLED OUT when an acronym appears in the title (if title is
+      "ACME | Best Service" and body says "Acme Corporation Manufacturing
+      Equipment", pick "Acme Corporation Manufacturing Equipment" —
+      the spelled-out parent — not "ACME")
+
+  AVOID putting these in "name" (use "tagline" or skip instead):
+    * Marketing taglines (page title "X | Welcome to the future" → name="X",
+      NOT the whole title — and only if X is the actual business name)
+    * Product or service names ("Plan Room", "Builders Exchange",
+      "Online Portal" are products/services, not the business)
+    * The string after " | ", " - ", " — " in a page title (that's tagline)
+    * Bare acronyms when a spelled-out version is elsewhere on the page
+
+  Example: page title "SCS | The Builders Exchange". Body says
+  "Sierra Contractors Source, 'The Builders Exchange' is..." and footer
+  has "©2017 SCS — All Rights Reserved". CORRECT extraction:
+    name = "Sierra Contractors Source"
+    tagline = "The Builders Exchange"
+  WRONG extraction:
+    name = "SCS | The Builders Exchange"     (whole title, no split)
+    name = "SCS"                              (acronym, parent is in body)
+    name = "The Builders Exchange"            (that's the product/tagline)
+
 - LOOK HARD FOR OWNERSHIP INFO. Owner / founder names tend to live in:
   * About / About Us / Our Story / Meet the Team pages
   * Footer copyright lines ("© 2026 Frank Smith dba J's Bakery")

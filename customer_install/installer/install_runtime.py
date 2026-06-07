@@ -59,7 +59,7 @@ log = logging.getLogger("orbi.installer")
 # ---------------------------------------------------------------------------
 
 BILLING_BASE_URL = os.environ.get(
-    "ORBI_BILLING_URL", "https://brain.twickell.com"
+    "ORBI_BILLING_URL", "https://billing.twickell.com"
 )
 # Brain proxy URL — separate env var so Frank can move the LLM brain to a
 # different host (a self-owned 70B box, an alternate Cloudflare tunnel)
@@ -98,6 +98,36 @@ def sanitize_token(raw: str) -> str:
     if not _TOKEN_RE.match(raw):
         raise ValueError("token must be 16-128 chars of [A-Za-z0-9_-]")
     return raw
+
+
+def _normalize_install_token(raw: str) -> str | None:
+    """Be forgiving about how customers paste an install token. Handles:
+      - leading/trailing whitespace, newlines, tabs
+      - wrapping single or double quotes
+      - the customer pasting an entire URL (extracts the token segment)
+      - extra angle brackets <inst_...> from copy from email
+      - the customer pasting WITHOUT the `inst_` prefix (we add it)
+    Returns the normalized token, or None if no valid token was found."""
+    import re as _re
+    s = (raw or "").strip().strip("'\"<>` ")
+    s = s.replace("\n", "").replace("\r", "").replace("\t", "")
+    # If it looks like a URL, pull out the last path segment that
+    # matches the token shape.
+    if "://" in s or "/" in s:
+        # Find any inst_XXX...XXX substring
+        m = _re.search(r"(inst_[A-Za-z0-9_\-]{16,128})", s)
+        if m:
+            return m.group(1)
+        # Or the last path-y segment
+        tail = s.rstrip("/").rsplit("/", 1)[-1]
+        s = tail
+    # Allow customers who copied without the prefix
+    if not s.startswith("inst_") and _re.fullmatch(r"[A-Za-z0-9_\-]{16,128}", s):
+        s = "inst_" + s
+    # Final shape check — must start with inst_ and be 21-133 total
+    if _re.fullmatch(r"inst_[A-Za-z0-9_\-]{16,128}", s):
+        return s
+    return None
 
 
 def sanitize_email(raw: str) -> str:
@@ -789,6 +819,158 @@ def verify_install(install_dir: Path) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# 6b. create_desktop_shortcut — gives the customer an icon they can find
+# ---------------------------------------------------------------------------
+
+def create_desktop_shortcut(install_dir: Path) -> None:
+    """Drop a desktop icon that opens the Orbi dashboard.
+
+    Windows: writes a launcher.cmd in install_dir that starts the service
+    (idempotent — sc start does nothing if already running) and opens
+    the default browser. Then drops an Orbi.lnk on the user's Desktop
+    pointing at the .cmd. Created via PowerShell since it's always
+    available on Windows 10/11 and avoids needing pywin32 in the bundle.
+
+    Linux: writes ~/Desktop/Orbi.desktop (the standard XDG entry).
+
+    Mac: skipped for now — Mac users typically use Spotlight or
+    /Applications, not desktop icons. Future work.
+    """
+    install_dir = Path(install_dir)
+    home = Path.home()
+    desktop = home / "Desktop"
+    if not desktop.exists():
+        # Some Linux distros + headless installs don't have a Desktop dir.
+        log.info("no ~/Desktop directory — skipping desktop shortcut")
+        return
+
+    if _SYS.startswith("win"):
+        # 1) Write the launcher .cmd. It tries Chrome's `--app=URL` mode
+        #    first (no URL bar, no tabs — looks like a real desktop app),
+        #    then Edge, then falls back to the default browser. Result is
+        #    a window that feels native instead of "just another website."
+        launcher = install_dir / "launcher.cmd"
+        url = f"http://localhost:{HEALTH_PORT}/owner/login"
+        launcher_body = (
+            "@echo off\r\n"
+            "REM Start Orbi service if not already running, then open the\r\n"
+            "REM dashboard in app-mode (no URL bar, no tabs — feels native).\r\n"
+            "sc start Orbi >nul 2>&1\r\n"
+            "REM Give the service a few seconds to come up on a cold start.\r\n"
+            "ping -n 4 127.0.0.1 >nul\r\n"
+            "\r\n"
+            "REM Try Chrome installed via the launcher (PATH) first\r\n"
+            "where chrome.exe >nul 2>&1\r\n"
+            f"if %ERRORLEVEL% == 0 ( start \"\" chrome.exe --app=\"{url}\" & exit /b )\r\n"
+            "\r\n"
+            "REM Standard Chrome install locations\r\n"
+            "if exist \"%ProgramFiles%\\Google\\Chrome\\Application\\chrome.exe\" ( "
+            f"start \"\" \"%ProgramFiles%\\Google\\Chrome\\Application\\chrome.exe\" --app=\"{url}\" & exit /b )\r\n"
+            "if exist \"%ProgramFiles(x86)%\\Google\\Chrome\\Application\\chrome.exe\" ( "
+            f"start \"\" \"%ProgramFiles(x86)%\\Google\\Chrome\\Application\\chrome.exe\" --app=\"{url}\" & exit /b )\r\n"
+            "if exist \"%LocalAppData%\\Google\\Chrome\\Application\\chrome.exe\" ( "
+            f"start \"\" \"%LocalAppData%\\Google\\Chrome\\Application\\chrome.exe\" --app=\"{url}\" & exit /b )\r\n"
+            "\r\n"
+            "REM Try Edge (ships with Windows 10/11 by default)\r\n"
+            "if exist \"%ProgramFiles(x86)%\\Microsoft\\Edge\\Application\\msedge.exe\" ( "
+            f"start \"\" \"%ProgramFiles(x86)%\\Microsoft\\Edge\\Application\\msedge.exe\" --app=\"{url}\" & exit /b )\r\n"
+            "if exist \"%ProgramFiles%\\Microsoft\\Edge\\Application\\msedge.exe\" ( "
+            f"start \"\" \"%ProgramFiles%\\Microsoft\\Edge\\Application\\msedge.exe\" --app=\"{url}\" & exit /b )\r\n"
+            "\r\n"
+            "REM Last resort: open in whatever the user's default browser is.\r\n"
+            f"start \"\" \"{url}\"\r\n"
+        )
+        try:
+            launcher.write_text(launcher_body, encoding="ascii", newline="")
+        except OSError as e:
+            log.warning("could not write launcher.cmd: %s", e)
+            return
+
+        # 2) Make the .lnk via PowerShell COM
+        shortcut_path = desktop / "Orbi.lnk"
+        # Embed paths via PS variable assignments to avoid quoting issues.
+        ps = (
+            "$ws = New-Object -ComObject WScript.Shell; "
+            f"$sc = $ws.CreateShortcut('{shortcut_path}'); "
+            f"$sc.TargetPath = '{launcher}'; "
+            f"$sc.WorkingDirectory = '{install_dir}'; "
+            "$sc.Description = 'Open your Orbi dashboard'; "
+            "$sc.Save()"
+        )
+        try:
+            subprocess.run(
+                ["powershell.exe", "-NoProfile", "-NonInteractive",
+                 "-Command", ps],
+                check=False, timeout=15,
+            )
+            log.info("desktop shortcut created at %s", shortcut_path)
+        except (subprocess.SubprocessError, OSError) as e:
+            log.warning("could not create Windows desktop shortcut: %s", e)
+        return
+
+    if _SYS == "linux":
+        # 1) Write the launcher.sh — tries Chromium-family browsers with
+        #    --app mode so the window has no URL bar (looks like a native
+        #    app), falls back to xdg-open if none are installed.
+        launcher = install_dir / "launcher.sh"
+        url = f"http://localhost:{HEALTH_PORT}/owner/login"
+        launcher_body = (
+            "#!/bin/bash\n"
+            f"URL=\"{url}\"\n"
+            "\n"
+            "# Idempotent service start (user systemd; fails silently if\n"
+            "# the service is already running or systemd isn't available).\n"
+            "systemctl --user start orbi 2>/dev/null\n"
+            "\n"
+            "# Wait briefly for the dashboard to come up.\n"
+            "for _i in 1 2 3 4 5; do\n"
+            "  if curl -s -o /dev/null --max-time 1 \"$URL\" 2>/dev/null; then break; fi\n"
+            "  sleep 1\n"
+            "done\n"
+            "\n"
+            "# Try Chrome/Chromium/Edge in --app mode for a native-app feel.\n"
+            "for browser in google-chrome google-chrome-stable chromium chromium-browser microsoft-edge brave-browser; do\n"
+            "  if command -v \"$browser\" >/dev/null 2>&1; then\n"
+            "    exec \"$browser\" --app=\"$URL\"\n"
+            "  fi\n"
+            "done\n"
+            "\n"
+            "# Fallback: default browser (URL bar visible, but at least it opens).\n"
+            "exec xdg-open \"$URL\"\n"
+        )
+        try:
+            launcher.write_text(launcher_body, encoding="utf-8")
+            os.chmod(launcher, 0o755)
+        except OSError as e:
+            log.warning("could not write launcher.sh: %s", e)
+            return
+
+        # 2) Write the .desktop entry pointing at launcher.sh.
+        shortcut_path = desktop / "Orbi.desktop"
+        body = (
+            "[Desktop Entry]\n"
+            "Type=Application\n"
+            "Name=Orbi\n"
+            "Comment=Open your Orbi assistant\n"
+            f"Exec={launcher}\n"
+            "Icon=applications-internet\n"
+            "Terminal=false\n"
+            "Categories=Network;Utility;\n"
+        )
+        try:
+            shortcut_path.write_text(body, encoding="utf-8")
+            # GNOME / KDE want the .desktop file marked executable + "trusted"
+            os.chmod(shortcut_path, 0o755)
+            log.info("desktop shortcut created at %s", shortcut_path)
+        except OSError as e:
+            log.warning("could not create Linux desktop shortcut: %s", e)
+        return
+
+    # Mac falls through — skipped for now.
+    log.info("desktop shortcut not implemented for %s — skipping", _SYS)
+
+
+# ---------------------------------------------------------------------------
 # 7. launch_setup_wizard
 # ---------------------------------------------------------------------------
 
@@ -914,7 +1096,7 @@ def run_interactive(install_dir: Path | None = None,
     install_dir = install_dir or default_install_dir()
 
     _print(_BANNER)
-    _print("Welcome to the Orby installer.")
+    _print("Welcome to the Orbi installer.")
     _print("")
 
     # ── Auto-detect token from clipboard or command-line arg ──
@@ -934,17 +1116,28 @@ def run_interactive(install_dir: Path | None = None,
     #    extra packages — important for our PyInstaller bundle)
     if not token:
         clip = _read_clipboard()
-        if clip and clip.startswith("inst_"):
-            token = clip.strip()
-            _print(f"Found your install token in the clipboard: {token[:14]}…")
-    # 3. Manual prompt as fallback
+        if clip:
+            cand = _normalize_install_token(clip)
+            if cand:
+                token = cand
+                _print(f"Found your install token in the clipboard: {token[:14]}…")
+    # 3. Manual prompt as fallback — be forgiving about format. Customers
+    # paste with leading/trailing whitespace, quote marks, or sometimes
+    # the wrong half (the URL surrounding the token). Normalize them all.
     if not token:
         _print("Paste the install token you received in your email.")
         _print("(Tip: visit the link in your email and the token is "
                "copied automatically — you can also paste it here.)")
         _print("It looks like:  inst_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXX")
         _print("")
-        token = input("Install token: ").strip()
+        while True:
+            raw = input("Install token: ")
+            token = _normalize_install_token(raw)
+            if token:
+                break
+            _print("That doesn't look like an install token. It should "
+                   "start with 'inst_' and be at least 24 characters. "
+                   "Check your email and try again.")
 
     biz_name = ""
     if not (argv and any(a == "--silent" or a == "--quiet" for a in argv)):
@@ -956,7 +1149,7 @@ def run_interactive(install_dir: Path | None = None,
     if not billing:
         _print("ERROR: token could not be verified.")
         _print("       Check your internet connection and try again.")
-        _print("       If it still fails, email support@orbi.frank.com.")
+        _print("       If it still fails, email orbiaisolutions@gmail.com.")
         return 2
     _print(f"  OK — tier: {billing['tier']}, owner: {billing['owner_email']}")
 
@@ -964,7 +1157,7 @@ def run_interactive(install_dir: Path | None = None,
     _print(f"Creating install at {install_dir} …")
     try:
         setup_directories(install_dir)
-        _print("Extracting Orby app files …")
+        _print("Extracting Orbi app files …")
         extract_app_source(install_dir)
         _print("Installing Python dependencies (this takes a minute) …")
         install_python_deps(install_dir)
@@ -983,6 +1176,14 @@ def run_interactive(install_dir: Path | None = None,
         _print(f"WARNING: service install failed: {e}")
         _print("         You can run orbi.py manually for now.")
         log.exception("service install failed")
+
+    _print("Creating desktop shortcut …")
+    try:
+        create_desktop_shortcut(install_dir)
+    except Exception as e:
+        # Cosmetic — never block the install over a shortcut failure.
+        _print(f"NOTE: desktop shortcut could not be created: {e}")
+        log.exception("desktop shortcut creation failed")
 
     _print("")
     if not verify_install(install_dir):
@@ -1107,7 +1308,73 @@ def _smoke_test() -> int:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def _setup_user_facing_log() -> Path | None:
+    """Add a FileHandler that writes to the user's Desktop, so even if
+    the cmd window auto-closes we still have a record of what happened.
+    Returns the log path so the main wrapper can mention it in error msgs."""
+    try:
+        home = Path.home()
+        # Try Desktop first; fall back to home if Desktop doesn't exist.
+        candidates = [home / "Desktop", home / "OneDrive" / "Desktop", home]
+        log_dir = next((c for c in candidates if c.exists()), home)
+        log_path = log_dir / "orbi_install.log"
+        fh = logging.FileHandler(str(log_path), mode="w", encoding="utf-8")
+        fh.setLevel(logging.DEBUG)
+        fh.setFormatter(logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+            datefmt="%H:%M:%S",
+        ))
+        logging.getLogger().addHandler(fh)
+        logging.getLogger().setLevel(logging.DEBUG)
+        return log_path
+    except Exception:
+        return None
+
+
+def _hold_window_open(message: str) -> None:
+    """On Windows, the cmd window auto-closes when the script exits — which
+    eats the error message. Pause for input so the user can read it."""
+    if not _SYS.startswith("win"):
+        return
+    try:
+        _print("")
+        _print(message)
+        _print("")
+        input("Press Enter to close this window...")
+    except (EOFError, KeyboardInterrupt):
+        pass
+
+
 if __name__ == "__main__":
     if "--smoke-test" in sys.argv:
         sys.exit(_smoke_test())
-    sys.exit(run_interactive())
+
+    # Wrap the whole install in try/except + file log so the user can
+    # see the failure even after the cmd window closes.
+    _log_path = _setup_user_facing_log()
+    try:
+        rc = run_interactive()
+        if rc != 0:
+            _hold_window_open(
+                f"Install ended with exit code {rc}. Log saved to: "
+                f"{_log_path}" if _log_path else
+                f"Install ended with exit code {rc}."
+            )
+        sys.exit(rc)
+    except KeyboardInterrupt:
+        _print("Install cancelled.")
+        sys.exit(130)
+    except Exception as e:
+        log.exception("Install failed with uncaught exception")
+        _print("")
+        _print("=" * 60)
+        _print(" INSTALL FAILED")
+        _print(f" Error: {e!r}")
+        if _log_path:
+            _print(f" Full log: {_log_path}")
+        _print("=" * 60)
+        _hold_window_open(
+            "The install hit an error. Send the log file above to "
+            "support so we can fix it."
+        )
+        sys.exit(1)

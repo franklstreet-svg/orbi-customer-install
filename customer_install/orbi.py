@@ -92,6 +92,7 @@ from modules import calendar as mod_calendar
 from modules import catalog as mod_catalog
 from modules import contacts as mod_contacts
 from modules import learning_loop as mod_learning
+from modules import marketing as mod_marketing
 from modules import memory as mod_memory
 from modules import messages as mod_messages
 from modules import notes as mod_notes
@@ -2135,12 +2136,16 @@ p {{ color: #444; line-height: 1.5; }}
 @app.route("/health")
 def health():
     business = mod_business.load(DATA_DIR)
+    enabled_mods = CONFIG.get("enabled_modules") or []
+    if not isinstance(enabled_mods, list):
+        enabled_mods = []
     return jsonify({
         "status": "ok",
         "version": CONFIG.get("version", "0.1.0"),
         "uptime": int(time.time() - START_TIME),
         "billing": BILLING_STATUS.get("active", True),
         "business_name": business.get("name") or CONFIG.get("business", {}).get("name", ""),
+        "enabled_modules": [str(m).strip().lower() for m in enabled_mods if m],
     })
 
 
@@ -2354,6 +2359,251 @@ def owner_catalog_reindex():
     return jsonify(result)
 
 
+# ---------------------------------------------------------------------------
+# MARKETING MODULE — multi-platform ad / campaign copy generation
+# ---------------------------------------------------------------------------
+# Gated by enabled_modules ("marketing"). When the customer subscribes to
+# the marketing module on Stripe, the brain pushes "marketing" into
+# their api_key's enabled_modules list and the routes below light up.
+
+def _require_marketing_module():
+    """Common entrypoint for the marketing routes: auth + entitlement.
+    Returns the owner_session dict or aborts with 402/401."""
+    owner_session = auth.require_owner(ORBI_DIR)
+    if not is_module_enabled("marketing"):
+        from flask import abort
+        return abort(402, "marketing module not enabled — subscribe at billing.twickell.com to add it")
+    return owner_session
+
+
+@app.route("/api/owner/marketing/generate", methods=["POST"])
+def owner_marketing_generate():
+    """Generate multi-platform campaign copy from a natural-language
+    brief. Returns the assets dict (NOT saved — caller decides whether
+    to save).
+
+    Body: {"brief": "Mother's Day brunch promo, $100 budget, audience local Reno families"}
+    """
+    owner_session = _require_marketing_module()
+    payload = request.get_json(silent=True) or {}
+    brief = (payload.get("brief") or "").strip()
+    if not brief or len(brief) < 8:
+        return jsonify({"ok": False, "error": "brief_too_short",
+                          "message": "Give me a few sentences about the campaign."}), 400
+    if len(brief) > 2000:
+        brief = brief[:2000]
+
+    business = (CONFIG.get("business") or {})
+    system, user_msg = prompts.build_marketing_prompt(business, brief)
+    try:
+        resp = llm_client.generate(CONFIG, system,
+                                    [{"role": "user", "content": user_msg}])
+    except Exception as e:
+        log.exception("marketing generate failed")
+        return jsonify({"ok": False, "error": "llm_error",
+                          "message": str(e)[:200]}), 502
+
+    raw = (getattr(resp, "text", "") or "").strip()
+    # Strip optional markdown fence the model might add
+    if raw.startswith("```"):
+        raw = raw.split("\n", 1)[1] if "\n" in raw else raw
+        if raw.endswith("```"):
+            raw = raw.rsplit("\n", 1)[0] if "\n" in raw else raw[:-3]
+    # Pull JSON between the first { and last }
+    try:
+        start = raw.find("{")
+        end = raw.rfind("}") + 1
+        if start < 0 or end <= start:
+            raise ValueError("no JSON object in model response")
+        assets = json.loads(raw[start:end])
+    except Exception as e:
+        log.warning("marketing JSON parse failed: %s — raw[:300]: %r", e, raw[:300])
+        return jsonify({"ok": False, "error": "parse_error",
+                          "message": "I generated something but couldn't structure it. Try again with a clearer brief?",
+                          "raw_preview": raw[:500]}), 502
+
+    title = (assets.get("title") or "").strip() or "(untitled campaign)"
+    # Remove title from assets — it's a top-level field on the saved record
+    assets.pop("title", None)
+    audit.log_event(DATA_DIR, actor=owner_session.get("username", "?"),
+                    action="marketing.generate",
+                    meta={"brief_chars": len(brief), "title": title})
+    return jsonify({"ok": True, "title": title, "brief": brief,
+                     "assets": assets})
+
+
+@app.route("/api/owner/marketing/save", methods=["POST"])
+def owner_marketing_save():
+    """Save (or update) a campaign. Body: {brief, title, assets, id?}.
+    Returns the saved record."""
+    owner_session = _require_marketing_module()
+    payload = request.get_json(silent=True) or {}
+    brief = (payload.get("brief") or "").strip()
+    title = (payload.get("title") or "").strip()
+    assets = payload.get("assets") or {}
+    campaign_id = (payload.get("id") or "").strip() or None
+    if not assets:
+        return jsonify({"ok": False, "error": "no_assets"}), 400
+    user_dir = users_mod.get_user_dir(DATA_DIR, owner_session.get("username", ""))
+    rec = mod_marketing.save_campaign(user_dir, brief=brief, title=title,
+                                       assets=assets, campaign_id=campaign_id)
+    audit.log_event(DATA_DIR, actor=owner_session.get("username", "?"),
+                    action="marketing.save",
+                    resource=f"campaign/{rec['id']}",
+                    meta={"title": rec.get("title")})
+    return jsonify({"ok": True, "campaign": rec})
+
+
+@app.route("/api/owner/marketing/campaigns", methods=["GET"])
+def owner_marketing_list():
+    """List saved campaigns, most-recent first. Returns id/title/brief/dates
+    only — assets are large, fetched per-campaign on demand."""
+    owner_session = _require_marketing_module()
+    user_dir = users_mod.get_user_dir(DATA_DIR, owner_session.get("username", ""))
+    items = mod_marketing.list_campaigns(user_dir)
+    summary = [{
+        "id":         c.get("id"),
+        "title":      c.get("title"),
+        "brief":      (c.get("brief") or "")[:200],
+        "created_at": c.get("created_at"),
+        "updated_at": c.get("updated_at"),
+        "image_count": len(c.get("images") or []),
+    } for c in items]
+    return jsonify({"ok": True, "campaigns": summary})
+
+
+@app.route("/api/owner/marketing/campaigns/<campaign_id>", methods=["GET"])
+def owner_marketing_get(campaign_id):
+    """Fetch full record for one campaign (assets + images)."""
+    owner_session = _require_marketing_module()
+    user_dir = users_mod.get_user_dir(DATA_DIR, owner_session.get("username", ""))
+    rec = mod_marketing.get_campaign(user_dir, campaign_id)
+    if not rec:
+        return jsonify({"ok": False, "error": "not_found"}), 404
+    return jsonify({"ok": True, "campaign": rec})
+
+
+@app.route("/api/owner/marketing/campaigns/<campaign_id>", methods=["DELETE"])
+def owner_marketing_delete(campaign_id):
+    """Delete a campaign by id. Images attached to it should be cleaned
+    up by a background pass — out of scope for this endpoint."""
+    owner_session = _require_marketing_module()
+    user_dir = users_mod.get_user_dir(DATA_DIR, owner_session.get("username", ""))
+    ok = mod_marketing.delete_campaign(user_dir, campaign_id)
+    if not ok:
+        return jsonify({"ok": False, "error": "not_found"}), 404
+    audit.log_event(DATA_DIR, actor=owner_session.get("username", "?"),
+                    action="marketing.delete",
+                    resource=f"campaign/{campaign_id}")
+    return jsonify({"ok": True})
+
+
+# ---------------------------------------------------------------------------
+# MARKETING — IMAGE SUB-MODULE (gated by enabled_modules "marketing_image")
+# ---------------------------------------------------------------------------
+# Routes the customer's brief through the prompt-enhancer, then calls
+# HuggingFace Inference for FLUX.1-schnell. Saves the PNG under the
+# customer's data dir and links it onto the campaign. NOT available
+# unless the customer has BOTH "marketing" AND "marketing_image" in
+# their enabled_modules list.
+
+@app.route("/api/owner/marketing/image", methods=["POST"])
+def owner_marketing_image():
+    """Generate an image for a campaign. Body:
+       {"brief": "<short>", "platform": "instagram"|..., "campaign_id": "<optional>"}
+    Returns {url, prompt} on success. If campaign_id is given, the
+    image is attached to that campaign's images[] list."""
+    owner_session = _require_marketing_module()
+    if not is_module_enabled("marketing_image"):
+        from flask import abort
+        return abort(402, "marketing_image sub-module not enabled — subscribe at billing.twickell.com")
+    payload = request.get_json(silent=True) or {}
+    brief = (payload.get("brief") or "").strip()
+    platform = (payload.get("platform") or "instagram").strip().lower()
+    campaign_id = (payload.get("campaign_id") or "").strip() or None
+    if not brief or len(brief) < 4:
+        return jsonify({"ok": False, "error": "brief_too_short"}), 400
+    if platform not in {"instagram", "facebook", "tiktok", "linkedin", "print"}:
+        platform = "instagram"
+
+    business = (CONFIG.get("business") or {})
+    # Phase 1 — turn the owner's short brief into a real diffusion prompt
+    sys_p, user_p = prompts.build_image_prompt_enhancer(business, brief, platform)
+    try:
+        resp = llm_client.generate(CONFIG, sys_p,
+                                    [{"role": "user", "content": user_p}])
+        sd_prompt = (getattr(resp, "text", "") or "").strip()
+        if not sd_prompt:
+            raise ValueError("empty prompt enhancer output")
+    except Exception as e:
+        log.exception("image prompt enhancement failed")
+        return jsonify({"ok": False, "error": "prompt_enhance_failed",
+                          "message": str(e)[:200]}), 502
+
+    # Phase 2 — call HuggingFace Inference for the actual image. The
+    # llm_client module already knows the HF token; we reuse its
+    # generate_image() helper if it exists, otherwise fall back to a
+    # direct HTTP call. (helper is added in llm_client patch — TODO note
+    # in case it isn't there yet on a given install.)
+    try:
+        png_bytes = llm_client.generate_image(
+            CONFIG, sd_prompt,
+            model="black-forest-labs/FLUX.1-schnell",
+            size=(1024, 1024 if platform != "tiktok" else 1792),
+        )
+    except AttributeError:
+        return jsonify({"ok": False, "error": "image_backend_missing",
+                          "message": "llm_client.generate_image is not available on this install. Update Orbi to enable the image sub-module."}), 501
+    except Exception as e:
+        log.exception("image generation failed")
+        return jsonify({"ok": False, "error": "generation_failed",
+                          "message": str(e)[:200]}), 502
+
+    # Phase 3 — save the PNG to disk so the dashboard can render it.
+    user_dir = users_mod.get_user_dir(DATA_DIR, owner_session.get("username", ""))
+    img_dir = user_dir / "marketing_images"
+    img_dir.mkdir(parents=True, exist_ok=True)
+    image_id = mod_marketing.new_id()
+    img_path = img_dir / f"{image_id}.png"
+    img_path.write_bytes(png_bytes)
+    # Served via the existing user-asset route below (see fetch endpoint).
+    url = f"/api/owner/marketing/images/{image_id}.png"
+
+    from datetime import datetime as _dt
+    image_rec = {
+        "id":         image_id,
+        "prompt":     sd_prompt,
+        "url":        url,
+        "platform":   platform,
+        "created_at": _dt.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    if campaign_id:
+        mod_marketing.attach_image(user_dir, campaign_id, image_rec)
+    audit.log_event(DATA_DIR, actor=owner_session.get("username", "?"),
+                    action="marketing.image_generated",
+                    meta={"image_id": image_id, "platform": platform,
+                          "campaign_id": campaign_id or "(none)"})
+    return jsonify({"ok": True, "image": image_rec})
+
+
+@app.route("/api/owner/marketing/images/<filename>", methods=["GET"])
+def owner_marketing_image_fetch(filename):
+    """Serve a generated marketing image. Owner-only — strangers can't
+    enumerate the image directory."""
+    owner_session = _require_marketing_module()
+    # Light filename sanitization: must be <hex>.png, no slashes or dots
+    import re as _re_img
+    if not _re_img.fullmatch(r"[a-f0-9]{12}\.png", filename or ""):
+        return jsonify({"ok": False, "error": "bad_filename"}), 400
+    user_dir = users_mod.get_user_dir(DATA_DIR, owner_session.get("username", ""))
+    img_path = user_dir / "marketing_images" / filename
+    if not img_path.exists():
+        return jsonify({"ok": False, "error": "not_found"}), 404
+    from flask import send_file
+    return send_file(img_path, mimetype="image/png",
+                       as_attachment=False, download_name=filename)
+
+
 @app.route("/api/public/business_summary")
 def public_business_summary():
     """Lightweight, no-auth snapshot for the visitor-facing chat shell.
@@ -2404,6 +2654,15 @@ def public_chat():
     if not user_msg:
         return jsonify({"error": "empty message"}), 400
 
+    # Resolve which business profile this chat is for FIRST — the privacy
+    # guard below needs to know whether this is the myOrbi sales bot
+    # (where visitors GIVE their contact info as part of the sale and
+    # "my email is X" is normal) or a real customer's Orby (where
+    # visitors should NOT be probing for the owner's personal data).
+    business = _resolve_business_profile_for_request(request)
+    _biz_name_norm = str((business.get("name") or "")).strip().lower().replace(" ", "")
+    _is_sales_bot = _biz_name_norm == "myorbi"
+
     # ─── PRIVACY GUARD ───────────────────────────────────────────────────
     # Public visitors must NOT be able to fish for owner-only data —
     # calendar, tasks, contacts, email, memory, staff list, file search,
@@ -2411,6 +2670,14 @@ def public_chat():
     # requires login; this endpoint is for visitors only and must refuse
     # any of those intents instead of letting the LLM hallucinate an
     # answer that could leak (or fabricate) personal info.
+    #
+    # 🚨 EXCEPTION: skip this guard entirely when the chat is the myOrbi
+    # sales bot. The sales flow REQUIRES the visitor to provide their
+    # own contact info ("my email is X", "my phone is Y", "I want to
+    # book a Pro plan") — that's not fishing, that's purchasing. The
+    # regex below was tripping legitimate sales-chat replies like
+    # "my email address is franklstreet@icloud.com" and dropping the
+    # visitor into the canned visitor-restriction fallback.
     _PERSONAL_INTENT_RE = _re.compile(
         r"\b("
         r"my\s+(?:calendar|schedule|agenda|todo|task|tasks|inbox|email|emails|"
@@ -2440,13 +2707,8 @@ def public_chat():
         r")\b",
         _re.IGNORECASE,
     )
-    if _PERSONAL_INTENT_RE.search(user_msg):
-        biz_name_for_refusal = "this business"
-        try:
-            biz_for_refusal = _resolve_business_profile_for_request(request)
-            biz_name_for_refusal = biz_for_refusal.get("name") or biz_name_for_refusal
-        except Exception:
-            pass
+    if not _is_sales_bot and _PERSONAL_INTENT_RE.search(user_msg):
+        biz_name_for_refusal = (business.get("name") or "this business")
         return jsonify({
             "reply": (
                 f"I can only help with questions about {biz_name_for_refusal} "
@@ -2460,10 +2722,8 @@ def public_chat():
             "source": "personal_intent_blocked",
         }), 200
 
-    # Multi-tenant routing: if the visitor came from a customer's website
-    # (purblum.com, joes-pizza.com, etc.), load THEIR scraped profile so
-    # Orby answers as their business — not as the default Orby owner.
-    business = _resolve_business_profile_for_request(request)
+    # Multi-tenant routing: business profile already resolved above (the
+    # privacy guard needed it to detect sales-bot mode).
     scope    = (CONFIG.get("scope") or {})
 
     # SALES BOT prospect attachment — when the visitor on twickell.com told
@@ -2724,7 +2984,32 @@ def public_chat():
             "tier": "rate_limited", "latency_ms": 0,
         })
 
+    # Pin already-captured sales info into the system prompt so the LLM
+    # can't ask for the same thing twice. The sales prompt covers the
+    # field list ("ask for name, then biz, then email, then phone"), but
+    # over 29k chars of instructions + 20 turns of history, the LLM
+    # loses track and re-asks. Scanning history for already-given values
+    # and pinning them as authoritative cuts the "she keeps asking my
+    # name" failure mode.
+    _captured = _extract_captured_sales_info(history)
+    if _captured:
+        pin_lines = ["\nALREADY CAPTURED FROM THIS CONVERSATION — "
+                      "DO NOT ASK AGAIN:"]
+        for k, v in _captured.items():
+            pin_lines.append(f"  · {k}: {v}")
+        pin_lines.append("If you need additional fields, ask ONLY for the "
+                          "missing ones. Never re-ask anything in the list "
+                          "above.")
+        system = system + "\n" + "\n".join(pin_lines)
+
     resp = llm_client.generate(CONFIG, system, messages)
+    # Auto-retry once when LLM came back empty — handles HuggingFace
+    # transient timeouts. Without this, visitors hit "I'm having
+    # trouble reaching my AI" mid-conversation and Orby loses track
+    # of state on the next turn.
+    if not (resp and resp.text and resp.text.strip()):
+        log.info("LLM came back empty on first try — retrying once")
+        resp = llm_client.generate(CONFIG, system, messages)
 
     # SALES SCRAPE marker — when the SALES MODE OVERRIDE prompt has the bot
     # ask for the visitor's URL and the visitor provides one, the LLM emits
@@ -2990,6 +3275,71 @@ def _conversation_text(history: list, current_msg: str) -> str:
     return " ".join(parts)
 
 
+def _extract_captured_sales_info(history: list) -> dict:
+    """Scan the conversation history for name/business/email/phone that
+    the visitor has already provided. Returns a dict with whatever was
+    found. Used to pin captured values into the system prompt so the LLM
+    can't re-ask. NOT exhaustive — picks the most recent confident match
+    for each field."""
+    out: dict = {}
+    # Walk USER turns from oldest to newest so the NEWEST value wins
+    # (visitors sometimes correct themselves: "wait, my email is X").
+    for m in (history or []):
+        if (m.get("role") or "") != "user":
+            continue
+        content = (m.get("content") or "").strip()
+        if not content:
+            continue
+        # Email
+        try:
+            e = _extract_email(content)
+            if e and "@" in e:
+                out["email"] = e
+        except Exception:
+            pass
+        # Phone
+        try:
+            p = _extract_phone(content)
+            if p and len(_re.sub(r"\D", "", p)) >= 10:
+                out["phone"] = p
+        except Exception:
+            pass
+        # Name — only when the message looks like a name reply
+        # ("my name is X", "I'm X", "this is X", or just a 1-3 word
+        # capitalized response to a name question). Avoid grabbing
+        # random capitalized words from mid-sentence.
+        low = content.lower()
+        name_match = _re.match(
+            r"^(?:my\s+name(?:'?s)?\s+(?:is\s+)?|i'?m\s+|this\s+is\s+|name(?:'?s)?\s+)?"
+            r"([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)?)\s*$",
+            content,
+        )
+        if name_match:
+            cand = name_match.group(1).strip()
+            # Exclude common short answers that LOOK like a name (capital
+            # word) but aren't — "Personal" / "Business" / "Restaurant"
+            # are answers to the triage question, not someone's name.
+            _NOT_A_NAME = {
+                "personal", "business", "restaurant", "yes", "no", "yeah",
+                "yep", "yup", "nope", "ok", "okay", "sure", "fine",
+                "good", "great", "perfect", "deli", "cafe", "pizza",
+                "bar", "diner", "thanks", "thank you",
+            }
+            if cand.lower() not in _NOT_A_NAME and len(cand) >= 2:
+                out["name"] = cand
+        # Business name — "my business is X" / "I run X" / "the business is X"
+        biz_match = _re.search(
+            r"(?:my\s+business\s+(?:is\s+)?(?:called\s+)?|i\s+run\s+|"
+            r"i\s+own\s+|the\s+business\s+(?:is\s+)?(?:called\s+)?|"
+            r"business\s+name\s+(?:is\s+)?)"
+            r"([A-Z][A-Za-z0-9 &'\-]{1,60})",
+            content,
+        )
+        if biz_match:
+            out["business"] = biz_match.group(1).strip().rstrip(".,;")
+    return out
+
+
 def _extract_phone(text: str) -> str | None:
     m = _PHONE_RE.search(text or "")
     if not m:
@@ -3100,6 +3450,42 @@ def owner_logout():
     resp = make_response(jsonify({"status": "ok"}))
     auth.clear_session_cookie(resp)
     return resp
+
+
+@app.route("/api/owner/report_issue", methods=["POST"])
+def owner_report_issue():
+    """Owner-initiated bug report from the dashboard. Forwards to the
+    central brain server's customer_error_report endpoint so Frank sees
+    it in his admin inbox alongside auto-captured exceptions."""
+    user = auth.require_user(ORBI_DIR, DATA_DIR)
+    data = request.get_json(silent=True) or {}
+    description = (data.get("description") or "").strip()
+    if len(description) < 5:
+        return jsonify({"ok": False,
+                        "error": "Description too short."}), 400
+    page_url = (data.get("page_url") or "")[:300]
+    ua       = (data.get("user_agent") or "")[:200]
+    try:
+        import error_reporter
+        error_reporter.report_message(
+            description,
+            error_class="OwnerReport",
+            context={
+                "owner": user.get("username", "?"),
+                "page_url": page_url,
+                "user_agent": ua,
+                "type": "manual_owner_report",
+            },
+        )
+    except Exception as e:
+        log.warning(f"owner report_issue forward failed: {e}")
+        return jsonify({"ok": False,
+                        "error": "Couldn't forward — try again."}), 503
+    audit.log_event(DATA_DIR, actor=user.get("username", "?"),
+                    action="owner.report_issue",
+                    meta={"length": len(description),
+                          "page_url": page_url[:100]})
+    return jsonify({"ok": True, "status": "sent"})
 
 @app.route("/api/owner/status")
 def owner_status():
@@ -3896,7 +4282,7 @@ def owner_reset_password_page():
     safe_token = (token or "")[:200]   # cap size for the hidden field
     return Response(f"""<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Reset Orby password</title>
+<title>Reset Orbi password</title>
 <style>
   body {{ font-family: system-ui, -apple-system, sans-serif; background: #0b0f1a;
           color: #eaf0ff; min-height: 100vh; display: flex; align-items: center;
@@ -5610,36 +5996,39 @@ _NAME_AFTER_FILLER = (
 # → personal; "restaurant" / "cafe" / "deli" → restaurant). Each track
 # has its own follow-up questions appropriate to the use case.
 ONBOARDING_STEPS_PERSONAL = [
-    ("track",       "Welcome! Quick setup — under a minute.\n\n"
-                     "First: how are you planning to use me?\n"
-                     "  · Type 'personal' if you want me as your own AI "
-                     "assistant (calendar, tasks, contacts, email, files, "
-                     "memory).\n"
-                     "  · Type 'restaurant' if you run a restaurant and need "
-                     "me to answer phones, take orders, and chat with website "
-                     "visitors.\n"
-                     "  · Type 'both' if you want both."),
-    ("display_name", "What's your name? (Just first name is fine.)"),
-    ("tone",         "What vibe do you want from me?\n"
-                     "  · 'friend' — casual, warm, like a friend who also "
-                     "helps run things (recommended)\n"
-                     "  · 'professional' — efficient and crisp, less chitchat\n"
-                     "  · 'playful' — light energy, banter\n"
-                     "  · 'formal' — strictly professional"),
-    ("companion_mode", "Should I notice and remember your moods, concerns, "
-                       "and check in on you over time? Or stay strictly "
-                       "transactional?\n"
-                       "  · 'personal' — yes, notice my emotional state and "
-                       "follow up (recommended for solo use)\n"
-                       "  · 'business' — no, keep things task-focused only"),
+    ("track",       "Hey — I'm Orby, the AI that just got installed on "
+                     "your computer. Four quick questions and we're good.\n\n"
+                     "First: are you here for **personal** use, "
+                     "**business** use, or do you run a **restaurant**?\n"
+                     "  · 'personal' — your own AI assistant for life "
+                     "stuff (calendar, contacts, email, files, memory)\n"
+                     "  · 'business' — same as personal but for your "
+                     "work (lawyer, contractor, consultant, anything)\n"
+                     "  · 'restaurant' — adds the phone receptionist + "
+                     "online ordering pieces"),
+    ("display_name", "What should I call you? (First name's fine.)"),
+    ("tone",         "How would you like me to talk to you?\n"
+                     "  · 'friend' — casual, warm, react like a real "
+                     "friend would (most people pick this)\n"
+                     "  · 'professional' — crisp and efficient, less small talk\n"
+                     "  · 'playful' — light energy, occasional banter\n"
+                     "  · 'formal' — strictly business-letter polite"),
+    ("companion_mode", "Last one — should I pay attention to how you're "
+                       "doing over time? Notice when you're stressed, "
+                       "remember things that worry you, check in when "
+                       "I haven't heard about something in a while?\n"
+                       "  · 'personal' — yes, be a real companion (most "
+                       "solo users pick this)\n"
+                       "  · 'business' — no, just keep things task-focused"),
 ]
 ONBOARDING_STEPS_RESTAURANT = [
-    # Track + display_name + tone are shared above; restaurant adds:
-    ("name",     "What's the restaurant called?"),
+    # Added on top of the personal track when track='restaurant' or 'both'.
+    ("name",     "What's the restaurant called? (This is what I'll say "
+                  "when I answer the phone.)"),
     ("phone",    "What's the main phone number for the restaurant?"),
-    ("services", "What kind of food do you serve? (e.g. 'New York-style "
-                  "pizza, calzones, salads')"),
-    ("address",  "What's the restaurant's address?"),
+    ("services", "What kind of food do you serve? (One line is fine — "
+                  "'New York-style pizza, calzones, salads' or similar.)"),
+    ("address",  "What's the restaurant's street address?"),
 ]
 # Backward-compat: legacy callers might import this name. Default to the
 # personal flow which is the most common Orby-buyer.
@@ -16576,6 +16965,56 @@ def not_found(e):
     Keeps the experience friendly for visitors who fat-fingered a URL."""
     from flask import redirect
     return redirect("/", code=302)
+
+
+@app.errorhandler(500)
+def internal_error(e):
+    """Last-resort handler for uncaught exceptions. Reports to the
+    central brain so Frank sees customer crashes in his admin dashboard,
+    then returns a friendly error page to the visitor."""
+    try:
+        import error_reporter
+        # request.path tells us WHERE the crash happened (route URL)
+        from flask import request as _req
+        error_reporter.report_exception(
+            e,
+            context={"endpoint": _req.endpoint or "",
+                     "method":   _req.method},
+            request_url=_req.path,
+        )
+    except Exception:
+        pass  # never fail in the error path itself
+    return (
+        "<h1>Something broke</h1>"
+        "<p>An unexpected error occurred. Frank's been notified and "
+        "will look into it. Please refresh and try again.</p>"
+    ), 500
+
+
+@app.errorhandler(Exception)
+def all_exceptions(e):
+    """Catch-all for non-HTTP exceptions that bubble out of routes.
+    Falls through to Flask's default handling AFTER reporting."""
+    # Don't intercept HTTPException — those have their own handlers
+    # (404, 405, etc.) and we don't want to convert them to 500s.
+    try:
+        from werkzeug.exceptions import HTTPException
+        if isinstance(e, HTTPException):
+            return e
+    except Exception:
+        pass
+    try:
+        import error_reporter
+        from flask import request as _req
+        error_reporter.report_exception(
+            e,
+            context={"endpoint": getattr(_req, "endpoint", None) or "",
+                     "method":   getattr(_req, "method", None) or ""},
+            request_url=getattr(_req, "path", "") or "",
+        )
+    except Exception:
+        pass
+    raise e
 
 START_TIME = time.time()
 
