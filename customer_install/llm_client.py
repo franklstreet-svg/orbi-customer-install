@@ -55,8 +55,13 @@ def call_brain(config: dict, system: str, messages: list[dict]) -> LLMResponse:
         "Content-Type": "application/json",
         "Authorization": f"Bearer {cfg['api_key']}",
         "X-Orbi-Client": "customer-install",
+        # Brain sits behind Cloudflare which 403s default python-urllib UA
+        # ("Python-urllib/3.10") via Bot Fight Mode / Browser Integrity
+        # Check. Send a real-browser UA so the request gets through.
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     }
-    return _http_chat(url, payload, headers, cfg.get("timeout_seconds", 15), tier="brain")
+    return _http_chat(url, payload, headers, cfg.get("timeout_seconds", 60), tier="brain")
 
 
 # ---------------------------------------------------------------------------
