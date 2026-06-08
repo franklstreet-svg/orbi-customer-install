@@ -129,7 +129,7 @@ def _default_orbi_dir() -> Path:
     """Platform-appropriate default if ORBI_DIR isn't set."""
     import platform as _p
     if _p.system() == "Windows":
-        return Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Orby"
+        return Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Orbi"
     if _p.system() == "Darwin":
         return Path.home() / ".orbi"
     return Path("/opt/orbi")
