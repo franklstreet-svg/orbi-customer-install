@@ -126,12 +126,54 @@ def build_app_tarball() -> Path:
     # If customer_install/owner_dashboard IS present (e.g. local dev where
     # the symlink resolves), os.walk(followlinks=True) below picks it up
     # natively — no extra_roots entry needed.
+    def _resolve_stub(abs_path: Path) -> Path:
+        """If `abs_path` is a 'symlink stub' — a small text file whose
+        content is a relative path to another file (this is what GitHub's
+        ZIP export does to symlinks) — resolve it and return the real
+        file path. Otherwise return abs_path unchanged.
+
+        The stub bug bit Kathy + Frank on 2026-06-07: static/dashboard.js
+        was a symlink in the repo, but the GitHub ZIP download turned it
+        into a 34-byte text file containing `../../owner_dashboard/...`.
+        The build packed the stub. Browsers then tried to parse the path
+        as JavaScript and barfed `Unexpected token '.'`.
+        """
+        try:
+            size = abs_path.stat().st_size
+        except OSError:
+            return abs_path
+        if size > 500:
+            return abs_path  # Real file, not a stub
+        try:
+            body = abs_path.read_bytes()
+        except OSError:
+            return abs_path
+        # Stubs are a SINGLE line of ASCII with no embedded NULs that names
+        # a real file when resolved relative to the stub's own folder.
+        if b"\0" in body or b"\n" in body[:-1]:
+            return abs_path
+        try:
+            candidate_text = body.decode("ascii").strip()
+        except UnicodeDecodeError:
+            return abs_path
+        if not candidate_text or not any(candidate_text.endswith(ext)
+                for ext in (".js", ".css", ".html", ".png", ".svg", ".json")):
+            return abs_path
+        candidate = (abs_path.parent / candidate_text).resolve()
+        return candidate if candidate.is_file() else abs_path
+
     def _pack_tree(tar, base: Path, arcname_prefix: str = "") -> int:
         """Walk `base`, packing files into `tar` rooted at arcname_prefix.
         Returns count of files packed. Symlinks are dereferenced so the
         archive only has regular file entries — required because
         tarfile.data_filter (default in Python 3.12+) rejects symlinks
-        that point outside the extraction destination."""
+        that point outside the extraction destination.
+
+        Also handles 'symlink stubs' — text files that contain a relative
+        path. GitHub's ZIP exports replace symlinks with these. Without
+        this resolver, the build would pack a 34-byte stub for files like
+        static/dashboard.js, browsers would fail to parse it, and the
+        whole dashboard would silently break."""
         count = 0
         for root, dirs, files in os.walk(base, followlinks=True):
             dirs[:] = [d for d in dirs if d not in _APP_TARBALL_EXCLUDES
@@ -145,7 +187,7 @@ def build_app_tarball() -> Path:
                 rel_inside = abs_path.relative_to(base)
                 arc = f"{arcname_prefix}/{rel_inside}" if arcname_prefix \
                     else str(rel_inside)
-                real = abs_path.resolve()
+                real = _resolve_stub(abs_path.resolve())
                 info = tar.gettarinfo(name=str(real), arcname=arc)
                 if info is None:
                     continue
