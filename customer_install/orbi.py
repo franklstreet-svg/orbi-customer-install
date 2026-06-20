@@ -1292,6 +1292,47 @@ def tts():
     tts_cfg = CONFIG.get("tts") or {}
     engine = tts_cfg.get("engine", "edge").lower()
 
+    # Kokoro branch — if the requested voice is a Kokoro voice ID
+    # (af, af_*, am_*, bm_*, bf_*), render via the bundled Kokoro engine
+    # (Apache 2.0, on-server, no shutdown risk). This is the v1 cloud
+    # default for customer-tenant Orbi instances. The sales bot on
+    # twickell.com still requests Microsoft "en-US-AvaNeural" by default
+    # and falls through to the edge_tts branch below — same code path,
+    # different voice id.
+    voice_lc = (voice or "").lower().strip()
+    looks_kokoro = (
+        voice_lc == "af"
+        or voice_lc.startswith("af_")
+        or voice_lc.startswith("am_")
+        or voice_lc.startswith("bm_")
+        or voice_lc.startswith("bf_")
+    )
+    if looks_kokoro:
+        try:
+            import kokoro_tts
+            if kokoro_tts.is_available():
+                # Speed-up rate parsing: "+10%" → 1.1, "-10%" → 0.9
+                speed = 1.0
+                try:
+                    s = (rate or "").strip().rstrip("%")
+                    if s:
+                        speed = max(0.5, min(2.0, 1.0 + float(s) / 100.0))
+                except Exception:
+                    speed = 1.0
+                mp3_bytes = kokoro_tts.render(text, voice=voice, speed=speed, format="mp3")
+                if mp3_bytes:
+                    from flask import Response
+                    return Response(
+                        mp3_bytes,
+                        mimetype="audio/mpeg",
+                        headers={"Cache-Control": "no-cache"},
+                    )
+                log.warning(f"kokoro_tts: render returned None for voice={voice!r} — falling through")
+            else:
+                log.warning(f"kokoro_tts: not available (files missing or import failed) — falling through to edge_tts for voice={voice!r}")
+        except Exception as e:
+            log.warning(f"kokoro_tts: branch crashed for voice={voice!r}: {e!r} — falling through")
+
     # Try Piper first if configured. Falls back to edge on failure so a
     # missing binary doesn't break TTS entirely.
     if engine == "piper":
