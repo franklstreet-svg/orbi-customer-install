@@ -61,7 +61,24 @@ def call_brain(config: dict, system: str, messages: list[dict]) -> LLMResponse:
         "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     }
-    return _http_chat(url, payload, headers, cfg.get("timeout_seconds", 60), tier="brain")
+    timeout = cfg.get("timeout_seconds", 60)
+    # Retry once on transient failure — Render's free tier sleeps the brain
+    # container after 15 min of inactivity, and the first request takes
+    # 30-50s to wake it (often exceeding even a generous timeout). Without
+    # a retry, a cold-start scrape extracts nothing because every per-page
+    # brain call fails. After the first request lands, subsequent calls
+    # are <2s warm. One retry covers the wake-up case without blowing up
+    # response time on a healthy brain.
+    resp = _http_chat(url, payload, headers, timeout, tier="brain")
+    if resp:
+        return resp
+    # Don't retry on permanent config errors — only on transient network
+    # failures consistent with Render cold-start.
+    if resp.error in ("disabled", "brain_not_configured"):
+        return resp
+    import time as _time
+    _time.sleep(5)
+    return _http_chat(url, payload, headers, timeout, tier="brain")
 
 
 # ---------------------------------------------------------------------------

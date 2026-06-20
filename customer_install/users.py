@@ -94,7 +94,8 @@ def list_users(data_dir: Path, include_archived: bool = False) -> list[dict]:
 
 
 def add_user(data_dir: Path, username: str, password: str,
-             role: str = "staff", display_name: str | None = None) -> dict:
+             role: str = "staff", display_name: str | None = None,
+             email: str | None = None) -> dict:
     """Create a new user. Username is lowercased. Role must be 'owner' or 'staff'.
     Raises ValueError on duplicate or bad input. Returns the new record (without pw_hash)."""
     if not username or not username.strip():
@@ -114,6 +115,7 @@ def add_user(data_dir: Path, username: str, password: str,
             "role":         role,
             "status":       "active",
             "display_name": display_name or username.strip(),
+            "email":        (email or "").strip().lower(),
             "pw_hash":      hash_password(password),
             "created_at":   _now_iso(),
         }

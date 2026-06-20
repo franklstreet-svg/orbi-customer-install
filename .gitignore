@@ -12,7 +12,10 @@ env/
 
 # Customer data (NEVER commit — this folder is per-install data)
 customer_install/data/
+customer_install/data.preroll-*/
 customer_install/snapshots/
+customer_install/backups/
+customer_install/bin/
 customer_install/llm_local/
 customer_install/tunnel/
 customer_install/desktop_shortcuts/
@@ -51,3 +54,10 @@ usb_bundle/dist/
 customer_install/installer/dist/
 customer_install/installer/build/
 customer_install/installer/_bin_cache/
+customer_install/installer/_bundled_runtime/
+
+# Runtime models + logs + ephemeral queues (regenerated/per-install)
+customer_install/tts_models/
+customer_install/notify_queue.jsonl
+customer_install/watchdog.log
+customer_install/*.log

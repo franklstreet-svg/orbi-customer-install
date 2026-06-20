@@ -25,3 +25,13 @@ twilio>=9.0
 python-escpos>=3.0
 # Misc utilities
 qrcode>=7.0
+# Web agent (browser control) — drives a real Chromium for the scraper
+# AND the web_agent module that lets Orbi operate any web app the
+# customer already uses (dispatch systems, supplier portals, etc.).
+# Chromium itself is downloaded by install_runtime.py via
+# `playwright install chromium --with-deps` post-pip.
+playwright>=1.45
+# Native desktop window for the dashboard. Wraps Windows' built-in
+# WebView2 (already on every Windows 10/11) so the customer sees a real
+# program window with the Orbi icon — not Chrome --app mode. ~2 MB.
+pywebview>=5.1; sys_platform == "win32"

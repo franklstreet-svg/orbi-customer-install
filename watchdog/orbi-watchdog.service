@@ -1,0 +1,30 @@
+[Unit]
+Description=Orbi Watchdog (health monitor + auto-restart + snapshot rollback)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/orbi/watchdog.py
+Restart=always
+RestartSec=15
+User=orbi
+Group=orbi
+WorkingDirectory=/opt/orbi
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=orbi-watchdog
+
+# Resource limits — watchdog should be tiny
+MemoryMax=128M
+CPUQuota=10%
+
+# Security
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+ReadWritePaths=/opt/orbi
+
+[Install]
+WantedBy=multi-user.target

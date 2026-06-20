@@ -68,9 +68,12 @@ BILLING_BASE_URL = os.environ.get(
 BRAIN_BASE_URL = os.environ.get(
     "ORBI_BRAIN_URL", BILLING_BASE_URL
 )
-VERIFY_TIMEOUT_SECONDS = 15
+VERIFY_TIMEOUT_SECONDS = 60   # Generous — Render free-tier brain can take
+                              # 30-50s to wake from sleep on a cold start
 HEALTH_TIMEOUT_SECONDS = 30
 HEALTH_PORT = 5050
+VERIFY_RETRY_ATTEMPTS = 3
+VERIFY_RETRY_BACKOFF_SECONDS = 5
 
 # Where to install based on platform
 _SYS = sys.platform
@@ -190,23 +193,57 @@ def verify_token(token: str) -> dict | None:
         return None
 
     url = f"{BILLING_BASE_URL.rstrip('/')}/api/verify/{token}"
+    # Cloudflare's Bot Fight Mode blocks default/short urllib UAs with 403
+    # on the billing.twickell.com edge. The customer-side `call_brain` and
+    # billing-check already use a Mozilla UA; this verify_token was the
+    # third call site, missed in the original fix. Without this, install
+    # fails with "token could not be verified" on any network whose IP
+    # range triggers Bot Fight Mode.
     req = urllib.request.Request(
-        url, headers={"User-Agent": "orbi-installer/0.1"}
+        url,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/126.0.0.0 Safari/537.36 orbi-installer/0.1"
+            ),
+            "Accept": "application/json",
+        },
     )
-    try:
-        with urllib.request.urlopen(req, timeout=VERIFY_TIMEOUT_SECONDS) as resp:
-            if resp.status != 200:
-                log.warning("verify_token: HTTP %s", resp.status)
+
+    # Retry loop — the brain runs on Render's free tier which sleeps after
+    # 15 min idle and takes 30-50s to wake up on the first request. A single
+    # short-timeout attempt would fail every cold-start, leaving Kathy with
+    # "token could not be verified" through no fault of the install token.
+    # 3 attempts with backoff covers cold start + most transient network
+    # blips on residential Wi-Fi.
+    body = None
+    for attempt in range(1, VERIFY_RETRY_ATTEMPTS + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=VERIFY_TIMEOUT_SECONDS) as resp:
+                if resp.status != 200:
+                    log.warning("verify_token: HTTP %s (attempt %d/%d)",
+                                resp.status, attempt, VERIFY_RETRY_ATTEMPTS)
+                    return None
+                body = resp.read().decode("utf-8")
+                break
+        except urllib.error.HTTPError as e:
+            # 4xx are definitive — the brain rejected the token. Don't retry.
+            log.warning("verify_token HTTPError: %s (attempt %d/%d)",
+                        e.code, attempt, VERIFY_RETRY_ATTEMPTS)
+            if 400 <= e.code < 500:
                 return None
-            body = resp.read().decode("utf-8")
-    except urllib.error.HTTPError as e:
-        log.warning("verify_token HTTPError: %s", e.code)
-        return None
-    except urllib.error.URLError as e:
-        log.warning("verify_token URLError: %s", e.reason)
-        return None
-    except (TimeoutError, OSError) as e:
-        log.warning("verify_token network error: %s", e)
+            # 5xx may be a transient brain issue — fall through to retry.
+        except urllib.error.URLError as e:
+            log.warning("verify_token URLError: %s (attempt %d/%d)",
+                        e.reason, attempt, VERIFY_RETRY_ATTEMPTS)
+        except (TimeoutError, OSError) as e:
+            log.warning("verify_token network error: %s (attempt %d/%d)",
+                        e, attempt, VERIFY_RETRY_ATTEMPTS)
+        if attempt < VERIFY_RETRY_ATTEMPTS:
+            _print(f"  brain is waking up (attempt {attempt}/{VERIFY_RETRY_ATTEMPTS}) — retrying in {VERIFY_RETRY_BACKOFF_SECONDS}s ...")
+            time.sleep(VERIFY_RETRY_BACKOFF_SECONDS)
+    if body is None:
         return None
 
     try:
@@ -232,13 +269,58 @@ def verify_token(token: str) -> dict | None:
 # 2. setup_directories
 # ---------------------------------------------------------------------------
 
+_ORBI_WORKSPACE_README = """\
+Welcome to your Orbi workspace.
+
+This folder is YOURS. Orbi reads everything you drop here, and any file
+she creates for you — charts, decks, invoices, ad mockups, briefing
+notes, transcripts, downloads from the web — lands here too.
+
+A few good ways to use it:
+
+  • Drop a PDF or Word doc in here and ask Orbi about it.
+  • Save a spreadsheet here and Orbi can build charts from it on request.
+  • Web tasks Orbi runs (downloading an invoice, exporting a report)
+    save their output to this folder.
+  • Anything you'd normally email yourself "for later" — put it here
+    and Orbi will remember.
+
+What does NOT happen with this folder:
+  • Nothing in here leaves your computer. It is yours. Your business
+    and your personal life stay on your computer — that's the deal.
+  • Orbi doesn't read this folder when you're away unless you ask her
+    to do something with a specific file.
+
+You can delete files from here any time. Orbi will notice on the next
+scan and forget them.
+
+— Orbi
+"""
+
+
 def setup_directories(install_dir: Path) -> None:
     """Create /opt/orbi/{data,snapshots,llm_local,tunnel,bin,tts_models}
-    (or platform-equiv). Idempotent — won't clobber existing data."""
+    (or platform-equiv). Idempotent — won't clobber existing data.
+    Also creates the customer-facing ~/Orbi workspace folder with a
+    welcome README so the new owner knows what it's for the moment
+    they peek inside."""
     install_dir = Path(install_dir)
     install_dir.mkdir(parents=True, exist_ok=True)
     for sub in ("data", "snapshots", "llm_local", "tunnel", "bin", "tts_models"):
         (install_dir / sub).mkdir(parents=True, exist_ok=True)
+    # ~/Orbi/ — the customer's workspace folder. Per Frank's local-data
+    # promise, this is where their files live. Auto-create on install so
+    # the first thing the customer sees in File Explorer is "Orbi" with
+    # a clear welcome message inside.
+    try:
+        workspace = Path.home() / "Orbi"
+        workspace.mkdir(parents=True, exist_ok=True)
+        readme = workspace / "README.txt"
+        if not readme.exists():
+            readme.write_text(_ORBI_WORKSPACE_README, encoding="utf-8")
+            log.info("created Orbi workspace at %s with README", workspace)
+    except OSError as e:
+        log.warning("could not create ~/Orbi workspace: %s", e)
     # Lock down data dir on POSIX
     if not _SYS.startswith("win"):
         try:
@@ -371,16 +453,129 @@ def extract_app_source(install_dir: Path) -> int:
     return count
 
 
-def _find_system_python() -> str:
-    """Find a real Python interpreter on the customer's system. Inside a
-    PyInstaller bundle, sys.executable points at the bundle binary itself,
-    NOT at a Python interpreter — so we can't use sys.executable to spawn
-    `python -m venv`. We have to find python3 on the host PATH.
+def _bundle_resource(name: str) -> Path | None:
+    """Locate a data file bundled with the installer by PyInstaller. Returns
+    a Path under sys._MEIPASS (the temp extraction dir for --onefile bundles)
+    or None if not found. When running from source (dev), falls back to the
+    installer directory."""
+    bases: list[Path] = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        bases.append(Path(meipass))
+    # Dev fallback — running install_runtime.py directly from source
+    bases.append(Path(__file__).resolve().parent / "_bundled_runtime")
+    for base in bases:
+        candidate = base / name
+        if candidate.exists():
+            return candidate
+    return None
 
-    Raises RuntimeError if no Python ≥3.10 is found, with a clear hint
-    to install one. (apt install python3 / brew install python / the
-    python.org installer on Windows.)
+
+def _extract_bundled_python(install_dir: Path) -> str | None:
+    """Extract the bundled Windows embeddable Python into install_dir/python/
+    so the customer doesn't need a system Python installed. Returns the path
+    to python.exe on success, or None on any failure (caller falls back to
+    finding a system Python).
+
+    Steps:
+      1. Locate the embeddable Python zip + get-pip.py inside the PyInstaller
+         bundle (under python_embed/).
+      2. Extract the zip to install_dir/python/.
+      3. Patch the *._pth file to uncomment `#import site` — required so
+         pip can install packages into the embedded distribution.
+      4. Run get-pip.py to install pip.
+      5. Return the path to python.exe.
     """
+    import zipfile
+    if not _SYS.startswith("win"):
+        # Embedded Python is Windows-specific. On Linux/Mac the system
+        # python3 is reliably present.
+        return None
+    embed_zip = _bundle_resource("python_embed/python-3.13.1-embed-amd64.zip")
+    get_pip = _bundle_resource("python_embed/get-pip.py")
+    if not embed_zip or not get_pip:
+        log.info("no bundled Python in this build — falling back to system Python")
+        return None
+    python_dir = install_dir / "python"
+    python_exe = python_dir / "python.exe"
+    if python_exe.exists():
+        log.info("bundled Python already extracted at %s", python_exe)
+        return str(python_exe)
+    python_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        log.info("extracting bundled Python to %s", python_dir)
+        with zipfile.ZipFile(embed_zip) as zf:
+            zf.extractall(python_dir)
+        if not python_exe.exists():
+            log.warning("python.exe missing after extraction")
+            return None
+        # Patch the *._pth file so:
+        #  (a) pip + site-packages work — embeddable Python ships with
+        #      `#import site` commented out; uncomment it.
+        #  (b) orbi.py's directory is on sys.path — embeddable Python with
+        #      a ._pth runs in ISOLATED mode and does NOT auto-add the
+        #      script's directory like normal Python does. We have to
+        #      explicitly add install_dir (where audit.py, modules/,
+        #      etc. live) or the orbi.py service will fail at
+        #      `import audit` on first boot.
+        for pth_file in python_dir.glob("*._pth"):
+            txt = pth_file.read_text(encoding="utf-8")
+            # Uncomment `import site`
+            if "#import site" in txt:
+                txt = txt.replace("#import site", "import site")
+            # Add install_dir absolute path to sys.path if not already there.
+            install_dir_str = str(install_dir).replace("/", "\\")
+            if install_dir_str not in txt:
+                # Insert before `import site` line so the path entry is
+                # registered before site.main() runs.
+                if "import site" in txt:
+                    txt = txt.replace("import site",
+                                       install_dir_str + "\nimport site")
+                else:
+                    txt = txt.rstrip() + "\n" + install_dir_str + "\n"
+            pth_file.write_text(txt, encoding="utf-8")
+            log.info("patched %s — enabled site imports + added %s to sys.path",
+                      pth_file.name, install_dir_str)
+        # Install pip via get-pip.py
+        log.info("installing pip into bundled Python")
+        subprocess.run([str(python_exe), str(get_pip), "--no-warn-script-location"],
+                        check=True, timeout=300)
+        log.info("bundled Python ready at %s", python_exe)
+        return str(python_exe)
+    except Exception as e:
+        log.warning("bundled Python setup failed (%s) — falling back to system", e)
+        return None
+
+
+# Cache the resolved Python path across calls so we don't extract twice
+_RESOLVED_PYTHON: str | None = None
+_INSTALL_DIR_FOR_PYTHON: Path | None = None
+
+
+def _find_system_python(install_dir: Path | None = None) -> str:
+    """Find a real Python interpreter for the customer's machine. On Windows,
+    we PREFER the embedded Python we shipped inside the installer (so the
+    customer doesn't have to install Python themselves). On other platforms,
+    or if the embedded extraction fails, we look on PATH.
+
+    Inside a PyInstaller bundle, sys.executable points at the bundle binary
+    itself, NOT at a Python interpreter — so we can't use sys.executable
+    to spawn `python -m venv`. We need a real interpreter.
+
+    Raises RuntimeError if no Python ≥3.10 is available, with a clear hint
+    to install one.
+    """
+    global _RESOLVED_PYTHON, _INSTALL_DIR_FOR_PYTHON
+    if _RESOLVED_PYTHON and Path(_RESOLVED_PYTHON).exists():
+        return _RESOLVED_PYTHON
+    # 1. Try the bundled embedded Python first (Windows only).
+    if install_dir is not None:
+        bundled = _extract_bundled_python(install_dir)
+        if bundled:
+            _RESOLVED_PYTHON = bundled
+            _INSTALL_DIR_FOR_PYTHON = install_dir
+            return bundled
+    # 2. Fall back to system Python on PATH.
     candidates = []
     if _SYS.startswith("win"):
         candidates = ["py", "python", "python3"]
@@ -403,15 +598,17 @@ def _find_system_python() -> str:
                     minor = int(major_minor.split(",")[1].strip().rstrip(")"))
                     if minor >= 10:
                         log.info("using system python: %s (3.%d)", path, minor)
+                        _RESOLVED_PYTHON = path
                         return path
                 except ValueError:
                     continue
         except (subprocess.SubprocessError, OSError):
             continue
     raise RuntimeError(
-        "No Python ≥3.10 found on PATH. Install python3 (apt install python3 "
-        "on Ubuntu, brew install python3 on macOS, or python.org installer "
-        "on Windows) and re-run this installer."
+        "No Python ≥3.10 found on PATH. This build of the Orbi installer "
+        "should include a bundled Python — if it doesn't, you may be running "
+        "an older installer. Re-download the latest installer from your "
+        "email link and retry."
     )
 
 
@@ -426,24 +623,86 @@ def install_python_deps(install_dir: Path) -> None:
     if not req.is_file():
         log.warning("no requirements.txt in %s — skipping pip install", install_dir)
         return
-    venv_dir = install_dir / ".venv"
-    if not venv_dir.exists():
-        log.info("creating venv at %s", venv_dir)
-        system_python = _find_system_python()
-        subprocess.run([system_python, "-m", "venv", str(venv_dir)],
-                        check=True)
-    pip = venv_dir / ("Scripts" if _SYS.startswith("win") else "bin") / "pip"
-    if not pip.exists():
-        # Fallback to using the venv's python -m pip
-        py = venv_dir / ("Scripts" if _SYS.startswith("win") else "bin") / "python"
-        pip_cmd = [str(py), "-m", "pip"]
+    # Pass install_dir so the bundled embedded Python (Windows) can be
+    # extracted into install_dir/python/ if present in this build.
+    system_python = _find_system_python(install_dir)
+    bundled_python_dir = install_dir / "python"
+    using_bundled = (
+        _SYS.startswith("win")
+        and bundled_python_dir.exists()
+        and Path(system_python).resolve().is_relative_to(bundled_python_dir.resolve())
+    )
+    if using_bundled:
+        # Windows Embeddable Python is a stripped-down distribution that's
+        # MISSING the `venv` module — `python -m venv` would fail. Skip the
+        # venv layer entirely and install deps directly into the embedded
+        # Python's site-packages. The embedded Python is already isolated
+        # under install_dir/python/, so it functions as its own private
+        # environment. This is the simpler, more reliable path for the
+        # zero-Python-required Windows install.
+        log.info("using bundled embedded Python — installing deps directly "
+                  "(no venv needed, install_dir/python is already isolated)")
+        pip_cmd = [system_python, "-m", "pip"]
     else:
-        pip_cmd = [str(pip)]
-    log.info("installing Python deps from %s into %s", req, venv_dir)
+        # System Python on PATH — use a real venv.
+        venv_dir = install_dir / ".venv"
+        if not venv_dir.exists():
+            log.info("creating venv at %s", venv_dir)
+            subprocess.run([system_python, "-m", "venv", str(venv_dir)],
+                            check=True)
+        pip = venv_dir / ("Scripts" if _SYS.startswith("win") else "bin") / "pip"
+        if not pip.exists():
+            # Fallback to using the venv's python -m pip
+            py = venv_dir / ("Scripts" if _SYS.startswith("win") else "bin") / "python"
+            pip_cmd = [str(py), "-m", "pip"]
+        else:
+            pip_cmd = [str(pip)]
+    log.info("installing Python deps from %s", req)
     subprocess.run(pip_cmd + ["install", "--upgrade", "pip"],
+                    check=False)
+    # Bootstrap setuptools + wheel BEFORE installing requirements.
+    # pip's build isolation needs setuptools.build_meta when ANY package
+    # in the dependency tree ships only as a source distribution (e.g.
+    # http-ece via pywebpush). The Windows embeddable Python doesn't
+    # ship setuptools by default, so installing them up front prevents
+    # the "Cannot import 'setuptools.build_meta'" error mid-resolution.
+    subprocess.run(pip_cmd + ["install", "setuptools", "wheel"],
                     check=False)
     subprocess.run(pip_cmd + ["install", "-r", str(req)], check=True)
     log.info("Python deps installed")
+
+    # Chromium auto-download for Playwright is GATED for now.
+    # The web_agent module is shipped in code but the heavyweight
+    # 170 MB Chromium download is skipped on install by default —
+    # restaurant customers (the v1 market) don't use web_agent and
+    # don't need a 3-5 minute Chromium download added to their
+    # install time. The capability is dormant; the dashboard
+    # exposes a one-button "enable web automation" later that
+    # triggers `playwright install chromium` on demand.
+    #
+    # Set ORBI_INSTALL_CHROMIUM=1 in the environment to force the
+    # download at install time (used for the cab-dispatch beta where
+    # web_agent IS needed from day one).
+    if os.environ.get("ORBI_INSTALL_CHROMIUM") == "1":
+        if using_bundled:
+            py_for_playwright = system_python
+        else:
+            py_for_playwright = str(
+                (install_dir / ".venv" /
+                 ("Scripts" if _SYS.startswith("win") else "bin") / "python"))
+        try:
+            log.info("downloading Chromium for Playwright (~170 MB, one-time)")
+            subprocess.run(
+                [py_for_playwright, "-m", "playwright", "install", "chromium"],
+                check=False, timeout=600,
+            )
+            log.info("Chromium download complete")
+        except Exception as e:
+            log.warning("playwright chromium install failed: %s — web agent "
+                        "will be unavailable until manual reinstall", e)
+    else:
+        log.info("skipping Chromium auto-download (web_agent dormant until "
+                 "owner enables it from the dashboard)")
 
 
 # ---------------------------------------------------------------------------
@@ -482,23 +741,47 @@ def write_config(install_dir: Path, billing_data: dict,
     biz = sanitize_business_name(business_name)
 
     cfg.setdefault("owner", {})["email"] = owner_email
-    cfg["owner"]["name"] = owner_email.split("@", 1)[0].title()
+    # Do NOT derive owner.name from the email local-part. We used to do
+    # `email.split("@",1)[0].title()` which produced wrong names like
+    # "Frank L Street" from "frank.l.street@…" and called the customer
+    # by their billing-email name even when their actual business owner
+    # was someone else (e.g. Frank installing for a client named Frank
+    # Hawbolt at scsplanroom.com). Leave it blank — the setup-password
+    # modal forces the customer to type the real owner name on first
+    # login, and the owner prompt falls back to "the owner" until then.
+    cfg["owner"]["name"] = ""
     # password_hash is filled in by bootstrap_owner() via users.add_user
     cfg["owner"].pop("_password_hash", None)
 
     cfg.setdefault("brain", {})["api_key"] = api_key
     cfg["brain"]["url"] = BRAIN_BASE_URL.rstrip("/")
-    cfg["brain"].setdefault("timeout_seconds", 30)
+    # Force 60s, even if template has a smaller value. Render's free tier
+    # sleeps the brain after 15 min idle and cold-start takes 30-50s.
+    # The historic 15s default would time out every first request and
+    # trip the circuit breaker before the brain woke up — leaving the
+    # scrape with no LLM and an empty business profile.
+    cfg["brain"]["timeout_seconds"] = 60
+    # Disable the direct-HuggingFace fallback on customer installs.
+    # The architecture intent is brain-only; customers don't get a real
+    # HF token. Leaving the tier enabled with the placeholder token
+    # causes 401s after every brain failure, slowing recovery without
+    # benefit. Set the brain.url + api_key right, retry on cold-start,
+    # and the brain handles everything.
+    cfg.setdefault("huggingface", {})["enabled"] = False
     # Auto-start a cloudflared trycloudflare tunnel on boot so the
     # brain server can forward Twilio webhooks + visitor traffic back
     # to this machine. URL is reported via heartbeat. Zero-config —
     # customer never touches Cloudflare.
     cfg.setdefault("tunnel", {})["enabled"] = True
-    # TTS: prefer Piper (self-hosted, MIT, commercially clean). orbi.py
-    # automatically falls back to edge_tts if the bundled Piper binary
-    # or voice model isn't present, so customer installs survive a
-    # voice-model download failure during the build.
-    cfg.setdefault("tts", {})["engine"] = "piper"
+    # TTS: ship with edge_tts as default. Piper is the long-term target
+    # (self-hosted, MIT, commercially clean) but the build script only
+    # bundles piper.exe — espeak-ng.dll + piper_phonemize.dll + the
+    # espeak-ng-data folder are dropped during _extract_binary, leaving
+    # piper.exe unable to start ("espeak-ng.dll was not found"). Until
+    # the bundle is fixed, default to edge_tts so customer installs
+    # actually speak. Frank's memory: edge_tts is fine until ~10
+    # customers; swap to Piper before scaling.
+    cfg.setdefault("tts", {})["engine"] = "edge_tts"
     cfg["tts"].setdefault("voice_model", "en_US-amy-medium")
     cfg.setdefault("billing", {})["check_url"] = (
         f"{BILLING_BASE_URL.rstrip('/')}/api/active"
@@ -582,12 +865,16 @@ def bootstrap_owner(install_dir: Path, owner_email: str) -> str:
                 raise RuntimeError("cannot find unique owner username")
 
         password = _random_password(12)
+        # display_name is left blank so the first-login password modal
+        # forces the customer to type their real name. See the matching
+        # change at install_runtime.py owner.name setup — we no longer
+        # auto-derive a name from the billing email.
         _users_mod.add_user(
             data_dir=data_dir,
             username=username,
             password=password,
             role="owner",
-            display_name=owner_email.split("@", 1)[0].title(),
+            display_name="",
         )
         log.info("bootstrap owner created: %s", username)
         # Persist the username back into config.json for the wizard
@@ -664,7 +951,7 @@ def _install_service_linux(install_dir: Path) -> None:
         python_bin = str(venv_py)
     else:
         try:
-            python_bin = _find_system_python()
+            python_bin = _find_system_python(install_dir)
         except RuntimeError:
             python_bin = shutil.which("python3") or "/usr/bin/python3"
     content = _LINUX_UNIT.format(install_dir=install_dir, python=python_bin)
@@ -760,10 +1047,89 @@ def _install_service_mac(install_dir: Path) -> None:
 
 
 def _install_service_windows(install_dir: Path) -> None:
-    """Register a Windows service via sc.exe. Prefers nssm if available
-    because Python scripts as native services are awkward without a wrapper."""
+    """Register Windows auto-start AND spawn orbi.py for the current session.
+
+    Skips the broken sc.exe service path — Python scripts can't be proper
+    Windows services without nssm, and nssm isn't bundled. Instead:
+      1. Drop a Startup-folder shortcut to launcher.cmd so Orbi auto-launches
+         at user login (same pattern Slack/Discord use unprivileged).
+      2. Spawn orbi.py in the background NOW via the bundled pythonw.exe,
+         so the post-install browser launch hits a live server. Without
+         this the customer lands on a dead page and has to double-click
+         the Orbi shortcut to bring the server up.
+
+    Depends on create_desktop_shortcut having already run to create
+    launcher.cmd. run_interactive enforces this ordering on Windows."""
     install_dir = Path(install_dir)
-    python_bin = shutil.which("python") or shutil.which("py") or "python"
+    launcher_cmd = install_dir / "launcher.cmd"
+
+    # Step 1: Startup-folder shortcut for auto-start at login.
+    appdata = os.environ.get("APPDATA")
+    if launcher_cmd.exists() and appdata:
+        startup_dir = Path(appdata) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
+        try:
+            startup_dir.mkdir(parents=True, exist_ok=True)
+            shortcut_path = startup_dir / "Orbi.lnk"
+            ps = (
+                "$ws = New-Object -ComObject WScript.Shell; "
+                f"$sc = $ws.CreateShortcut('{shortcut_path}'); "
+                f"$sc.TargetPath = '{launcher_cmd}'; "
+                f"$sc.WorkingDirectory = '{install_dir}'; "
+                "$sc.WindowStyle = 7; "  # 7 = Minimized — no flash of cmd window
+                "$sc.Description = 'Start Orbi at login'; "
+                "$sc.Save()"
+            )
+            subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive",
+                            "-Command", ps],
+                           check=False, timeout=30)
+            log.info("Startup shortcut created at %s", shortcut_path)
+        except Exception as e:
+            log.warning("could not create startup shortcut: %s", e)
+    else:
+        if not launcher_cmd.exists():
+            log.warning("launcher.cmd missing — skipping startup registration")
+        if not appdata:
+            log.warning("APPDATA env var not set — skipping startup registration")
+
+    # Step 2: Spawn orbi.py NOW so verify_install / launch_setup_wizard land
+    # on a live server. Detached so the child survives the installer exiting.
+    pythonw_exe = install_dir / "python" / "pythonw.exe"
+    python_exe = install_dir / "python" / "python.exe"
+    orbi_py = install_dir / "orbi.py"
+    py = pythonw_exe if pythonw_exe.exists() else python_exe
+    if py.exists() and orbi_py.exists():
+        try:
+            CREATE_NO_WINDOW = 0x08000000
+            DETACHED_PROCESS = 0x00000008
+            subprocess.Popen(
+                [str(py), str(orbi_py)],
+                cwd=str(install_dir),
+                creationflags=CREATE_NO_WINDOW | DETACHED_PROCESS,
+                close_fds=True,
+            )
+            log.info("spawned orbi.py via %s — server starting in background", py.name)
+        except Exception as e:
+            log.warning("could not spawn orbi.py: %s", e)
+    else:
+        log.warning("bundled Python or orbi.py missing — server will not "
+                    "start until the customer double-clicks the Orbi shortcut")
+    return  # SKIP the broken sc.exe service registration below
+    # --- legacy sc.exe / nssm path kept below for reference only ---
+    # (everything past this point is unreachable until nssm is bundled)
+    # noqa: code-after-return is intentional
+    install_dir = Path(install_dir)
+    # PREFER the bundled embedded Python at install_dir/python/python.exe.
+    # On a clean customer machine there's no system Python on PATH, so
+    # shutil.which("python") returns None and the service would crash at
+    # boot. The bundled Python is guaranteed to be there because the
+    # installer extracted it earlier in this run.
+    bundled_python = install_dir / "python" / "python.exe"
+    if bundled_python.exists():
+        python_bin = str(bundled_python)
+        log.info("service will run via bundled Python: %s", python_bin)
+    else:
+        python_bin = shutil.which("python") or shutil.which("py") or "python"
+        log.warning("no bundled Python found; service falls back to %s", python_bin)
     nssm = shutil.which("nssm")
 
     if nssm:
@@ -829,6 +1195,49 @@ def verify_install(install_dir: Path) -> bool:
 # 6b. create_desktop_shortcut — gives the customer an icon they can find
 # ---------------------------------------------------------------------------
 
+def _resolve_desktop_dir() -> Path | None:
+    """Find the user's actual Desktop directory.
+
+    Handles the two Windows footguns:
+      1. OneDrive redirection — Desktop becomes %USERPROFILE%\\OneDrive\\Desktop
+         and the legacy %USERPROFILE%\\Desktop may be empty or missing.
+      2. UAC elevation — Path.home() can return the admin profile or the
+         SYSTEM profile rather than the actual user's profile.
+
+    Strategy: ask Windows itself (PowerShell GetFolderPath('Desktop'))
+    first because that's authoritative even under redirection and
+    elevation. Fall back to USERPROFILE-based candidates, then Path.home().
+    Returns None if no Desktop directory can be found.
+    """
+    candidates: list[Path] = []
+    if _SYS.startswith("win"):
+        try:
+            r = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+                 "[Environment]::GetFolderPath('Desktop')"],
+                capture_output=True, text=True, timeout=8,
+            )
+            if r.returncode == 0:
+                ps_path = (r.stdout or "").strip()
+                if ps_path:
+                    candidates.append(Path(ps_path))
+        except (subprocess.SubprocessError, OSError):
+            pass
+        userprofile = os.environ.get("USERPROFILE")
+        if userprofile:
+            up = Path(userprofile)
+            candidates.append(up / "OneDrive" / "Desktop")
+            candidates.append(up / "Desktop")
+    candidates.append(Path.home() / "Desktop")
+    for c in candidates:
+        try:
+            if c.exists() and c.is_dir():
+                return c
+        except OSError:
+            continue
+    return None
+
+
 def create_desktop_shortcut(install_dir: Path) -> None:
     """Drop a desktop icon that opens the Orbi dashboard.
 
@@ -844,57 +1253,104 @@ def create_desktop_shortcut(install_dir: Path) -> None:
     /Applications, not desktop icons. Future work.
     """
     install_dir = Path(install_dir)
-    home = Path.home()
-    desktop = home / "Desktop"
-    if not desktop.exists():
-        # Some Linux distros + headless installs don't have a Desktop dir.
-        log.info("no ~/Desktop directory — skipping desktop shortcut")
+    desktop = _resolve_desktop_dir()
+    if desktop is None:
+        log.info("no Desktop directory found — skipping desktop shortcut")
         return
 
     if _SYS.startswith("win"):
-        # 1) Write the launcher .cmd. It tries Chrome's `--app=URL` mode
-        #    first (no URL bar, no tabs — looks like a real desktop app),
-        #    then Edge, then falls back to the default browser. Result is
-        #    a window that feels native instead of "just another website."
+        # 1) Write the launcher .cmd. The launcher boots orbi.py if it
+        #    isn't already running, then opens the dashboard in a REAL
+        #    native window via orbi_window.py (pywebview / WebView2).
+        #    Falls back to Chrome --app and then the default browser
+        #    if pywebview isn't installed yet (first install, before
+        #    the deps land). Per Frank: "I want it to look like a
+        #    program, not a website." This is what makes that true.
         launcher = install_dir / "launcher.cmd"
         url = f"http://localhost:{HEALTH_PORT}/owner/login"
+        python_exe = install_dir / "python" / "python.exe"
+        pythonw_exe = install_dir / "python" / "pythonw.exe"
+        orbi_py = install_dir / "orbi.py"
+        window_py = install_dir / "orbi_window.py"
         launcher_body = (
             "@echo off\r\n"
-            "REM Start Orbi service if not already running, then open the\r\n"
-            "REM dashboard in app-mode (no URL bar, no tabs — feels native).\r\n"
-            "sc start Orbi >nul 2>&1\r\n"
-            "REM Give the service a few seconds to come up on a cold start.\r\n"
-            "ping -n 4 127.0.0.1 >nul\r\n"
+            "REM Orbi launcher - start the server if not running, then open\r\n"
+            "REM the dashboard in a NATIVE WINDOW (WebView2) so it looks\r\n"
+            "REM like a real Windows program, not a browser.\r\n"
             "\r\n"
-            "REM Try Chrome installed via the launcher (PATH) first\r\n"
+            "REM Check if Orbi is already listening on port 5050. If yes,\r\n"
+            "REM just open the window. If no, start her up first.\r\n"
+            "netstat -ano | findstr \":5050\" | findstr \"LISTENING\" >nul 2>&1\r\n"
+            "if %ERRORLEVEL% NEQ 0 (\r\n"
+            f"    REM Not running - launch via pythonw (no console window)\r\n"
+            f"    if exist \"{pythonw_exe}\" (\r\n"
+            f"        start \"\" /B \"{pythonw_exe}\" \"{orbi_py}\"\r\n"
+            f"    ) else (\r\n"
+            f"        start \"\" /B \"{python_exe}\" \"{orbi_py}\"\r\n"
+            f"    )\r\n"
+            "    REM Wait up to 30 seconds for the port to come up.\r\n"
+            "    set /a _tries=0\r\n"
+            "    :wait_loop\r\n"
+            "    ping -n 2 127.0.0.1 >nul\r\n"
+            "    netstat -ano | findstr \":5050\" | findstr \"LISTENING\" >nul 2>&1\r\n"
+            "    if %ERRORLEVEL% EQU 0 goto port_ready\r\n"
+            "    set /a _tries+=1\r\n"
+            "    if %_tries% LSS 15 goto wait_loop\r\n"
+            "    :port_ready\r\n"
+            ")\r\n"
+            "\r\n"
+            "REM Primary: open in the native WebView2 window via pywebview.\r\n"
+            "REM This is the \"looks like a program\" path. orbi_window.py\r\n"
+            "REM blocks until the window is closed; we use pythonw to keep\r\n"
+            "REM the launching cmd.exe window hidden.\r\n"
+            f"if exist \"{pythonw_exe}\" (\r\n"
+            f"    if exist \"{window_py}\" (\r\n"
+            f"        \"{pythonw_exe}\" \"{window_py}\" & exit /b\r\n"
+            f"    )\r\n"
+            f")\r\n"
+            "if exist \"" + str(python_exe) + "\" (\r\n"
+            f"    if exist \"{window_py}\" (\r\n"
+            f"        \"{python_exe}\" \"{window_py}\" & exit /b\r\n"
+            f"    )\r\n"
+            f")\r\n"
+            "\r\n"
+            "REM Fallback chain: Chrome --app, Edge --app, default browser.\r\n"
+            "REM Only reached if pywebview or orbi_window.py is missing.\r\n"
             "where chrome.exe >nul 2>&1\r\n"
             f"if %ERRORLEVEL% == 0 ( start \"\" chrome.exe --app=\"{url}\" & exit /b )\r\n"
-            "\r\n"
-            "REM Standard Chrome install locations\r\n"
             "if exist \"%ProgramFiles%\\Google\\Chrome\\Application\\chrome.exe\" ( "
             f"start \"\" \"%ProgramFiles%\\Google\\Chrome\\Application\\chrome.exe\" --app=\"{url}\" & exit /b )\r\n"
             "if exist \"%ProgramFiles(x86)%\\Google\\Chrome\\Application\\chrome.exe\" ( "
             f"start \"\" \"%ProgramFiles(x86)%\\Google\\Chrome\\Application\\chrome.exe\" --app=\"{url}\" & exit /b )\r\n"
             "if exist \"%LocalAppData%\\Google\\Chrome\\Application\\chrome.exe\" ( "
             f"start \"\" \"%LocalAppData%\\Google\\Chrome\\Application\\chrome.exe\" --app=\"{url}\" & exit /b )\r\n"
-            "\r\n"
-            "REM Try Edge (ships with Windows 10/11 by default)\r\n"
             "if exist \"%ProgramFiles(x86)%\\Microsoft\\Edge\\Application\\msedge.exe\" ( "
             f"start \"\" \"%ProgramFiles(x86)%\\Microsoft\\Edge\\Application\\msedge.exe\" --app=\"{url}\" & exit /b )\r\n"
             "if exist \"%ProgramFiles%\\Microsoft\\Edge\\Application\\msedge.exe\" ( "
             f"start \"\" \"%ProgramFiles%\\Microsoft\\Edge\\Application\\msedge.exe\" --app=\"{url}\" & exit /b )\r\n"
-            "\r\n"
-            "REM Last resort: open in whatever the user's default browser is.\r\n"
+            "REM Last resort: open in the user's default browser.\r\n"
             f"start \"\" \"{url}\"\r\n"
         )
         try:
-            launcher.write_text(launcher_body, encoding="ascii", newline="")
-        except OSError as e:
+            # Use cp1252 (Windows-Latin-1) — what cmd.exe expects natively.
+            # Also catch UnicodeEncodeError in case future edits sneak in
+            # smart quotes / em-dashes — those silently broke the launcher
+            # on Kathy's install when this was encoded as ASCII.
+            launcher.write_text(launcher_body, encoding="cp1252", newline="")
+            log.info("wrote launcher.cmd (%d bytes)", launcher.stat().st_size)
+        except (OSError, UnicodeEncodeError) as e:
             log.warning("could not write launcher.cmd: %s", e)
             return
 
         # 2) Make the .lnk via PowerShell COM
         shortcut_path = desktop / "Orbi.lnk"
+        # The icon file ships with the install (extracted by extract_app_source
+        # into install_dir/icons/orbi.ico). It's the same icon the customer
+        # sees on their phone when they install Orbi as a PWA — keeps the
+        # brand consistent across surfaces.
+        icon_path = install_dir / "icons" / "orbi.ico"
+        icon_clause = (f"$sc.IconLocation = '{icon_path}'; "
+                        if icon_path.exists() else "")
         # Embed paths via PS variable assignments to avoid quoting issues.
         ps = (
             "$ws = New-Object -ComObject WScript.Shell; "
@@ -902,6 +1358,7 @@ def create_desktop_shortcut(install_dir: Path) -> None:
             f"$sc.TargetPath = '{launcher}'; "
             f"$sc.WorkingDirectory = '{install_dir}'; "
             "$sc.Description = 'Open your Orbi dashboard'; "
+            f"{icon_clause}"
             "$sc.Save()"
         )
         try:
@@ -913,6 +1370,63 @@ def create_desktop_shortcut(install_dir: Path) -> None:
             log.info("desktop shortcut created at %s", shortcut_path)
         except (subprocess.SubprocessError, OSError) as e:
             log.warning("could not create Windows desktop shortcut: %s", e)
+
+        # 3) A SECOND desktop shortcut pointing at the customer's
+        #    ~/Orbi/ workspace folder, so they see "Orbi" (the app)
+        #    and "Orbi Workspace" (their files) side by side. Frank's
+        #    framing: "your work, your life, your computer" — the
+        #    workspace shortcut makes the third part visible.
+        workspace_dir = Path.home() / "Orbi"
+        workspace_lnk = desktop / "Orbi Workspace.lnk"
+        ps_ws = (
+            "$ws = New-Object -ComObject WScript.Shell; "
+            f"$sc = $ws.CreateShortcut('{workspace_lnk}'); "
+            f"$sc.TargetPath = '{workspace_dir}'; "
+            f"$sc.WorkingDirectory = '{workspace_dir}'; "
+            "$sc.Description = "
+            "'Your Orbi workspace — drop files here, Orbi reads them'; "
+            f"{icon_clause}"
+            "$sc.Save()"
+        )
+        try:
+            subprocess.run(
+                ["powershell.exe", "-NoProfile", "-NonInteractive",
+                 "-Command", ps_ws],
+                check=False, timeout=15,
+            )
+            log.info("workspace shortcut created at %s", workspace_lnk)
+        except (subprocess.SubprocessError, OSError) as e:
+            log.warning("could not create workspace shortcut: %s", e)
+
+        # 4) Start Menu entry — the canonical place customers look for
+        # "installed apps." Even if the desktop shortcuts go missing or
+        # the customer hides them, the Start Menu entry is always
+        # findable by typing "Orbi" in the search bar.
+        # Path: %APPDATA%\Microsoft\Windows\Start Menu\Programs\Orbi.lnk
+        try:
+            appdata = os.environ.get("APPDATA")
+            if appdata:
+                start_dir = (Path(appdata) / "Microsoft" / "Windows"
+                              / "Start Menu" / "Programs")
+                start_dir.mkdir(parents=True, exist_ok=True)
+                start_lnk = start_dir / "Orbi.lnk"
+                ps_start = (
+                    "$ws = New-Object -ComObject WScript.Shell; "
+                    f"$sc = $ws.CreateShortcut('{start_lnk}'); "
+                    f"$sc.TargetPath = '{launcher}'; "
+                    f"$sc.WorkingDirectory = '{install_dir}'; "
+                    "$sc.Description = 'Open Orbi'; "
+                    f"{icon_clause}"
+                    "$sc.Save()"
+                )
+                subprocess.run(
+                    ["powershell.exe", "-NoProfile", "-NonInteractive",
+                     "-Command", ps_start],
+                    check=False, timeout=15,
+                )
+                log.info("start menu entry created at %s", start_lnk)
+        except (subprocess.SubprocessError, OSError) as e:
+            log.warning("could not create start menu entry: %s", e)
         return
 
     if _SYS == "linux":
@@ -1093,6 +1607,47 @@ def _read_clipboard() -> str:
         return ""
 
 
+def _windows_is_admin() -> bool:
+    """True on POSIX (no concept), or on Windows when we hold admin rights."""
+    if not _SYS.startswith("win"):
+        return True
+    try:
+        import ctypes
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def _windows_relaunch_elevated(forwarded_args: list[str]) -> int:
+    """Re-launch this installer with admin rights via the Windows UAC
+    prompt. Returns the exit code the unelevated parent should use:
+    0 means the elevated copy was successfully spawned (parent quits quietly);
+    non-zero means UAC was declined or failed."""
+    import ctypes
+    params = " ".join(f'"{a}"' for a in forwarded_args)
+    SW_NORMAL = 1
+    try:
+        rc = ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", sys.executable, params, None, SW_NORMAL
+        )
+    except Exception:
+        log.exception("ShellExecuteW failed during UAC self-elevation")
+        return 5
+    if rc > 32:
+        return 0
+    if rc == 5:
+        _print("")
+        _print("ERROR: Orbi needs administrator permission to install into")
+        _print("       'C:\\Program Files\\Orbi'. Please run the installer")
+        _print("       again and click 'Yes' on the Windows security prompt.")
+        return 5
+    _print("")
+    _print(f"ERROR: Could not request administrator permission (code {rc}).")
+    _print("       Right-click 'orbi-installer.exe' and choose")
+    _print("       'Run as administrator' to install Orbi.")
+    return int(rc)
+
+
 def run_interactive(install_dir: Path | None = None,
                     argv: list[str] | None = None) -> int:
     """Top-level installer flow. Returns the process exit code."""
@@ -1106,12 +1661,27 @@ def run_interactive(install_dir: Path | None = None,
     _print("Welcome to the Orbi installer.")
     _print("")
 
+    if _SYS.startswith("win") and not _windows_is_admin():
+        _print("Orbi installs into 'C:\\Program Files\\Orbi', which Windows")
+        _print("protects with administrator permission.")
+        _print("")
+        _print("Windows will now ask you to allow this. Click 'Yes' on the")
+        _print("security prompt and the installer will continue in a new")
+        _print("window.")
+        _print("")
+        return _windows_relaunch_elevated(sys.argv[1:])
+
     # ── Auto-detect token from clipboard or command-line arg ──
-    # The install page at twickell.com/install?t=<token> auto-copies the
-    # token to the clipboard on click. We try that first so the customer
-    # doesn't have to paste anything.
+    # Token source priority:
+    #   1. --token= command-line arg (used by automated/scripted installs)
+    #   2. Manual paste at the prompt (the customer-facing path)
+    #
+    # Clipboard auto-grab was REMOVED 2026-06-08 — it silently picked
+    # whichever token happened to be on the clipboard, which caused real
+    # confusion when a customer had multiple tokens copied (e.g. across
+    # retry attempts). Forcing a manual paste means the customer always
+    # sees and approves what they're using.
     token = ""
-    # 1. Command-line arg wins (--token=inst_...)
     for arg in (argv or sys.argv[1:]):
         if arg.startswith("--token="):
             token = arg.split("=", 1)[1].strip()
@@ -1119,22 +1689,8 @@ def run_interactive(install_dir: Path | None = None,
         if arg.startswith("--t="):
             token = arg.split("=", 1)[1].strip()
             break
-    # 2. Clipboard (tkinter is in stdlib + works cross-platform without
-    #    extra packages — important for our PyInstaller bundle)
     if not token:
-        clip = _read_clipboard()
-        if clip:
-            cand = _normalize_install_token(clip)
-            if cand:
-                token = cand
-                _print(f"Found your install token in the clipboard: {token[:14]}…")
-    # 3. Manual prompt as fallback — be forgiving about format. Customers
-    # paste with leading/trailing whitespace, quote marks, or sometimes
-    # the wrong half (the URL surrounding the token). Normalize them all.
-    if not token:
-        _print("Paste the install token you received in your email.")
-        _print("(Tip: visit the link in your email and the token is "
-               "copied automatically — you can also paste it here.)")
+        _print("Paste the install token from your email.")
         _print("It looks like:  inst_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXX")
         _print("")
         while True:
@@ -1147,8 +1703,23 @@ def run_interactive(install_dir: Path | None = None,
                    "Check your email and try again.")
 
     biz_name = ""
-    if not (argv and any(a == "--silent" or a == "--quiet" for a in argv)):
-        biz_name = input("Business name (optional, press Enter to skip): ").strip()
+    # Skip the biz_name prompt when --silent/--quiet is on the command line
+    # OR when stdin isn't a TTY (e.g. the installer was launched with output
+    # redirected to a log file, so there's no human to type). Previously the
+    # silent check only consulted the `argv` parameter and missed flags from
+    # sys.argv — and a non-TTY install would hang forever on the prompt.
+    _all_args = list(argv) if argv is not None else list(sys.argv[1:])
+    _silent = any(a in ("--silent", "--quiet") for a in _all_args)
+    _stdin_tty = False
+    try:
+        _stdin_tty = bool(sys.stdin and sys.stdin.isatty())
+    except (AttributeError, OSError, ValueError):
+        _stdin_tty = False
+    if not _silent and _stdin_tty:
+        try:
+            biz_name = input("Business name (optional, press Enter to skip): ").strip()
+        except (EOFError, OSError):
+            biz_name = ""
 
     _print("")
     _print("Verifying token with billing service …")
@@ -1176,14 +1747,10 @@ def run_interactive(install_dir: Path | None = None,
         return 3
 
     _print("")
-    _print("Installing system service …")
-    try:
-        install_service(install_dir)
-    except Exception as e:
-        _print(f"WARNING: service install failed: {e}")
-        _print("         You can run orbi.py manually for now.")
-        log.exception("service install failed")
-
+    # ORDER MATTERS on Windows: create_desktop_shortcut writes the
+    # launcher.cmd that install_service then registers as the Startup-folder
+    # auto-launch target. Run desktop-shortcut first so launcher.cmd is on
+    # disk before install_service goes looking for it.
     _print("Creating desktop shortcut …")
     try:
         create_desktop_shortcut(install_dir)
@@ -1191,6 +1758,14 @@ def run_interactive(install_dir: Path | None = None,
         # Cosmetic — never block the install over a shortcut failure.
         _print(f"NOTE: desktop shortcut could not be created: {e}")
         log.exception("desktop shortcut creation failed")
+
+    _print("Installing system service …")
+    try:
+        install_service(install_dir)
+    except Exception as e:
+        _print(f"WARNING: service install failed: {e}")
+        _print("         You can run orbi.py manually for now.")
+        log.exception("service install failed")
 
     _print("")
     if not verify_install(install_dir):

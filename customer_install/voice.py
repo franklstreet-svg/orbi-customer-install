@@ -120,6 +120,58 @@ def _extract_name_from_speech(speech: str) -> str | None:
 def _esc(text: str) -> str:
     return html.escape(text or "")
 
+
+def _strip_for_speech(text: str) -> str:
+    """Clean LLM output BEFORE handing it to Twilio Polly. Without this,
+    Polly reads markdown marks literally ("hashtag hashtag pricing") and
+    reads "$129" as "dollar one twenty nine" instead of "one hundred
+    twenty-nine dollars". Mirror of stripForSpeech() in static/chat.js."""
+    import re as _re
+    if not text:
+        return ""
+    s = str(text)
+    # Markdown bold/italic
+    s = _re.sub(r"\*\*?", "", s)
+    # Line-start bullets
+    s = _re.sub(r"(?m)^[-•]\s+", "", s)
+    # ALL hashes (## headings + #tags) — Polly reads each as "hashtag"
+    s = _re.sub(r"#+", "", s)
+    # Inline code backticks
+    s = _re.sub(r"`+", "", s)
+    # System tier hints
+    s = _re.sub(r"—\s*backup mode\s*—", "", s, flags=_re.IGNORECASE)
+    s = _re.sub(r"—\s*offline mode\s*—", "", s, flags=_re.IGNORECASE)
+    # Currency — "$129" → "129 dollars", "$29.99" → "29 dollars and 99 cents"
+    def _money_with_cents(m):
+        d = int(m.group(1))
+        c = int(m.group(2))
+        if d == 0:
+            return f"{c} cents"
+        if c == 0:
+            return f"{d} dollars"
+        return f"{d} dollars and {c} cents"
+    s = _re.sub(r"\$(\d+)\.(\d{2})\b", _money_with_cents, s)
+    s = _re.sub(r"\$(\d+)\b", lambda m: f"{m.group(1)} dollars", s)
+    # Per-unit slashes — "$29/mo" → "29 dollars per month", etc.
+    units = {
+        r"\s*/\s*mo\b": " per month",
+        r"\s*/\s*month\b": " per month",
+        r"\s*/\s*yr\b": " per year",
+        r"\s*/\s*year\b": " per year",
+        r"\s*/\s*seat\b": " per seat",
+        r"\s*/\s*user\b": " per user",
+        r"\s*/\s*day\b": " per day",
+        r"\s*/\s*hr\b": " per hour",
+        r"\s*/\s*hour\b": " per hour",
+        r"\s*/\s*wk\b": " per week",
+        r"\s*/\s*week\b": " per week",
+    }
+    for pat, repl in units.items():
+        s = _re.sub(pat, repl, s, flags=_re.IGNORECASE)
+    # Collapse double-spaces from substitutions
+    s = _re.sub(r"\s{2,}", " ", s).strip()
+    return s
+
 # ---------------------------------------------------------------------------
 # edge_tts audio cache — gives the phone the SAME voice the dashboard uses
 # (en-US-AvaNeural) instead of the broadcast-news-anchor Polly default.
@@ -200,7 +252,7 @@ def _say(text: str, voice: str = "Polly.Joanna") -> str:
 
     To revert to edge_tts + <Play>: change `voice` default back to
     'Polly.Joanna-Neural' and re-enable the _render_audio block below."""
-    return f'<Say voice="{voice}">{_esc(text)}</Say>'
+    return f'<Say voice="{voice}">{_esc(_strip_for_speech(text))}</Say>'
     # --- legacy edge_tts path (kept for easy revert if Polly voice is bad) ---
     # fname = _render_audio(text)
     # if fname:

@@ -33,9 +33,9 @@
   const prefs = loadPrefs();
   function loadPrefs() {
     try {
-      return Object.assign({ micOn: false, speakerOn: false, panelOpen: false },
+      return Object.assign({ micOn: false, speakerOn: true, panelOpen: false },
                            JSON.parse(localStorage.getItem(PREFS_KEY) || '{}'));
-    } catch { return { micOn: false, speakerOn: false, panelOpen: false }; }
+    } catch { return { micOn: false, speakerOn: true, panelOpen: false }; }
   }
   function savePrefs() {
     try { localStorage.setItem(PREFS_KEY, JSON.stringify(prefs)); } catch {}
@@ -105,27 +105,30 @@
       if (_pendingFirstSpeech && prefs.speakerOn) {
         const txt = _pendingFirstSpeech;
         _pendingFirstSpeech = null;
-        try { speak(txt); } catch {}
+        try { Promise.resolve(speak(txt)).finally(_markGreetingDone); } catch { _markGreetingDone(); }
       }
     };
     document.addEventListener('click', _drainOnFirstTap, { once: true });
     document.addEventListener('touchstart', _drainOnFirstTap, { once: true });
 
-    // Visiting / directly OR in embed iframe — both get the full-page chat.
-    // The floating launcher + landing card only exist for the demo embed-host page.
-    launcher.style.display = 'none';
-    document.querySelector('.landing')?.remove();
-    document.body.classList.add('fullpage-chat');
-    panel.classList.add('open');
-    panel.setAttribute('aria-hidden', 'false');
     if (IS_EMBED) {
-      panel.classList.add('embed-mode');
+      // Embed iframe — auto-open panel, hide standalone launcher (parent
+      // page already triggered this via its own gesture).
+      launcher.style.display = 'none';
+      document.querySelector('.landing')?.remove();
+      document.body.classList.add('fullpage-chat');
+      panel.classList.add('open', 'embed-mode');
+      panel.setAttribute('aria-hidden', 'false');
       panelClose.addEventListener('click', () => notifyParent('orbi:close'));
     } else {
+      // Standalone (visiting / directly in a browser/desktop app window).
+      // Keep launcher visible and landing card shown until user clicks
+      // "Talk to Orbi" — that click is the user-gesture context that
+      // unlocks audio so the proactive greeting actually plays out loud.
       panel.classList.add('standalone-mode');
-      // No close button on the standalone page — it IS the chat
       panelClose.style.display = 'none';
     }
+    setupLauncher();
     setupComposer();
     setupToggles();
     setupVoice();
@@ -143,14 +146,21 @@
         if (m.role === 'user' || m.role === 'assistant') addBubble(m.role, m.content);
       });
     }
-    // Auto-enable speaker + mic — in embed mode the chat panel auto-opens
-    // here (DOMContentLoaded), bypassing openPanel(), so this is where
-    // mic/speaker need to turn on for the embed widget. We do it slightly
-    // after applyPrefs() so the toggle states are settled first.
-    setTimeout(() => {
-      if (!prefs.speakerOn) setSpeakerOn(true);
-      if (!prefs.micOn) setMicOn(true);
-    }, 100);
+    // Auto-enable speaker first; mic waits until the proactive greeting
+    // has finished speaking. This makes the status flow "Speaking..." then
+    // "Listening" — she opens the conversation, instead of sitting in
+    // listen-mode waiting on the visitor.
+    //
+    // Standalone mode skips this — the user clicks the "Talk to Orbi"
+    // launcher, and openPanel() handles the on-toggle in that gesture
+    // context (which is the only way the browser will let her audio play).
+    if (IS_EMBED) {
+      setTimeout(async () => {
+        if (!prefs.speakerOn) setSpeakerOn(true);
+        await _greetingDone;
+        if (!prefs.micOn) setMicOn(true);
+      }, 100);
+    }
   });
 
   function setupClearButton() {
@@ -218,9 +228,13 @@
   }
 
   function applyPrefs() {
-    if (prefs.panelOpen) openPanel(false);
+    // Standalone mode requires a user-gesture (the launcher click) to
+    // open the panel — otherwise the browser blocks audio playback and
+    // the proactive greeting never plays out loud. Skip the auto-reopen
+    // here; the user clicks "Talk to Orbi" to start every session.
+    if (prefs.panelOpen && IS_EMBED) openPanel(false);
     setSpeakerOn(prefs.speakerOn, /*persist*/ false);
-    if (prefs.micOn) setMicOn(true, /*persist*/ false);
+    if (prefs.micOn && IS_EMBED) setMicOn(true, /*persist*/ false);
   }
 
   // ------------------------------------------------------------------
@@ -234,27 +248,32 @@
     panelClose.addEventListener('click', closePanel);
   }
 
-  function openPanel(persist = true) {
+  async function openPanel(persist = true) {
     panel.classList.add('open');
     panel.setAttribute('aria-hidden', 'false');
     launcher.classList.add('open');
     launcher.setAttribute('aria-label', 'Close chat with Orbi');
+    // In standalone mode, take over the screen (drop the landing card
+    // + go fullscreen). Embed mode is already auto-fullpage at boot.
+    if (!IS_EMBED) {
+      document.querySelector('.landing')?.remove();
+      document.body.classList.add('fullpage-chat');
+    }
     unread = 0;
     updateBadge();
     setTimeout(() => input.focus(), 200);
     if (persist) { prefs.panelOpen = true; savePrefs(); }
-    // Auto-enable speaker + mic when the chat opens so the visitor can
-    // immediately speak and hear Orby. Users who don't want voice can
-    // toggle off; the prefs are sticky so the OFF state persists.
-    if (!prefs.speakerOn) setSpeakerOn(true);
-    if (!prefs.micOn) setMicOn(true);
-    // iOS/mobile audio unlock — mobile browsers block audio playback unless
-    // the FIRST Audio.play() call happens directly inside a user-gesture
-    // handler. We're inside one right now (the launcher click triggered
-    // this), so prime a silent audio element to unlock the audio context.
-    // After this, subsequent speak() calls (which run async after fetch)
-    // can play audio without being silenced.
+    // CRITICAL: do these SYNCHRONOUSLY first. We're inside a user-gesture
+    // handler (the launcher click), and the audio unlock + speaker-on
+    // must run in this gesture context for the browser to allow playback.
+    // Any `await` here would drop the gesture context and silently block
+    // the proactive greeting.
     _unlockMobileAudio();
+    if (!prefs.speakerOn) setSpeakerOn(true);
+    // Mic-on waits for the greeting to finish so status reads
+    // "Speaking..." → "Listening", not the reverse.
+    await _greetingDone;
+    if (!prefs.micOn) setMicOn(true);
   }
 
   // Mobile audio unlock — two-pronged approach:
@@ -337,6 +356,19 @@ _audioEl.src = '/tts?text=%20&silent=1';
   // play the queued text from THAT context.
   let _pendingFirstSpeech = null;
 
+  // Boot sequencer — mic auto-on waits until the proactive greeting has
+  // finished speaking (or 8s failsafe). This keeps the status flow correct:
+  // "Speaking..." appears first, then "Listening". Without this gate, mic
+  // turns on at boot and the user sees "Listening" before she's said hi.
+  let _greetingDoneResolve = null;
+  const _greetingDone = new Promise(resolve => {
+    _greetingDoneResolve = resolve;
+    setTimeout(() => { if (_greetingDoneResolve) { _greetingDoneResolve(); _greetingDoneResolve = null; } }, 8000);
+  });
+  function _markGreetingDone() {
+    if (_greetingDoneResolve) { _greetingDoneResolve(); _greetingDoneResolve = null; }
+  }
+
   function closePanel(persist = true) {
     panel.classList.remove('open');
     panel.setAttribute('aria-hidden', 'true');
@@ -412,6 +444,16 @@ _audioEl.src = '/tts?text=%20&silent=1';
     speakerToggle.title = 'Speaker (' + (on ? 'on' : 'off') + ')';
     if (!on) stopSpeaking();
     if (persist) savePrefs();
+    // If we just turned the speaker ON and there's a queued first-greeting
+    // that never got to play (because speaker was off when greeting fired,
+    // or because the browser blocked autoplay), drain it now. This is the
+    // path that gets the proactive greeting actually heard the moment the
+    // speaker becomes available.
+    if (on && _pendingFirstSpeech) {
+      const txt = _pendingFirstSpeech;
+      _pendingFirstSpeech = null;
+      try { Promise.resolve(speak(txt)).finally(_markGreetingDone); } catch { _markGreetingDone(); }
+    }
   }
 
   // ------------------------------------------------------------------
@@ -993,12 +1035,49 @@ _audioEl.src = '/tts?text=%20&silent=1';
   }
 
   function stripForSpeech(t) {
-    // Strip markdown bullets, asterisks, and "— backup mode —" tier hints
+    // Clean text BEFORE it goes to TTS so she speaks like a human, not a
+    // markdown parser. Without these substitutions she reads markdown
+    // marks literally ("hashtag hashtag pricing") and reads "$129" as
+    // "dollar one twenty nine" instead of "one hundred twenty-nine dollars".
     return String(t || '')
+      // Markdown bold/italic markers
       .replace(/\*\*?/g, '')
+      // Line-start bullet markers
       .replace(/^[-•]\s+/gm, '')
+      // ALL hashes — markdown headings (## Pricing) and inline tags
+      // (#seat). TTS reads each one as the word "hashtag" otherwise.
+      .replace(/#+/g, '')
+      // Inline code backticks
+      .replace(/`+/g, '')
+      // System tier hints we don't want spoken
       .replace(/—\s*backup mode\s*—/gi, '')
       .replace(/—\s*offline mode\s*—/gi, '')
+      // Currency — Edge TTS reads "$129" as "dollar one twenty nine".
+      // Rewrite as natural English: "$129" → "129 dollars",
+      // "$29.99" → "29 dollars and 99 cents", "$0.99" → "99 cents".
+      .replace(/\$(\d+)\.(\d{2})\b/g, (_m, d, c) => {
+        const di = parseInt(d, 10);
+        const ci = parseInt(c, 10);
+        if (di === 0) return `${ci} cents`;
+        if (ci === 0) return `${di} dollars`;
+        return `${di} dollars and ${ci} cents`;
+      })
+      .replace(/\$(\d+)\b/g, (_m, d) => `${d} dollars`)
+      // Per-unit slashes — "$29/seat/mo" reads as "slash seat slash mo"
+      // by default. Rewrite the common units as "per X".
+      .replace(/\s*\/\s*mo\b/gi, ' per month')
+      .replace(/\s*\/\s*month\b/gi, ' per month')
+      .replace(/\s*\/\s*yr\b/gi, ' per year')
+      .replace(/\s*\/\s*year\b/gi, ' per year')
+      .replace(/\s*\/\s*seat\b/gi, ' per seat')
+      .replace(/\s*\/\s*user\b/gi, ' per user')
+      .replace(/\s*\/\s*day\b/gi, ' per day')
+      .replace(/\s*\/\s*hr\b/gi, ' per hour')
+      .replace(/\s*\/\s*hour\b/gi, ' per hour')
+      .replace(/\s*\/\s*wk\b/gi, ' per week')
+      .replace(/\s*\/\s*week\b/gi, ' per week')
+      // Collapse any double-spaces the substitutions introduced
+      .replace(/\s{2,}/g, ' ')
       .trim();
   }
 
@@ -1131,10 +1210,15 @@ _audioEl.src = '/tts?text=%20&silent=1';
         // navigated to a new page on the same site).
         if (history.length === 0) {
           _fireProactiveGreeting(data.name || 'us');
+        } else {
+          _markGreetingDone();
         }
+      } else {
+        _markGreetingDone();
       }
     } catch {
       renderQuickActions([]);
+      _markGreetingDone();
     }
 
     try {
@@ -1279,7 +1363,7 @@ _audioEl.src = '/tts?text=%20&silent=1';
   function _fireProactiveGreeting(businessName) {
     // Guard: if a greeting already exists in history (e.g. user reopened
     // the widget mid-session), don't double-greet.
-    if (history.some(m => m.role === 'assistant')) return;
+    if (history.some(m => m.role === 'assistant')) { _markGreetingDone(); return; }
     const hr = new Date().getHours();
     const tod = hr < 12 ? "Good morning" : hr < 17 ? "Good afternoon" : "Good evening";
     const v = (typeof visitor === 'object' && visitor) ? visitor : {};
@@ -1292,22 +1376,33 @@ _audioEl.src = '/tts?text=%20&silent=1';
     } else {
       // First-time visitor — one short sentence. The avatar + business
       // name in the header already shows who she is, so the greeting
-      // doesn't need to re-introduce.
-      greeting = `Hi! I'm Orbi at ${businessName} — how can I help?`;
+      // doesn't need to re-introduce. Special case: when the business
+      // IS Orbi (her own website / sales bot), saying "Orbi at Orbi"
+      // sounds dumb. Drop the "at X" suffix in that case.
+      const isOrbiSite = /^(orbi|orbi ai|myorbi)$/i.test((businessName || '').trim());
+      greeting = isOrbiSite
+        ? `Hi! I'm Orbi — how can I help?`
+        : `Hi! I'm Orbi at ${businessName} — how can I help?`;
     }
     // Remove the welcome bubble (replaced by Orby's actual first message)
     document.getElementById('welcome')?.remove();
     addBubble('assistant', greeting);
     history.push({ role: 'assistant', content: greeting });
     _saveHistory(history);
-    // Speak it aloud if speaker is on. On mobile, the playback will fail
-    // silently (no user gesture yet) — so ALSO queue it so a later gesture
-    // (mic "Allow" click → recognition.onstart, OR any tap inside the
-    // iframe) can drain the queue and play it then.
+    // ALWAYS queue the greeting for TTS, regardless of current speakerOn —
+    // because the auto-enable timeout (~100ms after DOM ready) may flip
+    // speaker on AFTER this point. If we gate on prefs.speakerOn here,
+    // a slow business-summary fetch finishes before the speaker auto-on,
+    // and the greeting never queues at all. The drains below (first tap,
+    // speaker toggle) consult prefs.speakerOn at drain time instead.
+    _pendingFirstSpeech = greeting;
     if (prefs.speakerOn) {
-      _pendingFirstSpeech = greeting;
-      try { speak(greeting); } catch {}
+      _pendingFirstSpeech = null;
+      try { Promise.resolve(speak(greeting)).finally(_markGreetingDone); } catch { _markGreetingDone(); }
     }
+    // If speakerOn is false right now, leave _pendingFirstSpeech queued —
+    // the setSpeakerOn drain (auto-on at boot or user toggle) picks it up
+    // and resolves the greeting gate at that point.
   }
 
   // Visitor profile (name + phone + email) lives in localStorage keyed per

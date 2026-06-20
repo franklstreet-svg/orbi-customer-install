@@ -16,15 +16,16 @@
     "_password_hash": "SET_BY_ONBOARDING_WIZARD"
   },
   "brain": {
-    "url": "https://brain.twickell.com",
+    "url": "https://billing.twickell.com",
     "api_key": "REPLACE_WITH_API_KEY_FROM_STRIPE_WEBHOOK",
-    "timeout_seconds": 15
+    "timeout_seconds": 60
   },
   "huggingface": {
-    "enabled": true,
+    "_comment": "Customer installs only talk to brain (not direct HF). The installer disables this tier; it's kept here for dev convenience.",
+    "enabled": false,
     "api_key": "REPLACE_WITH_HF_TOKEN",
     "model": "meta-llama/Llama-3.3-70B-Instruct",
-    "timeout_seconds": 15
+    "timeout_seconds": 30
   },
   "local_llm": {
     "enabled": true,
@@ -33,7 +34,7 @@
     "ctx_size": 2048
   },
   "billing": {
-    "check_url": "https://brain.twickell.com/api/active",
+    "check_url": "https://billing.twickell.com/api/active",
     "check_interval_seconds": 3600
   },
   "phone": {

@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Orbi — Offline</title>
+  <link rel="manifest" href="/pwa/manifest.json">
+  <style>
+    body {
+      margin: 0; min-height: 100vh;
+      background: #0b0f1a; color: #eaf0ff;
+      font-family: system-ui, -apple-system, sans-serif;
+      display: flex; align-items: center; justify-content: center;
+      padding: 24px;
+    }
+    .card {
+      max-width: 420px; text-align: center;
+      background: #1a2236; border: 1px solid #2c3957;
+      border-radius: 16px; padding: 32px 24px;
+    }
+    h1 { margin: 0 0 12px; font-size: 22px; }
+    p { margin: 0 0 18px; line-height: 1.5; color: #b8c6e0; font-size: 15px; }
+    button {
+      padding: 12px 24px; background: #4f8cff; color: white;
+      border: none; border-radius: 10px; font-size: 15px; font-weight: 600;
+      cursor: pointer;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div style="font-size:54px;margin-bottom:8px;">&#x1F4E1;</div>
+    <h1>Orbi is offline</h1>
+    <p>
+      Your internet connection appears to be down. Once it's back,
+      Orbi will reconnect automatically. If you'd still like to chat,
+      a limited offline version is available.
+    </p>
+    <button onclick="location.reload()">Try again</button>
+  </div>
+</body>
+</html>

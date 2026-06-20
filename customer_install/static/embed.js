@@ -45,35 +45,49 @@
   // ----- Styles (scoped, no global leakage) -----
   const css = `
     #orbi-embed-launcher {
-      position: fixed; bottom: 20px; right: 20px;
-      width: 60px; height: 60px;
-      border-radius: 50%;
-      background: #fff;
-      color: white;
+      position: fixed; bottom: 24px; right: 24px;
+      min-height: 76px;
+      padding: 14px 30px 14px 18px;
+      border-radius: 44px;
+      background: linear-gradient(135deg, #4c6cff 0%, #6c4cff 100%);
+      color: #fff;
       border: none;
       cursor: pointer;
-      box-shadow: 0 8px 24px rgba(0,0,0,0.22);
-      overflow: hidden;
-      padding: 0;
-      display: flex; align-items: center; justify-content: center;
+      box-shadow: 0 12px 32px rgba(76, 76, 255, 0.40);
+      overflow: visible;
+      display: inline-flex; align-items: center; gap: 14px;
+      font: 700 20px/1 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      letter-spacing: 0.3px;
       z-index: 2147483646;
-      transition: transform 0.2s ease, box-shadow 0.2s ease;
-      font-family: system-ui, sans-serif;
+      transition: transform 0.15s ease, box-shadow 0.2s ease;
     }
     #orbi-embed-launcher:hover {
-      transform: scale(1.06);
-      box-shadow: 0 10px 30px rgba(0,0,0,0.28);
+      transform: translateY(-1px) scale(1.03);
+      box-shadow: 0 16px 38px rgba(76, 76, 255, 0.50);
     }
     #orbi-embed-launcher .icon-orbi {
-      width: 100%; height: 100%;
+      width: 52px; height: 52px;
+      border-radius: 50%;
       object-fit: cover;
       display: block;
+      background: #fff;
+      box-shadow: 0 2px 6px rgba(0,0,0,0.15);
+      flex: 0 0 auto;
     }
-    #orbi-embed-launcher svg { width: 26px; height: 26px; fill: #1a2236; }
-    #orbi-embed-launcher.open .icon-orbi { display: none; }
+    #orbi-embed-launcher .launcher-text { white-space: nowrap; }
+    #orbi-embed-launcher svg { width: 28px; height: 28px; fill: #1a2236; }
     #orbi-embed-launcher .icon-close { display: none; }
+    #orbi-embed-launcher.open {
+      background: #fff;
+      color: #1a2236;
+      min-height: 0;
+      padding: 14px;
+      border-radius: 50%;
+      box-shadow: 0 8px 22px rgba(0,0,0,0.22);
+    }
+    #orbi-embed-launcher.open .icon-orbi { display: none; }
+    #orbi-embed-launcher.open .launcher-text { display: none; }
     #orbi-embed-launcher.open .icon-close { display: block; }
-    #orbi-embed-launcher.open { background: #fff; }
     #orbi-embed-badge {
       position: absolute; top: -2px; right: -2px;
       background: #ff5555; color: white;
@@ -118,9 +132,10 @@
   // ----- DOM -----
   const launcher = document.createElement('button');
   launcher.id = 'orbi-embed-launcher';
-  launcher.setAttribute('aria-label', 'Open chat with Orbi');
+  launcher.setAttribute('aria-label', 'Talk to Orbi');
   launcher.innerHTML = `
     <img class="icon-orbi" src="${origin}/static/myorbi-icon.png" alt="Orbi" />
+    <span class="launcher-text">Talk to Orbi</span>
     <svg class="icon-close" viewBox="0 0 24 24"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
     <span id="orbi-embed-badge" style="display:none;">1</span>
   `;

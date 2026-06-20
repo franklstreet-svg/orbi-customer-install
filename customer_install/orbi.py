@@ -242,7 +242,14 @@ def check_billing() -> None:
         return
     url = base_url.rstrip("/") + "/" + api_key
     try:
-        with urllib.request.urlopen(url, timeout=10) as r:
+        # Cloudflare Bot Fight Mode blocks the default Python urllib UA
+        # with HTTP 403 — every billing check fails until Mozilla UA is
+        # set. Same fix as call_brain in llm_client.py.
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+            "X-Orbi-Client": "customer-install-billing-check",
+        })
+        with urllib.request.urlopen(req, timeout=10) as r:
             data = json.loads(r.read().decode("utf-8"))
         BILLING_STATUS.update({
             "active":  bool(data.get("active")),
@@ -629,6 +636,18 @@ def tunnel_runner_loop():
     backoff = 5
     url_pattern = _re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
 
+    # On Windows, when the parent process is pythonw.exe (no console),
+    # subprocess.Popen of a console app like cloudflared.exe spawns a
+    # fresh visible cmd window unless we explicitly suppress it. Without
+    # CREATE_NO_WINDOW, every restart of the tunnel pops a new black
+    # box on the customer's desktop, and closing it just triggers the
+    # next iteration of this loop to open another one. Pass the flag
+    # so cloudflared runs silently in the background.
+    _popen_kwargs = {}
+    if os.name == "nt":
+        _CREATE_NO_WINDOW = 0x08000000
+        _popen_kwargs["creationflags"] = _CREATE_NO_WINDOW
+
     while True:
         try:
             log.info(f"cloudflared starting tunnel → {target}")
@@ -636,6 +655,7 @@ def tunnel_runner_loop():
                 [binpath, "tunnel", "--no-autoupdate", "--url", target],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, bufsize=1,
+                **_popen_kwargs,
             )
             # Parse stdout for the assigned URL
             for line in proc.stdout:
@@ -3431,11 +3451,17 @@ def owner_login():
 
     token = auth.issue_session(ORBI_DIR, username=user_rec["username"],
                                role=user_rec.get("role", "staff"))
+    # A user record with no `password_changed_at` is still on the
+    # installer-generated temp password. The dashboard sees this flag
+    # and forces a password reset before any onboarding starts so the
+    # customer leaves with a password they actually know.
+    must_change_password = not user_rec.get("password_changed_at")
     resp = make_response(jsonify({
         "status": "ok",
         "username": user_rec["username"],
         "role": user_rec["role"],
         "display_name": user_rec.get("display_name"),
+        "must_change_password": must_change_password,
     }))
     auth.set_session_cookie(resp, token)
     audit.log_event(DATA_DIR, actor=username, action="owner.login.success", ip=ip)
@@ -4079,6 +4105,200 @@ def owner_workspace_delete(filename):
         return jsonify({"status": "ok"})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+def _finalize_workspace_label_for_business(biz_name: str) -> dict:
+    """Rebrand the customer's workspace folder to match their business
+    name. The folder itself stays at ~/Orbi/ (so file paths in business
+    modules don't need to migrate), but the desktop shortcut + the
+    in-folder "Open Orbi" launcher get named after their business so
+    the customer sees THEIR business on their desktop, not a generic
+    "Orbi Workspace" label. Idempotent and Windows-focused for now.
+
+    Returns {"renamed": bool, "shortcut_path": str, "in_folder_launcher": str}
+    so the caller can surface a confirmation to the owner."""
+    result = {"renamed": False, "shortcut_path": "", "in_folder_launcher": ""}
+    if os.name != "nt":
+        return result
+    name = (biz_name or "").strip()
+    if not name:
+        return result
+    # Sanitize for filesystem use — strip characters Windows hates in filenames.
+    safe = "".join(c for c in name if c.isalnum() or c in (" ", "-", "_", "'"))[:60].strip()
+    if not safe:
+        return result
+
+    try:
+        import subprocess as _sp
+        # Locate the icon (ships with the install). If missing, shortcuts
+        # render with the generic Windows folder/cmd icon — not the end
+        # of the world, but the customer's-phone-icon match was an
+        # explicit ask, so we try.
+        install_dir_str = str(_install_dir_for_links()).replace("'", "''")
+        icon_path = _install_dir_for_links() / "icons" / "orbi.ico"
+        icon_clause_biz = (f"$sc.IconLocation = '{icon_path}'; "
+                            if icon_path.exists() else "")
+        icon_clause_launch = (f"$lc.IconLocation = '{icon_path}'; "
+                               if icon_path.exists() else "")
+        # 1. Rename the desktop shortcut "Orbi Workspace.lnk" to "<biz>.lnk"
+        ps = (
+            "$ws = New-Object -ComObject WScript.Shell; "
+            "$desktop = [Environment]::GetFolderPath('Desktop'); "
+            f"$oldName = Join-Path $desktop 'Orbi Workspace.lnk'; "
+            f"$newName = Join-Path $desktop '{safe}.lnk'; "
+            "$workspace = Join-Path $env:USERPROFILE 'Orbi'; "
+            "if (-not (Test-Path $newName)) { "
+                "$sc = $ws.CreateShortcut($newName); "
+                "$sc.TargetPath = $workspace; "
+                "$sc.WorkingDirectory = $workspace; "
+                f"$sc.Description = 'Your {safe} workspace — drop files here, Orbi reads them'; "
+                f"{icon_clause_biz}"
+                "$sc.Save(); "
+            "} "
+            "if (Test-Path $oldName) { Remove-Item -Force $oldName }; "
+            # 2. Drop an "Open Orbi" launcher shortcut INSIDE the workspace
+            # folder so the customer opens the folder and sees both their
+            # files AND a one-tap way to start a conversation with her.
+            "$launcher = Join-Path $env:USERPROFILE 'Orbi\\Open Orbi.lnk'; "
+            f"$installerLauncher = '{install_dir_str}\\launcher.cmd'; "
+            "if (Test-Path $installerLauncher) { "
+                "$lc = $ws.CreateShortcut($launcher); "
+                "$lc.TargetPath = $installerLauncher; "
+                "$lc.WorkingDirectory = (Split-Path $installerLauncher); "
+                "$lc.Description = 'Open Orbi to chat'; "
+                f"{icon_clause_launch}"
+                "$lc.Save(); "
+            "} "
+        )
+        _sp.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps],
+                check=False, timeout=20)
+        result["renamed"] = True
+        result["shortcut_path"] = f"{safe}.lnk (on desktop)"
+        result["in_folder_launcher"] = "Open Orbi.lnk (inside the folder)"
+    except Exception as e:
+        log.warning("workspace label finalize failed: %s", e)
+    return result
+
+
+def _install_dir_for_links() -> Path:
+    """Best-effort path to the install dir so we can build absolute
+    paths in the rename script."""
+    # ORBI_DIR is the install root the running orbi.py is using.
+    return ORBI_DIR
+
+
+@app.route("/api/owner/account/finalize_workspace_label", methods=["POST"])
+def owner_finalize_workspace_label():
+    """Trigger the workspace-label rebrand after onboarding lands a
+    business name. Idempotent — safe to call multiple times. The owner
+    can re-run from the dashboard if their business name changes."""
+    auth.require_owner(ORBI_DIR)
+    biz = mod_business.load(DATA_DIR) or {}
+    biz_name = (biz.get("name") or "").strip()
+    if not biz_name:
+        return jsonify({"error": "Business name not yet set."}), 400
+    result = _finalize_workspace_label_for_business(biz_name)
+    audit.log_event(DATA_DIR, actor="system",
+                    action="workspace.label_finalized",
+                    meta={"business_name": biz_name, **result})
+    return jsonify(result)
+
+
+@app.route("/api/owner/account/status", methods=["GET"])
+def owner_account_status():
+    """Lightweight status endpoint the dashboard hits on load to decide
+    whether to show the first-time password-set modal. Returns just
+    enough to render the UI without leaking sensitive data."""
+    session = auth.require_user(ORBI_DIR, DATA_DIR)
+    username = session.get("username", "")
+    user_rec = users_mod.load_users(DATA_DIR).get(username) or {}
+    return jsonify({
+        "username": username,
+        "display_name": user_rec.get("display_name") or username,
+        "must_change_password": not user_rec.get("password_changed_at"),
+    })
+
+
+@app.route("/api/owner/account/setup_initial_password", methods=["POST"])
+def owner_setup_initial_password():
+    """First-time password set. The installer creates the owner with a
+    random temp password the customer never sees (they auto-logged in
+    via the bootstrap query param). This endpoint lets them replace
+    that temp password with one they'll remember — WITHOUT having to
+    re-enter the temp password they don't know.
+
+    Hardened so it can't be abused as a no-old-password reset:
+    only callable when the user record has NO `password_changed_at`
+    field. Once a password's been changed once, this endpoint always
+    refuses and the user must go through the normal change_password
+    flow with their current password.
+    """
+    session = auth.require_user(ORBI_DIR, DATA_DIR)
+    username = session.get("username", "")
+    data = request.get_json(silent=True) or {}
+    new_pw = data.get("new_password") or data.get("password") or ""
+    display_name = (data.get("display_name") or "").strip()[:80]
+    assistant_name = (data.get("assistant_name") or "").strip()[:32] or "Orbi"
+    if len(new_pw) < 6:
+        return jsonify({"error": "Password must be at least 6 characters."}), 400
+    user_rec = users_mod.load_users(DATA_DIR).get(username)
+    if not user_rec:
+        return jsonify({"error": "User not found."}), 404
+    if user_rec.get("password_changed_at"):
+        audit.log_event(DATA_DIR, actor=username,
+                        action="owner.setup_initial_password.refused",
+                        meta={"reason": "password_already_set"})
+        return jsonify({"error": "Initial password already set. "
+                                  "Use the regular change-password flow."}), 409
+    if not users_mod.change_password(DATA_DIR, username, new_pw):
+        return jsonify({"error": "Could not update password."}), 500
+    # Save the customer-chosen display name (not the email-parsed one).
+    # If they typed nothing we leave whatever the installer set.
+    if display_name:
+        try:
+            with users_mod._LOCK:
+                users = users_mod.load_users(DATA_DIR)
+                if username in users:
+                    users[username]["display_name"] = display_name
+                    users_mod.save_users(DATA_DIR, users)
+        except Exception as _e:
+            log.warning("could not save display_name during setup: %s", _e)
+    # Save the assistant's name AND the owner's name into business_info
+    # so every surface (chat, phone receptionist, email signature, owner
+    # prompts) addresses the customer correctly. The owner_name field
+    # also overrides anything the LLM scraper hallucinated about the
+    # owner — we got reports of Orbi calling the customer by the
+    # business name's first word ("Hi Sierra" for Sierra Contractors
+    # Source) because the scraped owner.name was wrong. Explicit owner
+    # input wins.
+    #
+    # IMPORTANT: only the OWNER role writes the business-wide fields. A
+    # staff member running this same flow (first login → set password)
+    # would otherwise stomp the owner's name on business_info — Frank
+    # caught Orbi calling him by the most-recently-added staff name
+    # because the staff's setup_initial_password wrote display_name
+    # into business.personality.owner_name.
+    is_owner_role = (user_rec.get("role") == "owner")
+    if is_owner_role:
+        try:
+            biz = mod_business.load(DATA_DIR) or {}
+            personality = biz.get("personality") or {}
+            personality["name"] = assistant_name
+            if display_name:
+                personality["owner_name"] = display_name
+            biz["personality"] = personality
+            # Also write into the legacy top-level owner_name slot some
+            # callers still consult.
+            if display_name:
+                biz["owner_name"] = display_name
+            mod_business.save(DATA_DIR, biz)
+        except Exception as _e:
+            log.warning("could not save assistant_name/owner_name: %s", _e)
+    audit.log_event(DATA_DIR, actor=username,
+                    action="owner.setup_initial_password.success",
+                    meta={"set_display_name": bool(display_name),
+                          "set_assistant_name": assistant_name})
+    return jsonify({"status": "ok"})
+
 
 @app.route("/api/owner/change_password", methods=["POST"])
 def owner_change_password():
@@ -5555,11 +5775,10 @@ def owner_chat():
         log.warning(f"auto-memory thread launch failed: {e}")
 
     fallback_msg = (
-        "I couldn't reach any AI tier just now — that usually means a "
-        "brief internet hiccup or HuggingFace is rate-limiting. Wait "
-        "30 seconds and try again. If it keeps happening, restart Orbi "
-        "from Settings → Restart, or check `systemctl --user status "
-        "orbi.service` from the terminal."
+        "I'm having a hard time thinking right now — give me about "
+        "30 seconds and ask again. If it keeps happening, hit the "
+        "refresh button in your browser. Still stuck? Reach out to "
+        "support and we'll take a look."
     )
     return jsonify({
         "reply": resp.text or fallback_msg,
@@ -5996,30 +6215,17 @@ _NAME_AFTER_FILLER = (
 # → personal; "restaurant" / "cafe" / "deli" → restaurant). Each track
 # has its own follow-up questions appropriate to the use case.
 ONBOARDING_STEPS_PERSONAL = [
-    ("track",       "Hey — I'm Orby, the AI that just got installed on "
-                     "your computer. Four quick questions and we're good.\n\n"
-                     "First: are you here for **personal** use, "
-                     "**business** use, or do you run a **restaurant**?\n"
-                     "  · 'personal' — your own AI assistant for life "
-                     "stuff (calendar, contacts, email, files, memory)\n"
-                     "  · 'business' — same as personal but for your "
-                     "work (lawyer, contractor, consultant, anything)\n"
-                     "  · 'restaurant' — adds the phone receptionist + "
-                     "online ordering pieces"),
-    ("display_name", "What should I call you? (First name's fine.)"),
-    ("tone",         "How would you like me to talk to you?\n"
-                     "  · 'friend' — casual, warm, react like a real "
-                     "friend would (most people pick this)\n"
-                     "  · 'professional' — crisp and efficient, less small talk\n"
-                     "  · 'playful' — light energy, occasional banter\n"
-                     "  · 'formal' — strictly business-letter polite"),
-    ("companion_mode", "Last one — should I pay attention to how you're "
-                       "doing over time? Notice when you're stressed, "
-                       "remember things that worry you, check in when "
-                       "I haven't heard about something in a while?\n"
-                       "  · 'personal' — yes, be a real companion (most "
-                       "solo users pick this)\n"
-                       "  · 'business' — no, just keep things task-focused"),
+    ("assistant_name",
+     "Hi — I'm Orbi, your new assistant.\n\n"
+     "If you'd like to call me something else, just type the name "
+     "you'd prefer (Sarah, Maya, anything that fits). Otherwise, "
+     "type **keep** and I'll stay Orbi."),
+    ("website",
+     "Do you have a website I can read to learn your business? "
+     "Paste the URL — something like 'yourbusiness.com' — and I'll "
+     "pick up your name, address, hours, services, and what you offer.\n\n"
+     "If you don't have a website yet, type **no** and we'll fill "
+     "things in together over time."),
 ]
 ONBOARDING_STEPS_RESTAURANT = [
     # Added on top of the personal track when track='restaurant' or 'both'.
@@ -6082,15 +6288,65 @@ def _try_onboarding(message: str, user_rec: dict) -> dict | None:
     The first chat after install short-circuits whatever they typed and
     starts the flow. Each subsequent message captures the answer for
     the current step. 'skip' moves on for optional fields."""
-    if not _needs_onboarding():
-        # Wizard already complete (or N/A on this install)
-        state = _load_onboarding_state()
-        if not state.get("complete"):
-            state["complete"] = True
-            _save_onboarding_state(state)
-        return None
     state = _load_onboarding_state()
     if state.get("complete"):
+        return None
+
+    # Special case: even if the install wizard already filled in
+    # business_info (typical when the customer entered their website URL
+    # during setup and the scrape finished before they reached the
+    # dashboard), Orbi still owes them a real WELCOME on first chat. We
+    # used to short-circuit _try_onboarding here because business.name
+    # was non-empty, which left her silent. Now we always greet first,
+    # mark the welcome shown, and only then defer to the regular flow.
+    if not state.get("welcome_shown"):
+        state["welcome_shown"] = True
+        _save_onboarding_state(state)
+        try:
+            biz = mod_business.load(DATA_DIR) or {}
+        except Exception:
+            biz = {}
+        biz_name = (biz.get("name") or "").strip()
+        owner_first = ((biz.get("personality") or {}).get("owner_name")
+                        or biz.get("owner_name") or "").strip().split()
+        owner_first = owner_first[0] if owner_first else ""
+        hello = f"Hi{', ' + owner_first if owner_first else ''}! I'm Orbi — your new assistant."
+        if biz_name:
+            greeting = (
+                f"{hello}\n\n"
+                f"I just read your website, so I've already got a sense "
+                f"of {biz_name} — your services, hours, address, the basics. "
+                f"You can ask me to walk you through what I found, or "
+                f"jump straight into anything you need. A few good ways "
+                f"to start:\n\n"
+                f"  • \"Tell me about my business\" — I'll summarize what I "
+                f"picked up so you can confirm it.\n"
+                f"  • \"Show me my hours\" or \"What services did you find?\" — "
+                f"spot-check specific pieces.\n"
+                f"  • \"Add a contact named …\" or \"Remind me to … tomorrow\" — "
+                f"start using me as your assistant.\n\n"
+                f"What would you like to do first?"
+            )
+        else:
+            greeting = (
+                f"{hello}\n\n"
+                f"I don't have anything about your business yet. The "
+                f"easiest way to get me up to speed is to point me at "
+                f"your website — type the URL (something like "
+                f"'yourbusiness.com') and I'll read it and pick up your "
+                f"name, address, hours, and services.\n\n"
+                f"If you don't have a website, type **no** and we'll "
+                f"fill things in together as we go."
+            )
+        return {"reply": greeting, "tier": "local", "latency_ms": 0,
+                "source": "onboarding_welcome"}
+
+    # Welcome's been shown. If business_info is already populated, the
+    # wizard has nothing left to do — mark complete and let the regular
+    # chat path take over.
+    if not _needs_onboarding():
+        state["complete"] = True
+        _save_onboarding_state(state)
         return None
     step_idx = int(state.get("step", -1))
     collected = state.get("collected") or {}
@@ -6121,34 +6377,110 @@ def _try_onboarding(message: str, user_rec: dict) -> dict | None:
     answer = (message or "").strip()
     if step_idx < len(steps):
         key, _q = steps[step_idx]
-        if key == "track":
-            # Normalize free-form to one of the recognized tracks
-            low = answer.lower()
-            if any(t in low for t in ("restaurant", "deli", "cafe", "pizza",
-                                       "diner", "food truck", "bar")):
-                answer = "both" if "both" in low or "and" in low else "restaurant"
-            elif any(t in low for t in ("personal", "just me", "assistant",
-                                          "for myself", "solo")):
-                answer = "personal"
-            elif "both" in low:
-                answer = "both"
-            # Anything else: assume personal (the safe default)
+        if key == "assistant_name":
+            # "keep" / "no" / empty / "Orbi" — keep the default name.
+            # Anything else becomes the assistant's new name.
+            low = answer.lower().strip(".!? ").strip()
+            keep_signals = ("", "keep", "orbi", "no", "no thanks",
+                            "no thank you", "nope", "stay", "stay orbi",
+                            "you're fine", "you are fine", "default")
+            if low in keep_signals:
+                collected["assistant_name"] = "Orbi"
             else:
-                answer = "personal"
-            collected["track"] = answer
-            # Recompute steps now that the track is known
-            steps = _steps_for_track(answer)
-        elif key in ("tone",):
-            tone_map = {"friend":  "friend", "casual": "friend",
-                         "professional": "friendly_professional",
-                         "playful": "playful", "formal": "formal"}
-            collected["tone"] = tone_map.get(answer.lower(), "friend")
-        elif key == "companion_mode":
-            mode = answer.lower()
-            collected["companion_mode"] = (
-                "business" if "business" in mode or "transactional" in mode
-                else "personal"
-            )
+                # Strip common filler ("call me sarah" → "sarah") and clip
+                # to a reasonable length. Names beyond 32 chars are almost
+                # certainly the customer venting instead of naming her.
+                cleaned = answer.strip()
+                for prefix in ("call you ", "call me ", "name you ",
+                               "your name is ", "i'll call you ",
+                               "let's call you ", "lets call you "):
+                    if cleaned.lower().startswith(prefix):
+                        cleaned = cleaned[len(prefix):].strip()
+                        break
+                collected["assistant_name"] = cleaned[:32].strip() or "Orbi"
+        elif key == "website":
+            low = answer.lower().strip()
+            no_signals = ("", "no", "no website", "skip", "none",
+                          "don't have one", "i don't have one",
+                          "n/a", "not yet", "nope")
+            if low in no_signals:
+                collected["website"] = ""
+            else:
+                # Detect a URL — must contain a dot and a TLD-ish tail
+                import re as _re
+                url_match = _re.search(
+                    r"(?:https?://)?[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?"
+                    r"(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*"
+                    r"\.(?:com|net|org|co|biz|io|us|ai|app|edu|gov|me|info|"
+                    r"store|shop|tech|online|dev|xyz|nyc|la|sf|live|site)"
+                    r"(?:/\S*)?", answer)
+                if url_match:
+                    url = url_match.group(0)
+                    if not url.startswith(("http://", "https://")):
+                        url = "https://" + url
+                    collected["website"] = url
+                    # Kick off the scrape in a background thread so the
+                    # user isn't stuck staring at a loading spinner for
+                    # 1-3 minutes. The crawler writes into business_info
+                    # as it goes; the customer can refresh later to see
+                    # what was found.
+                    import threading
+                    def _bg_scrape(url=url):
+                        try:
+                            import site_scraper
+                            brain_call = site_scraper.make_brain_call(CONFIG)
+                            result = site_scraper.crawl_site(
+                                url, data_dir=DATA_DIR, brain_call=brain_call,
+                                max_pages=50, max_depth=3,
+                                wall_time_seconds=180,
+                                fetch_delay_seconds=0.5, save=True,
+                            )
+                            profile = result.get("profile", {}) or {}
+                            biz = mod_business.load(DATA_DIR) or {}
+                            # Treat empty-default nested dicts (e.g.
+                            # address={"street":"","city":"","state":"",
+                            # "zip":""}) as empty so the scrape can
+                            # populate them. The previous truthy check
+                            # treated those as "already has data" and
+                            # never let the scraped values in.
+                            for k, v in profile.items():
+                                if not v:
+                                    continue
+                                existing = biz.get(k)
+                                existing_is_empty = (
+                                    existing is None
+                                    or existing == ""
+                                    or existing == []
+                                    or existing == {}
+                                    or (isinstance(existing, dict)
+                                        and not any(existing.values()))
+                                )
+                                if existing_is_empty:
+                                    biz[k] = v
+                            biz["website"] = url
+                            mod_business.save(DATA_DIR, biz)
+                            log.info("onboarding bg scrape: %d fields from %s",
+                                      sum(1 for v in profile.values() if v), url)
+                            # Rebrand the workspace folder + desktop
+                            # shortcut to match the business name we
+                            # just learned, so the customer sees THEIR
+                            # business on their desktop instead of a
+                            # generic "Orbi Workspace" label.
+                            try:
+                                if biz.get("name"):
+                                    _finalize_workspace_label_for_business(
+                                        biz["name"])
+                            except Exception as _e:
+                                log.warning("workspace label rebrand "
+                                            "failed: %s", _e)
+                        except Exception as e:
+                            log.warning("onboarding bg scrape failed: %s", e)
+                    threading.Thread(target=_bg_scrape, daemon=True).start()
+                else:
+                    # Couldn't find a URL in their reply — record what
+                    # they typed and move on. The owner can still edit
+                    # the website later from the dashboard.
+                    collected["website"] = answer.strip()
         else:
             collected[key] = answer
     step_idx += 1
@@ -6162,45 +6494,30 @@ def _try_onboarding(message: str, user_rec: dict) -> dict | None:
         return {"reply": next_q, "tier": "local", "latency_ms": 0,
                 "source": "onboarding_step"}
 
-    # All done — save into business_info
+    # All done — save into business_info. The scrape (started in
+    # background when the customer pasted a URL) keeps filling in the
+    # rest as it lands; this save just records the assistant's name +
+    # the website + sane defaults so the dashboard doesn't sit empty
+    # while the crawler is still walking the customer's site.
     try:
         biz = mod_business.load(DATA_DIR) or {}
-        # Business name: prefer the explicit restaurant name; for
-        # personal-only, fall back to "{display_name}'s Workspace".
-        biz_name = (collected.get("name") or "").strip()
-        if not biz_name and collected.get("display_name"):
-            biz_name = f"{collected['display_name'].strip()}'s Workspace"
-        if biz_name:
-            biz["name"] = biz_name
-        contact = biz.get("contact") or {}
-        if collected.get("phone"):
-            contact["phone"] = collected["phone"]
-        biz["contact"] = contact
-        # Services
-        services = [s.strip() for s in (collected.get("services") or "").split(",")
-                     if s.strip()]
-        if services:
-            biz["services"] = services
-        if collected.get("address"):
-            biz["address"] = collected["address"]
-        # Personality block — tone + companion_mode + owner display name
         personality = biz.get("personality") or {}
-        if collected.get("tone"):
-            personality["tone"] = collected["tone"]
-        if collected.get("companion_mode"):
-            personality["companion_mode"] = collected["companion_mode"]
-        if collected.get("display_name"):
-            personality["owner_name"] = collected["display_name"]
+        assistant_name = (collected.get("assistant_name") or "Orbi").strip() or "Orbi"
+        personality["name"] = assistant_name
+        # Reasonable defaults — customer can change these in Settings.
+        personality.setdefault("tone", "friend")
+        personality.setdefault("companion_mode", "personal")
         biz["personality"] = personality
-        # Track persisted for diagnostics + later add-on enablement
-        biz["track"] = collected.get("track", "personal")
+        biz.setdefault("track", "personal")
+        if collected.get("website"):
+            biz["website"] = collected["website"]
         mod_business.save(DATA_DIR, biz)
         state["complete"] = True
         _save_onboarding_state(state)
         audit.log_event(DATA_DIR, actor=user_rec.get("username", "?"),
                         action="onboarding.completed",
-                        meta={"business_name": biz_name,
-                              "track": collected.get("track")})
+                        meta={"assistant_name": assistant_name,
+                              "website": collected.get("website", "")})
     except Exception as e:
         log.exception("onboarding save failed")
         return {"reply": (
@@ -6208,21 +6525,22 @@ def _try_onboarding(message: str, user_rec: dict) -> dict | None:
             f"details under Settings instead, no harm done."
         ), "tier": "local", "latency_ms": 0,
                 "source": "onboarding_save_error"}
-    nice_name = collected.get("display_name") or "there"
-    track_kind = collected.get("track", "personal")
-    if track_kind == "restaurant":
-        ready_line = (f"the restaurant is ready to take calls and chats. "
-                      f"Try \"morning brief\" or jump to Settings → Hours "
-                      f"+ Menu to finish the basics.")
-    elif track_kind == "both":
-        ready_line = (f"both sides are ready. Personal: try \"what's on my "
-                      f"calendar.\" Restaurant: head to Settings → Hours + "
-                      f"Menu and we're live for calls.")
+    assistant_name = (collected.get("assistant_name") or "Orbi").strip() or "Orbi"
+    if collected.get("website"):
+        ready_line = (f"I'm reading {collected['website']} right now and "
+                      f"learning your business — it'll keep filling in "
+                      f"for the next minute or two. Meanwhile, try "
+                      f"\"what's on my calendar\" or \"remind me tomorrow "
+                      f"at 9.\" You can change anything in Settings.")
     else:
         ready_line = (f"I'm ready. Try \"what's on my calendar,\" "
-                      f"\"remind me tomorrow at 9,\" or \"tell me about "
-                      f"my wife\" (after you add some memories).")
-    return {"reply": f"🎉 All set, {nice_name} — {ready_line}",
+                      f"\"remind me tomorrow at 9,\" or just tell me "
+                      f"about your business. You can change anything "
+                      f"in Settings.")
+    intro = (f"🎉 All set — call me **{assistant_name}** from now on. "
+             if assistant_name.lower() != "orbi"
+             else "🎉 All set. ")
+    return {"reply": f"{intro}{ready_line}",
             "tier": "local", "latency_ms": 0,
             "source": "onboarding_complete"}
 
@@ -10523,6 +10841,34 @@ def _try_tell_me_about(message: str, user_rec: dict) -> dict | None:
         pass
 
     if not mem_hits and not contact_hits:
+        # No personal facts found. Before falling back to the canned
+        # "tell me a fact" response, check whether business_info has
+        # been populated (post-scrape or via owner edits) — if so,
+        # let the LLM answer, since it builds its system prompt from
+        # business_info and CAN answer questions about the business,
+        # the owner, or Orbi herself without hallucinating.
+        # If business_info is still empty (fresh install, scrape hasn't
+        # finished, no owner edits), keep the canned response so we
+        # don't invite the old hallucination problem with personal
+        # facts ("wife is supportive", "kids are good with people")
+        # that have no source.
+        try:
+            biz = mod_business.load(DATA_DIR) or {}
+            biz_has_data = bool(
+                (biz.get("name") or "").strip()
+                or (biz.get("description") or "").strip()
+                or (biz.get("services") or [])
+                or (biz.get("menu_items") or [])
+                or (biz.get("menu") or [])
+            )
+        except Exception:
+            biz_has_data = False
+        if biz_has_data:
+            # Fall through to the LLM — it has business_info in the
+            # system prompt and can answer "tell me about my business",
+            # "what do you know about PurBlum", "what do you know about
+            # me", etc. reliably.
+            return None
         return {"reply": (
             f"I don't have anything saved about \"{topic_raw}\" yet. "
             f"Tell me a fact and I'll remember next time. "
@@ -10753,6 +11099,25 @@ def _try_memory_recall(message: str, user_rec: dict) -> dict | None:
     else:
         facts = mod_memory.recall(user_dir, query=None, limit=30)
     if not facts:
+        # Same fall-through as _try_tell_me_about: if business_info has
+        # been populated (post-scrape or owner edits), let the LLM
+        # answer using its system prompt. This is the handler that
+        # PurBlum questions actually hit — _try_tell_me_about's fix
+        # alone wasn't enough because "What do you know about X?"
+        # matches _MEMORY_RECALL_RE first.
+        try:
+            biz = mod_business.load(DATA_DIR) or {}
+            biz_has_data = bool(
+                (biz.get("name") or "").strip()
+                or (biz.get("description") or "").strip()
+                or (biz.get("services") or [])
+                or (biz.get("menu_items") or [])
+                or (biz.get("menu") or [])
+            )
+        except Exception:
+            biz_has_data = False
+        if biz_has_data:
+            return None
         if topic:
             return {"reply": (
                 f"I don't have anything saved about \"{topic}\" yet. "
@@ -15864,6 +16229,244 @@ def messages_update_tags(msg_id):
 
 
 # ---------------------------------------------------------------------------
+# Web agent — Orbi drives a real Chrome to operate web apps for the owner.
+# Horizontal infrastructure: build once, works on dispatch systems, supplier
+# portals, restaurant ordering platforms, anything the customer uses.
+# ---------------------------------------------------------------------------
+
+# In-process task registry. Tasks are short-lived (60-180s typical) so a
+# Redis-backed queue is overkill — a thread + dict is plenty. Wiped on
+# orbi.py restart, which is fine since recipe results land in workspace
+# files anyway.
+_WEB_AGENT_TASKS: dict[str, dict] = {}
+_WEB_AGENT_TASKS_LOCK = threading.Lock()
+_WEB_AGENT_CONFIRMATIONS: dict[str, dict] = {}  # task_id → {action, decided, decision}
+
+
+def _web_agent_task_path(task_id: str) -> "Path":
+    return DATA_DIR / "web_agent_runs" / f"{task_id}.json"
+
+
+def _web_agent_save_task(task_id: str, task: dict) -> None:
+    p = _web_agent_task_path(task_id)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(task, default=str), encoding="utf-8")
+    tmp.replace(p)
+
+
+def _web_agent_make_confirm_callback(task_id: str):
+    """Build the on_confirm callable the agent loop calls before any
+    consequential action. Blocks in the worker thread until the owner
+    accepts or rejects via /api/owner/web_agent/confirm. Times out at
+    5 minutes (default to reject so we never leave a half-done state)."""
+    def _on_confirm(action: dict) -> bool:
+        with _WEB_AGENT_TASKS_LOCK:
+            _WEB_AGENT_CONFIRMATIONS[task_id] = {
+                "action":   action,
+                "decided":  False,
+                "decision": None,
+                "asked_at": time.time(),
+            }
+            if task_id in _WEB_AGENT_TASKS:
+                _WEB_AGENT_TASKS[task_id]["status"] = "awaiting_confirmation"
+                _WEB_AGENT_TASKS[task_id]["pending_action"] = action
+        deadline = time.time() + 300  # 5 min
+        while time.time() < deadline:
+            with _WEB_AGENT_TASKS_LOCK:
+                entry = _WEB_AGENT_CONFIRMATIONS.get(task_id) or {}
+                if entry.get("decided"):
+                    decision = bool(entry.get("decision"))
+                    _WEB_AGENT_CONFIRMATIONS.pop(task_id, None)
+                    if task_id in _WEB_AGENT_TASKS:
+                        _WEB_AGENT_TASKS[task_id]["status"] = (
+                            "running" if decision else "declined"
+                        )
+                        _WEB_AGENT_TASKS[task_id].pop("pending_action", None)
+                    return decision
+            time.sleep(0.4)
+        # Timed out — fail closed
+        with _WEB_AGENT_TASKS_LOCK:
+            if task_id in _WEB_AGENT_TASKS:
+                _WEB_AGENT_TASKS[task_id]["status"] = "declined_timeout"
+                _WEB_AGENT_TASKS[task_id].pop("pending_action", None)
+        return False
+    return _on_confirm
+
+
+def _web_agent_run_worker(task_id: str, goal: str, *,
+                           recipe_name: str | None,
+                           recipe_params: dict,
+                           start_url: str | None,
+                           username: str) -> None:
+    """Background thread — actually drives the browser."""
+    try:
+        import web_agent
+        import site_scraper
+        # Reuse the scraper's brain_call adapter — it already builds the
+        # llm_client.generate call with the right tier configuration.
+        brain_call = site_scraper.make_brain_call(CONFIG)
+        try:
+            workspace_dir = mod_workspace.workspace_path(CONFIG)
+        except Exception:
+            workspace_dir = Path.home() / "Orbi"
+        workspace_dir.mkdir(parents=True, exist_ok=True)
+
+        on_confirm = _web_agent_make_confirm_callback(task_id)
+
+        result = web_agent.run_task(
+            goal=goal,
+            data_dir=DATA_DIR,
+            workspace_dir=workspace_dir,
+            brain_call=brain_call,
+            start_url=start_url,
+            recipe_name=recipe_name,
+            recipe_params=recipe_params,
+            on_confirm=on_confirm,
+            headless=True,
+        )
+        with _WEB_AGENT_TASKS_LOCK:
+            if task_id in _WEB_AGENT_TASKS:
+                _WEB_AGENT_TASKS[task_id]["status"] = (
+                    "done" if result.get("ok") else "failed"
+                )
+                _WEB_AGENT_TASKS[task_id]["result"] = result
+                _WEB_AGENT_TASKS[task_id]["finished_at"] = time.time()
+                _web_agent_save_task(task_id, _WEB_AGENT_TASKS[task_id])
+        audit.log_event(DATA_DIR, actor=username, action="web_agent.run.done",
+                         meta={"task_id": task_id, "goal": goal[:200],
+                               "ok": result.get("ok"),
+                               "stopped_reason": result.get("stopped_reason")})
+    except Exception as e:
+        log.exception("web_agent task %s crashed", task_id)
+        with _WEB_AGENT_TASKS_LOCK:
+            if task_id in _WEB_AGENT_TASKS:
+                _WEB_AGENT_TASKS[task_id].update({
+                    "status": "crashed",
+                    "error":  f"{type(e).__name__}: {e}",
+                    "finished_at": time.time(),
+                })
+                _web_agent_save_task(task_id, _WEB_AGENT_TASKS[task_id])
+
+
+@app.route("/api/owner/web_agent/run", methods=["POST"])
+def owner_web_agent_run():
+    """Kick off a browser-agent task. Returns the task_id immediately;
+    poll /status/<task_id> for progress, or /confirm/<task_id> when the
+    agent needs the owner to approve a consequential action.
+
+    Request: {
+        "goal":          "plain-English description of what to do",
+        "start_url":     optional starting URL,
+        "recipe":        optional recipe name (e.g. "google_search"),
+        "recipe_params": optional dict the recipe expects,
+    }
+    Response: {"task_id": "...", "status": "running"}
+    """
+    user = auth.require_owner(ORBI_DIR)
+    data = request.get_json(silent=True) or {}
+    goal = (data.get("goal") or "").strip()
+    if not goal:
+        return jsonify({"error": "goal required"}), 400
+    start_url    = (data.get("start_url") or "").strip() or None
+    recipe_name  = (data.get("recipe") or "").strip() or None
+    recipe_params = data.get("recipe_params") or {}
+    if not isinstance(recipe_params, dict):
+        return jsonify({"error": "recipe_params must be an object"}), 400
+
+    import secrets as _secrets_local
+    task_id = f"wa_{int(time.time() * 1000)}_{_secrets_local.token_hex(4)}"
+    username = user.get("username", "owner")
+    task = {
+        "task_id":      task_id,
+        "goal":         goal,
+        "start_url":    start_url,
+        "recipe":       recipe_name,
+        "started_at":   time.time(),
+        "status":       "running",
+        "actor":        username,
+    }
+    with _WEB_AGENT_TASKS_LOCK:
+        _WEB_AGENT_TASKS[task_id] = task
+        _web_agent_save_task(task_id, task)
+    audit.log_event(DATA_DIR, actor=username, action="web_agent.run.start",
+                     meta={"task_id": task_id, "goal": goal[:200],
+                           "recipe": recipe_name})
+    threading.Thread(
+        target=_web_agent_run_worker,
+        args=(task_id, goal),
+        kwargs={"recipe_name": recipe_name, "recipe_params": recipe_params,
+                "start_url": start_url, "username": username},
+        daemon=True,
+    ).start()
+    return jsonify({"task_id": task_id, "status": "running"})
+
+
+@app.route("/api/owner/web_agent/status/<task_id>", methods=["GET"])
+def owner_web_agent_status(task_id: str):
+    """Poll a task's current status. Returns the running snapshot OR the
+    full result + actions log if the task has finished."""
+    auth.require_owner(ORBI_DIR)
+    with _WEB_AGENT_TASKS_LOCK:
+        task = dict(_WEB_AGENT_TASKS.get(task_id) or {})
+    if not task:
+        # Cold start — load from disk
+        p = _web_agent_task_path(task_id)
+        if p.exists():
+            try:
+                task = json.loads(p.read_text(encoding="utf-8"))
+            except Exception:
+                task = {}
+    if not task:
+        return jsonify({"error": "unknown task_id"}), 404
+    return jsonify(task)
+
+
+@app.route("/api/owner/web_agent/confirm/<task_id>", methods=["POST"])
+def owner_web_agent_confirm(task_id: str):
+    """Owner approves or rejects the pending action for a task."""
+    auth.require_owner(ORBI_DIR)
+    data = request.get_json(silent=True) or {}
+    decision = bool(data.get("approve"))
+    with _WEB_AGENT_TASKS_LOCK:
+        entry = _WEB_AGENT_CONFIRMATIONS.get(task_id)
+        if not entry:
+            return jsonify({"error": "no pending confirmation"}), 404
+        entry["decided"]  = True
+        entry["decision"] = decision
+    return jsonify({"task_id": task_id, "approve": decision})
+
+
+@app.route("/api/owner/web_agent/recipes", methods=["GET"])
+def owner_web_agent_recipes():
+    """List available recipes the dashboard can offer as one-click options."""
+    auth.require_owner(ORBI_DIR)
+    try:
+        import web_agent
+        return jsonify({"recipes": web_agent.list_recipes()})
+    except Exception as e:
+        return jsonify({"recipes": [], "error": str(e)})
+
+
+@app.route("/api/owner/web_agent/recent", methods=["GET"])
+def owner_web_agent_recent():
+    """List recent task IDs (last 20) so the dashboard can show history."""
+    auth.require_owner(ORBI_DIR)
+    runs_dir = DATA_DIR / "web_agent_runs"
+    if not runs_dir.exists():
+        return jsonify({"runs": []})
+    files = sorted(runs_dir.glob("*.json"), key=lambda p: p.stat().st_mtime,
+                    reverse=True)[:20]
+    runs = []
+    for f in files:
+        try:
+            runs.append(json.loads(f.read_text(encoding="utf-8")))
+        except Exception:
+            continue
+    return jsonify({"runs": runs})
+
+
+# ---------------------------------------------------------------------------
 # Onboarding wizard — discover business from website + ask gap questions
 # ---------------------------------------------------------------------------
 
@@ -15906,6 +16509,45 @@ def onboarding_discover():
         # gap_questions: build from the confidence map so the wizard's
         # gap-fill flow still works. Same shape as the old onboarding.gap_questions.
         questions = _gap_questions_from_confidence(confidence, profile)
+        # Also persist the scraped profile into business_info.json
+        # immediately. The legacy flow expected the wizard's "Save"
+        # step (apply) to land the data, but if the owner closes the
+        # wizard before reaching that step, the scrape was wasted —
+        # the chat handler reads business_info.json, not customer_
+        # profiles/<domain>.json. Mirror the merge logic used by the
+        # chat-onboarding background scrape so both paths end with the
+        # same business_info.json content.
+        try:
+            biz = mod_business.load(DATA_DIR) or {}
+            for _k, _v in (profile or {}).items():
+                if not _v:
+                    continue
+                _existing = biz.get(_k)
+                _existing_is_empty = (
+                    _existing is None
+                    or _existing == ""
+                    or _existing == []
+                    or _existing == {}
+                    or (isinstance(_existing, dict)
+                        and not any(_existing.values()))
+                )
+                if _existing_is_empty:
+                    biz[_k] = _v
+            biz["website"] = url
+            mod_business.save(DATA_DIR, biz)
+            log.info("discover: persisted %d scraped fields into "
+                     "business_info.json", sum(1 for v in profile.values()
+                                                if v))
+            # Same workspace-folder rebrand as the chat-onboarding path —
+            # whichever onboarding flow the customer used, the desktop
+            # ends up branded with their business name.
+            try:
+                if biz.get("name"):
+                    _finalize_workspace_label_for_business(biz["name"])
+            except Exception as _e:
+                log.warning("workspace label rebrand failed: %s", _e)
+        except Exception as _e:
+            log.warning("discover: could not persist business_info: %s", _e)
         audit.log_event(DATA_DIR, actor=user["username"],
                         action="onboarding.discover_full",
                         meta={"url": url,
@@ -15929,39 +16571,44 @@ def _gap_questions_from_confidence(confidence: dict, profile: dict) -> list[dict
     """Build the wizard's gap-fill questions from the new full-scrape
     confidence map. Format mirrors what onboarding.gap_questions() returns
     so the existing wizard UI consumes them unchanged.
-    Each question: {field, prompt, kind: 'text'|'address'|'hours', placeholder}."""
+
+    Wizard dashboard.js reads `q.question` and `q.type` (NOT `q.prompt` /
+    `q.kind`) — the new contract diverged from the legacy one and shipped
+    empty <h3> headings to customers, with placeholder used as the only
+    visible cue. Keys match onboarding.gap_questions() exactly so both
+    code paths feed the same UI."""
     out = []
     if confidence.get("name") != "high":
-        out.append({"field": "name", "kind": "text",
-                    "prompt": "What's your business called?",
+        out.append({"field": "name", "type": "text",
+                    "question": "What's your business called?",
                     "placeholder": "PurBlum / Joe's Pizza"})
     if confidence.get("tagline") != "high":
-        out.append({"field": "tagline", "kind": "text",
-                    "prompt": "One short line describing your business — what would you tell a stranger in an elevator?",
+        out.append({"field": "tagline", "type": "text",
+                    "question": "One short line describing your business — what would you tell a stranger in an elevator?",
                     "placeholder": "Neighborhood deli + market in Reno"})
     if confidence.get("address") != "high":
-        out.append({"field": "address", "kind": "address",
-                    "prompt": "What's your address? (Customers ask this constantly.)",
+        out.append({"field": "address", "type": "text",
+                    "question": "What's your address? (Customers ask this constantly.)",
                     "placeholder": "1842 Sierra Market Lane, Reno NV 89501"})
     if confidence.get("phone") != "high":
-        out.append({"field": "contact.phone", "kind": "text",
-                    "prompt": "Best phone number for customers?",
+        out.append({"field": "contact.phone", "type": "tel",
+                    "question": "Best phone number for customers?",
                     "placeholder": "(775) 555-0192"})
     if confidence.get("email") != "high":
-        out.append({"field": "contact.email", "kind": "text",
-                    "prompt": "Best email for customer questions?",
+        out.append({"field": "contact.email", "type": "email",
+                    "question": "Best email for customer questions?",
                     "placeholder": "hello@yourbusiness.com"})
     if confidence.get("hours") != "high":
-        out.append({"field": "hours", "kind": "hours",
-                    "prompt": "What are your business hours? (I couldn't pull them off the site cleanly.)",
+        out.append({"field": "hours", "type": "textarea",
+                    "question": "What are your business hours? (I couldn't pull them off the site cleanly.)",
                     "placeholder": "Mon-Fri 9-5, Sat 10-2, Sun closed"})
     if confidence.get("services") != "high" and confidence.get("menu_items") != "high":
-        out.append({"field": "services", "kind": "text",
-                    "prompt": "What do you sell or do? (List 3-8 main things — paste your menu, list services, whatever fits.)",
+        out.append({"field": "services", "type": "textarea",
+                    "question": "What do you sell or do? (List 3-8 main things — paste your menu, list services, whatever fits.)",
                     "placeholder": "Sandwiches, soups, salads, catering trays, market grocery"})
     if confidence.get("policies") != "high":
-        out.append({"field": "policies.payment_methods", "kind": "text",
-                    "prompt": "How do customers pay? (Cash, credit, Venmo, etc.)",
+        out.append({"field": "policies.payment_methods", "type": "text",
+                    "question": "How do customers pay? (Cash, credit, Venmo, etc.)",
                     "placeholder": "Credit cards, cash, Apple Pay"})
     return out
 
@@ -16086,16 +16733,20 @@ def email_imap_providers():
     out = []
     for pid, p in imap_smtp.PROVIDER_PRESETS.items():
         out.append({
-            "id":            pid,
-            "label":         p["label"],
-            "imap_host":     p["imap_host"],
-            "imap_port":     p["imap_port"],
-            "imap_ssl":      p["imap_ssl"],
-            "smtp_host":     p["smtp_host"],
-            "smtp_port":     p["smtp_port"],
-            "smtp_starttls": p["smtp_starttls"],
-            "help":          p.get("help", ""),
-            "help_url":      p.get("help_url", ""),
+            "id":             pid,
+            "label":          p["label"],
+            "imap_host":      p["imap_host"],
+            "imap_port":      p["imap_port"],
+            "imap_ssl":       p["imap_ssl"],
+            "smtp_host":      p["smtp_host"],
+            "smtp_port":      p["smtp_port"],
+            "smtp_starttls":  p["smtp_starttls"],
+            "help":           p.get("help", ""),
+            "help_url":       p.get("help_url", ""),
+            "needs_app_pw":   p.get("needs_app_pw", False),
+            "password_label": p.get("password_label", "Password"),
+            "warning":        p.get("warning", ""),
+            "setup_steps":    p.get("setup_steps", []),
         })
     return jsonify({"providers": out})
 

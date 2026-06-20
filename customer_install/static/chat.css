@@ -94,34 +94,48 @@ body.fullpage-chat .orbi-panel.embed-mode {
    -------------------------------------------------------------- */
 .orbi-launcher {
   position: fixed;
-  bottom: 20px; right: 20px;
-  width: 60px; height: 60px;
-  border-radius: 50%;
-  background: #fff url('/static/myorbi-icon.png') center/cover no-repeat;
-  color: white;
+  bottom: 24px; right: 24px;
+  min-height: 76px;
+  padding: 14px 30px 14px 18px;
+  border-radius: 44px;
+  background: linear-gradient(135deg, #4c6cff 0%, #6c4cff 100%);
+  color: #fff;
   border: none;
   cursor: pointer;
-  box-shadow: 0 8px 24px rgba(0,0,0,0.22);
-  overflow: hidden;
-  padding: 0;
-  display: flex;
+  box-shadow: 0 12px 32px rgba(76, 76, 255, 0.40);
+  overflow: visible;
+  display: inline-flex;
   align-items: center;
-  justify-content: center;
+  gap: 14px;
+  font: 700 20px/1 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  letter-spacing: 0.3px;
   z-index: 9998;
-  transition: transform 0.2s ease, box-shadow 0.2s ease;
-  bottom: max(20px, env(safe-area-inset-bottom));
+  transition: transform 0.15s ease, box-shadow 0.2s ease;
+  bottom: max(24px, env(safe-area-inset-bottom));
 }
 .orbi-launcher:hover {
-  transform: scale(1.06);
-  box-shadow: 0 10px 30px rgba(0,0,0,0.28);
+  transform: translateY(-1px) scale(1.03);
+  box-shadow: 0 16px 38px rgba(76, 76, 255, 0.50);
 }
-/* The bundled chat-bubble svg lived ON TOP of the gradient. Now the
-   button background IS the Orbi logo — hide the chat icon by default
-   so only the logo shows. The close X still appears when .open. */
-.orbi-launcher .launcher-icon-chat { display: none; }
+.orbi-launcher .launcher-avatar {
+  width: 52px; height: 52px;
+  border-radius: 50%;
+  background: #fff url('/static/myorbi-icon.png') center/cover no-repeat;
+  flex: 0 0 auto;
+  box-shadow: 0 2px 6px rgba(0,0,0,0.15);
+}
+.orbi-launcher .launcher-label { white-space: nowrap; }
 .orbi-launcher .launcher-icon-close { display: none; }
-.orbi-launcher.open { background: #fff; }
-.orbi-launcher.open .launcher-icon-chat { display: none; }
+.orbi-launcher.open {
+  background: #fff;
+  color: #1a2236;
+  padding: 12px 14px;
+  min-height: 0;
+  border-radius: 50%;
+  box-shadow: 0 8px 22px rgba(0,0,0,0.22);
+}
+.orbi-launcher.open .launcher-avatar { display: none; }
+.orbi-launcher.open .launcher-label { display: none; }
 .orbi-launcher.open .launcher-icon-close { display: block; color: #1a2236; }
 
 .launcher-badge {

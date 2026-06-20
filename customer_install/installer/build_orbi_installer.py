@@ -66,6 +66,42 @@ DATA_FILES = [
     CUSTOMER_INSTALL / "config.json.template",
 ]
 
+# Bundled runtime — Windows-only. We ship an embedded Python distribution
+# inside the installer .exe so customers DON'T have to install Python
+# themselves. install_runtime.py extracts these into the customer's install
+# dir at install time and uses that Python for the venv.
+_BUNDLED_RUNTIME_DIR = HERE / "_bundled_runtime"
+_EMBED_PYTHON_ZIP = _BUNDLED_RUNTIME_DIR / "python-3.13.1-embed-amd64.zip"
+_GET_PIP = _BUNDLED_RUNTIME_DIR / "get-pip.py"
+_EMBED_PYTHON_URL = (
+    "https://www.python.org/ftp/python/3.13.1/python-3.13.1-embed-amd64.zip"
+)
+_GET_PIP_URL = "https://bootstrap.pypa.io/get-pip.py"
+
+
+def fetch_windows_embed_python() -> list:
+    """Ensure the Windows embeddable Python distribution + get-pip.py are
+    cached locally for the next build. Returns the list of paths to
+    include in the PyInstaller bundle (empty list if download fails so
+    a non-Windows-targeted build doesn't break)."""
+    _BUNDLED_RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    import urllib.request
+    for url, dest in [(_EMBED_PYTHON_URL, _EMBED_PYTHON_ZIP),
+                       (_GET_PIP_URL, _GET_PIP)]:
+        if dest.exists() and dest.stat().st_size > 1024:
+            continue
+        log.info("downloading %s → %s", url, dest)
+        try:
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "orbi-installer-build/1.0"})
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                dest.write_bytes(resp.read())
+            log.info("  → %.1f MB", dest.stat().st_size / 1e6)
+        except Exception as e:
+            log.warning("could not fetch %s: %s", url, e)
+            return []
+    return [_EMBED_PYTHON_ZIP, _GET_PIP]
+
 # Where the app-source tarball gets written before PyInstaller embeds it.
 # install_runtime.py extracts this tarball into the customer's install dir
 # at install time — that's how orbi.py, modules/, owner_dashboard/, etc.
@@ -243,10 +279,14 @@ def _clean() -> None:
 
 def _pyinstaller_cmd(out_subdir: Path, name: str = "orbi-installer",
                      bundled_bins: list[Path] | None = None,
-                     voice_models: list[Path] | None = None) -> list:
+                     voice_models: list[Path] | None = None,
+                     embed_python: list[Path] | None = None) -> list:
     """Common PyInstaller args used for all three targets.
     `bundled_bins` = ffmpeg / cloudflared / piper binaries → install_dir/bin/
     `voice_models` = Piper .onnx / .onnx.json files → install_dir/tts_models/
+    `embed_python` = Windows embeddable Python zip + get-pip.py →
+        bundle/python_embed/ (extracted at install time so the customer
+        doesn't need to install Python themselves)
     """
     cmd = [
         sys.executable, "-m", "PyInstaller",
@@ -286,6 +326,12 @@ def _pyinstaller_cmd(out_subdir: Path, name: str = "orbi-installer",
     for model in voice_models or []:
         if model and model.exists():
             cmd += ["--add-data", f"{model}{sep}tts_models"]
+    # Ship the Windows embeddable Python distribution + get-pip.py into
+    # python_embed/ so install_runtime can extract them on the customer's
+    # machine. Customers no longer need to install Python first.
+    for embed_file in embed_python or []:
+        if embed_file and embed_file.exists():
+            cmd += ["--add-data", f"{embed_file}{sep}python_embed"]
     cmd.append(str(RUNTIME_ENTRY))
     return cmd
 
@@ -457,8 +503,15 @@ def build_windows() -> Path:
     build_app_tarball()
     bins = fetch_platform_binaries("windows")
     models = fetch_piper_voice_models()
+    embed_python = fetch_windows_embed_python()
     cmd = _pyinstaller_cmd(out, name="orbi-installer", bundled_bins=bins,
-                           voice_models=models)
+                           voice_models=models, embed_python=embed_python)
+    # Embed a Windows manifest that requests administrator elevation. The
+    # installer writes to C:\Program Files\Orbi (UAC-protected), so the
+    # customer must double-click and click "Yes" on the UAC prompt — no
+    # need to remember "right-click → Run as administrator". install_runtime
+    # also has a runtime self-elevate fallback for any path that misses this.
+    cmd.insert(cmd.index("--onefile") + 1, "--uac-admin")
     _run(cmd)
     exe = out / "orbi-installer.exe"
     if not exe.exists():

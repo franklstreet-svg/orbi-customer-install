@@ -1,5 +1,123 @@
 /* Orbi owner dashboard — client logic */
 
+// First-time password setup overlay. Installer creates the owner user
+// with a random temp password that auto-fills the login form via the
+// bootstrap query param — the customer never sees it. On the first
+// dashboard load after install, we check /api/owner/account/status;
+// if must_change_password is true we lock the dashboard behind a modal
+// asking for a real password they'll remember. Runs as an IIFE outside
+// the main module so it fires before any other init touches the page.
+(function () {
+  'use strict';
+
+  async function _fetchJson(path, init) {
+    const res = await fetch(path, Object.assign({
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+    }, init || {}));
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
+    return body;
+  }
+
+  function _showSetPasswordModal() {
+    if (document.getElementById('orbi-set-password-overlay')) return;
+    const overlay = document.createElement('div');
+    overlay.id = 'orbi-set-password-overlay';
+    overlay.setAttribute('role', 'dialog');
+    overlay.setAttribute('aria-modal', 'true');
+    overlay.style.cssText = [
+      'position:fixed', 'inset:0', 'background:rgba(0,0,0,0.92)',
+      'z-index:99999', 'display:flex', 'align-items:center',
+      'justify-content:center', 'backdrop-filter:blur(6px)',
+      '-webkit-backdrop-filter:blur(6px)', 'padding:20px',
+    ].join(';');
+    overlay.innerHTML = `
+      <div style="background:#1a2235;border:1px solid #2dd4bf;border-radius:14px;padding:32px;max-width:440px;width:100%;color:#e8eaf0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
+        <h2 style="color:#2dd4bf;margin:0 0 8px;font-size:22px">Let's set you up</h2>
+        <p style="margin:0 0 18px;font-size:14px;color:#aab0bc;line-height:1.5">Three quick things and you're in.</p>
+
+        <label style="display:block;font-size:13px;color:#aab0bc;margin-bottom:4px">What should Orbi call you?</label>
+        <input type="text" id="orbi-display-name" placeholder="Your first name" autocomplete="off" style="width:100%;background:#0b0f1a;border:1px solid #2c3957;color:#eaf0ff;border-radius:8px;padding:12px 14px;font-size:15px;margin-bottom:14px;box-sizing:border-box">
+
+        <label style="display:block;font-size:13px;color:#aab0bc;margin-bottom:4px">What would you like to call her? (default: Orbi)</label>
+        <input type="text" id="orbi-assistant-name" placeholder="Orbi" autocomplete="off" style="width:100%;background:#0b0f1a;border:1px solid #2c3957;color:#eaf0ff;border-radius:8px;padding:12px 14px;font-size:15px;margin-bottom:14px;box-sizing:border-box">
+
+        <label style="display:block;font-size:13px;color:#aab0bc;margin-bottom:4px">Set a password you'll remember (6+ characters)</label>
+        <input type="password" id="orbi-pw-1" placeholder="New password" autocomplete="new-password" style="width:100%;background:#0b0f1a;border:1px solid #2c3957;color:#eaf0ff;border-radius:8px;padding:12px 14px;font-size:15px;margin-bottom:10px;box-sizing:border-box">
+        <input type="password" id="orbi-pw-2" placeholder="Confirm password" autocomplete="new-password" style="width:100%;background:#0b0f1a;border:1px solid #2c3957;color:#eaf0ff;border-radius:8px;padding:12px 14px;font-size:15px;margin-bottom:18px;box-sizing:border-box">
+
+        <div id="orbi-pw-error" style="color:#ffb0b0;font-size:13px;margin-bottom:10px;min-height:18px"></div>
+        <button id="orbi-pw-submit" type="button" style="width:100%;background:#2dd4bf;color:#0a0a0a;border:0;border-radius:8px;padding:12px;font-weight:700;font-size:15px;cursor:pointer">Save and continue</button>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+
+    const displayNameEl   = overlay.querySelector('#orbi-display-name');
+    const assistantNameEl = overlay.querySelector('#orbi-assistant-name');
+    const pw1 = overlay.querySelector('#orbi-pw-1');
+    const pw2 = overlay.querySelector('#orbi-pw-2');
+    const err = overlay.querySelector('#orbi-pw-error');
+    const btn = overlay.querySelector('#orbi-pw-submit');
+    setTimeout(() => displayNameEl.focus(), 50);
+
+    async function submit() {
+      err.textContent = '';
+      const displayName = (displayNameEl.value || '').trim();
+      if (!displayName) {
+        err.textContent = 'What should Orbi call you?';
+        displayNameEl.focus(); return;
+      }
+      if (pw1.value.length < 6) {
+        err.textContent = 'Password must be at least 6 characters.';
+        pw1.focus(); return;
+      }
+      if (pw1.value !== pw2.value) {
+        err.textContent = "Passwords don't match.";
+        pw2.focus(); return;
+      }
+      btn.disabled = true;
+      btn.textContent = 'Saving…';
+      try {
+        await _fetchJson('/api/owner/account/setup_initial_password', {
+          method: 'POST',
+          body: JSON.stringify({
+            new_password:    pw1.value,
+            display_name:    displayName,
+            assistant_name: (assistantNameEl.value || '').trim() || 'Orbi',
+          }),
+        });
+        overlay.remove();
+        window.location.reload();
+      } catch (e) {
+        err.textContent = (e && e.message) || 'Could not save.';
+        btn.disabled = false;
+        btn.textContent = 'Save and continue';
+      }
+    }
+
+    btn.addEventListener('click', submit);
+    [displayNameEl, assistantNameEl, pw1, pw2].forEach(el => el.addEventListener('keydown', e => {
+      if (e.key === 'Enter') submit();
+    }));
+  }
+
+  async function _checkInitialPasswordSetup() {
+    try {
+      const status = await _fetchJson('/api/owner/account/status');
+      if (status && status.must_change_password) {
+        _showSetPasswordModal();
+      }
+    } catch (_) { /* silent — endpoint may be unavailable */ }
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', _checkInitialPasswordSetup);
+  } else {
+    _checkInitialPasswordSetup();
+  }
+})();
+
 (function () {
   'use strict';
 
@@ -619,6 +737,14 @@
     text = (text || '').trim();
     if (!text || ownerChatSending) return;
     ownerChatSending = true;
+
+    // ECHO FIX: stop recognition the INSTANT a message is submitted (text
+    // OR voice). Without this, recognition auto-restarts during the
+    // network roundtrip to /api/owner/chat, so the mic is hot when
+    // Orbi's TTS starts playing the reply — and the mic captures her
+    // own voice as if it were the user's next input. The 400ms-after-
+    // speak restart in speakReply's finish() will turn it back on.
+    try { if (typeof recognition !== 'undefined' && recognition) recognition.stop(); } catch {}
 
     const input  = document.getElementById('owner-chat-input');
     const send   = document.getElementById('owner-chat-send');
@@ -1269,10 +1395,17 @@
       u.rate = 1.05;
       u.pitch = 1.0;
       u.lang = 'en-US';
-      // Prefer a female English voice (rough Ava match)
-      const female = _ssVoices.find(v =>
-        /female|samantha|karen|moira|tessa|ava|nicky|nora/i.test(v.name) &&
-        /^en/i.test(v.lang));
+      // Prefer a US English female voice that matches Ava as closely as
+      // possible. Karen/Moira/Tessa/Nicky are Australian/NZ/UK voices —
+      // explicitly EXCLUDED so Windows installs that lack better voices
+      // don't get a wrong-accent fallback. Order matters: try US voices
+      // first, fall back to en-* female only as a last resort, never to
+      // a non-female or non-English voice.
+      const enUS = _ssVoices.filter(v => /^en-US/i.test(v.lang));
+      const female = enUS.find(v => /samantha|ava|aria|nora|jenny|female/i.test(v.name))
+                  || enUS.find(v => /zira|hazel|david/i.test(v.name) === false)
+                  || _ssVoices.find(v => /^en-US/i.test(v.lang))
+                  || _ssVoices.find(v => /samantha|ava|aria|nora|jenny/i.test(v.name) && /^en/i.test(v.lang));
       if (female) u.voice = female;
       u.onend = onDone || (() => {});
       u.onerror = () => {
@@ -3448,6 +3581,57 @@
 
   // Each screen: {title, render() → HTML, onNext() async → void or string error,
   //               nextLabel?, showBack?, showSkip?}
+  // Compact human-readable rendering of a hours dict from the scraper.
+  // Collapses consecutive identical days into a single range ("Mon-Fri
+  // 7:00 AM - 8:00 PM") and converts 24h times to AM/PM. Returns "" if
+  // nothing useful, so the wizard's "missing" indicator can take over.
+  function _formatHoursForDisplay(hours) {
+    if (!hours || typeof hours !== 'object') return '';
+    const order = ['monday','tuesday','wednesday','thursday',
+                    'friday','saturday','sunday'];
+    const abbr  = {monday:'Mon', tuesday:'Tue', wednesday:'Wed',
+                    thursday:'Thu', friday:'Fri', saturday:'Sat', sunday:'Sun'};
+    function to12h(t) {
+      if (!t || typeof t !== 'string') return '';
+      const m = t.match(/^(\d{1,2}):?(\d{2})?/);
+      if (!m) return t;
+      let h = parseInt(m[1], 10);
+      const mins = m[2] || '00';
+      const ampm = h >= 12 ? 'PM' : 'AM';
+      h = h % 12; if (h === 0) h = 12;
+      return mins === '00' ? `${h} ${ampm}` : `${h}:${mins} ${ampm}`;
+    }
+    function fmtDay(d) {
+      const v = hours[d];
+      if (!v) return 'closed';
+      if (typeof v === 'string') return v;
+      if (v.closed === true) return 'closed';
+      const open = to12h(v.open);
+      const close = to12h(v.close);
+      if (!open || !close) return 'closed';
+      return `${open} - ${close}`;
+    }
+    // Build per-day strings then collapse runs of identical adjacent days.
+    const dayStrs = order.map(d => ({day: d, str: fmtDay(d)}));
+    const groups = [];
+    let i = 0;
+    while (i < dayStrs.length) {
+      let j = i;
+      while (j + 1 < dayStrs.length && dayStrs[j + 1].str === dayStrs[i].str) j++;
+      groups.push({
+        label: i === j ? abbr[dayStrs[i].day]
+                       : `${abbr[dayStrs[i].day]}-${abbr[dayStrs[j].day]}`,
+        str: dayStrs[i].str,
+      });
+      i = j + 1;
+    }
+    // Drop groups that are all-closed unless every day is closed
+    const allClosed = groups.every(g => g.str === 'closed');
+    const visible = allClosed ? groups : groups.filter(g => g.str !== 'closed');
+    if (!visible.length) return '';
+    return visible.map(g => `${g.label} ${g.str}`).join(', ');
+  }
+
   function wizardScreens() {
     return [
       // 0. Welcome
@@ -3467,7 +3651,7 @@
               <li>Connect your website (I'll learn your business)</li>
               <li>Fill in anything I missed</li>
               <li>Connect your email (Gmail or Outlook)</li>
-              <li>Set up your phone receptionist (Twilio)</li>
+              <li>Confirm your business phone number (already included)</li>
               <li>Pick your tunnel URL (so customers can reach you)</li>
               <li>Add your staff (optional)</li>
               <li>Done — you're live</li>
@@ -3494,7 +3678,15 @@
           if (!url) return "Please enter your website URL.";
           _wizState.website = url;
           const status = document.getElementById('wiz-scan-status');
-          status.innerHTML = '<span style="color:#4f8cff">Scanning your website…</span>';
+          const nextBtn = document.getElementById('wiz-next-btn');
+          // Tell the customer what's happening — the disabled cursor on
+          // the button alone reads as "blocked", and the scan can take
+          // 30-90 seconds. Spinner + button text change makes it clear
+          // Orbi is working, not stuck.
+          if (nextBtn) {
+            nextBtn.textContent = '⏳ Scanning your website…';
+          }
+          status.innerHTML = '<div style="color:#4f8cff;font-size:14px;padding:10px;background:rgba(79,140,255,0.08);border:1px solid rgba(79,140,255,0.3);border-radius:8px;">⏳ <strong>Reading your homepage, About page, services, hours…</strong><br><span style="font-size:12px;opacity:0.85">Usually 30-90 seconds. The button stays grey until I\'m done — that\'s normal.</span></div>';
           try {
             const r = await api('/api/owner/onboarding/discover', {
               method: 'POST', body: JSON.stringify({url}),
@@ -3504,6 +3696,7 @@
             _wizState.gapQuestions = r.gap_questions || [];
             _wizState.currentGap = 0;
           } catch (err) {
+            if (nextBtn) nextBtn.textContent = 'Scan my website';
             return `Couldn't scan that site: ${err.message}. You can still continue and fill in everything manually.`;
           }
         }
@@ -3535,7 +3728,7 @@
               ${row('Address', addrStr, 'address')}
               ${row('Phone', contact.phone, 'phone')}
               ${row('Email', contact.email, 'email')}
-              ${row('Hours', d.hours && Object.keys(d.hours).length ? Object.keys(d.hours).length+' day(s) of hours found' : '', 'hours')}
+              ${row('Hours', _formatHoursForDisplay(d.hours), 'hours')}
               <div style="margin-top:8px">🟢 <strong>Services found:</strong> ${(d.services||[]).length}</div>
               ${svc ? `<ul style="margin:4px 0 0 16px;color:#b8c6e0;font-size:13px">${svc}</ul>` : ''}
             </div>
@@ -3632,15 +3825,30 @@
         onNext: async () => {}
       },
 
-      // 6. Phone (Twilio)
+      // 6. Phone receptionist — auto-provisioned, no setup required.
+      // The brain creates the customer's Twilio number on Stripe
+      // checkout and includes the cost in their monthly subscription.
+      // Owner just sees the number Orbi will answer on.
       {
-        title: "Phone receptionist",
+        title: "Your phone receptionist",
         nextLabel: "Continue",
-        showSkip: true,
+        showSkip: false,
         render: () => `
-          <p style="font-size:14px">Orbi can answer calls 24/7 if you give her a phone number. This uses Twilio — you'll need a Twilio account (~$1/mo per number + a few cents per call).</p>
-          <p class="muted" style="font-size:13px;margin-top:8px">You can configure this from Settings → Phone whenever you're ready. Skip for now if you don't have Twilio set up.</p>
+          <p style="font-size:14px">Orbi answers your business calls 24/7 — already set up, already paid for, no Twilio account on your end.</p>
+          <div id="wiz-phone-number" style="background:#0b0f1a;border:1px solid #2dd4bf;border-radius:8px;padding:14px 16px;margin:14px 0;font-size:18px;color:#fff;text-align:center;font-weight:600">Looking up your number…</div>
+          <p class="muted" style="font-size:13px;margin-top:8px">Give that number to customers, put it on your business cards, your website, your menus. Orbi answers every call — captures leads, takes orders, books appointments — whatever you've taught her.</p>
         `,
+        onShow: async () => {
+          const target = document.getElementById('wiz-phone-number');
+          if (!target) return;
+          try {
+            const info = await api('/api/owner/business_info');
+            const number = (info.phone || (info.contact && info.contact.phone) || '').trim();
+            target.textContent = number || 'Number provisioning — check Settings → Phone in a few minutes';
+          } catch {
+            target.textContent = 'Open Settings → Phone to see your number';
+          }
+        },
         onNext: async () => {}
       },
 
@@ -3759,9 +3967,16 @@
       renderWizStep();
     });
 
-    // Auto-open if business_info looks empty on first load
+    // Auto-open if business_info looks empty on first load.
+    // BUT — the first-time password-set modal (rendered by the IIFE at
+    // the top of this file) needs to land first. HTML <dialog>'s top-
+    // layer rendering would cover our overlay regardless of z-index,
+    // so we defer auto-opening the wizard while the password overlay
+    // is up. Once the customer submits, the page reloads and this
+    // check passes on the next pass.
     setTimeout(async () => {
       try {
+        if (document.getElementById('orbi-set-password-overlay')) return;
         const biz = await api('/api/owner/business_info');
         const looksEmpty = !biz.name || biz.name === "REPLACE_WITH_BUSINESS_NAME";
         if (looksEmpty && !sessionStorage.getItem('orbi-wiz-shown')) {
@@ -3775,6 +3990,172 @@
     }, 1500);
   }
   document.addEventListener('DOMContentLoaded', wireWizard);
+
+  // ------------------------------------------------------------------
+  // Web Tasks tab — Orbi drives a real Chrome for the owner.
+  // Polls each running task for status. When a task lands in
+  // status=awaiting_confirmation, pops the confirmation modal so the
+  // owner can approve or decline the pending action.
+  // ------------------------------------------------------------------
+  function wireWebTasks() {
+    const goalEl   = document.getElementById('web-agent-goal');
+    const urlEl    = document.getElementById('web-agent-url');
+    const recipeEl = document.getElementById('web-agent-recipe');
+    const startBtn = document.getElementById('web-agent-start-btn');
+    const runsEl   = document.getElementById('web-agent-runs');
+    const dlg      = document.getElementById('web-agent-confirm-dialog');
+    const actionEl = document.getElementById('web-agent-confirm-action');
+    const approveBtn = document.getElementById('web-agent-confirm-approve');
+    const denyBtn  = document.getElementById('web-agent-confirm-deny');
+
+    if (!goalEl || !startBtn) return;
+
+    const pollers = {};        // task_id → setTimeout id
+    let activeConfirmTaskId = null;
+
+    async function loadRecipes() {
+      try {
+        const r = await api('/api/owner/web_agent/recipes');
+        const list = (r && r.recipes) || [];
+        // Clear all but the "no recipe" placeholder
+        recipeEl.innerHTML = '<option value="">No recipe (free-form)</option>';
+        list.forEach(name => {
+          const opt = document.createElement('option');
+          opt.value = name;
+          opt.textContent = name;
+          recipeEl.appendChild(opt);
+        });
+      } catch (e) { /* silent — endpoint may not be up yet */ }
+    }
+
+    async function loadRecent() {
+      try {
+        const r = await api('/api/owner/web_agent/recent');
+        const runs = (r && r.runs) || [];
+        if (!runs.length) {
+          runsEl.innerHTML = '<p class="muted" style="font-size:13px">No tasks yet. Start one above.</p>';
+          return;
+        }
+        runsEl.innerHTML = '';
+        runs.forEach(renderRun);
+      } catch {}
+    }
+
+    function statusBadge(status) {
+      const colors = {
+        running:                {bg:'#1e3a5f', fg:'#9ad6ff', label:'Running…'},
+        awaiting_confirmation:  {bg:'#5f4f1e', fg:'#ffe39a', label:'Needs your OK'},
+        done:                   {bg:'#1e5f3a', fg:'#9affb5', label:'Done'},
+        failed:                 {bg:'#5f1e2e', fg:'#ff9ab5', label:'Failed'},
+        declined:               {bg:'#3a3a3a', fg:'#b8b8b8', label:'Declined'},
+        declined_timeout:       {bg:'#3a3a3a', fg:'#b8b8b8', label:'Timed out'},
+        crashed:                {bg:'#5f1e2e', fg:'#ff9ab5', label:'Crashed'},
+      };
+      const c = colors[status] || {bg:'#2c3957', fg:'#aab0bc', label:status||'unknown'};
+      return `<span style="background:${c.bg};color:${c.fg};padding:3px 10px;border-radius:99px;font-size:11px;font-weight:600">${c.label}</span>`;
+    }
+
+    function renderRun(task) {
+      const id = task.task_id;
+      const existing = document.getElementById('run-' + id);
+      const startedFmt = task.started_at
+        ? new Date(task.started_at * 1000).toLocaleString()
+        : '';
+      const elapsed = task.result ? `${task.result.elapsed_seconds || ''}s` : '';
+      const stopped = task.result ? (task.result.stopped_reason || '') : '';
+      const downloads = (task.result && task.result.downloaded_files) || [];
+      const dlList = downloads.length
+        ? `<div style="margin-top:8px;font-size:12px;color:#9ad6ff">Saved to your Orbi folder: ${downloads.map(p => p.split(/[/\\]/).pop()).join(', ')}</div>`
+        : '';
+      const html = `
+        <div id="run-${id}" style="background:#0b1224;border:1px solid #1f2c4a;border-radius:10px;padding:14px;">
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
+            <div style="flex:1;min-width:0">
+              <div style="font-size:14px;color:#eaf0ff;word-break:break-word">${esc(task.goal || '')}</div>
+              <div class="muted" style="font-size:12px;margin-top:3px">${startedFmt} ${elapsed ? ' · ' + esc(elapsed) : ''} ${stopped ? ' · ' + esc(stopped) : ''}</div>
+            </div>
+            <div>${statusBadge(task.status)}</div>
+          </div>
+          ${dlList}
+        </div>
+      `;
+      if (existing) {
+        existing.outerHTML = html;
+      } else {
+        runsEl.insertAdjacentHTML('afterbegin', html);
+      }
+    }
+
+    async function pollTask(taskId) {
+      try {
+        const r = await api(`/api/owner/web_agent/status/${encodeURIComponent(taskId)}`);
+        renderRun(r);
+        if (r.status === 'awaiting_confirmation' && activeConfirmTaskId !== taskId) {
+          activeConfirmTaskId = taskId;
+          const a = r.pending_action || {};
+          actionEl.textContent = JSON.stringify(a, null, 2);
+          if (typeof dlg.showModal === 'function') dlg.showModal();
+        }
+        if (['done','failed','declined','declined_timeout','crashed'].includes(r.status)) {
+          delete pollers[taskId];
+          return; // stop polling
+        }
+      } catch (e) { /* keep trying */ }
+      pollers[taskId] = setTimeout(() => pollTask(taskId), 1500);
+    }
+
+    startBtn.addEventListener('click', async () => {
+      const goal = (goalEl.value || '').trim();
+      if (!goal) { goalEl.focus(); return; }
+      startBtn.disabled = true;
+      startBtn.textContent = 'Starting…';
+      try {
+        const body = {
+          goal,
+          start_url: (urlEl.value || '').trim() || null,
+          recipe:    recipeEl.value || null,
+          recipe_params: {},
+        };
+        const r = await api('/api/owner/web_agent/run', {
+          method: 'POST', body: JSON.stringify(body),
+        });
+        goalEl.value = '';
+        urlEl.value = '';
+        recipeEl.value = '';
+        renderRun({task_id: r.task_id, goal, status: 'running',
+                    started_at: Date.now()/1000});
+        pollTask(r.task_id);
+      } catch (e) {
+        alert('Could not start: ' + (e.message || 'unknown error'));
+      } finally {
+        startBtn.disabled = false;
+        startBtn.textContent = 'Run';
+      }
+    });
+
+    async function decideConfirm(approve) {
+      const taskId = activeConfirmTaskId;
+      if (!taskId) return;
+      try {
+        await api(`/api/owner/web_agent/confirm/${encodeURIComponent(taskId)}`, {
+          method: 'POST', body: JSON.stringify({approve}),
+        });
+      } catch (e) { /* still close the modal */ }
+      activeConfirmTaskId = null;
+      try { dlg.close(); } catch {}
+    }
+    approveBtn.addEventListener('click', () => decideConfirm(true));
+    denyBtn.addEventListener('click',    () => decideConfirm(false));
+
+    // Lazy load when the tab is opened
+    document.querySelectorAll('.tab[data-tab="web_tasks"]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        loadRecipes();
+        loadRecent();
+      });
+    });
+  }
+  document.addEventListener('DOMContentLoaded', wireWebTasks);
 
   // ------------------------------------------------------------------
   // Help tab — renders orbi_capabilities.md
@@ -4243,15 +4624,64 @@
       const p = providers.find(x => x.id === sel.value) || providers[0];
       if (!p) return;
       helpEl.innerHTML = '';
-      const helpText = document.createElement('span');
-      helpText.textContent = p.help || '';
-      helpEl.appendChild(helpText);
-      if (p.help_url) {
-        helpEl.appendChild(document.createTextNode(' '));
-        const a = document.createElement('a');
-        a.href = p.help_url; a.target = '_blank'; a.rel = 'noopener';
-        a.textContent = 'Open settings ↗';
-        helpEl.appendChild(a);
+      // Top warning block — only shown for providers that require an
+      // app password. Customers consistently miss the one-line help
+      // text and try their normal email password, so make it loud and
+      // unmissable.
+      if (p.warning) {
+        const warn = document.createElement('div');
+        warn.style.cssText =
+          'background:#3a2a16; border:1px solid #f0a23a; color:#ffd9a3;' +
+          'padding:10px 12px; border-radius:8px; font-size:13px;' +
+          'margin-bottom:10px; line-height:1.4;';
+        warn.textContent = '⚠ ' + p.warning;
+        helpEl.appendChild(warn);
+      }
+      // Provider-specific setup walkthrough — numbered list rendered
+      // from the array in PROVIDER_PRESETS. Falls back to the single-
+      // line `help` blurb when the preset doesn't ship steps yet.
+      if (p.setup_steps && p.setup_steps.length) {
+        if (p.help_url) {
+          const linkP = document.createElement('p');
+          linkP.style.cssText = 'margin:0 0 8px';
+          const a = document.createElement('a');
+          a.href = p.help_url; a.target = '_blank'; a.rel = 'noopener';
+          a.textContent = 'Open settings ↗';
+          linkP.appendChild(document.createTextNode('Step 0: '));
+          linkP.appendChild(a);
+          linkP.appendChild(document.createTextNode(' (opens in a new tab)'));
+          helpEl.appendChild(linkP);
+        }
+        const ol = document.createElement('ol');
+        ol.style.cssText = 'margin:6px 0 8px 18px; padding:0; font-size:13px; line-height:1.45;';
+        for (const step of p.setup_steps) {
+          const li = document.createElement('li');
+          li.style.marginBottom = '4px';
+          li.textContent = step;
+          ol.appendChild(li);
+        }
+        helpEl.appendChild(ol);
+      } else {
+        const helpText = document.createElement('span');
+        helpText.textContent = p.help || '';
+        helpEl.appendChild(helpText);
+        if (p.help_url) {
+          helpEl.appendChild(document.createTextNode(' '));
+          const a = document.createElement('a');
+          a.href = p.help_url; a.target = '_blank'; a.rel = 'noopener';
+          a.textContent = 'Open settings ↗';
+          helpEl.appendChild(a);
+        }
+      }
+      // Update the password field's label so customers see "App
+      // Password (16 characters from Yahoo)" instead of the generic
+      // "Password" prompt that confused everyone in early tests.
+      const pwLabel = document.getElementById('imap-password-label');
+      if (pwLabel && p.password_label) {
+        const labelText = p.password_label +
+          (p.needs_app_pw ? ' — NOT your normal email password' : '');
+        const pwInput = pwLabel.querySelector('input, div');
+        pwLabel.firstChild && (pwLabel.firstChild.nodeValue = labelText + ' ');
       }
       custom.hidden = (p.id !== 'custom');
       document.getElementById('imap-host').value = p.imap_host || '';
@@ -4262,7 +4692,29 @@
     sel.addEventListener('change', syncProvider);
     syncProvider();
     document.getElementById('imap-email').value = '';
-    document.getElementById('imap-password').value = '';
+    const pwField = document.getElementById('imap-password');
+    pwField.value = '';
+    // Reset the password field to masked every time the dialog opens —
+    // never persist "show" state across openings, so a forgotten "show"
+    // doesn't leave the password visible on the next account add.
+    pwField.type = 'password';
+    const toggleBtn = document.getElementById('imap-password-toggle');
+    if (toggleBtn && !toggleBtn.dataset.wired) {
+      toggleBtn.addEventListener('click', () => {
+        const field = document.getElementById('imap-password');
+        if (field.type === 'password') {
+          field.type = 'text';
+          toggleBtn.textContent = '🙈';
+          toggleBtn.title = 'Hide password';
+        } else {
+          field.type = 'password';
+          toggleBtn.textContent = '👁';
+          toggleBtn.title = 'Show password';
+        }
+      });
+      toggleBtn.dataset.wired = '1';
+    }
+    if (toggleBtn) { toggleBtn.textContent = '👁'; toggleBtn.title = 'Show password'; }
     document.getElementById('imap-save-status').textContent = '';
     if (typeof dlg.showModal === 'function') dlg.showModal();
     else dlg.setAttribute('open', '');

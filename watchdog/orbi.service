@@ -1,0 +1,30 @@
+[Unit]
+Description=Orbi (customer-side AI service)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/orbi/orbi.py
+Restart=on-failure
+RestartSec=10
+User=orbi
+Group=orbi
+WorkingDirectory=/opt/orbi
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=orbi
+Environment=PYTHONUNBUFFERED=1
+
+# Resource limits
+MemoryMax=4G
+
+# Security
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+ReadWritePaths=/opt/orbi
+
+[Install]
+WantedBy=multi-user.target
