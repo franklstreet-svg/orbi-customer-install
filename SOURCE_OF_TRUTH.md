@@ -1,6 +1,6 @@
 # Orbi — Source of Truth
 
-**Last updated:** 2026-06-20 (file-audit refresh — no policy changes since 6-18, but file counts, route lists, line counts, and the customer_install/owner_dashboard symlink claim were stale. Also captures the uncommitted edits that landed 6-19 on top of the 6-18 16:19 build but haven't been pushed to git yet.)
+**Last updated:** 2026-06-20 (CLOUD-V1 PIVOT day — Frank pivoted from local-install to cloud-hosted. Reasons: SmartScreen/AV trust problem, no time + money for code-signing cert, install pain was the bottleneck to revenue. New plan: cloud now → revenue → fund certs → ship v2 local install later. ALL build work today lives on `cloud-v1` branches in both `orbi_web` and `twickell_live`. Production (main branches, twickell.com, billing.twickell.com on Render) are UNCHANGED — pivot ships only after Frank's fine-tooth-comb review + Stripe products created. Earlier today: file-audit refresh — no policy changes since 6-18, but file counts, route lists, line counts, and the customer_install/owner_dashboard symlink claim were stale.)
 **Previous refresh:** 2026-06-18 (after Frank's external-customer install round — SCS / scsplanroom.com test surfaced new bugs around the welcome wizard, owner-name handling, and staff session writes. All fixed in source 6-18 and shipped in a fresh `.exe` (16:19) that's on Frank's thumb drive.)
 **Owner:** Frank Street
 **Legal entity:** FST LLC
@@ -379,9 +379,70 @@ This means the live disk is AHEAD of what GitHub knows about. The 6-18 16:19 `.e
 - All seven fixed in source 6-18 and bundled into the 6-18 16:19 build. New `.exe` (131 MB) + hardened TEST_INSTALL.bat + fresh token (`inst_aa5ee60d9b8555a40a47922a1b3206c6`) on thumb drive D: as of 17:47. Round 3 install pending.
 
 **Since the 6-18 build cut (2026-06-19 → 2026-06-20):**
-- Further edits to `orbi.py`, `imap_smtp.py`, the dashboard, and the chat/embed widgets — all uncommitted (see "Uncommitted source state" above).
-- Audit pass on this SoT file (this update) — file counts, route lists, line counts, and the owner_dashboard symlink claim were corrected.
-- Round 3 install on the test PC still pending. Either re-cut the `.exe` from current source if the 6-19 edits matter for the round-3 verification, or run round 3 against the 6-18 16:19 build first to verify the seven SCS fixes in isolation.
+- Further edits to `orbi.py`, `imap_smtp.py`, the dashboard, and the chat/embed widgets — committed at checkpoint commit `bdc0194` on `main`.
+- Audit pass on this SoT file — file counts, route lists, line counts, and the owner_dashboard symlink claim were corrected.
+- **2026-06-20 afternoon — full pivot to CLOUD-V1.** Replaces the immediate next-build queue (Round 3 install on test PC) with a cloud signup flow. See the "Cloud v1 pivot — work completed today" section below.
+
+---
+
+## Cloud v1 pivot — work completed today (2026-06-20)
+
+**Triggers for pivot:** Three weeks of install bugs blocking revenue. Code-signing cert unaffordable pre-revenue. SmartScreen + AV popup is a real customer trust problem ("we want you to override your computer's security on day one"). Email regression broke a working v1 install path. Frank reached "I can't keep going like this with no money."
+
+**Frank's pivot framing:**
+- v1 cloud = fastest path to first revenue. Cloud-host on `orbi.twickell.com` for now ($0); migrate to Render ($7/mo) before Customer #3.
+- v2 local install = the real long-term product, funded by v1 revenue. Code-signing certs purchased from first $$. Local install becomes the "data on your computer" privacy upgrade.
+- v3 hybrid (local Orbi server + cloud Orbi orchestration) = the moat play for high-trust verticals (legal, eventually medical).
+
+**Architecture decisions locked:**
+- **TTS engine for customer Orbi instances: Kokoro-82M** (Apache 2.0, open weights, owned forever). 9 voices in dropdown: af (default), af_bella, af_sarah, af_nicole, af_sky, am_michael, am_adam, bm_george, bm_lewis.
+- **TTS engine for twickell.com sales bot only: Microsoft Ava** (en-US-AvaNeural via edge_tts, legally gray). Kept until Microsoft kills the engine. Risk isolated to Frank's own marketing surface — customers never have Ava so they can't lose it.
+- **Pricing model: App Store / Base + Modules.** $49.99 Base first seat + $29.99 each additional. +$69.99 Receptionist (1k calls). +$49.99 Website Controller. +$49.99 each industry module (Restaurant available; Construction/Auto/Salon coming; Legal v1.1 with UPL safeguards; Medical deferred for HIPAA). +$29.99 Marketing. +$19.99 Image Generation sub-module. Annual = pay 10 months, get 12.
+- **Refund policy: 50% refund of first month within 30 days, none after.** Customer covers the AI compute + telephony + hosting Frank already paid on their behalf.
+- **Customer signup: magic-link.** Stripe checkout → email with one-click sign-in URL → click → in the dashboard → 10-min onboarding wizard → live. No download, no install, no SmartScreen.
+- **Excluded verticals in v1 ToS:** healthcare (HIPAA pending), practicing attorneys as client-facing receptionist (until v1.1 Legal module). Both documented in `terms.html` §7(n), (o), (p).
+- **No human support team.** Customer Support module ships in v1 — every Orbi has `product_knowledge.json` bundled so she can answer product questions instantly. Escalation to Frank only when she genuinely can't resolve. Marketed PROUDLY: "I'm the support team — 24/7, no queue, no hold music."
+
+**Branches (cloud-v1 work):**
+- `~/twickell_live/cloud-v1` — pushed to GitHub. Vercel preview should be auto-deployed. Production `main` UNCHANGED.
+- `~/orbi_web/cloud-v1` — pushed to GitHub. Production `main` UNCHANGED.
+
+**Code changes today (all on cloud-v1 branches):**
+
+`twickell_live/`:
+- `website/index.html` — Pricing section restructured (Personal+Business → unified Orbi Base + Modules). "What she replaces" simplified, named-competitor table removed. Privacy section cloud-honest ("encrypted in our cloud, yours alone, local-install coming v2"). Footer CTA: "Email Frank" → "Call Orbi at 681-252-9085". ChatGPT FAQ updated. SCS Preview button removed. Hero CTA: "Get Orby Personal $29.99" → "Get Orbi Base $49.99". Refund FAQ rewritten for 50%/30-day policy. All install-flow language removed.
+- `website/orbi.html` — replaced with `<meta refresh>` redirect to `/`. Original v2 marketing preserved as `orbi.html.v2-local-archive`.
+- `website/refund.html` — 50%/30-day policy in summary cards + Section 1 + summary table. Email-cancellation removed (now self-serve only). Original preserved as `refund.html.v2-local-archive`.
+- `website/terms.html` — §5 (50%/30-day refund), §6 (self-serve cancellation, no Frank email), §7 added (n) HIPAA prohibition, (o) UPL safeguards for attorneys, (p) medical/mental-health disclaimer including 988/911 references, §8 "Cloud-Hosted Storage" (replaced "Local Data Storage"). Original preserved as `terms.html.v2-local-archive`.
+
+`orbi_web/customer_install/`:
+- `kokoro_tts.py` — NEW. Kokoro-82M wrapper, 9-voice catalog, lazy-loaded model, MP3 render via ffmpeg.
+- `tts_models/kokoro/` — model files (316MB total, gitignored). `kokoro-v0_19.onnx` + `voices.bin`.
+- `orbi.py` — Added `/owner/magic-login?token=...` handler (verifies token via brain's `/api/verify`, saves api_key+tier+modules into config, bootstraps owner user, issues session cookie, redirects to `/owner?welcome=1`). Added Kokoro branch to `/tts` endpoint (voice IDs starting with af/am/bm/bf → Kokoro; everything else → existing edge_tts fallback). Welcome greeting fixed to only claim "I read your website" when `_scraped_pages_text` is actually present.
+- `prompts.py` — Cloud-v1 sales prompt (App Store pricing, magic-link signup, NO install/SmartScreen language). Anti-hallucination block (never invent 1-800 support, never invent support@myOrbi.com, never promise 24/7 human support). Cloud-v1 post-purchase concierge (confirm email → click magic link → dashboard onboarding → you're live). Loads `product_knowledge.json` into every prompt via `_format_product_knowledge_block()`.
+- `product_knowledge.json` — NEW (~23 KB). Pricing structure, 9 Kokoro voices catalog (with note about Ava on twickell.com), 11 capability sections, 13 how-to entries, 4 troubleshooting playbooks, escalation rules (product → Frank with no SLA, business → owner via learning loop), do-not-offer list (no 1-800 support, no white-glove, no HIPAA today, no attorney client-facing till v1.1), honest_limits list.
+- `data/business_info.json` — Sales-bot knowledge updated to cloud-v1 messaging, prices, support FAQ entries with "proud" framing. Backup at `business_info.json.bak_pre_cloud_v1`.
+
+`orbi-brain/` (LOCAL ONLY — NOT YET PUSHED TO RENDER):
+- `stripe_webhook.py` — Added `_send_magic_link_email()` function. Webhook handler switches between install vs magic-link email based on `ORBI_V1_MODE` env var (defaults to "cloud"). Magic-link email points to `https://orbi.twickell.com/owner/magic-login?token=...`.
+
+**Smoke tests passed today:**
+- Magic-link login flow: ✅ test token `inst_43fe1f67a9db13709fa79104844923ff` created via brain, Frank clicked, landed in dashboard as owner. End-to-end works.
+- Kokoro TTS: ✅ `GET /tts?voice=af` → 200 OK, 13.5 KB MP3.
+- Microsoft Ava fallback: ✅ `GET /tts?voice=en-US-AvaNeural` → 200 OK, 7.6 KB MP3 via edge_tts.
+- All services healthy: orbi.twickell.com, billing.twickell.com, twickell.com (prod), cloud-v1 preview tunnel all returning HTTP 200.
+
+**Still pending before real customer signup works (NOT done yet — Frank's call when to do these):**
+
+1. **Push `orbi-brain` to Render** (production deploy of magic-link webhook code). Frank's rule: do NOT push until Stripe products are ready, because the new webhook expects new tier_keys. Until pushed, real Stripe checkouts still email the OLD install token.
+2. **Create new Stripe products** (TEST mode first): `base_mo`, `receptionist_mo`, `website_mo`, `restaurant_mo`, `marketing_mo`, plus their `_yr` annual equivalents. Frank's rule: do NOT touch Stripe until website is fully reviewed. Claude can create these via Stripe API (stripe.env has the key) — run when Frank gives the go.
+3. **Push `twickell_live/cloud-v1` → `main`** to deploy new website to twickell.com. Frank's fine-tooth-comb review first.
+4. **Push `orbi_web/cloud-v1` → `main`** to ship the new sales bot + magic-link handler + Kokoro voices to production-dev Orbi.
+5. **Flip Stripe TEST → LIVE mode** when first real prospect is ready to pay.
+
+**Branches deliberately preserved for v2 (local install) launch later:**
+- `index.html.v2-local-archive`, `orbi.html.v2-local-archive`, `refund.html.v2-local-archive`, `terms.html.v2-local-archive`, `business_info.json.bak_pre_cloud_v1`.
+- Local-install code on `main` branch (unchanged) — checkpoint commit `bdc0194` captures all the local install work + missing source.
 
 **Build workflow used this session (deviates from REBUILD_ORBI.bat):**
 
