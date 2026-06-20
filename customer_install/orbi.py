@@ -6447,7 +6447,13 @@ def _try_onboarding(message: str, user_rec: dict) -> dict | None:
                         or biz.get("owner_name") or "").strip().split()
         owner_first = owner_first[0] if owner_first else ""
         hello = f"Hi{', ' + owner_first if owner_first else ''}! I'm Orbi — your new assistant."
-        if biz_name:
+        # Did the install actually scrape a website? Only claim "I read your
+        # website" if there's real scrape evidence. Otherwise the customer
+        # gets a misleading "I just read your website" greeting when no scrape
+        # ever happened (common when business_info was pre-populated by some
+        # other path, like a magic-link login on a fresh tenant).
+        scraped_text = (biz.get("_scraped_pages_text") or "").strip()
+        if biz_name and scraped_text:
             greeting = (
                 f"{hello}\n\n"
                 f"I just read your website, so I've already got a sense "
@@ -6462,6 +6468,21 @@ def _try_onboarding(message: str, user_rec: dict) -> dict | None:
                 f"  • \"Add a contact named …\" or \"Remind me to … tomorrow\" — "
                 f"start using me as your assistant.\n\n"
                 f"What would you like to do first?"
+            )
+        elif biz_name:
+            # Have a business name but no website scrape evidence — common
+            # right after a fresh magic-link login. Be honest about what I
+            # know and offer to fill in the rest.
+            greeting = (
+                f"{hello}\n\n"
+                f"I see your business is called {biz_name}. I don't have "
+                f"everything else yet — your services, hours, location, that "
+                f"kind of detail. Easiest way to get me up to speed is to "
+                f"point me at your website — type the URL (something like "
+                f"'yourbusiness.com') and I'll read it and pick up your "
+                f"address, hours, and services automatically.\n\n"
+                f"If you don't have a website, type **no** and we'll fill "
+                f"things in together as we go."
             )
         else:
             greeting = (
