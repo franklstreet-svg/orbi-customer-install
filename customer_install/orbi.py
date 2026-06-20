@@ -3467,6 +3467,101 @@ def owner_login():
     audit.log_event(DATA_DIR, actor=username, action="owner.login.success", ip=ip)
     return resp
 
+@app.route("/owner/magic-login")
+def owner_magic_login():
+    """Cloud v1 magic-link login.
+
+    Customer clicks the post-Stripe-checkout email link
+    (https://orbi.twickell.com/owner/magic-login?token=...). We verify the
+    token against the brain's /api/verify endpoint (one-shot, consumes it),
+    save the api_key + tier + enabled_modules into config so Orbi knows who
+    she's serving, bootstrap an owner user record on first click, issue a
+    session cookie, and redirect into the dashboard with welcome=1 so the
+    onboarding wizard kicks in.
+
+    Failure modes redirect to /owner/login?err=... so the customer can ask
+    Orbi on the chat for help instead of being stuck on a blank page.
+    """
+    from flask import redirect
+    import urllib.request, urllib.error
+    global CONFIG
+
+    token = (request.args.get("token") or "").strip()
+    # Same input-validation discipline as the brain's /api/verify endpoint:
+    # length cap + alphanumeric (+ underscore) only. Defense in depth.
+    if (not token or len(token) > 80
+            or not token.replace("_", "").isalnum()):
+        return redirect("/owner/login?err=bad_link")
+
+    brain_verify_base = (CONFIG.get("brain", {}).get("verify_url")
+                         or "https://billing.twickell.com/api/verify")
+    verify_url = f"{brain_verify_base.rstrip('/')}/{token}"
+
+    try:
+        req = urllib.request.Request(
+            verify_url,
+            headers={"User-Agent": "Mozilla/5.0 Orbi-magic-login"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        log.warning(f"magic-login: token verify HTTP {e.code} for {token[:14]}...")
+        return redirect("/owner/login?err=link_expired")
+    except Exception as e:
+        log.error(f"magic-login: brain unreachable ({e!r})")
+        return redirect("/owner/login?err=brain_unreachable")
+
+    api_key = (data.get("api_key") or "").strip()
+    owner_email = (data.get("owner_email") or "").strip().lower()
+    tier = (data.get("tier") or "standard").strip()
+    enabled_modules = data.get("enabled_modules") or []
+    if not api_key or not owner_email:
+        log.warning(f"magic-login: incomplete record from brain for {token[:14]}...")
+        return redirect("/owner/login?err=incomplete_record")
+
+    # Save the tenant identity into config.json so this Orbi installation
+    # knows who she's serving on subsequent requests.
+    cfg = load_config()
+    cfg["api_key"] = api_key
+    cfg["owner_email"] = owner_email
+    cfg["tier"] = tier
+    if enabled_modules:
+        cfg["enabled_modules"] = [str(m).strip().lower()
+                                  for m in enabled_modules if m]
+    save_config(cfg)
+    # Re-read CONFIG global so the rest of this process sees it.
+    CONFIG = load_config()
+
+    # Bootstrap an owner user record if one doesn't exist yet. We generate
+    # a one-time random password — the dashboard's must_change_password
+    # gate forces the customer to set their own on first visit.
+    username = (owner_email.split("@")[0] or "owner").lower()
+    if not users_mod.get_user(DATA_DIR, username):
+        import secrets as _secrets
+        import string as _string
+        temp_pw = "".join(_secrets.choice(_string.ascii_letters + _string.digits)
+                          for _ in range(20))
+        try:
+            users_mod.add_user(
+                DATA_DIR, username, temp_pw,
+                role="owner",
+                display_name=username,
+            )
+        except Exception as e:
+            log.error(f"magic-login: user bootstrap failed: {e}")
+            return redirect("/owner/login?err=user_bootstrap")
+
+    # Issue session, set cookie, redirect into the onboarding wizard.
+    session_token = auth.issue_session(
+        ORBI_DIR, username=username, role="owner")
+    resp = make_response(redirect("/owner?welcome=1"))
+    auth.set_session_cookie(resp, session_token)
+    audit.log_event(
+        DATA_DIR, actor=username, action="owner.magic_login.success",
+        meta={"api_key_prefix": api_key[:14], "tier": tier})
+    return resp
+
+
 @app.route("/api/owner/logout", methods=["POST"])
 def owner_logout():
     owner_session = auth.current_owner(ORBI_DIR)

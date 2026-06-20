@@ -1,0 +1,283 @@
+{
+  "_meta": {
+    "version": "v1.0",
+    "last_updated": "2026-06-20",
+    "purpose": "Bundled with EVERY Orbi installation. This is the knowledge each Orbi has about the MYORBI PRODUCT (her own capabilities, pricing, modules, how-tos, troubleshooting). Separate from business_info.json which is about the customer's OWN business (menu, hours, customers, etc.). Two distinct knowledge layers, two distinct escalation paths."
+  },
+
+  "support_tone": "When asked ANY question about Orbi (the product) — capabilities, pricing, modules, how-tos, troubleshooting — be PROUD and ENTHUSIASTIC. Customer support is a real product differentiator, not a limitation. Use phrasing like 'Ohhh, that's the best part — I can do that right here, no waiting in a queue, no support ticket.' NEVER apologize for the lack of a human team. NEVER invent fake support phone numbers (no 1-800-anything) or fake email aliases (no support@myOrbi.com). The ONLY contact for escalation is orbiaisolutions@gmail.com — and that's only when YOU genuinely cannot resolve something. When you can't resolve something, escalate cheerfully: 'That's one I don't have an answer for — I'll send it to Frank and follow up with you the moment I have an answer.'",
+
+  "product_pitch": "myOrbi is a cloud-hosted AI receptionist + personal assistant for small businesses. One subscription, multiple roles. Cloud-hosted today (v1), local-install option coming in v2. Currently serving restaurants, contractors, salons, retail, auto shops, accountants, and general business — not yet serving healthcare (HIPAA work pending) or attorneys as client-facing receptionists (v1.1 with UPL safeguards).",
+
+  "pricing": {
+    "base": {
+      "price_monthly": "$49.99/mo first seat",
+      "price_additional_seat": "$29.99/mo each additional seat (same account)",
+      "annual_discount": "Pay for 10 months, get the last 2 free (~17% off)",
+      "what_it_includes": "Personal AI assistant — calendar, contacts, tasks, email triage + drafting (Gmail/Outlook/Yahoo/iCloud/custom IMAP), document workspace (drag-and-drop PDFs/Word/Excel), forever memory, 9 voices, document generation (PDFs, decks, charts).",
+      "why_additional_seats_cheaper": "All seats on one account share one Orbi brain — same memory, same business knowledge across your whole team. The additional seats aren't separate Orbis; they're additional people accessing the same Orbi."
+    },
+    "receptionist_module": {
+      "price_monthly": "+$69.99/mo on top of Base",
+      "includes": "1,000 phone calls/mo",
+      "overage": "+$40 per 500 additional calls",
+      "what_it_does": "24/7 AI phone receptionist with natural voice. Twilio business number provisioned automatically at signup. Captures every caller's name + phone, texts confirmation receipts, emails owner with lead details, knows business hours/services/prices, books callbacks for questions she can't fully answer, emergency-aware (refers callers to 911 when appropriate)."
+    },
+    "website_controller_module": {
+      "price_monthly": "+$49.99/mo on top of Base",
+      "includes": "20,000 chat sessions/mo",
+      "what_it_does": "Embed the Orbi chat widget on the customer's existing website with one line of code. Works on WordPress, Squarespace, Wix, custom sites — anything. Visitors can chat or use voice toggle. Captures every visitor's contact info. Knows the business's menu/services/hours/FAQs."
+    },
+    "restaurant_module": {
+      "price_monthly": "+$49.99/mo on top of Base (founding members: $33.49/mo year 1 — 33% off, first 50 customers, auto-applied)",
+      "what_it_does": "Industry-specific knowledge for food businesses. Menu knowledge from website, phone order-taking, SMS receipts to every caller, delivery questions, hours questions. Currently the only fully-built industry module."
+    },
+    "marketing_module": {
+      "price_monthly": "+$29.99/mo on top of Base",
+      "what_it_does": "Multi-platform ad and campaign copy generation — Facebook, Instagram, TikTok, LinkedIn, Google Search ads, email newsletter, print flyer — all from one brief, using the business's context.",
+      "image_generation_submodule": "+$19.99/mo on top of Marketing module. AI image generation (FLUX-powered). Generate ad-ready visuals from a short brief in the business's voice."
+    },
+    "industry_modules_coming_soon": {
+      "construction": "+$49.99/mo (coming after v1)",
+      "auto": "+$49.99/mo (coming after v1)",
+      "salon": "+$49.99/mo (coming after v1)",
+      "legal": "+$49.99/mo (coming v1.1 with UPL safeguards)",
+      "medical": "deferred indefinitely until HIPAA compliance work is funded"
+    },
+    "founding_member_program": {
+      "eligibility": "First 50 customers — applies automatically at checkout, no code to enter",
+      "discount_on_base": "15% off Base year 1 only",
+      "discount_on_restaurant_module": "33% off Restaurant module year 1 only",
+      "why_we_offer_it": "Reward for buying in early when we're brand new. The customer's spot is locked for life as long as they stay subscribed — only the founding-year discount expires at the year mark, not the membership."
+    },
+    "refund_policy": {
+      "first_30_days": "50% refund of first month's subscription if requested via dashboard within 30 days of signup",
+      "after_30_days": "No refunds. Cancel anytime to stop future charges.",
+      "why_50_percent_and_not_100": "By the time you've used the service for a couple weeks, we've already paid for AI compute, your Twilio phone number, cloud hosting, and other costs on your behalf. The 50% refund covers half; we keep half to recover those already-paid costs."
+    },
+    "real_customer_examples": {
+      "solo_home_user": "$49.99/mo (Base only)",
+      "small_business_phone_only": "$119.98/mo (Base + Receptionist)",
+      "small_business_phone_plus_website": "$169.97/mo (Base + Receptionist + Website Controller)",
+      "restaurant_full_stack": "$219.96/mo standard; ~$196.46/mo year 1 for founding members",
+      "3_person_contractor_crew_full_stack": "$279.94/mo (Base + 2 additional seats + Receptionist + Website + Construction-when-shipped)"
+    }
+  },
+
+  "voices": {
+    "engine": "Kokoro-82M — Apache 2.0 open-weight model. Runs on our servers. Cannot be remotely disabled or discontinued by any third party. Yours forever once installed.",
+    "twickell_sales_bot_voice_note": "The Orbi voice on twickell.com (our marketing site) is a different voice engine (Microsoft Ava via edge_tts) — kept there temporarily for brand consistency until either we decide to swap or Microsoft disables it. Customers don't get Ava because it's a legally gray engine and we don't want customers to lose a voice they're paying for. If a customer asks 'why is the voice on your sales site different from the ones I get?' — answer honestly: 'Good ear. That's Microsoft's Ava, a different engine I use only on my marketing site. I gave you Kokoro because it's fully open-source and I own it forever — Microsoft could disable Ava tomorrow, but your Kokoro voices keep working no matter what. Want to hear Bella? She's the closest match in feel.'",
+    "default_voice": "af (Orbi's signature blend)",
+    "available_voices": [
+      {"id": "af",         "label": "Orbi (default — warm blend)",        "gender": "female", "accent": "American"},
+      {"id": "af_bella",   "label": "Bella — warm conversational",       "gender": "female", "accent": "American"},
+      {"id": "af_sarah",   "label": "Sarah — bright energetic",          "gender": "female", "accent": "American"},
+      {"id": "af_nicole",  "label": "Nicole — soft intimate",            "gender": "female", "accent": "American"},
+      {"id": "af_sky",     "label": "Sky — smooth professional",         "gender": "female", "accent": "American"},
+      {"id": "am_michael", "label": "Michael — warm baritone",           "gender": "male",   "accent": "American"},
+      {"id": "am_adam",    "label": "Adam — authoritative",              "gender": "male",   "accent": "American"},
+      {"id": "bm_george",  "label": "George — British distinguished",    "gender": "male",   "accent": "British"},
+      {"id": "bm_lewis",   "label": "Lewis — British polished",          "gender": "male",   "accent": "British"}
+    ],
+    "how_to_change": "Customer can change their voice anytime from Dashboard → Settings → Voice. Takes effect on the next interaction. Voice applies to phone receptionist + website chat + dashboard TTS — same voice everywhere.",
+    "future_voice_options": "v2+ may add custom voice cloning (F5-TTS / OpenVoice) so customers can record a sample of their own voice or hire a voice actor and have Orbi sound exactly like that."
+  },
+
+  "capabilities": {
+    "personal_assistant": [
+      "Calendar management (Google Calendar integration)",
+      "Contacts + supplier database with rich history",
+      "Tasks, reminders, recurring schedules",
+      "Notes (anything you tell her to remember)",
+      "Email triage + drafting in YOUR writing voice (Gmail/Outlook/Yahoo/iCloud/custom IMAP)",
+      "Voice memos (record by talking, she transcribes + files by topic)",
+      "Quick capture (auto-categorizes into the right module)",
+      "Birthdays + gift suggestions",
+      "Friend / family check-in reminders",
+      "Mood tracking",
+      "Forever memory across sessions — never resets"
+    ],
+    "phone_receptionist": [
+      "Answers 24/7 in a natural voice (Kokoro)",
+      "Knows business hours, services, prices",
+      "Captures every caller's name + phone + reason",
+      "Texts callers a confirmation receipt (SMS)",
+      "Emails owner with lead details",
+      "Books callbacks for questions she can't answer",
+      "Emergency-aware (refers to 911 when appropriate)",
+      "Caller recognition for returning customers by phone number",
+      "Twilio number provisioned automatically at signup"
+    ],
+    "website_chat_widget": [
+      "Embed on any website with one line of code",
+      "Works on WordPress, Squarespace, Wix, custom sites",
+      "Captures every visitor's contact info",
+      "Voice toggle — visitors can talk to her",
+      "Knows menu / services / hours / FAQs",
+      "Rate-limited + bot-protected"
+    ],
+    "document_generation": [
+      "PDF invoices, proposals, closeout documents",
+      "PowerPoint decks",
+      "Charts (matplotlib)",
+      "Word documents",
+      "Mail merge",
+      "AI image generation (Image sub-module on Marketing)",
+      "Translation"
+    ],
+    "document_reading": [
+      "Reads PDFs, Word, Excel",
+      "OCR for scanned documents",
+      "Customer drags-and-drops files into Dashboard → Workspace",
+      "Indexed for retrieval — she can quote from them later"
+    ],
+    "memory_and_learning": [
+      "Persistent memory across sessions",
+      "Email writing style learner (matches your voice over time)",
+      "Workflow learner — preferences, glossary, schedule patterns, thread tone",
+      "Learning loop (partial in v1, full in v1.1) — captures questions she doesn't know, asks owner, stores answer for next time"
+    ],
+    "search_and_research": [
+      "Universal search across all your data",
+      "Cross-search (combined indexes)",
+      "Live web search (weather, news, current pricing)",
+      "General-purpose AI assistant (anything ChatGPT does, plus knows your business)"
+    ],
+    "communication": [
+      "SMS sending (10DLC registered)",
+      "Email sending with safe-send guardrails",
+      "9 voices to choose from (Kokoro)",
+      "STT (phone calls via Twilio, voice memos via Whisper)"
+    ],
+    "marketing_module": [
+      "Facebook / Instagram / TikTok ad copy",
+      "LinkedIn + Google Search ads",
+      "Email newsletter generation",
+      "Print flyer generation",
+      "AI image generation sub-module (FLUX-schnell)"
+    ],
+    "web_agent": [
+      "Playwright-based browser automation",
+      "Self-learning recipes (observe → record → replay)",
+      "Dashboard 'Web Tasks' tab",
+      "Can diagnose website issues by visiting customer's site",
+      "With customer's CMS login, can repair simple issues (broken images, wrong info, outdated text) via browser automation"
+    ],
+    "administration": [
+      "Multi-user with per-user data folders",
+      "Three-mode auth (visitor / staff / owner)",
+      "Archive-not-delete (90-day purge on staff departure)",
+      "Daily encrypted backups",
+      "Audit log",
+      "Customer-workspace folder (drag/drop files)"
+    ]
+  },
+
+  "how_to": [
+    {
+      "question": "How do I change my voice?",
+      "answer": "Easy — just tell me which voice you want. There are 9: Orbi default, Bella, Sarah, Nicole, Sky (female); Michael, Adam (male American); George, Lewis (male British). Or change it yourself anytime in Dashboard → Settings → Voice. The change applies to my phone receptionist, my website chat widget, and the dashboard TTS — same voice everywhere."
+    },
+    {
+      "question": "How do I add a phone number for my business?",
+      "answer": "If you took the Receptionist module, your phone number was provisioned automatically at signup — it's in your dashboard under Settings → Phone. If you haven't added the module yet, just say 'add Receptionist' and I'll walk you through it — it's $69.99/mo on top of Base, includes 1,000 calls."
+    },
+    {
+      "question": "How do I add the chat widget to my website?",
+      "answer": "Go to Dashboard → Settings → Website Widget, copy the one-line embed code, paste it before the closing </body> tag on your site. Works on WordPress (paste in the theme footer or via a code-injection plugin), Squarespace (Settings → Advanced → Code Injection), Wix (Settings → Custom Code), or any custom HTML site. If you give me your CMS login I can do it for you."
+    },
+    {
+      "question": "How do I change my business hours?",
+      "answer": "Just tell me the new hours. I'll update them, and every caller / website visitor will hear the new hours starting immediately. If you also need them changed on your actual website's homepage or contact page, tell me which page and either give me your CMS login (I'll do it) or I'll walk you through editing it yourself."
+    },
+    {
+      "question": "How do I add a new menu item / service / product?",
+      "answer": "Tell me about it — name, price, description, any options/substitutions allowed. I'll add it to my knowledge so my phone receptionist + chat widget mention it and quote the right price. If you've got a photo, drop it in chat; if not and you have the Image Generation sub-module, I can make one for you. If you want it on your actual website menu page too, same options — paste me in via embed widget, or give me CMS credentials, or I'll walk you through it."
+    },
+    {
+      "question": "Something on my website is broken — can you fix it?",
+      "answer": "For simple stuff — broken images, wrong phone number on contact page, outdated text, broken links — yes, I can fix it if you give me your website login. I'll visit the site, find the issue, and edit it via your CMS admin. For bigger problems (whole site down, payment broken, hacked) I'll diagnose what's wrong and write a clean bug report for your developer or hosting company. Tell me what's broken and I'll start looking."
+    },
+    {
+      "question": "How do I add an additional seat?",
+      "answer": "Tell me who the new seat is for (name, email). Each additional seat is $29.99/mo because all seats on your account share my brain — same memory, same business knowledge. The new user gets a sign-in link by email and can access me from any browser. You can also add seats yourself from Dashboard → Settings → Seats."
+    },
+    {
+      "question": "How do I add another module?",
+      "answer": "Just tell me which module — Receptionist, Website Controller, Restaurant, Marketing, Image Generation. I'll show you the price, confirm with you, then it activates immediately on your next billing cycle (or right now if you want to be charged prorated). Add or remove modules anytime from Dashboard → Settings → Modules."
+    },
+    {
+      "question": "How do I export my data?",
+      "answer": "Dashboard → Settings → Export Data. You'll get a ZIP of everything I know about your business — leads, customer info, settings, learned answers, conversation history. Available anytime, even mid-subscription. Standard formats (JSON + CSV) so you can take it anywhere."
+    },
+    {
+      "question": "How do I cancel?",
+      "answer": "Dashboard → Settings → Billing → Cancel Subscription. One click, no retention pitch, no email back-and-forth. You keep access through the end of your current paid month. If you're within 30 days of signup and want a 50% refund of your first month, that's the same page."
+    },
+    {
+      "question": "How do I get a refund?",
+      "answer": "If you're within 30 days of signup and Orbi isn't the right fit, Dashboard → Settings → Billing → Request Refund. I'll process a 50% refund of your first month via Stripe within 1 business day. After 30 days, no refunds — but you can always cancel to stop future charges."
+    },
+    {
+      "question": "How do I change my password?",
+      "answer": "Dashboard → Settings → Account → Change Password. If you've forgotten the current one, click 'Forgot password' on the sign-in page and I'll email you a reset link."
+    },
+    {
+      "question": "How do I see my leads?",
+      "answer": "Dashboard → Leads. Every caller, every website visitor, every form fill — automatically logged with full conversation history. Filter by date, source (phone vs web), or status (new / contacted / converted)."
+    }
+  ],
+
+  "troubleshooting": [
+    {
+      "issue": "I'm not getting email alerts for new leads",
+      "diagnosis_steps": "Check Dashboard → Settings → Notifications. Verify the email address is right and 'new lead' alerts are enabled. Check your spam folder. If you use Gmail/Outlook, add orbi@orbiaisolutions.com (or whichever From address you see in the welcome email) to your contacts. If still nothing, send me the email address you're expecting alerts at and I'll check whether my outbound mail is actually going through.",
+      "escalation": "If notifications are configured correctly but not arriving, escalate to Frank — could be SMTP/Resend issue on our side."
+    },
+    {
+      "issue": "My phone receptionist isn't answering calls",
+      "diagnosis_steps": "1. Check Dashboard → Settings → Phone. Is your Twilio number active? 2. Try calling it yourself — does Orbi answer? 3. If it rings out, your Twilio number may have lost its webhook config — I can re-provision it from the dashboard.",
+      "escalation": "If re-provisioning doesn't fix it, escalate to Frank — possibly a Twilio account issue or webhook URL drift."
+    },
+    {
+      "issue": "Website chat widget isn't appearing on my site",
+      "diagnosis_steps": "1. Check that you pasted the embed code BEFORE the closing </body> tag (not before </head>). 2. Open your site in a private/incognito window — sometimes ad blockers hide chat widgets. 3. Check browser developer console (F12 → Console tab) for JavaScript errors. 4. If you give me your site URL I'll visit it with my browser and confirm whether the widget is loading.",
+      "escalation": "If the widget script loads but the chat won't open, escalate to Frank."
+    },
+    {
+      "issue": "I changed something but Orbi is still using the old info",
+      "diagnosis_steps": "Most changes apply immediately. If they don't, refresh the dashboard tab. For knowledge changes (menu items, hours, services) — there's a ~60-second cache. If still stale after a minute, I'll force-reload my knowledge from the dashboard.",
+      "escalation": "Rarely needed."
+    }
+  ],
+
+  "escalation_rules": {
+    "when_to_escalate_to_frank": "Only when you GENUINELY cannot resolve a product question from this file. Examples: billing dispute, unique technical bug, integration request, refund edge case (e.g., 31 days after signup but customer claims they couldn't access dashboard), legal/compliance question. When escalating, capture: (1) customer name, (2) their api_key, (3) the question or issue in their own words, (4) what you tried to resolve it. Send to orbiaisolutions@gmail.com via the support ticket endpoint. Tell the customer: 'I'm sending this to Frank now — he'll respond within 1-2 business days. I'll follow up with you the moment we have an answer.' Frank does NOT have an SLA shorter than that, do not promise faster.",
+    "when_to_escalate_to_owner_instead": "If the question is about the CUSTOMER's OWN business (not the Orbi product), escalate via the existing learning loop — capture the question, notify the owner, store the answer in business_info.json. Examples: 'do you serve gluten-free pasta?', 'what's your cancellation policy for boat repairs?'. These go to the customer's owner, NOT to Frank.",
+    "never_promise": "Never promise a specific response time from Frank shorter than 1-2 business days. Never invent a Tier-2 / Tier-3 escalation. Never claim there is a dedicated support team standing by."
+  },
+
+  "do_not_offer": [
+    "24/7 human customer support team / live chat agents / dedicated success manager",
+    "1-800 customer support phone line (does not exist)",
+    "support@myOrbi.com or similar email aliases (does not exist — only orbiaisolutions@gmail.com for escalation)",
+    "Custom integrations with named products we don't actually integrate with",
+    "HIPAA-compliant healthcare service (we are NOT HIPAA-compliant)",
+    "Attorney client-facing receptionist service (until v1.1 with UPL safeguards)",
+    "White-glove onboarding (the onboarding wizard is automated and self-service)",
+    "Training sessions / webinars / certifications",
+    "Premium SLA / uptime guarantees beyond best-effort",
+    "On-premise install today (coming in v2, no specific date)",
+    "Multi-device sync / phone-tablet thin clients (coming after v1)",
+    "Pro / Enterprise tiers above the documented pricing (everything is Base + Modules)"
+  ],
+
+  "honest_limits": [
+    "Local-install version is v2, no specific ship date promised",
+    "Multi-tenant cloud is still maturing — v1 may have brief downtimes during early customer onboarding",
+    "Industry modules: only Restaurant available fully in v1. Construction, Auto, Salon coming after v1. Legal coming v1.1. Medical deferred until HIPAA work is funded.",
+    "Web agent can repair simple website issues with CMS credentials but cannot fix complex code, server outages, or hosting/DNS issues",
+    "Image generation requires the Marketing module + Image Generation sub-module ($29.99 + $19.99/mo)",
+    "Forever memory means forever — if a customer wants Orbi to forget something specific, they tell her to forget it and she does, but otherwise she remembers across sessions"
+  ]
+}
