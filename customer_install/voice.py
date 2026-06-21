@@ -141,6 +141,31 @@ def _strip_for_speech(text: str) -> str:
     # System tier hints
     s = _re.sub(r"—\s*backup mode\s*—", "", s, flags=_re.IGNORECASE)
     s = _re.sub(r"—\s*offline mode\s*—", "", s, flags=_re.IGNORECASE)
+    # ── Brand pronunciation fix: "Orbi" → "Or-bee" ──────────────────
+    # Twilio Polly Generative pronounces "Orbi" as "Orbeez" (plural) on
+    # the phone. The chat widget (different TTS engine) doesn't have this
+    # issue. Replacing with a phonetic spelling forces Polly to say it
+    # right without needing SSML (which the rest of this pipeline
+    # html-escapes anyway). Frank caught this on a live call test.
+    s = _re.sub(r"\b[Oo]rbie?\b", "Or-bee", s)
+    s = _re.sub(r"\bOrby\b", "Or-bee", s)
+    s = _re.sub(r"\b[Oo]rbey\b", "Or-bee", s)
+    # myOrbi → "my Or-bee"
+    s = _re.sub(r"\bmyOrbi\b", "my Or-bee", s, flags=_re.IGNORECASE)
+    # ── URL pronunciation fix: spell out acronyms in domains ────────
+    # Polly reads "scsplanroom.com" as "XES Plenum dot com". The fix
+    # is to insert spaces between the leading consonant cluster of a
+    # URL's hostname so Polly reads letters individually. Conservative:
+    # only fire when we see a known acronym pattern before "plan",
+    # "room", etc. For v1 just convert URLs to spelled-out form.
+    def _spell_url(m):
+        url = m.group(0)
+        # Strip protocol so we don't say "https colon slash slash"
+        url = _re.sub(r"^https?://", "", url, flags=_re.IGNORECASE)
+        # Replace dots with " dot " and dashes with " dash "
+        url = url.replace(".", " dot ").replace("-", " dash ")
+        return url
+    s = _re.sub(r"https?://[^\s)]+", _spell_url, s)
     # Currency — "$129" → "129 dollars", "$29.99" → "29 dollars and 99 cents"
     def _money_with_cents(m):
         d = int(m.group(1))
@@ -194,16 +219,53 @@ def _phone_voice() -> str:
     return (cfg.get("phone") or {}).get("voice") or _PHONE_VOICE_DEFAULT
 
 
-def _render_audio(text: str) -> str | None:
-    """Render `text` to MP3 via edge_tts. Returns the cache filename
-    (e.g. 'abcd1234.mp3') so it can be served by /voice/audio/<file>.
-    Cache hits return the existing file's name. On failure returns None
-    so the caller can fall back to Twilio's Polly <Say>."""
+def _render_audio_kokoro(text: str, voice_id: str = "af") -> str | None:
+    """Render `text` to MP3 via Kokoro (Apache 2.0, our owned voice engine).
+    Returns the cache filename so it can be served by /voice/audio/<file>.
+    On failure returns None so the caller can fall back to Polly <Say>.
+
+    This is the v1 cloud phone path — gives the caller the same Orbi voice
+    they hear on the dashboard + web chat, with no third-party API cost.
+    """
     if not text:
         return None
+    key = hashlib.sha1(f"kokoro|{voice_id}|{text}".encode("utf-8")).hexdigest()[:16]
+    fname = f"kokoro_{key}.mp3"
+    fpath = _AUDIO_CACHE_DIR / fname
+    if fpath.exists() and fpath.stat().st_size > 0:
+        return fname
+    try:
+        import kokoro_tts
+        if not kokoro_tts.is_available():
+            log.warning("kokoro_tts not available — falling through to edge_tts")
+            return None
+        mp3_bytes = kokoro_tts.render(text, voice=voice_id, format="mp3")
+        if not mp3_bytes:
+            return None
+        tmp_path = fpath.with_suffix(".mp3.tmp")
+        with open(tmp_path, "wb") as fh:
+            fh.write(mp3_bytes)
+        os.replace(tmp_path, fpath)
+        return fname
+    except Exception as e:
+        log.warning(f"kokoro render failed for text={text!r}: {e}")
+        return None
+
+
+def _render_audio(text: str) -> str | None:
+    """Render `text` to MP3. Tries Kokoro first (our owned voice, $0 cost).
+    Falls back to edge_tts on failure. Returns cache filename or None."""
+    if not text:
+        return None
+    # Try Kokoro first — customer-tenant voice preference if available
+    cfg = (_CONFIG_REF[0] or {}) if "_CONFIG_REF" in globals() else {}
+    voice_pref = (cfg.get("phone") or {}).get("kokoro_voice") or \
+                  (cfg.get("voice") or {}).get("kokoro_id") or "af"
+    kokoro_fname = _render_audio_kokoro(text, voice_id=voice_pref)
+    if kokoro_fname:
+        return kokoro_fname
+    # Fall back to edge_tts (legacy path — Microsoft Ava)
     voice = _phone_voice()
-    # The cache key MUST include the voice — same text in a different voice
-    # is a different file.
     key = hashlib.sha1(f"{voice}|{text}".encode("utf-8")).hexdigest()[:16]
     fname = f"{key}.mp3"
     fpath = _AUDIO_CACHE_DIR / fname
@@ -252,19 +314,25 @@ def _say(text: str, voice: str = "Polly.Joanna") -> str:
 
     To revert to edge_tts + <Play>: change `voice` default back to
     'Polly.Joanna-Neural' and re-enable the _render_audio block below."""
-    return f'<Say voice="{voice}">{_esc(_strip_for_speech(text))}</Say>'
-    # --- legacy edge_tts path (kept for easy revert if Polly voice is bad) ---
-    # fname = _render_audio(text)
-    # if fname:
-    #     return f'<Play>{_audio_url(fname)}</Play>'
-    # return f'<Say voice="{voice}">{_esc(text)}</Say>'
+    # ── Cloud v1: Kokoro first (our voice), Polly fallback ──────────
+    # Try our own Kokoro engine first — customer hears the same voice
+    # as the dashboard, no per-call TTS cost, no "Orbeez" mispronunciation.
+    # Fall back to Twilio Polly if Kokoro is unavailable so the phone
+    # never goes silent.
+    clean_text = _strip_for_speech(text)
+    fname = _render_audio(clean_text)
+    if fname:
+        return f'<Play>{_audio_url(fname)}</Play>'
+    return f'<Say voice="{voice}">{_esc(clean_text)}</Say>'
 
 
 def _gather(prompt_text: str, action_url: str,
-            voice: str = "Polly.Joanna", timeout: int = 10,
+            voice: str = "Polly.Joanna", timeout: int = 6,
             speech_timeout: str = "auto",
             hints: str = "") -> str:
-    """timeout=10s for the caller to START speaking.
+    """timeout=6s for the caller to START speaking — tightened from 10s
+    on 2026-06-21 because the 10s window made "Are you there?" prompts
+    fire too often during natural conversational pauses.
     speech_timeout="auto" lets Twilio's recognizer decide when the caller
     is done — safer than a fixed "1" which caused some carriers to flag
     calls for unusual response patterns. Trade-off: slightly more lag,
@@ -575,22 +643,56 @@ def _ai_reply(config: dict, business: dict, scope: dict,
     except Exception as e:
         log.warning(f"[call {call_sid[:8]}] phone totals injection failed: {e}")
 
-    # Voice = hard length cap. The HF tier with max_tokens=4096 was
-    # generating 85-132 token replies that took 8-13 seconds to stream
-    # back — phone callers hung up. Capping at 60 tokens forces 1-2
-    # sentence answers and brings turn latency under 4 seconds.
-    # Also prepend a brevity directive to the system prompt — the model
-    # will end its reply on its own at the right place instead of just
-    # being truncated mid-sentence by the cap.
+    # Voice = length cap. The HF tier with max_tokens=4096 streams 85-132
+    # tokens (8-13 seconds) which is too long for phone callers. But the
+    # original 60-token cap was so tight it cut off mid-sentence on
+    # multi-item answers (Frank caught: "...website controller module,
+    # dollar." — out of tokens at "dollar"). 200 tokens gives ~150 words
+    # of headroom for itemized prices and short recaps without making her
+    # sound long-winded.
     voice_brevity = (
         "\n\nABSOLUTE LENGTH RULE FOR THIS TURN:\n"
-        "- Reply in 1-2 SHORT sentences. Maximum 25 words.\n"
-        "- This is a phone call. Long answers feel like the call froze.\n"
-        "- End with a brief invitation (question, or 'anything else?')."
+        "- Reply in 1-2 SHORT sentences. Maximum 35 words / 220 characters.\n"
+        "- Phone webhook hard-times-out at 15 seconds. Long replies KILL the call.\n"
+        "- For 'tell me about X' questions, give a one-sentence summary then\n"
+        "  invite a follow-up ('Want me to go deeper on the pricing or the features?').\n"
+        "- When listing prices, finish the full list AND give the total\n"
+        "  in plain words ('one hundred seventy-nine dollars and ninety-\n"
+        "  seven cents per month'). Do NOT stop mid-list.\n"
+        "- End with a brief invitation (question, or 'anything else?').\n"
+        "\n"
+        "🚨 PHONE-SPECIFIC URL CONFIRMATION RULE:\n"
+        "- If the caller speaks a website URL (anything ending in .com,\n"
+        "  .net, .org, .co, .biz, .us), DO NOT scrape it immediately.\n"
+        "- Phone STT mangles URLs constantly — 'scsplanroom.com' is heard\n"
+        "  as 'XES Plenum dot com', 'jjspieco.com' becomes 'Jay Jay Speak\n"
+        "  Oh', etc. Scraping the wrong site means we know nothing about\n"
+        "  the caller's business.\n"
+        "- INSTEAD: spell the URL back letter-by-letter, then ASK if you\n"
+        "  got it right. Wait for 'yes' / 'correct' / 'that's right'\n"
+        "  before emitting the SCRAPE marker. Example:\n"
+        "    Caller: 'scsplanroom.com'\n"
+        "    You: 'Got it — let me confirm. S, C, S, P, L, A, N, R, O, O,\n"
+        "    M, dot com. Did I get that right?'\n"
+        "    Caller: 'yes'\n"
+        "    You: 'Perfect, looking now — give me about a minute.\n"
+        "    <<SCRAPE:https://scsplanroom.com>>'\n"
+        "- If they say it's wrong, ask them to say it again slowly,\n"
+        "  spell it again, confirm again. Don't scrape until they say yes.\n"
     )
     resp = llm_client.generate(config, system + voice_brevity, messages,
-                                 max_tokens=60)
+                                 max_tokens=110)
     text = resp.text or "I'm sorry, I'm having trouble right now. Please call back in a moment."
+
+    if len(text) > 260:
+        cut = text[:260]
+        for marker in (". ", "! ", "? "):
+            idx = cut.rfind(marker)
+            if idx > 120:
+                text = cut[: idx + 1].rstrip() + " Anything else?"
+                break
+        else:
+            text = cut.rstrip(",;: ").rstrip() + "… anything else?"
 
     # Post-LLM: learning-loop trigger when Orbi bluffs on a real question.
     if (data_dir
@@ -1244,6 +1346,12 @@ def register(app, CONFIG: dict, DATA_DIR: Path) -> None:
         f"Good evening, thanks for calling {_biz}. This is Orby. Can I get your name?",
     ]
     def _warmup():
+        try:
+            import kokoro_tts
+            kokoro_tts.render("Warming up.", voice="af", format="mp3")
+            log.info("voice: kokoro model warm")
+        except Exception as e:
+            log.warning(f"voice: kokoro warmup failed: {e}")
         for phrase in _WARMUP_PHRASES:
             try:
                 _render_audio(phrase)
@@ -1255,10 +1363,15 @@ def register(app, CONFIG: dict, DATA_DIR: Path) -> None:
     @app.route("/voice/audio/<fname>", methods=["GET"])
     def voice_audio(fname):
         """Serve a cached MP3 to Twilio's <Play> verb.
-        Tight allowlist: filename must be 16 hex chars + .mp3 to avoid
-        any path traversal."""
+        Tight allowlist: filename is either
+          - 16 hex chars + .mp3 (legacy edge_tts cache), or
+          - kokoro_ + 16 hex chars + .mp3 (cloud v1 Kokoro cache)
+        Prevents path traversal."""
         import re
-        if not re.fullmatch(r"[0-9a-f]{16}\.mp3", fname or ""):
+        if not (
+            re.fullmatch(r"[0-9a-f]{16}\.mp3", fname or "")
+            or re.fullmatch(r"kokoro_[0-9a-f]{16}\.mp3", fname or "")
+        ):
             return Response("not found", status=404)
         fpath = _AUDIO_CACHE_DIR / fname
         if not fpath.exists():
@@ -1389,7 +1502,20 @@ def register(app, CONFIG: dict, DATA_DIR: Path) -> None:
         scope = CONFIG.get("scope", {}) or {}
 
         reply = _ai_reply(CONFIG, business, scope, state, speech)
-        log.info(f"[call {sid[:8]}] reply: {reply!r}")
+        log.info(f"[call {sid[:8]}] reply (raw): {reply!r}")
+
+        # ── Strip sales-flow markers BEFORE the reply goes to TTS ───────
+        # The LLM may emit <<SCRAPE:url>> or <<NAV:url>> markers as part
+        # of the sales flow. These are for the chat widget to consume —
+        # the phone path must NEVER speak them aloud. Without this strip,
+        # callers literally hear "Scrape h-t-t-p-s colon slash slash..."
+        # and the call collapses into nonsense.
+        if reply and ("<<SCRAPE:" in reply or "<<NAV:" in reply):
+            reply = _re.sub(r"\s*<<SCRAPE:\s*.+?\s*>>\s*", " ", reply)
+            reply = _re.sub(r"\s*<<NAV:\s*.+?\s*>>\s*", " ", reply)
+            reply = _re.sub(r"\s+", " ", reply).strip()
+            log.info(f"[call {sid[:8]}] reply (stripped): {reply!r}")
+
 
         # End the call if the caller said goodbye
         if _detect_goodbye(speech) or state["turns"] >= 15:
