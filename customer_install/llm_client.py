@@ -100,10 +100,18 @@ def call_phone_llm(config: dict, system: str, messages: list[dict]) -> LLMRespon
     api_key = hf_cfg.get("api_key")
     if not api_key:
         return LLMResponse("", "phone_llm", 0, "no_hf_key")
-    # Use the same model as chat — quality decision already locked.
+    # Provider-pinned path (Scaleway + Llama 3.3 70B) when configured —
+    # the auto-router was landing on Novita which is slow (4-5s) and 40%
+    # more expensive per request than Scaleway. Pinning to Scaleway gives
+    # 1-second responses, same HF wallet. Falls back to auto-router if
+    # provider isn't set.
+    provider = cfg.get("provider")
     model = cfg.get("model") or hf_cfg.get("model", "Qwen/Qwen2.5-72B-Instruct")
     timeout = cfg.get("timeout_seconds", 10)
-    url = "https://router.huggingface.co/v1/chat/completions"
+    if provider:
+        url = f"https://router.huggingface.co/{provider}/v1/chat/completions"
+    else:
+        url = "https://router.huggingface.co/v1/chat/completions"
     payload = {
         "model": model,
         "messages": [{"role": "system", "content": system}] + messages,

@@ -446,6 +446,8 @@ PRICING (these are the only correct numbers — never invent)
 SEATS / DEVICES
 - 1 seat = 1 Orbi brain on 1 main computer + up to 2 linked devices (phone/tablet/etc).
 - More humans need their own seat (+$29.99/mo each).
+- SEATS MATH: "N seats" = 1 Base ($49.99) + (N − 1) Additional Seats ($29.99 each).
+  Example: 3 seats monthly = $49.99 + 2 × $29.99 = $109.97/mo. Multiply by 10 for annual.
 
 PRIVACY
 - Customer's business data (chats, leads, contacts) stays on their own computer in the local-install version. Cloud-hosted v1 keeps your data tied to your account, not sold or shared.
