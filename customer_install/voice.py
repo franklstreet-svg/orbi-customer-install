@@ -1684,6 +1684,24 @@ def register(app, CONFIG: dict, DATA_DIR: Path) -> None:
                 _CALLS.pop(sid, None)
             return Response(_hangup(reply), mimetype="application/xml")
 
+        # ── Canned-reply fast-path ──────────────────────────────────────
+        # If this turn matches a canned sales-bot reply, skip the entire
+        # async dispatch and return the cached audio directly. No filler,
+        # no /voice/wait poll loop — the response is already on disk.
+        if business and (business.get("is_sales_bot")
+                         or str(business.get("name","")).strip().lower().replace(" ","") == "myorbi"):
+            canned = _canned_sales_reply(speech)
+            if canned:
+                state.setdefault("history", []).append(
+                    {"role": "user", "content": speech})
+                state["history"].append(
+                    {"role": "assistant", "content": canned})
+                state["turns"] = state.get("turns", 0) + 1
+                log.info(f"[call {sid[:8]}] canned reply (dispatched in /voice/gather)")
+                twiml = _gather(canned, action_url="/voice/gather",
+                                hints=state.get("speech_hints", ""))
+                return Response(twiml, mimetype="application/xml")
+
         # ── Async render dispatch ───────────────────────────────────────
         # The LLM call + Kokoro render together routinely take 10-17s on this
         # CPU, which blows past Twilio's ~15s webhook timeout and kills the
@@ -1753,29 +1771,13 @@ def register(app, CONFIG: dict, DATA_DIR: Path) -> None:
                 _hangup("Sorry, I'm running slow right now. Please try me again in a moment."),
                 mimetype="application/xml",
             )
-        # Periodically reassure the caller so they don't think the line went
-        # dead. Phrases come from the warmup cache so they play instantly.
-        if try_num in (3, 7):
-            filler = "Just one more second..."
-        elif try_num == 5:
-            filler = "Sure — anything else?"  # bridge phrase, gentle tone
-            filler = "Just one more second..."
-        else:
-            filler = None
-
-        if filler:
-            fname = _render_audio(filler)
-            if fname:
-                lead = f'<Play>{_audio_url(fname)}</Play>'
-            else:
-                lead = '<Pause length="1"/>'
-        else:
-            lead = '<Pause length="2"/>'
-
+        # One filler already played in /voice/gather. Don't stack more — Frank
+        # heard 4x "Just one more second" per turn in 2026-06-21 testing and
+        # rightly called it out. Silent pause + redirect until ready.
         twiml = (
             '<?xml version="1.0" encoding="UTF-8"?>'
             '<Response>'
-            f'{lead}'
+            '<Pause length="2"/>'
             f'<Redirect>/voice/wait?sid={sid}&amp;try={try_num + 1}</Redirect>'
             '</Response>'
         )
