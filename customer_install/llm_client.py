@@ -261,9 +261,16 @@ def generate(config: dict, system: str, messages: list[dict],
     force <=60-token replies so phone callers don't sit through 12-second
     LLM streams.
 
-    channel: "chat" (default) uses the normal brain→HF→local chain.
-    "phone" tries the phone_llm tier (HF Inference Providers via Groq)
-    FIRST for sub-second responses, then falls back to the normal chain.
+    channel: "chat" or "phone" — both can use the phone_llm tier
+    (Scaleway-pinned, sub-second) FIRST, then fall back through
+    brain → HF → local. The phone_llm config's `skip_brain` flag
+    drops the brain hop entirely when set, eliminating the Render
+    cold-start (and brain → HF passthrough latency).
+
+    Frank's 2026-06-22 chat tests showed the brain tier intermittently
+    failing or timing out under load — the chat would flip into
+    "— offline mode —" mid-conversation. Routing chat through phone_llm
+    too gives consistent sub-second responses for both channels.
     """
     now = time.time()
     # Stash on a thread-local so the tier callers can read it without
@@ -271,9 +278,13 @@ def generate(config: dict, system: str, messages: list[dict],
     _GEN_OVERRIDES["max_tokens"] = max_tokens
     tiers = []
     skip_brain = False
-    if channel == "phone":
+    phone_cfg = (config or {}).get("phone_llm") or {}
+    # Use phone_llm as the FIRST tier for both phone and chat — it's the
+    # fastest path (Scaleway-pinned Llama 3.3 70B, ~1s). Channels that
+    # don't want it can pass an unknown channel name to bypass.
+    if channel in ("phone", "chat") and phone_cfg.get("enabled"):
         tiers.append((call_phone_llm, "phone_llm"))
-        skip_brain = bool(((config or {}).get("phone_llm") or {}).get("skip_brain"))
+        skip_brain = bool(phone_cfg.get("skip_brain"))
     if not skip_brain:
         tiers.append((call_brain, "brain"))
     tiers.extend([
