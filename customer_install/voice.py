@@ -740,7 +740,7 @@ def _ai_reply(config: dict, business: dict, scope: dict,
         "  link, just say the word.'\n"
     )
     resp = llm_client.generate(config, system + voice_brevity, messages,
-                                 max_tokens=110)
+                                 max_tokens=110, channel="phone")
     text = resp.text or "Sorry, my brain is being slow right now. Could I email you the answer instead?"
 
     if len(text) > 260:

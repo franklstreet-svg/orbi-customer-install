@@ -82,6 +82,45 @@ def call_brain(config: dict, system: str, messages: list[dict]) -> LLMResponse:
 
 
 # ---------------------------------------------------------------------------
+# Phone tier — HF Inference Providers with a specific fast provider (Groq).
+# Same HF wallet as Tier 2 but routed through Groq's LPU hardware for
+# sub-second Llama 3.3 70B responses. Used by voice.py only.
+# ---------------------------------------------------------------------------
+
+def call_phone_llm(config: dict, system: str, messages: list[dict]) -> LLMResponse:
+    """Phone tier: call HF Inference auto-router directly, bypassing the
+    brain (Render free-tier container that cold-starts in 30-50s). Live
+    probe 2026-06-21 showed Qwen 72B returning in 862ms via the auto-router
+    while the brain hop was timing out at 15s. Same model as chat, just
+    fewer hops in the chain."""
+    cfg = (config or {}).get("phone_llm") or {}
+    if not cfg.get("enabled"):
+        return LLMResponse("", "phone_llm", 0, "disabled")
+    hf_cfg = (config or {}).get("huggingface") or {}
+    api_key = hf_cfg.get("api_key")
+    if not api_key:
+        return LLMResponse("", "phone_llm", 0, "no_hf_key")
+    # Use the same model as chat — quality decision already locked.
+    model = cfg.get("model") or hf_cfg.get("model", "Qwen/Qwen2.5-72B-Instruct")
+    timeout = cfg.get("timeout_seconds", 10)
+    url = "https://router.huggingface.co/v1/chat/completions"
+    payload = {
+        "model": model,
+        "messages": [{"role": "system", "content": system}] + messages,
+        "temperature": 0.25,
+        "max_tokens": _GEN_OVERRIDES.get("max_tokens") or 4096,
+        "stream": False,
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    }
+    return _http_chat(url, payload, headers, timeout, tier="phone_llm")
+
+
+# ---------------------------------------------------------------------------
 # Tier 2: HuggingFace
 # ---------------------------------------------------------------------------
 
@@ -189,8 +228,8 @@ def _http_chat(url: str, payload: dict, headers: dict,
 # Circuit breaker — once brain has failed N times in a row, skip it for the
 # next COOLDOWN seconds. Brain DNS lookup costs ~50-100ms even when it fails;
 # avoiding the dead tier saves real latency on every call.
-_TIER_FAIL_STREAK: dict[str, int] = {"brain": 0, "huggingface": 0}
-_TIER_SKIP_UNTIL: dict[str, float] = {"brain": 0.0, "huggingface": 0.0}
+_TIER_FAIL_STREAK: dict[str, int] = {"brain": 0, "huggingface": 0, "phone_llm": 0}
+_TIER_SKIP_UNTIL: dict[str, float] = {"brain": 0.0, "huggingface": 0.0, "phone_llm": 0.0}
 # Per-call overrides set by generate() before dispatching to a tier.
 # Cleared after the call completes. Used to thread max_tokens through to
 # the tier-specific call functions without adding it to every signature.
@@ -200,7 +239,8 @@ _SKIP_COOLDOWN_SECONDS = 300   # then skip the tier for 5 min before retry
 
 
 def generate(config: dict, system: str, messages: list[dict],
-              max_tokens: int | None = None) -> LLMResponse:
+              max_tokens: int | None = None,
+              channel: str = "chat") -> LLMResponse:
     """
     Try each tier in order, return the first successful response.
     Returns an empty LLMResponse with tier='none' if all tiers fail.
@@ -212,16 +252,27 @@ def generate(config: dict, system: str, messages: list[dict],
     max_tokens (optional): cap the response length. Used by voice to
     force <=60-token replies so phone callers don't sit through 12-second
     LLM streams.
+
+    channel: "chat" (default) uses the normal brain→HF→local chain.
+    "phone" tries the phone_llm tier (HF Inference Providers via Groq)
+    FIRST for sub-second responses, then falls back to the normal chain.
     """
     now = time.time()
     # Stash on a thread-local so the tier callers can read it without
     # threading the param through every signature.
     _GEN_OVERRIDES["max_tokens"] = max_tokens
-    for tier_fn, tier_name in (
-        (call_brain,       "brain"),
+    tiers = []
+    skip_brain = False
+    if channel == "phone":
+        tiers.append((call_phone_llm, "phone_llm"))
+        skip_brain = bool(((config or {}).get("phone_llm") or {}).get("skip_brain"))
+    if not skip_brain:
+        tiers.append((call_brain, "brain"))
+    tiers.extend([
         (call_huggingface, "huggingface"),
         (call_local,       "local"),
-    ):
+    ])
+    for tier_fn, tier_name in tiers:
         # Skip tiers we've tripped the circuit-breaker on
         if _TIER_SKIP_UNTIL.get(tier_name, 0) > now:
             continue
