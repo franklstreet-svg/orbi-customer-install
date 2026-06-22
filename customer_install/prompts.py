@@ -1810,6 +1810,95 @@ def _format_address(a: dict) -> str:
              " ".join(x for x in [a.get("state"), a.get("zip")] if x)]
     return ", ".join(p for p in parts if p) or "not listed"
 
+def build_phone_brief(business: dict, scope: dict | None = None) -> str:
+    """Compact ~2-3KB prompt for customer businesses on the PHONE.
+
+    The full chat prompt is ~22KB (sales-flow blocks, FORBIDDEN BEHAVIORS,
+    math-rules, etc.) which drives Qwen 72B round-trips to 6-15s and routinely
+    times out Twilio's 15s webhook. On the phone the LLM doesn't need ANY of
+    the sales flow — it just needs: who the business is, what they sell,
+    when they're open, and how to keep replies short and conversational.
+
+    Used by voice._build_voice_prompt() for non-sales-bot businesses (each
+    customer Orbi). Sales bot uses _PHONE_SALES_BRIEF in voice.py."""
+    scope = scope or {}
+    name = business.get("name", "this business")
+    desc = (business.get("description") or "").strip()
+    tagline = (business.get("tagline") or "").strip()
+    address_parts = business.get("address") or {}
+    city = address_parts.get("city", "") if isinstance(address_parts, dict) else ""
+    state_abbr = address_parts.get("state", "") if isinstance(address_parts, dict) else ""
+
+    personality = business.get("personality") or {}
+    owner_name = personality.get("owner_name") or ""
+    owner_role = personality.get("owner_role") or "owner"
+
+    hours_str = _format_hours(business.get("hours", {})).strip()
+    # Combine all service-list shapes (services / menu_items / menu).
+    services = (
+        list(business.get("services", []) or [])
+        + list(business.get("menu_items", []) or [])
+        + list(business.get("menu", []) or [])
+    )
+    # Compact menu: name + price only, max 25 items so the prompt stays small.
+    menu_lines: list[str] = []
+    for s in services[:25]:
+        if not isinstance(s, dict):
+            continue
+        nm = s.get("name")
+        if not nm:
+            continue
+        price = ""
+        if isinstance(s.get("price"), str) and s["price"].strip():
+            price = f" — {s['price']}"
+        elif s.get("price_from") is not None:
+            if s.get("price_to") is not None and s["price_to"] != s["price_from"]:
+                price = f" (${s['price_from']:.0f}-${s['price_to']:.0f})"
+            else:
+                price = f" (${s['price_from']:.0f})"
+        menu_lines.append(f"  - {nm}{price}")
+    menu_block = "\n".join(menu_lines) if menu_lines else "  (no menu/services listed yet)"
+
+    cap_lines = []
+    if scope.get("public_can_take_orders"):
+        cap_lines.append("- Take orders. Capture name, items, phone, pickup/delivery time.")
+    if scope.get("public_can_book_appointments"):
+        cap_lines.append("- Book appointments. Capture name, phone, service, date+time.")
+    if scope.get("public_can_request_quotes"):
+        cap_lines.append("- Capture quote requests (name, phone, what they need).")
+    if scope.get("public_can_request_callbacks"):
+        cap_lines.append("- Capture callback requests (name, phone, best time, reason).")
+    cap_block = "\n".join(cap_lines) if cap_lines else "- Answer questions about the business. Capture leads (name + phone) if useful."
+
+    avoid = scope.get("topics_to_avoid") or []
+    avoid_line = f"\nNEVER discuss: {', '.join(avoid)}." if avoid else ""
+
+    owner_intro = f" (owner: {owner_name}, the {owner_role})" if owner_name else ""
+    location = f" in {city}, {state_abbr}" if city else ""
+    tagline_line = f" — {tagline}" if tagline else ""
+
+    return f"""You are Orby, the AI receptionist for {name}{owner_intro}{location}{tagline_line}.
+{desc[:400]}
+
+HOURS
+{hours_str}
+
+MENU / SERVICES (authoritative — quote these names + prices VERBATIM)
+{menu_block}
+
+WHAT YOU CAN DO ON THIS CALL
+{cap_block}{avoid_line}
+
+PHONE DELIVERY RULES (strict)
+- 1-2 SHORT sentences. Maximum 35 words per turn.
+- Always end with a question or invitation ("anything else?", "what time?", "sound good?") — silence sounds like the call hung up.
+- Use contractions, sound like a real person who works at the place. No "Great!", "Awesome!", "Perfect!" openers.
+- NEVER invent menu items, prices, hours, or services not listed above. If you don't know, say so and offer to take a message.
+- NEVER ask the caller for a URL (phone STT mangles them).
+- NEVER emit <<SCRAPE:>> or <<NAV:>> markers — those are for the website widget, not the phone.
+"""
+
+
 def _format_hours(h: dict) -> str:
     days = ['monday','tuesday','wednesday','thursday','friday','saturday','sunday']
     lines = []

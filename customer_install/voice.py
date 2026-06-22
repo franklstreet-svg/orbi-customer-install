@@ -428,8 +428,62 @@ def _hangup(text: str | None = None, voice: str = "Polly.Joanna") -> str:
 # Voice → LLM → speech turn
 # ---------------------------------------------------------------------------
 
+_PHONE_SALES_BRIEF = """You are Orbi, the AI sales agent for myOrbi (the company). You're on the PHONE — keep replies to 1-2 short sentences (max 35 words). Always end with a question or invitation so the caller knows to talk back.
+
+WHAT ORBI IS
+Orbi is one AI brain that lives across three surfaces for a small business: (1) the business phone — answers 24/7, takes orders, captures leads, books appointments; (2) the website chat widget — answers visitor questions about services and hours, captures leads; (3) a personal assistant — calendar, email drafting, document work, reminders. ONE brain across all three is the differentiator — nobody else (Goodcall, Smith.ai, Intercom, Tidio, ChatGPT) does all three at once.
+
+PRICING (these are the only correct numbers — never invent)
+- Orbi Base: $49.99/mo (first seat), $499.90/yr — required for everything.
+- Additional seat: +$29.99/mo each (1 brain shared, just more devices on it).
+- Receptionist module: +$79.99/mo. 1,000 minutes of calls included. Then $20 per 500-minute block.
+- Website Controller module: +$49.99/mo. 20,000 website chats included.
+- Restaurant module: +$49.99/mo. Menu lookups, order taking, daily specials.
+- Marketing module: +$29.99/mo. Image Generation add-on: +$19.99/mo on top of Marketing.
+- Annual = monthly × 10 (pay 10, get 2 free).
+- Common bundles: Base+Receptionist = $129.98/mo. Base+Website = $99.98. Base+Receptionist+Website = $179.97. Restaurant full stack (Base+Receptionist+Website+Restaurant) = $229.96.
+
+SEATS / DEVICES
+- 1 seat = 1 Orbi brain on 1 main computer + up to 2 linked devices (phone/tablet/etc).
+- More humans need their own seat (+$29.99/mo each).
+
+PRIVACY
+- Customer's business data (chats, leads, contacts) stays on their own computer in the local-install version. Cloud-hosted v1 keeps your data tied to your account, not sold or shared.
+
+HOW TO SIGN UP
+- Tell them: head to twickell.com, pick what you want, get a magic-link to start in minutes.
+- If they say "yes" to "want me to text you the link?", the system fires the SMS — you don't have to do anything else. Confirm aloud after.
+
+SCOPE LIMITS (be honest about these)
+- v1 does NOT include healthcare/HIPAA businesses or lawyers as client-facing receptionist (coming in v1.1).
+- v1 is cloud-hosted browser access. A local-install v2 is coming for customers who want everything on their own computer.
+
+DELIVERY RULES (phone-specific — strict)
+- 1-2 SHORT sentences. Maximum 35 words.
+- Use contractions, sound like a person, not a brochure.
+- NEVER open with "Great!"/"Awesome!"/"Perfect!" — just answer.
+- NEVER ask for the caller's website URL (phone STT mangles URLs and the caller can't type).
+- NEVER emit <<SCRAPE:>> or <<NAV:>> markers — those are for the chat widget.
+- If you don't know: "Honestly, not sure — let me have someone follow up. What's the best email?"
+"""
+
+
 def _build_voice_prompt(business: dict, scope: dict) -> str:
-    """Same as the public chat prompt but with voice-specific guardrails."""
+    """Phone uses a compact ~2-3KB system prompt so the LLM round-trip stays
+    in the 1-3s range. The full chat prompt was 22KB and routinely pushed
+    Qwen 72B past 10s — too slow for phone callers.
+
+      - myOrbi sales bot: _PHONE_SALES_BRIEF (price list + pitch + scope)
+      - Customer business: prompts.build_phone_brief (name, hours, menu,
+        capability scope, voice delivery rules)
+    Both omit the sales-flow phases, FORBIDDEN BEHAVIORS blocks, and
+    multi-paragraph rules that bloat the chat prompt."""
+    is_sales = bool(business and (business.get("is_sales_bot")
+            or str(business.get("name","")).strip().lower().replace(" ","") == "myorbi"))
+    if is_sales:
+        return _PHONE_SALES_BRIEF
+    return prompts.build_phone_brief(business, scope)
+    # Legacy path (kept for reference if we ever need to fall back):
     base = prompts.build_public_prompt(business, scope, channel="phone")
     voice_extras = """
 
@@ -574,20 +628,13 @@ def _ai_reply(config: dict, business: dict, scope: dict,
     caller_phone = call_state.get("from", "")
     call_sid = call_state.get("sid", "unknown")
 
-    # PRIORITY 0a — sales-bot canned replies (instant, no LLM call).
-    # For the myOrbi sales bot, the most common phone questions ("what is
-    # Orbi", "how much does it cost") are predictable and don't need an
-    # LLM call. Saves 6-15 seconds of brain latency per turn and means
-    # the call works even when the brain is down.
-    if business and (business.get("is_sales_bot")
-                     or str(business.get("name","")).strip().lower().replace(" ","") == "myorbi"):
-        canned = _canned_sales_reply(user_speech)
-        if canned:
-            log.info(f"[call {call_sid[:8]}] canned sales reply (skipped LLM)")
-            call_state["history"].append({"role": "user", "content": user_speech})
-            call_state["history"].append({"role": "assistant", "content": canned})
-            call_state["turns"] += 1
-            return canned
+    # NOTE: Canned-reply fast-path intentionally removed 2026-06-21.
+    # Per Frank: every question must go to the LLM so the SAME architecture
+    # works for every business — not just myOrbi sales. The compact phone
+    # brief (~705 tokens) keeps the round-trip in the 1-3s range, fast
+    # enough that canning isn't needed. Learned answers and order finalize
+    # still use the local fast paths below — those aren't canned content,
+    # they're captured data from the owner / order pipeline.
 
     # PRIORITY 0 — learned answers (instant, no LLM call)
     if data_dir:
@@ -1556,10 +1603,6 @@ def register(app, CONFIG: dict, DATA_DIR: Path) -> None:
         f"Good morning, thanks for calling {_biz}. This is Orby. Can I get your name?",
         f"Good afternoon, thanks for calling {_biz}. This is Orby. Can I get your name?",
         f"Good evening, thanks for calling {_biz}. This is Orby. Can I get your name?",
-        # Canned sales-bot answers — pre-bake the audio so the first matching
-        # question on a cold call still returns in <1s. After _strip_for_speech
-        # the cached file is reused at runtime.
-        *[_strip_for_speech(reply) for _triggers, reply in _CANNED_SALES_REPLIES],
         # Universal failure message — pre-bake so brain-down replies still play fast.
         "Sorry, my brain is being slow right now. Could I email you the answer instead?",
     ]
@@ -1812,22 +1855,11 @@ def register(app, CONFIG: dict, DATA_DIR: Path) -> None:
                                 hints=state.get("speech_hints", ""))
                 return Response(twiml, mimetype="application/xml")
 
-        # ── Canned-reply fast-path ──────────────────────────────────────
-        # If this turn matches a canned sales-bot reply, skip the entire
-        # async dispatch and return the cached audio directly. No filler,
-        # no /voice/wait poll loop — the response is already on disk.
-        if is_sales:
-            canned = _canned_sales_reply(speech)
-            if canned:
-                state.setdefault("history", []).append(
-                    {"role": "user", "content": speech})
-                state["history"].append(
-                    {"role": "assistant", "content": canned})
-                state["turns"] = state.get("turns", 0) + 1
-                log.info(f"[call {sid[:8]}] canned reply (dispatched in /voice/gather)")
-                twiml = _gather(canned, action_url="/voice/gather",
-                                hints=state.get("speech_hints", ""))
-                return Response(twiml, mimetype="application/xml")
+        # NOTE: Canned-reply fast-paths intentionally removed 2026-06-21.
+        # Frank's principle: every customer question must go to the LLM
+        # so the same architecture works for every business — not just
+        # myOrbi sales. The compact phone brief (~2.8KB) keeps the LLM
+        # round-trip in the 1-3s range, fast enough without canning.
 
         # ── Async render dispatch ───────────────────────────────────────
         # The LLM call + Kokoro render together routinely take 10-17s on this
