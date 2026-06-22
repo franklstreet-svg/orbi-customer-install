@@ -1011,6 +1011,26 @@ _VM_NO = ("no", "nope", "no thanks", "no thank you", "not now", "nevermind",
           "never mind")
 
 
+_YES_TOKENS = {
+    "yes", "yeah", "yep", "yup", "sure", "ok", "okay", "please", "yes please",
+    "do it", "go ahead", "send it", "text me", "text it",
+    "absolutely", "definitely", "of course", "sounds good",
+}
+
+
+def _is_yes(text: str) -> bool:
+    """Light yes detector for confirmation prompts. False on ambiguous input."""
+    t = (text or "").strip().lower().rstrip(".!?,")
+    if not t:
+        return False
+    if t in _YES_TOKENS:
+        return True
+    # Short phrases starting with yes (e.g., "yes please send it")
+    if any(t.startswith(p + " ") or t.startswith(p + ",") for p in _YES_TOKENS):
+        return True
+    return False
+
+
 def _wants_voicemail(text: str) -> bool:
     """True if the caller said something that means 'yes take a voicemail'."""
     t = (text or "").strip().lower()
@@ -1684,12 +1704,53 @@ def register(app, CONFIG: dict, DATA_DIR: Path) -> None:
                 _CALLS.pop(sid, None)
             return Response(_hangup(reply), mimetype="application/xml")
 
+        # ── SMS-the-link fast-path ──────────────────────────────────────
+        # If Orbi just offered to text the signup link AND the caller said
+        # yes, actually fire the SMS. Frank caught the LLM saying "I'll text
+        # the link" without us ever sending one. State-tracked so we only
+        # send once per call.
+        is_sales = bool(business and (business.get("is_sales_bot")
+                or str(business.get("name","")).strip().lower().replace(" ","") == "myorbi"))
+        if is_sales and not state.get("link_sms_sent"):
+            history = list(state.get("history", []))
+            last_asst = next((m["content"] for m in reversed(history)
+                              if m.get("role") == "assistant"), "")
+            offered_link = bool(last_asst) and any(p in last_asst.lower() for p in (
+                "text or email you the link",
+                "text you the link",
+                "send you the link",
+                "want me to text",
+            ))
+            if offered_link and _is_yes(speech):
+                tunnel = (_TUNNEL_URL_REF[0] or "").rstrip("/") or "https://twickell.com/orbi"
+                link = "https://twickell.com/orbi"
+                body = (f"Hi! It's Orbi from myOrbi. Here's the link to pick "
+                        f"your plan and get started: {link}")
+                sms_status = sms_sender.send(CONFIG, from_phone, body)
+                if sms_status.get("ok"):
+                    state["link_sms_sent"] = True
+                    log.info(f"[call {sid[:8]}] signup link SMS sent to {from_phone}")
+                    reply = ("Sent! Check your phone in a few seconds — tap the "
+                             "link, pick what you want, and you'll be up and "
+                             "running. Anything else?")
+                else:
+                    log.warning(f"[call {sid[:8]}] SMS failed: {sms_status.get('error')}")
+                    reply = ("Hmm, the text didn't go through. You can head to "
+                             "twickell.com slash orbi yourself when you're "
+                             "ready. Anything else?")
+                state.setdefault("history", []).append(
+                    {"role": "user", "content": speech})
+                state["history"].append({"role": "assistant", "content": reply})
+                state["turns"] = state.get("turns", 0) + 1
+                twiml = _gather(reply, action_url="/voice/gather",
+                                hints=state.get("speech_hints", ""))
+                return Response(twiml, mimetype="application/xml")
+
         # ── Canned-reply fast-path ──────────────────────────────────────
         # If this turn matches a canned sales-bot reply, skip the entire
         # async dispatch and return the cached audio directly. No filler,
         # no /voice/wait poll loop — the response is already on disk.
-        if business and (business.get("is_sales_bot")
-                         or str(business.get("name","")).strip().lower().replace(" ","") == "myorbi"):
+        if is_sales:
             canned = _canned_sales_reply(speech)
             if canned:
                 state.setdefault("history", []).append(
