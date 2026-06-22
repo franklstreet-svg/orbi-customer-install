@@ -18,10 +18,10 @@
       "why_additional_seats_cheaper": "All seats on one account share one Orbi brain — same memory, same business knowledge across your whole team. The additional seats aren't separate Orbis; they're additional people accessing the same Orbi."
     },
     "receptionist_module": {
-      "price_monthly": "+$69.99/mo on top of Base",
-      "includes": "1,000 phone calls/mo",
-      "overage": "+$40 per 500 additional calls",
-      "what_it_does": "24/7 AI phone receptionist with natural voice. Twilio business number provisioned automatically at signup. Captures every caller's name + phone, texts confirmation receipts, emails owner with lead details, knows business hours/services/prices, books callbacks for questions she can't fully answer, emergency-aware (refers callers to 911 when appropriate)."
+      "price_monthly": "+$79.99/mo on top of Base",
+      "includes": "1,000 minutes of phone-call time per month (about 333 calls at 3-min average)",
+      "overage": "+$20 per 500 additional minutes (~$0.04/min effective)",
+      "what_it_does": "24/7 AI phone receptionist with natural voice. Twilio business number provisioned automatically at signup. Captures every caller's name + phone, texts confirmation receipts, emails owner with lead details, knows business hours/services/prices, books callbacks for questions she can't fully answer, emergency-aware (refers callers to 911 when appropriate). Metered by MINUTES (not calls) — the same way Twilio bills us, so the pricing is honest and predictable."
     },
     "website_controller_module": {
       "price_monthly": "+$49.99/mo on top of Base",
@@ -141,7 +141,7 @@
       "Universal search across all your data",
       "Cross-search (combined indexes)",
       "Live web search (weather, news, current pricing)",
-      "General-purpose AI assistant (anything ChatGPT does, plus knows your business)"
+      "General-purpose AI assistant (anything a general chatbot does, plus knows your business)"
     ],
     "communication": [
       "SMS sending (10DLC registered)",
@@ -180,7 +180,7 @@
     },
     {
       "question": "How do I add a phone number for my business?",
-      "answer": "If you took the Receptionist module, your phone number was provisioned automatically at signup — it's in your dashboard under Settings → Phone. If you haven't added the module yet, just say 'add Receptionist' and I'll walk you through it — it's $69.99/mo on top of Base, includes 1,000 calls."
+      "answer": "If you took the Receptionist module, your phone number was provisioned automatically at signup — it's in your dashboard under Settings → Phone. If you haven't added the module yet, just say 'add Receptionist' and I'll walk you through it — it's $79.99/mo on top of Base, includes 1,000 minutes of phone time, and $20 per 500 minutes if you go over."
     },
     {
       "question": "How do I add the chat widget to my website?",
