@@ -190,11 +190,14 @@ def _strip_for_speech(text: str) -> str:
     s = _re.sub(r"—\s*offline mode\s*—", "", s, flags=_re.IGNORECASE)
     # ── Domain spell-out: twickell.com is an unusual spelling that Kokoro
     # phonemizes as "twico, com" (dropping the -kell). Spell it letter-by-
-    # letter so the caller hears the right URL. Run BEFORE the generic URL
+    # letter with periods + commas so Kokoro pauses between each letter —
+    # callers need time to write it down. Hyphens (the previous form)
+    # rendered as a fast continuous blur. Run BEFORE the generic URL
     # substitution so the literal hostname gets caught.
-    s = _re.sub(r"\btwickell\.com/orbi\b", "T-W-I-C-K-E-L-L dot com slash O-R-B-I", s, flags=_re.IGNORECASE)
-    s = _re.sub(r"\btwickell\.com\b", "T-W-I-C-K-E-L-L dot com", s, flags=_re.IGNORECASE)
-    s = _re.sub(r"\btwickell\b", "T-W-I-C-K-E-L-L", s, flags=_re.IGNORECASE)
+    _SPELLED = "T. W. I. C. K. E. L. L."
+    s = _re.sub(r"\btwickell\.com/orbi\b", f"{_SPELLED} dot com slash O. R. B. I.", s, flags=_re.IGNORECASE)
+    s = _re.sub(r"\btwickell\.com\b", f"{_SPELLED} dot com", s, flags=_re.IGNORECASE)
+    s = _re.sub(r"\btwickell\b", _SPELLED, s, flags=_re.IGNORECASE)
     # ── Brand pronunciation fix: "Orbi" → "Or-bee" ──────────────────
     # Twilio Polly Generative pronounces "Orbi" as "Orbeez" (plural) on
     # the phone. The chat widget (different TTS engine) doesn't have this
@@ -889,11 +892,16 @@ _CANNED_SALES_REPLIES: list[tuple[tuple[str, ...], str]] = [
         "runs the chat widget on your website, and handles personal things like calendar "
         "and email. Want the pricing, or more about what she does on the phone and website?",
     ),
-    # Pricing
+    # Pricing — cover the contractions AND the spelled-out forms STT may emit
     (
-        ("how much", "what's the price", "what's the cost", "pricing", "what does it cost",
-         "what does she cost", "how much does it cost", "how much is it",
-         "how much is orbi", "how much is or-bee", "what's it cost"),
+        ("how much", "what's the price", "what is the price", "what is your price",
+         "tell me the price", "tell me the prices", "what are the prices",
+         "what's the cost", "what is the cost", "what's the pricing",
+         "what is the pricing", "pricing", "how much does she cost",
+         "what does it cost", "what does she cost", "how much does it cost",
+         "how much is it", "how much is orbi", "how much is orbee",
+         "how much is or-bee", "what's it cost", "what is it cost",
+         "price please", "give me the price", "i'd like the price"),
         "Orbi Base is forty-nine ninety-nine a month. The phone receptionist adds seventy-nine "
         "ninety-nine — that's a thousand minutes of calls included. Want me to break down what "
         "fits your business?",
