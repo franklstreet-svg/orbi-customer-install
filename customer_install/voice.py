@@ -474,8 +474,11 @@ SEATS / DEVICES
 PRIVACY
 - Customer's business data (chats, leads, contacts) stays on their own computer in the local-install version. Cloud-hosted v1 keeps your data tied to your account, not sold or shared.
 
-HOW TO SIGN UP
-- Tell them: head to twickell.com, pick what you want, get a magic-link to start in minutes.
+HOW TO SIGN UP — WHITE-GLOVE ONBOARDING (founding-member phase)
+- Tell them: head to twickell.com, pick what you want, check out with Stripe.
+- After they pay, they'll get a "welcome, founding member" email immediately, and then within 24 hours Frank personally emails them with their dashboard sign-in link plus a walkthrough of getting Orbi onto their website and phones.
+- Frame it as a premium experience, NOT a delay: "While we're still in founding-member mode, Frank does each onboarding personally so everything's set up right before Orbi goes live."
+- If they ask why 24 hours, the honest answer: he checks each setup by hand, makes sure their phone number / website hook-up is solid, and is a real human on the other end if anything's confusing.
 - If they say "yes" to "want me to text you the link?", the system fires the SMS — you don't have to do anything else. Confirm aloud after.
 
 SCOPE LIMITS (be honest about these)
@@ -1856,15 +1859,17 @@ def register(app, CONFIG: dict, DATA_DIR: Path) -> None:
             if offered_link and _is_yes(speech):
                 tunnel = (_TUNNEL_URL_REF[0] or "").rstrip("/") or "https://twickell.com/orbi"
                 link = "https://twickell.com"
-                body = (f"Hi! It's Orbi from myOrbi. Here's the link to pick "
-                        f"your plan and get started: {link}")
+                body = (f"Hi! It's Orbi from myOrbi. Here's the link to "
+                        f"pick your plan: {link} — after checkout you'll get a "
+                        f"welcome email, then Frank personally emails your "
+                        f"sign-in + setup walkthrough within 24 hours.")
                 sms_status = sms_sender.send(CONFIG, from_phone, body)
                 if sms_status.get("ok"):
                     state["link_sms_sent"] = True
                     log.info(f"[call {sid[:8]}] signup link SMS sent to {from_phone}")
-                    reply = ("Sent! Check your phone in a few seconds — tap the "
-                             "link, pick what you want, and you'll be up and "
-                             "running. Anything else?")
+                    reply = ("Sent! Check your phone — link's there. After you "
+                             "check out, Frank emails you personally within 24 "
+                             "hours to walk you through setup. Anything else?")
                 else:
                     log.warning(f"[call {sid[:8]}] SMS failed: {sms_status.get('error')}")
                     reply = ("Hmm, the text didn't go through. You can head to "
