@@ -61,6 +61,42 @@ def _prune_calls():
             if _CALLS[sid].get("last_touch", 0) < cutoff:
                 _CALLS.pop(sid, None)
 
+_PENDING_LOCK = threading.Lock()
+_PENDING: dict[str, dict] = {}
+
+
+def _render_reply_in_background(sid, config, business, scope, state, user_speech):
+    """Run _ai_reply, strip flow markers, apply voicemail offer, and pre-render
+    the audio. Result lands in _PENDING[sid] for /voice/wait to pick up."""
+    import re as _re_local
+    try:
+        reply = _ai_reply(config, business, scope, state, user_speech)
+        if reply and ("<<SCRAPE:" in reply or "<<NAV:" in reply):
+            reply = _re_local.sub(r"\s*<<SCRAPE:\s*.+?\s*>>\s*", " ", reply)
+            reply = _re_local.sub(r"\s*<<NAV:\s*.+?\s*>>\s*", " ", reply)
+            reply = _re_local.sub(r"\s+", " ", reply).strip()
+        log.info(f"[call {sid[:8]}] reply (raw, async): {reply!r}")
+
+        if _should_offer_voicemail(state, user_speech, reply):
+            state["voicemail_offered"] = True
+            log.info(f"[call {sid[:8]}] offering voicemail (async)")
+            reply = (f"{reply} "
+                     "Would you like to leave a voicemail for the owner? "
+                     "Just say yes or no.")
+
+        try:
+            _render_audio(_strip_for_speech(reply))
+        except Exception as e:
+            log.warning(f"[call {sid[:8]}] pre-render failed (will fall back at play time): {e}")
+
+        with _PENDING_LOCK:
+            _PENDING[sid] = {"ready": True, "text": reply, "error": None}
+    except Exception as e:
+        log.exception(f"[call {sid[:8]}] background reply crashed: {e}")
+        with _PENDING_LOCK:
+            _PENDING[sid] = {"ready": True, "text": None, "error": str(e)}
+
+
 def _call_state(sid: str, from_phone: str | None = None) -> dict:
     with _CALLS_LOCK:
         state = _CALLS.get(sid)
@@ -112,6 +148,17 @@ def _extract_name_from_speech(speech: str) -> str | None:
         return None  # question, not a name
     # Reject if it's clearly multiple sentences
     if s.count(" ") > 4:
+        return None
+    # Reject greetings + polite acknowledgements that aren't names
+    _NOT_A_NAME = {
+        "hi", "hello", "hey", "yo", "howdy", "greetings", "sup",
+        "good morning", "good afternoon", "good evening", "good day",
+        "morning", "evening", "afternoon",
+        "yes", "yeah", "yep", "no", "nope", "ok", "okay", "sure",
+        "thanks", "thank you", "ma'am", "sir", "miss",
+        "nothing", "nobody", "anyone", "someone",
+    }
+    if low in _NOT_A_NAME:
         return None
     # Title-case the result so "frank" → "Frank", "PRANK" → "Prank"
     return s.title()
@@ -1501,24 +1548,17 @@ def register(app, CONFIG: dict, DATA_DIR: Path) -> None:
         business = state.get("business_profile") or _load_profile_for_inbound_call(to_number)
         scope = CONFIG.get("scope", {}) or {}
 
-        reply = _ai_reply(CONFIG, business, scope, state, speech)
-        log.info(f"[call {sid[:8]}] reply (raw): {reply!r}")
-
-        # ── Strip sales-flow markers BEFORE the reply goes to TTS ───────
-        # The LLM may emit <<SCRAPE:url>> or <<NAV:url>> markers as part
-        # of the sales flow. These are for the chat widget to consume —
-        # the phone path must NEVER speak them aloud. Without this strip,
-        # callers literally hear "Scrape h-t-t-p-s colon slash slash..."
-        # and the call collapses into nonsense.
-        if reply and ("<<SCRAPE:" in reply or "<<NAV:" in reply):
-            reply = _re.sub(r"\s*<<SCRAPE:\s*.+?\s*>>\s*", " ", reply)
-            reply = _re.sub(r"\s*<<NAV:\s*.+?\s*>>\s*", " ", reply)
-            reply = _re.sub(r"\s+", " ", reply).strip()
-            log.info(f"[call {sid[:8]}] reply (stripped): {reply!r}")
-
-
-        # End the call if the caller said goodbye
+        # Goodbye must be detected synchronously (turns the call's tail into
+        # an order finalize or a clean hangup); we still need a reply for the
+        # hangup farewell, so render that inline.
         if _detect_goodbye(speech) or state["turns"] >= 15:
+            import re as _re
+            reply = _ai_reply(CONFIG, business, scope, state, speech)
+            if reply and ("<<SCRAPE:" in reply or "<<NAV:" in reply):
+                reply = _re.sub(r"\s*<<SCRAPE:\s*.+?\s*>>\s*", " ", reply)
+                reply = _re.sub(r"\s*<<NAV:\s*.+?\s*>>\s*", " ", reply)
+                reply = _re.sub(r"\s+", " ", reply).strip()
+            log.info(f"[call {sid[:8]}] reply (raw, goodbye-path): {reply!r}")
             # If this conversation looks like an order, kick off the full
             # finalize pipeline (extract → cart → web_driver submit → SMS).
             # Bridges the caller with "Hold on a sec..." TwiML while the
@@ -1559,22 +1599,76 @@ def register(app, CONFIG: dict, DATA_DIR: Path) -> None:
                 _CALLS.pop(sid, None)
             return Response(_hangup(reply), mimetype="application/xml")
 
-        # Offer voicemail when appropriate (couldn't answer, caller asked
-        # for a human, or stalled after a few turns). This is the v1
-        # "human handoff" — Orbi takes a message and the owner gets a push.
-        if _should_offer_voicemail(state, speech, reply):
-            state["voicemail_offered"] = True
-            log.info(f"[call {sid[:8]}] offering voicemail")
-            # Pipe Orbi's reply first, then the offer, in one Gather.
-            offer = (f"{reply} "
-                     "Would you like to leave a voicemail for the owner? "
-                     "Just say yes or no.")
-            twiml = _gather(offer, action_url="/voice/gather",
-                              hints=state.get("speech_hints", ""))
+        # ── Async render dispatch ───────────────────────────────────────
+        # The LLM call + Kokoro render together routinely take 10-17s on this
+        # CPU, which blows past Twilio's ~15s webhook timeout and kills the
+        # call. We dispatch both to a background thread, return TwiML that
+        # parks the caller with a tiny <Pause> + <Redirect> to /voice/wait,
+        # and that polling endpoint plays the audio as soon as it's ready.
+        with _PENDING_LOCK:
+            _PENDING[sid] = {"ready": False, "started_at": time.time()}
+        threading.Thread(
+            target=_render_reply_in_background,
+            args=(sid, CONFIG, business, scope, state, speech),
+            daemon=True,
+        ).start()
+        twiml = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<Response>'
+            '<Pause length="1"/>'
+            f'<Redirect>/voice/wait?sid={sid}&amp;try=1</Redirect>'
+            '</Response>'
+        )
+        return Response(twiml, mimetype="application/xml")
+
+    @app.route("/voice/wait", methods=["GET", "POST"])
+    def voice_wait():
+        """Polled by Twilio while the background thread renders the reply.
+        Each call here is its OWN webhook (its own 15s budget), so a slow
+        Kokoro render no longer kills the call."""
+        sid = request.args.get("sid") or request.form.get("sid", "")
+        try:
+            try_num = int(request.args.get("try") or request.form.get("try") or "1")
+        except ValueError:
+            try_num = 1
+
+        pending = _PENDING.get(sid)
+        state = _call_state(sid)
+
+        if pending and pending.get("ready"):
+            with _PENDING_LOCK:
+                _PENDING.pop(sid, None)
+            if pending.get("error") or not pending.get("text"):
+                log.warning(f"[call {sid[:8]}] async render failed: {pending.get('error')}")
+                twiml = _gather(
+                    "Sorry, I had a hiccup. What was that again?",
+                    action_url="/voice/gather",
+                    hints=state.get("speech_hints", ""),
+                )
+                return Response(twiml, mimetype="application/xml")
+            twiml = _gather(
+                pending["text"],
+                action_url="/voice/gather",
+                hints=state.get("speech_hints", ""),
+            )
             return Response(twiml, mimetype="application/xml")
 
-        twiml = _gather(reply, action_url="/voice/gather",
-                          hints=state.get("speech_hints", ""))
+        # Not ready. Wait another 2s; cap retries so we never loop forever.
+        if try_num >= 8:
+            log.warning(f"[call {sid[:8]}] async render timed out after {try_num} tries")
+            with _PENDING_LOCK:
+                _PENDING.pop(sid, None)
+            return Response(
+                _hangup("Sorry, I'm running slow right now. Please try me again in a moment."),
+                mimetype="application/xml",
+            )
+        twiml = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<Response>'
+            '<Pause length="2"/>'
+            f'<Redirect>/voice/wait?sid={sid}&amp;try={try_num + 1}</Redirect>'
+            '</Response>'
+        )
         return Response(twiml, mimetype="application/xml")
 
     @app.route("/voice/finalize/<sid>", methods=["POST"])
@@ -1703,7 +1797,7 @@ def register(app, CONFIG: dict, DATA_DIR: Path) -> None:
         return Response("<Response/>", mimetype="application/xml")
 
     log.info("Voice endpoints registered: /voice/incoming /voice/gather "
-             "/voice/status /voice/voicemail_recording_callback "
+             "/voice/wait /voice/audio /voice/status /voice/voicemail_recording_callback "
              "/api/owner/voicemails (GET/DELETE) "
              "/api/owner/voicemails/<id>/handled (POST)")
 
