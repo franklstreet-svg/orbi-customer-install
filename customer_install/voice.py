@@ -420,7 +420,7 @@ def _hangup(text: str | None = None, voice: str = "Polly.Joanna") -> str:
 
 def _build_voice_prompt(business: dict, scope: dict) -> str:
     """Same as the public chat prompt but with voice-specific guardrails."""
-    base = prompts.build_public_prompt(business, scope)
+    base = prompts.build_public_prompt(business, scope, channel="phone")
     voice_extras = """
 
 VOICE CALL SPECIFICS
