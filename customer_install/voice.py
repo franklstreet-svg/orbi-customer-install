@@ -892,7 +892,54 @@ _CANNED_SALES_REPLIES: list[tuple[tuple[str, ...], str]] = [
         "runs the chat widget on your website, and handles personal things like calendar "
         "and email. Want the pricing, or more about what she does on the phone and website?",
     ),
-    # Pricing — cover the contractions AND the spelled-out forms STT may emit
+    # Module-specific pricing — these have to come BEFORE the generic
+    # pricing entry so "how much is the receptionist" doesn't fall into
+    # the generic Base+Receptionist top-line answer.
+    (
+        ("receptionist module", "how much is the receptionist",
+         "how much is receptionist", "what's the receptionist cost",
+         "what does the receptionist cost", "price of the receptionist",
+         "how much for the receptionist", "receptionist price",
+         "phone receptionist cost", "phone receptionist price"),
+        "The Receptionist module is seventy-nine ninety-nine a month, with "
+        "one thousand minutes of calls included. After that it's twenty "
+        "dollars per five hundred minutes. Anything else you want to know?",
+    ),
+    (
+        ("how much is the website", "how much is the website controller",
+         "what does the website controller cost", "website controller cost",
+         "website controller price", "price of the website",
+         "how much for the website", "website module cost",
+         "how much is the chat widget"),
+        "The Website Controller module is forty-nine ninety-nine a month, "
+        "with twenty thousand chats included. It runs the chat widget on "
+        "your site. Want the full bundle math?",
+    ),
+    (
+        ("how much is the restaurant", "restaurant module cost",
+         "restaurant module price", "how much for the restaurant"),
+        "The Restaurant module is forty-nine ninety-nine a month — handles "
+        "menu lookups, order taking, daily specials. Anything else?",
+    ),
+    (
+        ("how much is marketing", "marketing module cost",
+         "marketing module price", "how much for marketing"),
+        "The Marketing module is twenty-nine ninety-nine a month. Image "
+        "generation is a nineteen ninety-nine add-on on top. Anything else?",
+    ),
+    # Seats / multiple devices / team
+    (
+        ("more than one computer", "multiple computers", "two computers",
+         "how many computers", "multiple devices", "additional seat",
+         "extra seat", "extra user", "more than one user", "more than one person",
+         "how many seats", "how many people", "team", "for my whole team",
+         "for my team", "for everyone", "second computer", "another computer"),
+        "One seat means one Orbi brain on one main computer plus up to two "
+        "linked devices — your phone, a tablet, whatever. Each extra seat is "
+        "twenty-nine ninety-nine a month. How many seats do you need?",
+    ),
+    # Generic pricing — cover the contractions AND the spelled-out forms STT
+    # may emit. Module-specific entries above must catch their case first.
     (
         ("how much", "what's the price", "what is the price", "what is your price",
          "tell me the price", "tell me the prices", "what are the prices",
