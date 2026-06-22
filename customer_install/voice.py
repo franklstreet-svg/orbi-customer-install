@@ -564,6 +564,21 @@ def _ai_reply(config: dict, business: dict, scope: dict,
     caller_phone = call_state.get("from", "")
     call_sid = call_state.get("sid", "unknown")
 
+    # PRIORITY 0a — sales-bot canned replies (instant, no LLM call).
+    # For the myOrbi sales bot, the most common phone questions ("what is
+    # Orbi", "how much does it cost") are predictable and don't need an
+    # LLM call. Saves 6-15 seconds of brain latency per turn and means
+    # the call works even when the brain is down.
+    if business and (business.get("is_sales_bot")
+                     or str(business.get("name","")).strip().lower().replace(" ","") == "myorbi"):
+        canned = _canned_sales_reply(user_speech)
+        if canned:
+            log.info(f"[call {call_sid[:8]}] canned sales reply (skipped LLM)")
+            call_state["history"].append({"role": "user", "content": user_speech})
+            call_state["history"].append({"role": "assistant", "content": canned})
+            call_state["turns"] += 1
+            return canned
+
     # PRIORITY 0 — learned answers (instant, no LLM call)
     if data_dir:
         learned = mod_learning.find_learned(data_dir, user_speech)
@@ -726,7 +741,7 @@ def _ai_reply(config: dict, business: dict, scope: dict,
     )
     resp = llm_client.generate(config, system + voice_brevity, messages,
                                  max_tokens=110)
-    text = resp.text or "I'm sorry, I'm having trouble right now. Please call back in a moment."
+    text = resp.text or "Sorry, my brain is being slow right now. Could I email you the answer instead?"
 
     if len(text) > 260:
         cut = text[:260]
@@ -842,6 +857,73 @@ _FAST_ACK_REPLIES = (
     "Sure — anything else?",
     "No problem — what else can I get for you?",
 )
+
+
+# ---------------------------------------------------------------------------
+# Canned sales-bot replies — bypass the LLM entirely for the most common
+# phone questions. Each entry has trigger phrases and a 1-2 sentence answer
+# crafted for phone delivery (short, ends with an invitation). Audio is
+# pre-baked at startup so first-call latency is also tiny.
+# ---------------------------------------------------------------------------
+_CANNED_SALES_REPLIES: list[tuple[tuple[str, ...], str]] = [
+    # "What is Orbi?" / "Tell me about her"
+    (
+        ("what is orbi", "what is or-bee", "what is orbie", "what's orbi", "tell me about orbi",
+         "tell me about her", "tell me about or-bee", "what can you do", "what does she do",
+         "what does orbi do", "what are your capabilities", "capabilities",
+         "what's she good at", "what can orbi do", "interested in orbi",
+         "i want to know about orbi", "interested in or-bee",
+         "i'd like to know about orbi", "what are you"),
+        "Orbi is your AI for business and personal life — she answers your business phone, "
+        "runs the chat widget on your website, and handles personal things like calendar "
+        "and email. Want the pricing, or more about what she does on the phone and website?",
+    ),
+    # Pricing
+    (
+        ("how much", "what's the price", "what's the cost", "pricing", "what does it cost",
+         "what does she cost", "how much does it cost", "how much is it",
+         "how much is orbi", "how much is or-bee", "what's it cost"),
+        "Orbi Base is forty-nine ninety-nine a month. The phone receptionist adds seventy-nine "
+        "ninety-nine — that's a thousand minutes of calls included. Want me to break down what "
+        "fits your business?",
+    ),
+    # Privacy / data
+    (
+        ("is it secure", "is it private", "where does my data go", "where's my data",
+         "is my data safe", "data privacy", "are you secure",
+         "what about privacy"),
+        "Your business data — chats, leads, contacts — lives on your computer, not in the cloud. "
+        "I'm cloud-hosted on the brain side, but your customer info stays yours. Want more on "
+        "how that works?",
+    ),
+    # Sign-up
+    (
+        ("how do i sign up", "how do i buy", "how do i get started", "how do i start",
+         "how do i get it", "where do i sign up", "how do i purchase"),
+        "Easiest way: head to twickell.com slash orbi, pick what you want, and you'll get a "
+        "magic link to start in minutes. Want me to text or email you the link right now?",
+    ),
+    # What surfaces / channels
+    (
+        ("phone and website", "phone or website", "all of it", "everything",
+         "the whole thing", "all of the above"),
+        "Perfect — Base plus the Receptionist plus the Website Controller. What kind of "
+        "business are you in? Restaurant, contractor, salon, retail, anything's fine.",
+    ),
+]
+
+
+def _canned_sales_reply(user_speech: str) -> str | None:
+    """Substring match against pre-written sales-bot answers. Returns the
+    canned answer on hit, None otherwise. Case-insensitive."""
+    txt = (user_speech or "").strip().lower()
+    if not txt or len(txt) > 120:
+        return None
+    for triggers, reply in _CANNED_SALES_REPLIES:
+        for trigger in triggers:
+            if trigger in txt:
+                return reply
+    return None
 
 
 def _fast_path_ack(user_speech: str, call_state: dict) -> str | None:
@@ -1388,6 +1470,12 @@ def register(app, CONFIG: dict, DATA_DIR: Path) -> None:
         f"Good morning, thanks for calling {_biz}. This is Orby. Can I get your name?",
         f"Good afternoon, thanks for calling {_biz}. This is Orby. Can I get your name?",
         f"Good evening, thanks for calling {_biz}. This is Orby. Can I get your name?",
+        # Canned sales-bot answers — pre-bake the audio so the first matching
+        # question on a cold call still returns in <1s. After _strip_for_speech
+        # the cached file is reused at runtime.
+        *[_strip_for_speech(reply) for _triggers, reply in _CANNED_SALES_REPLIES],
+        # Universal failure message — pre-bake so brain-down replies still play fast.
+        "Sorry, my brain is being slow right now. Could I email you the answer instead?",
     ]
     def _warmup():
         try:
