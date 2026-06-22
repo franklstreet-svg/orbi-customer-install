@@ -873,14 +873,18 @@ _FAST_ACK_REPLIES = (
 # pre-baked at startup so first-call latency is also tiny.
 # ---------------------------------------------------------------------------
 _CANNED_SALES_REPLIES: list[tuple[tuple[str, ...], str]] = [
-    # "What is Orbi?" / "Tell me about her"
+    # "What is Orbi?" / "Tell me about her" — include common STT mishears
     (
-        ("what is orbi", "what is or-bee", "what is orbie", "what's orbi", "tell me about orbi",
-         "tell me about her", "tell me about or-bee", "what can you do", "what does she do",
-         "what does orbi do", "what are your capabilities", "capabilities",
-         "what's she good at", "what can orbi do", "interested in orbi",
-         "i want to know about orbi", "interested in or-bee",
-         "i'd like to know about orbi", "what are you"),
+        ("what is orbi", "what is or-bee", "what is orbie", "what is orbee", "what's orbi",
+         "what's orbee", "tell me about orbi", "tell me about orbee",
+         "tell me about her", "tell me about or-bee", "what can you do",
+         "what does she do", "what does orbi do", "what does orbee do",
+         "what are your capabilities", "capabilities",
+         "what's she good at", "what can orbi do", "what can orbee do",
+         "interested in orbi", "interested in orbee",
+         "i want to know about orbi", "i want to know about orbee",
+         "interested in or-bee", "i'd like to know about orbi",
+         "i'd like to know about orbee", "what are you"),
         "Orbi is your AI for business and personal life — she answers your business phone, "
         "runs the chat widget on your website, and handles personal things like calendar "
         "and email. Want the pricing, or more about what she does on the phone and website?",
@@ -907,7 +911,7 @@ _CANNED_SALES_REPLIES: list[tuple[tuple[str, ...], str]] = [
     (
         ("how do i sign up", "how do i buy", "how do i get started", "how do i start",
          "how do i get it", "where do i sign up", "how do i purchase"),
-        "Easiest way: head to twickell.com slash orbi, pick what you want, and you'll get a "
+        "Easiest way: head to twickell.com, pick what you want, and you'll get a "
         "magic link to start in minutes. Want me to text or email you the link right now?",
     ),
     # What surfaces / channels
@@ -1730,7 +1734,7 @@ def register(app, CONFIG: dict, DATA_DIR: Path) -> None:
             ))
             if offered_link and _is_yes(speech):
                 tunnel = (_TUNNEL_URL_REF[0] or "").rstrip("/") or "https://twickell.com/orbi"
-                link = "https://twickell.com/orbi"
+                link = "https://twickell.com"
                 body = (f"Hi! It's Orbi from myOrbi. Here's the link to pick "
                         f"your plan and get started: {link}")
                 sms_status = sms_sender.send(CONFIG, from_phone, body)
@@ -1743,7 +1747,7 @@ def register(app, CONFIG: dict, DATA_DIR: Path) -> None:
                 else:
                     log.warning(f"[call {sid[:8]}] SMS failed: {sms_status.get('error')}")
                     reply = ("Hmm, the text didn't go through. You can head to "
-                             "twickell.com slash orbi yourself when you're "
+                             "twickell.com yourself when you're "
                              "ready. Anything else?")
                 state.setdefault("history", []).append(
                     {"role": "user", "content": speech})

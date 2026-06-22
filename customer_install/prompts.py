@@ -958,7 +958,7 @@ OVERRIDES:
 - If you need business context, ask for the business NAME + CITY
   (short, dictionary words STT can hear), not a URL.
 - For full details (pricing tables, side-by-side comparisons, sign-up
-  flow), refer callers to "twickell.com slash orbi" — read it aloud
+  flow), refer callers to "twickell.com" — read it aloud
   that way, not as a URL. Offer to text or email the link if they want.
 
 CAPTURE PHASE ADJUSTMENTS FOR PHONE:
