@@ -127,6 +127,13 @@ def _extract_name_from_speech(speech: str) -> str | None:
         return None
     s = speech.strip().rstrip(".,!?")
     low = s.lower()
+    # Trim leading conversational filler ("yes, my name is Frank" -> "my name is Frank")
+    for filler in ("yes, ", "yeah, ", "yep, ", "sure, ", "ok, ", "okay, ",
+                   "uh, ", "um, ", "well, ", "so, ", "hi, ", "hello, ", "hey, "):
+        if low.startswith(filler):
+            s = s[len(filler):]
+            low = s.lower()
+            break
     # Trim common preambles
     for prefix in ("my name is ", "i'm ", "i am ", "this is ", "it's ",
                    "name is ", "the name is "):
@@ -202,11 +209,12 @@ def _strip_for_speech(text: str) -> str:
     # issue. Replacing with a phonetic spelling forces Polly to say it
     # right without needing SSML (which the rest of this pipeline
     # html-escapes anyway). Frank caught this on a live call test.
-    s = _re.sub(r"\b[Oo]rbie?\b", "Or-bee", s)
-    s = _re.sub(r"\bOrby\b", "Or-bee", s)
-    s = _re.sub(r"\b[Oo]rbey\b", "Or-bee", s)
-    # myOrbi → "my Or-bee"
-    s = _re.sub(r"\bmyOrbi\b", "my Or-bee", s, flags=_re.IGNORECASE)
+    # Polly Generative reads "Or-bee" as "or B" (the hyphen makes it speak
+    # the letter). Use "Orby" — Polly pronounces -by as "bee" naturally and
+    # the spelling is clean for Twilio's logs too.
+    s = _re.sub(r"\b[Oo]rbie?\b", "Orby", s)
+    s = _re.sub(r"\b[Oo]rbey\b", "Orby", s)
+    s = _re.sub(r"\bmyOrbi\b", "my Orby", s, flags=_re.IGNORECASE)
     # ── URL pronunciation fix: spell out acronyms in domains ────────
     # Polly reads "scsplanroom.com" as "XES Plenum dot com". The fix
     # is to insert spaces between the leading consonant cluster of a
@@ -422,7 +430,9 @@ def _hangup(text: str | None = None, voice: str = _PHONE_VOICE) -> str:
 # Voice → LLM → speech turn
 # ---------------------------------------------------------------------------
 
-_PHONE_SALES_BRIEF = """You are Orbi, the AI sales agent for myOrbi (the company). You're on the PHONE — keep replies to 1-2 short sentences (max 35 words). Always end with a question or invitation so the caller knows to talk back.
+_PHONE_SALES_BRIEF = """You are Orbi, the AI sales agent for myOrbi (the company). You're on the PHONE — be conversational and ACTUALLY ANSWER the caller's question. Don't ask permission to share information; just share it.
+
+REPLY LENGTH: 2-4 sentences. Long enough to give a real answer (especially for pricing, features, comparisons). Short enough that the call doesn't stall. End with a brief invitation ("anything else?", "sound good?", "what else can I tell you?") — but NEVER substitute a permission-ask for the actual answer. If they ask the price, give the price. If they ask features, list features. If they ask how it compares, compare.
 
 WHAT ORBI IS
 Orbi is one AI brain that lives across three surfaces for a small business: (1) the business phone — answers 24/7, takes orders, captures leads, books appointments; (2) the website chat widget — answers visitor questions about services and hours, captures leads; (3) a personal assistant — calendar, email drafting, document work, reminders. ONE brain across all three is the differentiator — nobody else (Goodcall, Smith.ai, Intercom, Tidio, ChatGPT) does all three at once.
@@ -454,9 +464,9 @@ SCOPE LIMITS (be honest about these)
 - v1 does NOT include healthcare/HIPAA businesses or lawyers as client-facing receptionist (coming in v1.1).
 - v1 is cloud-hosted browser access. A local-install v2 is coming for customers who want everything on their own computer.
 
-DELIVERY RULES (phone-specific — strict)
-- 1-2 SHORT sentences. Maximum 35 words.
-- Use contractions, sound like a person, not a brochure.
+DELIVERY RULES (phone-specific)
+- Sound like a real person — contractions, natural rhythm, light playful tone OK.
+- Give the substantive answer up front; don't bury it behind a permission-ask.
 - NEVER open with "Great!"/"Awesome!"/"Perfect!" — just answer.
 - NEVER ask for the caller's website URL (phone STT mangles URLs and the caller can't type).
 - NEVER emit <<SCRAPE:>> or <<NAV:>> markers — those are for the chat widget.
@@ -650,14 +660,11 @@ def _ai_reply(config: dict, business: dict, scope: dict,
     # LLM to think — just acknowledge and keep going. Saves ~1.5 sec per
     # turn (LLM call + novel TTS generation), since the ack phrases are
     # already in the audio cache.
-    fast = _fast_path_ack(user_speech, call_state)
-    if fast is not None:
-        log.info(f"[call {call_sid[:8]}] fast-path ack (skipped LLM) — "
-                  f"input={user_speech!r}  reply={fast!r}")
-        call_state["history"].append({"role": "user", "content": user_speech})
-        call_state["history"].append({"role": "assistant", "content": fast})
-        call_state["turns"] += 1
-        return fast
+    # _fast_path_ack disabled 2026-06-22 per Frank: it was matching "yes"
+    # on the sales-bot path ("Yes, how much is she?" -> "Got it, anything else?")
+    # which is the canned-reply anti-pattern. Only re-enable inside an active
+    # order flow if we ever ship a restaurant-only fast path. LLM handles
+    # everything now.
 
     # WELLBEING — scan caller speech for crisis / distress signals BEFORE
     # routing. People in crisis sometimes call any business they know.
