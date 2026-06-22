@@ -188,6 +188,13 @@ def _strip_for_speech(text: str) -> str:
     # System tier hints
     s = _re.sub(r"—\s*backup mode\s*—", "", s, flags=_re.IGNORECASE)
     s = _re.sub(r"—\s*offline mode\s*—", "", s, flags=_re.IGNORECASE)
+    # ── Domain spell-out: twickell.com is an unusual spelling that Kokoro
+    # phonemizes as "twico, com" (dropping the -kell). Spell it letter-by-
+    # letter so the caller hears the right URL. Run BEFORE the generic URL
+    # substitution so the literal hostname gets caught.
+    s = _re.sub(r"\btwickell\.com/orbi\b", "T-W-I-C-K-E-L-L dot com slash O-R-B-I", s, flags=_re.IGNORECASE)
+    s = _re.sub(r"\btwickell\.com\b", "T-W-I-C-K-E-L-L dot com", s, flags=_re.IGNORECASE)
+    s = _re.sub(r"\btwickell\b", "T-W-I-C-K-E-L-L", s, flags=_re.IGNORECASE)
     # ── Brand pronunciation fix: "Orbi" → "Or-bee" ──────────────────
     # Twilio Polly Generative pronounces "Orbi" as "Orbeez" (plural) on
     # the phone. The chat widget (different TTS engine) doesn't have this
