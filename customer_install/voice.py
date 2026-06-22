@@ -84,10 +84,8 @@ def _render_reply_in_background(sid, config, business, scope, state, user_speech
                      "Would you like to leave a voicemail for the owner? "
                      "Just say yes or no.")
 
-        try:
-            _render_audio(_strip_for_speech(reply))
-        except Exception as e:
-            log.warning(f"[call {sid[:8]}] pre-render failed (will fall back at play time): {e}")
+        # Polly Generative is server-side and instant — no audio pre-render
+        # needed. (Kokoro pre-render was here when we owned the TTS pipeline.)
 
         with _PENDING_LOCK:
             _PENDING[sid] = {"ready": True, "text": reply, "error": None}
@@ -359,32 +357,28 @@ def _audio_url(fname: str) -> str:
     return f"{base}/voice/audio/{fname}"
 
 
-def _say(text: str, voice: str = "Polly.Joanna") -> str:
-    """Speak text via Twilio's native Polly Generative voice — renders
-    instantly server-side, no MP3 fetch round-trip. ~800ms faster per
-    turn than the edge_tts approach we used before.
+_PHONE_VOICE = "Polly.Joanna-Generative"
 
-    Generative voices (Joanna-Generative, Ruth-Generative, etc.) are
-    Twilio's newest tier — much more natural than the old standard Polly
-    voices. Slight voice difference vs the dashboard Ava, but the latency
-    win is significant.
 
-    To revert to edge_tts + <Play>: change `voice` default back to
-    'Polly.Joanna-Neural' and re-enable the _render_audio block below."""
-    # ── Cloud v1: Kokoro first (our voice), Polly fallback ──────────
-    # Try our own Kokoro engine first — customer hears the same voice
-    # as the dashboard, no per-call TTS cost, no "Orbeez" mispronunciation.
-    # Fall back to Twilio Polly if Kokoro is unavailable so the phone
-    # never goes silent.
+def _say(text: str, voice: str = _PHONE_VOICE) -> str:
+    """Speak via Twilio's Polly Generative voice — server-rendered, instant,
+    no MP3 fetch round-trip. Swapped in 2026-06-22 after Kokoro on WSL CPU
+    was pushing per-turn time to 6-8 seconds (caller-unfriendly). Polly is
+    free (rolled into Twilio per-minute call cost) and ships now.
+
+    _strip_for_speech handles pronunciation: 'Orbi' -> 'Or-bee' (Polly was
+    saying 'Orbeez' otherwise), 'twickell.com' -> 'T. W. I. C. K. E. L. L.
+    dot com', currency spelled out. Those rules still apply with Polly.
+
+    To swap to another TTS later (Cartesia, ElevenLabs, etc.), this single
+    function is the seam — the rest of the voice path treats it as a
+    black box that returns TwiML."""
     clean_text = _strip_for_speech(text)
-    fname = _render_audio(clean_text)
-    if fname:
-        return f'<Play>{_audio_url(fname)}</Play>'
     return f'<Say voice="{voice}">{_esc(clean_text)}</Say>'
 
 
 def _gather(prompt_text: str, action_url: str,
-            voice: str = "Polly.Joanna", timeout: int = 6,
+            voice: str = _PHONE_VOICE, timeout: int = 6,
             speech_timeout: str = "auto",
             hints: str = "") -> str:
     """timeout=6s for the caller to START speaking — tightened from 10s
@@ -420,7 +414,7 @@ def _gather(prompt_text: str, action_url: str,
 </Response>""".strip()
 
 
-def _hangup(text: str | None = None, voice: str = "Polly.Joanna") -> str:
+def _hangup(text: str | None = None, voice: str = _PHONE_VOICE) -> str:
     parts = [_say(text, voice)] if text else []
     return f"<Response>{''.join(parts)}<Hangup/></Response>"
 
@@ -1863,13 +1857,12 @@ def register(app, CONFIG: dict, DATA_DIR: Path) -> None:
         # myOrbi sales. The compact phone brief (~2.8KB) keeps the LLM
         # round-trip in the 1-3s range, fast enough without canning.
 
-        # ── Async render dispatch ───────────────────────────────────────
-        # The LLM call + Kokoro render together routinely take 10-17s on this
-        # CPU, which blows past Twilio's ~15s webhook timeout and kills the
-        # call. We dispatch both to a background thread, return TwiML that
-        # plays a SHORT filler ack ("Just one more second...") so the caller
-        # hears that we're working, then redirects to /voice/wait which polls
-        # for the result. Each poll is its own 15s webhook budget.
+        # ── Dispatch background renderer ────────────────────────────────
+        # LLM + Kokoro render runs in a thread. We BLOCK here for up to
+        # ~7s waiting for it — that covers the common case (sub-1s LLM via
+        # Scaleway + 3-6s Kokoro on CPU). If ready in time, we return the
+        # answer directly with NO filler, NO redirect. The filler dance
+        # only kicks in for the slow tail (>7s).
         with _PENDING_LOCK:
             _PENDING[sid] = {"ready": False, "started_at": time.time()}
         threading.Thread(
@@ -1877,6 +1870,22 @@ def register(app, CONFIG: dict, DATA_DIR: Path) -> None:
             args=(sid, CONFIG, business, scope, state, speech),
             daemon=True,
         ).start()
+
+        deadline = time.time() + 7.0
+        while time.time() < deadline:
+            p = _PENDING.get(sid)
+            if p and p.get("ready"):
+                with _PENDING_LOCK:
+                    _PENDING.pop(sid, None)
+                if p.get("text") and not p.get("error"):
+                    log.info(f"[call {sid[:8]}] fast-path (no filler)")
+                    twiml = _gather(p["text"], action_url="/voice/gather",
+                                    hints=state.get("speech_hints", ""))
+                    return Response(twiml, mimetype="application/xml")
+                break  # error case — fall through to filler path
+            time.sleep(0.1)
+
+        # Still rendering after 7s — play filler + redirect to /voice/wait
         ack_fname = _render_audio("Just one more second...")
         if ack_fname:
             ack_play = f'<Play>{_audio_url(ack_fname)}</Play>'
