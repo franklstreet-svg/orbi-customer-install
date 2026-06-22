@@ -1600,8 +1600,9 @@ def register(app, CONFIG: dict, DATA_DIR: Path) -> None:
         # The LLM call + Kokoro render together routinely take 10-17s on this
         # CPU, which blows past Twilio's ~15s webhook timeout and kills the
         # call. We dispatch both to a background thread, return TwiML that
-        # parks the caller with a tiny <Pause> + <Redirect> to /voice/wait,
-        # and that polling endpoint plays the audio as soon as it's ready.
+        # plays a SHORT filler ack ("Just one more second...") so the caller
+        # hears that we're working, then redirects to /voice/wait which polls
+        # for the result. Each poll is its own 15s webhook budget.
         with _PENDING_LOCK:
             _PENDING[sid] = {"ready": False, "started_at": time.time()}
         threading.Thread(
@@ -1609,10 +1610,15 @@ def register(app, CONFIG: dict, DATA_DIR: Path) -> None:
             args=(sid, CONFIG, business, scope, state, speech),
             daemon=True,
         ).start()
+        ack_fname = _render_audio("Just one more second...")
+        if ack_fname:
+            ack_play = f'<Play>{_audio_url(ack_fname)}</Play>'
+        else:
+            ack_play = '<Say voice="Polly.Joanna">Just one moment.</Say>'
         twiml = (
             '<?xml version="1.0" encoding="UTF-8"?>'
             '<Response>'
-            '<Pause length="1"/>'
+            f'{ack_play}'
             f'<Redirect>/voice/wait?sid={sid}&amp;try=1</Redirect>'
             '</Response>'
         )
@@ -1650,8 +1656,8 @@ def register(app, CONFIG: dict, DATA_DIR: Path) -> None:
             )
             return Response(twiml, mimetype="application/xml")
 
-        # Not ready. Wait another 2s; cap retries so we never loop forever.
-        if try_num >= 8:
+        # Not ready. Cap retries so we never loop forever.
+        if try_num >= 12:
             log.warning(f"[call {sid[:8]}] async render timed out after {try_num} tries")
             with _PENDING_LOCK:
                 _PENDING.pop(sid, None)
@@ -1659,10 +1665,29 @@ def register(app, CONFIG: dict, DATA_DIR: Path) -> None:
                 _hangup("Sorry, I'm running slow right now. Please try me again in a moment."),
                 mimetype="application/xml",
             )
+        # Periodically reassure the caller so they don't think the line went
+        # dead. Phrases come from the warmup cache so they play instantly.
+        if try_num in (3, 7):
+            filler = "Just one more second..."
+        elif try_num == 5:
+            filler = "Sure — anything else?"  # bridge phrase, gentle tone
+            filler = "Just one more second..."
+        else:
+            filler = None
+
+        if filler:
+            fname = _render_audio(filler)
+            if fname:
+                lead = f'<Play>{_audio_url(fname)}</Play>'
+            else:
+                lead = '<Pause length="1"/>'
+        else:
+            lead = '<Pause length="2"/>'
+
         twiml = (
             '<?xml version="1.0" encoding="UTF-8"?>'
             '<Response>'
-            '<Pause length="2"/>'
+            f'{lead}'
             f'<Redirect>/voice/wait?sid={sid}&amp;try={try_num + 1}</Redirect>'
             '</Response>'
         )
