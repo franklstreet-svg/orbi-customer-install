@@ -3116,6 +3116,52 @@ def public_chat():
         except Exception as _e:
             log.warning(f"NAV marker parse failed: {_e}")
 
+    # NAV FALLBACK (added 2026-06-22): the sales-bot LLM (Qwen 72B via
+    # Scaleway) reliably says "Perfect — sending you to the terms page now"
+    # at close-out but routinely drops the <<NAV:...>> marker, leaving the
+    # customer stranded on the chat. Detect close-out phrasing and inject
+    # the right tier URL server-side based on conversation history.
+    if (_sales_nav_request is None
+        and resp and resp.text
+        and any(p in resp.text.lower() for p in (
+            "sending you to the terms",
+            "heading to the terms",
+            "heading to checkout",
+            "off to the terms",
+            "off to checkout",
+            "send you to the terms",
+            "send you to checkout",
+        ))):
+        try:
+            history_text = " ".join(
+                str(m.get("content", "")) for m in messages
+            ).lower()
+            # Infer tier from conversation history. Order matters —
+            # check most-specific first.
+            if "restaurant" in history_text and any(
+                k in history_text for k in ("everything", "all of it", "full stack")
+            ):
+                _tier = "restaurant_mo"
+            elif any(k in history_text for k in (
+                    "everything", "all of it", "all of the above", "the whole thing"
+            )):
+                _tier = "receptionist_mo"  # bundles Base + Receptionist + Website
+            elif "website" in history_text and "phone" not in history_text and "receptionist" not in history_text:
+                _tier = "website_mo"
+            elif "phone" in history_text or "receptionist" in history_text:
+                _tier = "receptionist_mo"
+            elif "marketing" in history_text:
+                _tier = "marketing_mo"
+            elif "restaurant" in history_text:
+                _tier = "restaurant_mo"
+            else:
+                _tier = "base_mo"
+            _sales_nav_request = {"url": f"https://billing.twickell.com/agree/{_tier}"}
+            log.info(f"chat: NAV fallback fired (LLM dropped marker), "
+                     f"inferred tier={_tier}")
+        except Exception as _e:
+            log.warning(f"NAV fallback failed: {_e}")
+
     # LEARNING-LOOP TRIGGER — if Orby's reply reads like "I don't know"
     # AND the visitor was actually asking a question, kick off the
     # learning loop: capture the question for the owner to answer, ask
