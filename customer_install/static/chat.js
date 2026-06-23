@@ -1095,8 +1095,14 @@ _audioEl.src = '/tts?text=%20&silent=1';
     body.textContent = text;
     div.appendChild(body);
 
-    // Tier hint
-    if (opts.tier && opts.tier !== 'brain' && opts.tier !== 'none') {
+    // Tier hint — only show when we're actually degraded. 'phone_llm'
+    // (Scaleway Llama 3.3 70B direct, what chat normally uses) is
+    // healthy; don't flag it as anything. 'huggingface' is the
+    // brain-fallback so 'backup mode'. 'local' means offline.
+    if (opts.tier
+        && opts.tier !== 'brain'
+        && opts.tier !== 'phone_llm'
+        && opts.tier !== 'none') {
       const hint = document.createElement('div');
       hint.className = 'message-tier-hint';
       hint.textContent = opts.tier === 'huggingface' ? '— backup mode —' : '— offline mode —';
@@ -1161,7 +1167,7 @@ _audioEl.src = '/tts?text=%20&silent=1';
   }
 
   function updateConnectionPill(tier) {
-    if (!tier || tier === 'brain') {
+    if (!tier || tier === 'brain' || tier === 'phone_llm') {
       connStatus.className = 'status';
       connStatus.textContent = '● Online';
     } else if (tier === 'huggingface') {

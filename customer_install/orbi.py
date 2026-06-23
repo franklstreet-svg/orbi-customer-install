@@ -3077,6 +3077,31 @@ def public_chat():
     # `<<SCRAPE:url>>` in its reply. Strip it from the user-visible text and
     # forward the URL to the client so chat.js can fire /api/public/sales_scrape.
     _sales_scrape_request = None
+    # SCRAPE FALLBACK (added 2026-06-22): the LLM keeps saying "Cool,
+    # looking at example.com now — give me about a minute" but drops the
+    # <<SCRAPE:...>> marker, so the scrape never fires and the customer
+    # waits forever. Detect the "looking at <url>" phrasing in the LLM
+    # response when no marker is present and synthesize the marker.
+    if (resp and resp.text and "<<SCRAPE:" not in resp.text
+        and any(p in resp.text.lower() for p in (
+            "looking at ", "checking out ", "pulling up ", "give me about a minute",
+            "give me a sec",
+        ))):
+        try:
+            _m = _re.search(
+                r"(?:looking|checking|pulling)[^.?!\n]*?"
+                r"((?:https?://)?[a-z0-9][a-z0-9-]*(?:\.[a-z0-9][a-z0-9-]*)+(?:/[^\s)]*)?)",
+                resp.text, flags=_re.IGNORECASE,
+            )
+            if _m:
+                _u = _m.group(1).strip().rstrip(".,;:!?")
+                if not _u.lower().startswith("http"):
+                    _u = "https://" + _u
+                resp.text = resp.text.rstrip() + f" <<SCRAPE:{_u}>>"
+                log.info(f"chat: SCRAPE fallback fired (LLM dropped marker), url={_u}")
+        except Exception as _e:
+            log.warning(f"SCRAPE fallback failed: {_e}")
+
     if resp and resp.text and "<<SCRAPE:" in resp.text:
         try:
             _m = _re.search(r"<<SCRAPE:\s*(.+?)\s*>>", resp.text)
