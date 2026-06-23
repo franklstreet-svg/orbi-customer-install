@@ -3202,7 +3202,7 @@ def public_chat():
             elif any(k in history_text for k in (
                     "everything", "all of it", "all of the above", "the whole thing"
             )):
-                _tier = "receptionist_mo"  # bundles Base + Receptionist + Website
+                _tier = "full_mo"  # Base + Receptionist + Website Controller
             elif "website" in history_text and "phone" not in history_text and "receptionist" not in history_text:
                 _tier = "website_mo"
             elif "phone" in history_text or "receptionist" in history_text:
