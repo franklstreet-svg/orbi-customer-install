@@ -146,19 +146,15 @@
         if (m.role === 'user' || m.role === 'assistant') addBubble(m.role, m.content);
       });
     }
-    // Auto-enable speaker first; mic waits until the proactive greeting
-    // has finished speaking. This makes the status flow "Speaking..." then
-    // "Listening" — she opens the conversation, instead of sitting in
-    // listen-mode waiting on the visitor.
-    //
-    // Standalone mode skips this — the user clicks the "Talk to Orbi"
-    // launcher, and openPanel() handles the on-toggle in that gesture
-    // context (which is the only way the browser will let her audio play).
+    // Frank 2026-06-23: mic stays OFF by default. Auto-turning mic on
+    // after the greeting failed on iOS anyway (post-await, no gesture)
+    // and confused customers — many don't realize the mic light is
+    // already on. Customer taps the mic icon when they want to talk;
+    // that tap unlocks audio + turns speaker on + starts the mic in
+    // one gesture (see micToggle handler in setupToggles).
     if (IS_EMBED) {
-      setTimeout(async () => {
+      setTimeout(() => {
         if (!prefs.speakerOn) setSpeakerOn(true);
-        await _greetingDone;
-        if (!prefs.micOn) setMicOn(true);
       }, 100);
     }
   });
@@ -270,10 +266,12 @@
     // the proactive greeting.
     _unlockMobileAudio();
     if (!prefs.speakerOn) setSpeakerOn(true);
-    // Mic-on waits for the greeting to finish so status reads
-    // "Speaking..." → "Listening", not the reverse.
-    await _greetingDone;
-    if (!prefs.micOn) setMicOn(true);
+    // Frank 2026-06-23: mic stays OFF on panel open. Customer taps the
+    // mic icon when they want to talk — that tap is the gesture that
+    // also turns on the speaker (already on by default here) and primes
+    // audio. Defaulting mic OFF avoids the confusing "is the mic on
+    // already? do I need to tap it?" UX and gives us the gesture iOS
+    // requires before recording.
   }
 
   // Mobile audio unlock — two-pronged approach:
