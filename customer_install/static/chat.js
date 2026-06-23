@@ -429,7 +429,16 @@ _audioEl.src = '/tts?text=%20&silent=1';
       _unlockMobileAudio();
       const turningOn = !prefs.micOn;
       if (turningOn && !prefs.speakerOn) setSpeakerOn(true);
-      setMicOn(turningOn);
+      // If this is the FIRST mic-on tap in this conversation, deliver
+      // the spoken+typed welcome before turning the mic on. That way
+      // Orby actually GREETS the visitor in her voice (per Frank's
+      // request) instead of sitting there with a canned silent welcome
+      // bubble. Subsequent mic taps don't re-greet.
+      if (turningOn && history.length === 0 && !_welcomeDelivered) {
+        deliverSpokenWelcome().finally(() => setMicOn(true));
+      } else {
+        setMicOn(turningOn);
+      }
     });
     speakerToggle.addEventListener('click', () => {
       _unlockMobileAudio();   // gesture-time unlock
@@ -919,6 +928,43 @@ _audioEl.src = '/tts?text=%20&silent=1';
       interimBubble.remove();
       interimBubble = null;
     }
+  }
+
+  // ------------------------------------------------------------------
+  // Spoken welcome — Frank 2026-06-23. When the user taps the mic for the
+  // first time, Orby greets them out loud + types the same line into the
+  // chat so it appears as her first message. Replaces the old static
+  // "Hi! How can I help?" placeholder bubble that just sat there silently.
+  // ------------------------------------------------------------------
+  let _welcomeDelivered = false;
+  async function deliverSpokenWelcome() {
+    if (_welcomeDelivered) return;
+    _welcomeDelivered = true;
+    const welcomeText = "Hi, welcome to myOrbi. How can I help you today?";
+    // Remove the static placeholder card now that real conversation starts
+    welcomeEl?.remove();
+    // Create the bubble empty, then type characters in while speech plays
+    const div = document.createElement('div');
+    div.className = 'message assistant';
+    const body = document.createElement('div');
+    body.className = 'message-body';
+    div.appendChild(body);
+    chatArea.appendChild(div);
+    chatArea.scrollTop = chatArea.scrollHeight;
+    // Speak in parallel with typing — both kick off now
+    const speechPromise = (prefs.speakerOn ? speak(welcomeText) : Promise.resolve());
+    // Type ~30 chars/sec — slow enough to read along with her voice
+    for (let i = 0; i < welcomeText.length; i++) {
+      body.textContent = welcomeText.slice(0, i + 1);
+      chatArea.scrollTop = chatArea.scrollHeight;
+      await new Promise(r => setTimeout(r, 33));
+    }
+    // Push into chat history so the LLM sees her opening turn and
+    // continues the conversation from there.
+    history.push({ role: 'assistant', content: welcomeText });
+    _saveHistory(history);
+    // Wait for speech to finish (so anti-echo guard works correctly)
+    try { await speechPromise; } catch {}
   }
 
   // ------------------------------------------------------------------
