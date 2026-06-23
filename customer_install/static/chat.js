@@ -1126,13 +1126,16 @@ _audioEl.src = '/tts?text=%20&silent=1';
     body.textContent = text;
     div.appendChild(body);
 
-    // Tier hint — only show when we're actually degraded. 'phone_llm'
-    // (Scaleway Llama 3.3 70B direct, what chat normally uses) is
-    // healthy; don't flag it as anything. 'huggingface' is the
-    // brain-fallback so 'backup mode'. 'local' means offline.
+    // Tier hint — only show when we're ACTUALLY degraded. Healthy tiers:
+    // brain, phone_llm (Scaleway Llama 3.3 70B direct), local (intentional
+    // fast paths like time/date/canned cap_overview), learned (learning
+    // loop hits). Only huggingface counts as "backup mode" (brain fallback).
     if (opts.tier
         && opts.tier !== 'brain'
         && opts.tier !== 'phone_llm'
+        && opts.tier !== 'local'
+        && opts.tier !== 'learned'
+        && opts.tier !== 'learning_loop'
         && opts.tier !== 'none') {
       const hint = document.createElement('div');
       hint.className = 'message-tier-hint';
@@ -1198,15 +1201,17 @@ _audioEl.src = '/tts?text=%20&silent=1';
   }
 
   function updateConnectionPill(tier) {
-    if (!tier || tier === 'brain' || tier === 'phone_llm') {
+    // Frank 2026-06-23: 'local' is an intentional fast path (time, date,
+    // capability overview, etc.) — it's not a failure, so it shouldn't
+    // show as 'Offline mode'. Only flag true degradation (huggingface
+    // fallback) or no-connectivity (none).
+    if (!tier || tier === 'brain' || tier === 'phone_llm' || tier === 'local'
+        || tier === 'learned' || tier === 'learning_loop') {
       connStatus.className = 'status';
       connStatus.textContent = '● Online';
     } else if (tier === 'huggingface') {
       connStatus.className = 'status degraded';
       connStatus.textContent = '● Backup mode';
-    } else if (tier === 'local') {
-      connStatus.className = 'status offline';
-      connStatus.textContent = '● Offline mode';
     } else if (tier === 'none') {
       connStatus.className = 'status offline';
       connStatus.textContent = '● No connection';

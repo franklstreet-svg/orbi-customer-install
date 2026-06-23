@@ -54,11 +54,11 @@ def pre_execute(message: str, data_dir: Path,
     msg_l = msg.lower().rstrip("?!. ")
     business = business or {}
 
-    # ── GREETINGS → direct reply ──────────────────────────────────────
-    if _GREETING_RE.match(msg_l):
-        biz_name = business.get("name", "") or "us"
-        return (f"Hi! Thanks for reaching out to {biz_name}. What can I help with?",
-                "direct")
+    # ── GREETINGS — removed 2026-06-23 per Frank's no-canned-replies policy.
+    # Was returning a canned "Hi! Thanks for reaching out to {biz}..." which
+    # (a) felt robotic on the sales bot, and (b) made the connection pill
+    # show "Offline mode" because tier=local. The compact prompt makes the
+    # LLM fast enough to handle "hi" properly — let it.
 
     # ── TIME / DATE / DAY-OF-WEEK → direct reply ──────────────────────
     if _TIME_RE.search(msg_l):
