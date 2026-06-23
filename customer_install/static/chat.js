@@ -312,8 +312,13 @@
       () => document.body.appendChild(_audioEl), { once: true });
   }
 
+  // Frank 2026-06-23: was single-shot (return early if _audioUnlocked).
+  // iOS routinely re-suspends the AudioContext after a tab switch / idle
+  // window, and the single-shot pattern meant we never re-armed it,
+  // causing the "type 4-5 times to wake her up" flake. Now: run every
+  // gesture, idempotent, cheap. Sets _audioUnlocked true on first
+  // success and starts a heartbeat to prevent iOS re-suspension.
   function _unlockMobileAudio() {
-    if (_audioUnlocked) return;
     try {
       // (1) Persistent <audio> element: prime with silent WAV in the
       // current gesture context. Once this play succeeds, the element
@@ -345,7 +350,27 @@ _audioEl.src = '/tts?text=%20&silent=1';
       }
 
       _audioUnlocked = true;
+      _startAudioHeartbeat();
     } catch {}
+  }
+  // Once the AudioContext is alive, keep it alive with a 1-sample silent
+  // buffer every 3 seconds. iOS treats this as continuous output and
+  // never suspends the session. Prevents "she's silent after I haven't
+  // touched the panel for 30 seconds" — common in voice mode.
+  let _heartbeatTimer = null;
+  function _startAudioHeartbeat() {
+    if (_heartbeatTimer || !_audioCtx) return;
+    _heartbeatTimer = setInterval(() => {
+      const ctx = _audioCtx;
+      if (!ctx || ctx.state !== 'running') return;
+      try {
+        const buf = ctx.createBuffer(1, 1, 22050);
+        const src = ctx.createBufferSource();
+        src.buffer = buf;
+        src.connect(ctx.destination);
+        src.start(0);
+      } catch {}
+    }, 3000);
   }
 
   // Mobile audio gate — Orby's first message (the proactive greeting) is
@@ -400,8 +425,13 @@ _audioEl.src = '/tts?text=%20&silent=1';
     // when the user is turning the toggle OFF, because the next tap to
     // turn it back on still benefits from already-unlocked audio.
     micToggle.addEventListener('click', () => {
-      _unlockMobileAudio();   // gesture-time unlock
-      setMicOn(!prefs.micOn);
+      // Frank 2026-06-23: one tap = full voice conversation. Unlock
+      // audio, force speaker on (else her replies are silent), then
+      // toggle mic. Speaker stays sticky after mic is later turned off.
+      _unlockMobileAudio();
+      const turningOn = !prefs.micOn;
+      if (turningOn && !prefs.speakerOn) setSpeakerOn(true);
+      setMicOn(turningOn);
     });
     speakerToggle.addEventListener('click', () => {
       _unlockMobileAudio();   // gesture-time unlock
@@ -480,6 +510,9 @@ _audioEl.src = '/tts?text=%20&silent=1';
       sendBtn.disabled = !input.value.trim();
     });
     input.addEventListener('keydown', (e) => {
+      // Every keystroke is a user gesture — keep iOS audio session alive
+      // even between Orby's replies in typed-only conversations.
+      try { _unlockMobileAudio(); } catch {}
       if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
         e.preventDefault();
         send(input.value);
