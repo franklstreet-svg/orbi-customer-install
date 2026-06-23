@@ -3116,6 +3116,40 @@ def public_chat():
         except Exception as _e:
             log.warning(f"NAV marker parse failed: {_e}")
 
+    # BUSINESS-NAME-GUESS SCRUB (added 2026-06-22): when the sales bot asks
+    # for the business name (Phase 6), the LLM (Qwen 72B) keeps appending
+    # a hedge guess from the URL — "I see the business is likely X" — even
+    # when the prompt forbids it. Strip these hedge phrases server-side so
+    # the customer is never shown a wrong guess. Detection is conservative:
+    # only fires on the specific hedge patterns we've seen, in messages
+    # that are also asking for the business name.
+    if (resp and resp.text
+        and ("business name" in resp.text.lower() or "biz name" in resp.text.lower())):
+        try:
+            _patterns = [
+                # "I see the business is likely 'X' — is that right?"
+                r"\s*I\s+see\s+(the\s+)?business\s+is\s+[^.?!\n]+[.?!]?",
+                # "maybe something like 'X'"
+                r"\s*,?\s*maybe\s+something\s+like\s+['\"][^'\"]+['\"][^.?!\n]*[.?!]?",
+                # "perhaps 'X'"
+                r"\s*,?\s*perhaps\s+['\"][^'\"]+['\"][^.?!\n]*[.?!]?",
+                # "likely 'X'"
+                r"\s*,?\s*likely\s+['\"][^'\"]+['\"][^.?!\n]*[.?!]?",
+                # ", or does it go by something else"
+                r"\s*,?\s*(or\s+does\s+it\s+go\s+by\s+something\s+else[?.!]?)",
+                # "is it the same as the website"
+                r"\s*(is\s+it\s+(the\s+)?same\s+as\s+(the\s+)?website[^.?!\n]*[.?!]?)",
+            ]
+            _orig = resp.text
+            for _pat in _patterns:
+                resp.text = _re.sub(_pat, "", resp.text, flags=_re.IGNORECASE)
+            # Collapse double spaces / fix trailing punctuation
+            resp.text = _re.sub(r"\s{2,}", " ", resp.text).strip()
+            if resp.text != _orig:
+                log.info("chat: scrubbed business-name hedge from LLM reply")
+        except Exception as _e:
+            log.warning(f"biz-name scrub failed: {_e}")
+
     # NAV FALLBACK (added 2026-06-22): the sales-bot LLM (Qwen 72B via
     # Scaleway) reliably says "Perfect — sending you to the terms page now"
     # at close-out but routinely drops the <<NAV:...>> marker, leaving the
