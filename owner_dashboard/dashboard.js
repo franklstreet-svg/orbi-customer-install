@@ -1639,11 +1639,19 @@
     }
 
     btn.addEventListener('click', () => {
-      // Unlock iOS PWA audio on this click too — voice mode also wants
-      // Orby to speak replies, and the unlock only happens once per
-      // session via a user gesture.
+      // Frank 2026-06-23: tapping Voice = "open a full conversation with
+      // Orby." Always inside the user gesture, do all three things at once:
+      //   1. Unlock iOS audio session (must be in this gesture)
+      //   2. Turn the speaker ON so her replies actually play
+      //   3. Toggle mic mode (the on/off behavior of this button)
+      // Speaker stays sticky after voice mode is later turned off — if
+      // Frank only wanted text + voice in this moment, he can mute the
+      // speaker separately. Not auto-muting on voice-off avoids surprising
+      // typed-chat users who liked the speaker on.
       _unlockAudio();
-      setVoiceMode(!voiceOn);
+      const turningOn = !voiceOn;
+      if (turningOn && !speakRepliesOn) setSpeakReplies(true);
+      setVoiceMode(turningOn);
     });
     stopBtn.addEventListener('click', stopSpeaking);
 
