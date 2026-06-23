@@ -58,6 +58,14 @@ def make_brain_call(config: dict):
     extractor_config["huggingface"] = base_hf
 
     def _call(system: str, messages: list[dict]) -> str:
-        resp = llm_client.generate(extractor_config, system, messages)
+        # channel="extractor" deliberately bypasses the phone_llm tier
+        # (Scaleway/Llama 3.3 70B) that channel="chat" now routes through.
+        # The extractor needs its OWN small, JSON-strict model (Llama 3.1
+        # 8B) — Frank 2026-06-22: scrapes were extracting "Sierra
+        # Construction Source" instead of "Sierra Contractors Source"
+        # because the 70B model was paraphrasing semantically-similar
+        # words. 8B model copies verbatim.
+        resp = llm_client.generate(extractor_config, system, messages,
+                                    channel="extractor")
         return (resp.text or "").strip()
     return _call
