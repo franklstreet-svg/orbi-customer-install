@@ -318,11 +318,72 @@ Be concise. 2-4 sentences per turn typical, longer only when explaining real mat
 
 
 def _build_chat_sales_brief(business: dict) -> str:
-    """The compact (~6-8KB) chat sales prompt. Replaces the 72KB / 18k-token
-    legacy prompt for the myOrbi sales bot on the chat widget. Purpose-built
-    around the phase-ordering rules + concrete examples so Qwen 72B can
-    actually follow them."""
-    return _CHAT_SALES_BRIEF_TEMPLATE
+    """The compact (~6-8KB) chat sales prompt for the myOrbi sales bot.
+    Replaces the 72KB / 18k-token legacy prompt — purpose-built around the
+    phase-ordering rules + concrete examples so Qwen 72B can actually
+    follow them.
+
+    Frank 2026-06-23: when the bot has scraped a prospect's website, append
+    the structured prospect record + raw scraped text so the bot can answer
+    follow-up questions ("what else do you know about Sierra Contractors
+    Source?") with real facts instead of "I'm not sure."
+    """
+    brief = _CHAT_SALES_BRIEF_TEMPLATE
+    prospect = business.get("_prospect_business") or {}
+    if not prospect:
+        return brief
+
+    # Build a compact "what I know about the prospect" block that's tucked
+    # at the END of the brief (so it overrides everything else as the
+    # most recent context). Limit each field's size — we don't want to
+    # blow the prompt back up to 18k tokens.
+    lines = ["", "═══ WHAT YOU LEARNED ABOUT THE PROSPECT (from website scrape) ═══",
+             "Use this to answer follow-up questions about their business.",
+             "Quote VERBATIM from this data — do NOT paraphrase, do NOT invent."]
+    if prospect.get("name"):
+        lines.append(f"  Business name: {prospect['name']}")
+    if prospect.get("tagline"):
+        lines.append(f"  Tagline: {prospect['tagline']}")
+    if prospect.get("description"):
+        lines.append(f"  Description: {str(prospect['description'])[:400]}")
+    addr = prospect.get("address") or {}
+    if isinstance(addr, dict):
+        addr_parts = [addr.get("street"), addr.get("city"),
+                       addr.get("state"), addr.get("zip")]
+        addr_str = ", ".join(p for p in addr_parts if p)
+        if addr_str:
+            lines.append(f"  Address: {addr_str}")
+    contact = prospect.get("contact") or {}
+    if isinstance(contact, dict):
+        if contact.get("phone"):
+            lines.append(f"  Phone: {contact['phone']}")
+        if contact.get("email"):
+            lines.append(f"  Email: {contact['email']}")
+    if prospect.get("hours"):
+        lines.append(f"  Hours: {str(prospect['hours'])[:200]}")
+    services = prospect.get("services") or []
+    if isinstance(services, list) and services:
+        svc_lines = []
+        for s in services[:10]:
+            if isinstance(s, dict) and s.get("name"):
+                svc_lines.append(f"    - {s['name']}"
+                                  f"{(': ' + s['description']) if s.get('description') else ''}")
+        if svc_lines:
+            lines.append("  Services / products:")
+            lines.extend(svc_lines)
+    owner = prospect.get("owner") or {}
+    if isinstance(owner, dict) and owner.get("name"):
+        lines.append(f"  Owner: {owner.get('name')}"
+                     f"{(' (' + owner.get('role') + ')') if owner.get('role') else ''}")
+    # Tail with the raw scraped text capped, so the LLM can fall back to
+    # quote-pulling from page content for things the structured fields
+    # missed.
+    raw_pages = (prospect.get("_scraped_pages_text") or "").strip()
+    if raw_pages:
+        lines.append("")
+        lines.append("  RAW WEBSITE TEXT (search this if the structured fields above don't cover the question):")
+        lines.append(raw_pages[:6000])
+    return brief + "\n".join(lines) + "\n"
 
 
 def build_public_prompt(business: dict, scope: dict | None = None,
