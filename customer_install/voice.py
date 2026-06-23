@@ -1007,9 +1007,12 @@ _CANNED_SALES_REPLIES: list[tuple[tuple[str, ...], str]] = [
          "extra seat", "extra user", "more than one user", "more than one person",
          "how many seats", "how many people", "team", "for my whole team",
          "for my team", "for everyone", "second computer", "another computer"),
-        "One seat means one Orbi brain on one main computer plus up to two "
-        "linked devices — your phone, a tablet, whatever. Each extra seat is "
-        "twenty-nine ninety-nine a month. How many seats do you need?",
+        "One seat means one login plus up to two linked devices — your phone, "
+        "a tablet, whatever. Your whole team shares one business memory "
+        "folder for services, hours, and customer history, but each user "
+        "gets their own private folder for calendar, drafts, and personal "
+        "data. Each extra seat is twenty-nine ninety-nine a month. How many "
+        "seats do you need?",
     ),
     # Generic pricing — cover the contractions AND the spelled-out forms STT
     # may emit. Module-specific entries above must catch their case first.
