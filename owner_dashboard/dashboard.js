@@ -1321,9 +1321,12 @@
   // Separate from voiceOn — owner can have Orby READ HER REPLIES aloud
   // without turning on mic listening. Persisted in localStorage so it
   // stays on across sessions.
+  // Default ON. Frank 2026-06-23: PurBlum's embed widget defaults speaker
+  // ON and customers expect the dashboard chat to behave the same way.
+  // Only treat a saved '0' as off; missing/anything-else = on.
   let speakRepliesOn = (function() {
-    try { return localStorage.getItem('orbi_speak_replies') === '1'; }
-    catch { return false; }
+    try { return localStorage.getItem('orbi_speak_replies') !== '0'; }
+    catch { return true; }
   })();
   // One-time banner suggesting Chrome on iOS Safari users. Apple's
   // standalone PWA audio sandbox blocks Orby's voice; Chrome's shortcut
