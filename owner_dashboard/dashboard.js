@@ -757,6 +757,12 @@
     ownerChatHistory.push({ role: 'user', content: text });
     input.value = ''; input.style.height = 'auto';
     send.disabled = true;
+    // Frank 2026-06-23: prime the audio session synchronously inside the
+    // gesture that triggered this send (Send-button click, Enter key, or
+    // voice-mode auto-click from speech recognition). Guarantees the
+    // AudioContext is resumed BEFORE the LLM fetch returns, so the very
+    // first reply has voice.
+    try { _unlockAudio(); } catch {}
 
     state.hidden = false;
     state.className = 'owner-chat-state-bar thinking';
@@ -1475,6 +1481,29 @@
     try { _audioCtx = new AC(); } catch { return null; }
     return _audioCtx;
   }
+  // Frank 2026-06-23: in voice mode there are no keystrokes, so the
+  // _keepAudioPrimed gesture listeners never fire between Orby's replies.
+  // iOS suspends the AudioContext after ~10s of silence, and the next
+  // reply lands on a suspended context with no fresh gesture to revive
+  // it. Heartbeat: once the context has been resumed by a real gesture,
+  // play a 1-sample silent buffer every 3 seconds. iOS treats this as
+  // continuous output and keeps the context 'running' for the whole
+  // session. Cost: ~0.0001ms of CPU and zero audible output.
+  let _heartbeatTimer = null;
+  function _startAudioHeartbeat() {
+    if (_heartbeatTimer || !_audioCtx) return;
+    _heartbeatTimer = setInterval(() => {
+      const ctx = _audioCtx;
+      if (!ctx || ctx.state !== 'running') return;
+      try {
+        const buf = ctx.createBuffer(1, 1, 22050);
+        const src = ctx.createBufferSource();
+        src.buffer = buf;
+        src.connect(ctx.destination);
+        src.start(0);
+      } catch {}
+    }, 3000);
+  }
   function _unlockAudio() {
     // Resume the AudioContext inside the user gesture. Once resumed, it
     // stays "running" for the whole session and we can play arbitrary
@@ -1483,9 +1512,10 @@
     // PWA-compatible way to autoplay chat replies.
     const ctx = _ensureAudioCtx();
     if (ctx && ctx.state === 'suspended') {
-      ctx.resume().then(() => { _audioUnlocked = true; }).catch(() => {});
+      ctx.resume().then(() => { _audioUnlocked = true; _startAudioHeartbeat(); }).catch(() => {});
     } else if (ctx) {
       _audioUnlocked = true;
+      _startAudioHeartbeat();
     }
     // Also play a silent WAV via plain <audio> as a belt-and-suspenders
     // unlock — some browsers prefer one path or the other.
