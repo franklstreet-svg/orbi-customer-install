@@ -261,7 +261,7 @@ body.fullpage-chat .orbi-panel.embed-mode {
   background: transparent;
   border: 1px solid transparent;
   color: var(--text-dim);
-  width: 36px; height: 36px;
+  width: 48px; height: 48px;
   border-radius: 50%;
   cursor: pointer;
   display: flex;
@@ -269,6 +269,10 @@ body.fullpage-chat .orbi-panel.embed-mode {
   justify-content: center;
   font-family: inherit;
   transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+.toggle-btn svg, .icon-btn svg {
+  width: 28px;
+  height: 28px;
 }
 .toggle-btn:hover, .icon-btn:hover {
   background: var(--bg-card-2);
@@ -286,11 +290,13 @@ body.fullpage-chat .orbi-panel.embed-mode {
 .toggle-btn[aria-pressed="true"] .icon-speaker-off { display: none; }
 .toggle-btn[aria-pressed="true"] .icon-mic-on,
 .toggle-btn[aria-pressed="true"] .icon-speaker-on  { display: block; }
-/* Special: mic shows pulsing red when actively listening */
+/* Frank 2026-06-23: brand teal instead of red. Red reads as 'stop' —
+   the mic-is-listening state is GOOD (she's hearing you), so a friendly
+   teal pulse matches the myOrbi brand and the favicon. */
 .toggle-btn#mic-toggle.listening {
-  background: rgba(255,85,85,0.18);
-  color: var(--danger);
-  border-color: rgba(255,85,85,0.4);
+  background: rgba(15,185,177,0.18);
+  color: #2dd4bf;
+  border-color: rgba(15,185,177,0.55);
   animation: micPulse 1.6s infinite ease-in-out;
 }
 .toggle-btn#mic-toggle.muted-while-speaking {
@@ -299,8 +305,8 @@ body.fullpage-chat .orbi-panel.embed-mode {
   border-color: rgba(255,195,107,0.4);
 }
 @keyframes micPulse {
-  0%, 100% { box-shadow: 0 0 0 0 rgba(255,85,85,0.4); }
-  50%      { box-shadow: 0 0 0 8px rgba(255,85,85,0); }
+  0%, 100% { box-shadow: 0 0 0 0 rgba(15,185,177,0.5); }
+  50%      { box-shadow: 0 0 0 10px rgba(15,185,177,0); }
 }
 
 /* --------------------------------------------------------------
@@ -314,7 +320,7 @@ body.fullpage-chat .orbi-panel.embed-mode {
   color: var(--text-soft);
   border-bottom: 1px solid var(--border);
 }
-.orbi-state-bar.listening { background: rgba(255,85,85,0.08); color: #ffb0b0; }
+.orbi-state-bar.listening { background: rgba(15,185,177,0.10); color: #5eead4; }
 .orbi-state-bar.thinking  { background: rgba(139,92,246,0.10); color: #c4b3ff; }
 .orbi-state-bar.speaking  { background: rgba(79,140,255,0.10); color: #8eb6ff; }
 
