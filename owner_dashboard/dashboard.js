@@ -1444,16 +1444,20 @@
   // browsers require an active user gesture before any audio plays;
   // this guarantees that gesture happens early no matter what the
   // user actually clicks.
-  function _unlockOnFirstGesture() {
-    const handler = () => {
-      _unlockAudio();
-      document.removeEventListener('click', handler, { capture: true });
-      document.removeEventListener('touchstart', handler, { capture: true });
-    };
-    document.addEventListener('click', handler, { capture: true });
-    document.addEventListener('touchstart', handler, { capture: true });
+  // Frank 2026-06-23: flake fix. Was removing the listener after the first
+  // tap, which broke after iOS suspended the AudioContext (tab switch,
+  // backgrounding, idle). Subsequent gestures had no rehook, so Orby went
+  // silent until enough button toggles accidentally tripped a different
+  // code path. Now: every user gesture re-runs _unlockAudio (idempotent,
+  // cheap — silent WAV + ctx.resume()). Keeps the session armed for the
+  // life of the page.
+  function _keepAudioPrimed() {
+    const handler = () => { try { _unlockAudio(); } catch {} };
+    document.addEventListener('click', handler, { capture: true, passive: true });
+    document.addEventListener('touchstart', handler, { capture: true, passive: true });
+    document.addEventListener('keydown', handler, { capture: true, passive: true });
   }
-  _unlockOnFirstGesture();
+  _keepAudioPrimed();
   // Mobile browsers (iOS Safari AND iOS Chrome AND Android Chrome) all
   // require a user gesture to unlock audio playback for the session.
   // Without the unlock, the first Audio().play() in a fetch callback
@@ -1778,6 +1782,13 @@
     // from any callback — including fetch responses like /tts replies.
     // This is the ONLY reliable autoplay path on iOS Chrome PWA.
     const ctx = _ensureAudioCtx();
+    // If iOS suspended the context between the last gesture and now,
+    // try a non-gesture resume. It frequently succeeds when the user's
+    // tap on Send is still inside the browser's "recent activation"
+    // window. Costs nothing if it fails — we fall through to Strategy 2.
+    if (ctx && ctx.state === 'suspended') {
+      try { await ctx.resume(); } catch {}
+    }
     if (ctx && ctx.state === 'running') {
       try {
         const res = await fetch(url);
