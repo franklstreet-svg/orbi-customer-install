@@ -3901,7 +3901,9 @@
     nextBtn.textContent = s.nextLabel || "Next →";
     nextBtn.disabled = false;
     document.getElementById('wiz-back-btn').hidden = (s.showBack === false) || i === 0;
-    document.getElementById('wiz-skip-btn').hidden = !s.showSkip;
+    // Skip button: default to VISIBLE on every screen — Frank 2026-06-23.
+    // A screen can opt out by explicitly setting showSkip: false.
+    document.getElementById('wiz-skip-btn').hidden = s.showSkip === false;
     if (s.onShow) {
       try { await s.onShow(); } catch (e) { console.warn(e); }
     }
