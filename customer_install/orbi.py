@@ -3063,6 +3063,37 @@ def public_chat():
                           "above.")
         system = system + "\n" + "\n".join(pin_lines)
 
+    # Inline helper used by the NAV fallback below to extract customer
+    # info (name, email, phone, biz, seats) from the conversation history's
+    # recap message. terms.html accepts these as query params and pre-fills
+    # the acceptance record so the customer doesn't have to retype.
+    def _extract_customer_params_from_history(msgs):
+        import re as _re_local
+        params = {}
+        full_text = "\n".join(str(m.get("content", "")) for m in msgs)
+        recap_match = _re_local.search(
+            r"([A-Z][A-Za-z'\-]+(?:\s+[A-Z][A-Za-z'\-]+)?)\s+at\s+"
+            r"([A-Za-z0-9'&,\-\s]+?),\s+"
+            r"([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}),\s+"
+            r"([0-9\-\(\)\s\+]{10,20}),\s+"
+            r"(\d{1,3})\s*seats?",
+            full_text,
+        )
+        if recap_match:
+            params["name"] = recap_match.group(1).strip()
+            params["biz"] = recap_match.group(2).strip().rstrip(",.")
+            params["email"] = recap_match.group(3).strip()
+            params["phone"] = recap_match.group(4).strip()
+            params["seats"] = recap_match.group(5).strip()
+            return params
+        em = _re_local.search(r"([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})", full_text)
+        if em:
+            params["email"] = em.group(1)
+        ph = _re_local.search(r"\b(\d{3}[-.\s]?\d{3}[-.\s]?\d{4})\b", full_text)
+        if ph:
+            params["phone"] = ph.group(1)
+        return params
+
     resp = llm_client.generate(CONFIG, system, messages)
     # Auto-retry once when LLM came back empty — handles HuggingFace
     # transient timeouts. Without this, visitors hit "I'm having
@@ -3126,14 +3157,51 @@ def public_chat():
             _m = _re.search(r"<<NAV:\s*(.+?)\s*>>", resp.text)
             if _m:
                 _nav_url = _m.group(1).strip()
-                # Light validation: must be HTTPS and on our own domains
-                # (billing.twickell.com or twickell.com proper) so a
-                # confused LLM can't redirect visitors off-site.
                 _ok_hosts = (
                     "https://billing.twickell.com/",
                     "https://twickell.com/",
                 )
                 if any(_nav_url.startswith(h) for h in _ok_hosts):
+                    # REWRITE: Frank explicitly wants the chat NAV destination
+                    # to be twickell.com/terms (the polished marketing-styled
+                    # Terms of Service page), NOT billing.twickell.com/agree
+                    # (the plain billing-side template). If the LLM emitted
+                    # an /agree URL, rewrite to /terms?tier=<key> + customer
+                    # info from history so terms.html can pre-fill the
+                    # acceptance form.
+                    _agree_m = _re.match(
+                        r"https://billing\.twickell\.com/agree/([a-z_]+)",
+                        _nav_url,
+                    )
+                    if _agree_m:
+                        _tier_key = _agree_m.group(1)
+                        try:
+                            _customer_params = _extract_customer_params_from_history(messages)
+                        except Exception:
+                            _customer_params = {}
+                        # SAFETY UPGRADE: if the LLM picked receptionist_mo
+                        # but the conversation history shows Website Controller
+                        # was pitched (Base + Receptionist + Website), upgrade
+                        # to full_mo so the customer is charged for the bundle
+                        # they actually agreed to.
+                        if _tier_key in ("receptionist_mo", "receptionist_yr"):
+                            _history_text = " ".join(
+                                str(m.get("content", "")) for m in messages
+                            ).lower()
+                            if ("website controller" in _history_text
+                                or "+ website" in _history_text
+                                or "and website" in _history_text
+                                or "everything" in _history_text
+                                or "all of it" in _history_text):
+                                _new = "full_yr" if _tier_key.endswith("_yr") else "full_mo"
+                                log.info(f"chat: NAV tier upgrade "
+                                         f"{_tier_key} -> {_new} (bundle includes Website)")
+                                _tier_key = _new
+                        from urllib.parse import urlencode
+                        _qs = urlencode({"tier": _tier_key, **_customer_params})
+                        _nav_url = f"https://twickell.com/terms?{_qs}"
+                        log.info(f"chat: rewrote NAV {_agree_m.group(0)} -> "
+                                  f"twickell.com/terms?tier={_tier_key}")
                     _sales_nav_request = {"url": _nav_url}
                 resp.text = _re.sub(
                     r"\s*<<NAV:\s*.+?\s*>>\s*", " ", resp.text
@@ -3213,9 +3281,24 @@ def public_chat():
                 _tier = "restaurant_mo"
             else:
                 _tier = "base_mo"
-            _sales_nav_request = {"url": f"https://billing.twickell.com/agree/{_tier}"}
+            # Send the customer to twickell.com/terms (the polished Terms of
+            # Service page) with the tier + customer info as query params.
+            # terms.html already knows how to read these, show the Accept
+            # button, and forward to billing.twickell.com/agree-finalize
+            # (which records acceptance and proceeds to Stripe checkout).
+            # Frank 2026-06-22: explicitly wants the destination to be the
+            # twickell-styled /terms page, NOT the plain billing.twickell.com
+            # /agree page.
+            try:
+                _customer_params = _extract_customer_params_from_history(messages)
+            except Exception:
+                _customer_params = {}
+            from urllib.parse import urlencode
+            _qs = urlencode({"tier": _tier, **_customer_params})
+            _sales_nav_request = {"url": f"https://twickell.com/terms?{_qs}"}
             log.info(f"chat: NAV fallback fired (LLM dropped marker), "
-                     f"inferred tier={_tier}")
+                     f"inferred tier={_tier}, "
+                     f"customer_params={list(_customer_params.keys())}")
         except Exception as _e:
             log.warning(f"NAV fallback failed: {_e}")
 
