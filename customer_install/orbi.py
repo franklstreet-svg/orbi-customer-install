@@ -5667,6 +5667,14 @@ def owner_chat():
     contact_note_resp = _try_contact_personal_note(user_msg, user_dir)
     if contact_note_resp is not None:
         return jsonify(contact_note_resp)
+    # Business info updates — phone/address/hours/add-service. Was getting
+    # routed through calendar_reschedule due to 'change my' prefix.
+    biz_update_resp = _try_business_info_update(user_msg)
+    if biz_update_resp is not None:
+        audit.log_event(DATA_DIR, actor=username,
+                        action="business_info.update_via_chat",
+                        meta={"source": biz_update_resp.get("source", "")})
+        return jsonify(biz_update_resp)
 
     # Calendar CANCEL — "cancel my Tuesday appointment" — actually
     # removes the event from the calendar (was returning fake "done" via
@@ -10137,9 +10145,37 @@ _DELETE_TASK_RE = _re.compile(
 _RESCHEDULE_APPT_RE = _re.compile(
     r"^\s*(?:reschedule|move|shift|change|push)\s+"
     r"(?:my\s+|the\s+)?"
+    # Frank 2026-06-24: negative lookahead — 'change my hours' / 'change
+    # my Monday hours' / 'change the business phone' was getting routed
+    # to calendar reschedule. These belong on business info updates, not
+    # the calendar. Same defensive pattern we used on _CANCEL_APPT_RE.
+    r"(?!(?:\w+\s+)?(?:hours?|address|phone|email|website|service|services|tagline|description|business\b))"
     r"(?P<what>.+?)"
     r"\s+(?:from\s+(?P<from_when>[^,]+?)\s+)?"
     r"(?:to|until|for)\s+(?P<to_when>.+?)\s*[.?!]?\s*$",
+    _re.IGNORECASE,
+)
+# Frank 2026-06-24: explicit business info update intents. Was no fast
+# path → "change my hours" / "change the business phone" hit calendar
+# reschedule and returned a confused "I don't see an appointment" reply.
+_BIZ_INFO_UPDATE_PHONE_RE = _re.compile(
+    r"^\s*(?:change|update|set)\s+(?:the\s+|my\s+)?(?:business\s+)?phone\s+"
+    r"(?:number\s+)?to\s+(?P<value>.+?)\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+_BIZ_INFO_UPDATE_ADDRESS_RE = _re.compile(
+    r"^\s*(?:change|update|set)\s+(?:the\s+|my\s+)?(?:business\s+)?address\s+"
+    r"to\s+(?P<value>.+?)\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+_BIZ_INFO_UPDATE_HOURS_RE = _re.compile(
+    r"^\s*(?:change|update|set)\s+(?:the\s+|my\s+)?"
+    r"(?P<day>monday|tuesday|wednesday|thursday|friday|saturday|sunday|all)?\s*hours\s+"
+    r"to\s+(?P<value>.+?)\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+_BIZ_INFO_ADD_SERVICE_RE = _re.compile(
+    r"^\s*add\s+(?P<value>.+?)\s+to\s+(?:my\s+|the\s+)?services?\s*[?.!]?\s*$",
     _re.IGNORECASE,
 )
 _DAY_HINT_RE = _re.compile(
@@ -10214,6 +10250,135 @@ def _event_display(e: dict) -> str:
     except (ValueError, OSError):
         when = start
     return f"{title} ({when})"
+
+
+def _parse_hours_phrase(phrase: str) -> dict | None:
+    """Frank 2026-06-24: parse '9am to 5pm' / '8-6' / '9 to 5' / 'closed'
+    into the {open, close, closed} schema the business profile uses."""
+    if not phrase:
+        return None
+    p = phrase.strip().lower().rstrip(".!?")
+    if p in ("closed", "shut", "off"):
+        return {"open": "", "close": "", "closed": True}
+    # Normalize separators
+    p = p.replace(" through ", " to ").replace(" - ", " to ").replace("-", " to ")
+    parts = [s.strip() for s in p.split(" to ", 1)]
+    if len(parts) != 2:
+        return None
+
+    def _to_24h(tok: str) -> str | None:
+        tok = tok.strip().lower().replace(".", "")
+        # noon/midnight
+        if tok == "noon":
+            return "12:00"
+        if tok == "midnight":
+            return "00:00"
+        # Strip "am"/"pm" suffix
+        m = _re.match(r"^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$", tok)
+        if not m:
+            return None
+        hour = int(m.group(1))
+        minute = int(m.group(2) or 0)
+        suffix = m.group(3) or ""
+        if suffix == "pm" and hour < 12:
+            hour += 12
+        if suffix == "am" and hour == 12:
+            hour = 0
+        if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+            return None
+        return f"{hour:02d}:{minute:02d}"
+
+    open_ = _to_24h(parts[0])
+    close_ = _to_24h(parts[1])
+    if not open_ or not close_:
+        return None
+    return {"open": open_, "close": close_, "closed": False}
+
+
+def _try_business_info_update(message: str) -> dict | None:
+    """Frank 2026-06-24: explicit business-info update fast paths. Was
+    routing 'change my hours to 9-5' / 'change the business phone to X'
+    through calendar_reschedule which returned 'I don't see an
+    appointment matching business phone' (confusing). Now lands cleanly
+    on mod_business.save with proper field updates."""
+    stripped = _strip_polite_prefix(message or "")
+
+    # Phone update
+    m = _BIZ_INFO_UPDATE_PHONE_RE.match(stripped)
+    if m:
+        value = (m.group("value") or "").strip().rstrip(".!?")
+        if value:
+            biz = mod_business.load(DATA_DIR)
+            contact = (biz.get("contact") or {})
+            contact["phone"] = value
+            biz["contact"] = contact
+            mod_business.save(DATA_DIR, biz)
+            return {"reply": f"✓ Updated business phone to {value}.",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "biz_info_update_phone"}
+
+    # Address update
+    m = _BIZ_INFO_UPDATE_ADDRESS_RE.match(stripped)
+    if m:
+        value = (m.group("value") or "").strip().rstrip(".!?")
+        if value:
+            biz = mod_business.load(DATA_DIR)
+            addr = (biz.get("address") or {})
+            addr["street"] = value
+            biz["address"] = addr
+            mod_business.save(DATA_DIR, biz)
+            return {"reply": f"✓ Updated business address to {value}.",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "biz_info_update_address"}
+
+    # Hours update — single day or "all". Hours stored as
+    # {open: "HH:MM", close: "HH:MM", closed: bool} so we parse the
+    # natural-language value into that schema.
+    m = _BIZ_INFO_UPDATE_HOURS_RE.match(stripped)
+    if m:
+        day = (m.group("day") or "").strip().lower()
+        value = (m.group("value") or "").strip().rstrip(".!?")
+        if value:
+            biz = mod_business.load(DATA_DIR)
+            hours = (biz.get("hours") or {})
+            days_to_update = ([day] if day and day != "all"
+                              else ["monday", "tuesday", "wednesday",
+                                    "thursday", "friday", "saturday", "sunday"])
+            entry = _parse_hours_phrase(value)
+            if not entry:
+                return {"reply": (f"I couldn't parse \"{value}\" as hours. "
+                                  f"Try '9am to 5pm' or '8-6' or 'closed'."),
+                        "tier": "local", "latency_ms": 0,
+                        "source": "biz_info_hours_parse_fail"}
+            for d in days_to_update:
+                hours[d] = entry
+            biz["hours"] = hours
+            mod_business.save(DATA_DIR, biz)
+            label = day.title() if day and day != "all" else "all days"
+            return {"reply": f"✓ Updated {label} hours to {value}.",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "biz_info_update_hours"}
+
+    # Add service
+    m = _BIZ_INFO_ADD_SERVICE_RE.match(stripped)
+    if m:
+        value = (m.group("value") or "").strip().rstrip(".!?")
+        if value:
+            biz = mod_business.load(DATA_DIR)
+            services = biz.get("services") or []
+            if any(value.lower() == (s.get("name", "") or "").lower()
+                   for s in services if isinstance(s, dict)):
+                return {"reply": f"You already have \"{value}\" in your services.",
+                        "tier": "local", "latency_ms": 0,
+                        "source": "biz_info_service_dup"}
+            services.append({"name": value, "description": "", "price": ""})
+            biz["services"] = services
+            mod_business.save(DATA_DIR, biz)
+            return {"reply": f"✓ Added \"{value}\" to your services.",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "biz_info_add_service"}
+
+    return None
 
 
 def _try_contact_personal_note(message: str, user_dir) -> dict | None:
