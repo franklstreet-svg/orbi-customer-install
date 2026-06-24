@@ -5459,6 +5459,15 @@ def owner_chat():
     history  = data.get("history") or []
     if not user_msg:
         return jsonify({"error": "empty message"}), 400
+    # Frank 2026-06-24: strip outer wrapping quotes so the verb-anchored
+    # fast-path regexes ("^schedule", "^remind") still fire when the user
+    # pasted the message in quotes ("Schedule a haircut Friday at 10am"
+    # was bypassing every fast-path because of the leading "). Handles
+    # straight + curly quotes on both ends.
+    for ql, qr in (('"', '"'), ("'", "'"), ('“', '”'), ('‘', '’')):
+        if user_msg.startswith(ql) and user_msg.endswith(qr) and len(user_msg) > 2:
+            user_msg = user_msg[1:-1].strip()
+            break
 
     # Mark owner as active so the friend-checkin scheduler doesn't ping them
     # mid-conversation.
