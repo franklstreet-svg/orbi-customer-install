@@ -5661,6 +5661,12 @@ def owner_chat():
     task_del_resp = _try_delete_task(user_msg, user_dir)
     if task_del_resp is not None:
         return jsonify(task_del_resp)
+    # Contact personal-note append — must come BEFORE file_fetch, which was
+    # picking up "Lisa Chen prefers email over phone" as a search for files
+    # named "over phone".
+    contact_note_resp = _try_contact_personal_note(user_msg, user_dir)
+    if contact_note_resp is not None:
+        return jsonify(contact_note_resp)
 
     # Calendar CANCEL — "cancel my Tuesday appointment" — actually
     # removes the event from the calendar (was returning fake "done" via
@@ -10111,6 +10117,17 @@ _DELETE_CONTACT_RE = _re.compile(
     r"(?P<name>.+?)\s*[?.!]?\s*$",
     _re.IGNORECASE,
 )
+# Frank 2026-06-23: append a personal note to a contact's record.
+# "Lisa Chen prefers email" / "Bob likes oat milk" / "Joe Maxwell hates
+# being called after 8pm" — captures a preference statement about a known
+# contact, routes to mod_contacts.append_personal_note.
+_CONTACT_PERSONAL_NOTE_RE = _re.compile(
+    r"^\s*(?P<name>[A-Z][A-Za-z'\-]+(?:\s+[A-Z][A-Za-z'\-]+){0,2})\s+"
+    r"(?:prefers?|likes?|loves?|hates?|wants?|needs?|always|never|usually|"
+    r"can'?t|cannot|won'?t|will\s+not|doesn'?t|does\s+not|is|has)\s+"
+    r"(?P<rest>.+?)\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
 _DELETE_TASK_RE = _re.compile(
     r"^\s*(?:delete|remove|drop|cancel)\s+(?:the\s+|my\s+)?"
     r"(?:task|todo|reminder)\s+(?:to\s+|about\s+|for\s+|called\s+|named\s+)?"
@@ -10197,6 +10214,39 @@ def _event_display(e: dict) -> str:
     except (ValueError, OSError):
         when = start
     return f"{title} ({when})"
+
+
+def _try_contact_personal_note(message: str, user_dir) -> dict | None:
+    """Frank 2026-06-23: 'Lisa Chen prefers email over phone' / 'Bob likes
+    oat milk' → append to that contact's personal_notes if the name matches
+    a known contact. If no contact match, return None so the message
+    falls through to the memory fast path."""
+    stripped = _strip_polite_prefix(message or "")
+    m = _CONTACT_PERSONAL_NOTE_RE.match(stripped)
+    if not m:
+        return None
+    name = (m.group("name") or "").strip()
+    rest = (m.group("rest") or "").strip()
+    if not name or not rest:
+        return None
+    contact = mod_contacts.find_by_name(user_dir, name)
+    if not contact:
+        return None  # Fall through — memory fast path will catch via "remember that"
+    # Save the FULL statement minus the contact's name as the note. Including
+    # the verb ('prefers', 'likes', 'hates') is critical — 'oat milk' alone is
+    # ambiguous; 'likes oat milk' / 'hates oat milk' is useful.
+    name_len = len(m.group("name"))
+    note_text = stripped[name_len:].strip().rstrip(".!?")
+    if not note_text:
+        note_text = rest
+    try:
+        mod_contacts.append_personal_note(user_dir, contact["id"], note_text)
+        return {"reply": f"Got it — noted on {contact.get('name','?')}'s record: \"{note_text[:120]}\"",
+                "tier": "local", "latency_ms": 0,
+                "source": "contact_personal_note_done"}
+    except Exception as e:
+        log.warning(f"append_personal_note failed: {e}")
+        return None
 
 
 def _try_delete_contact(message: str, user_dir) -> dict | None:
