@@ -95,8 +95,26 @@ _TASK_SIMPLE_RE = re.compile(
 )
 
 _APPT_RE = re.compile(
-    r"^(?:appointment|meeting|event|book|schedule)\s+(.+?)\s+"
+    r"^(?:appointment|meeting|event|book|schedule|"
+    # Frank 2026-06-23: extended so "lunch with Sam Friday at noon",
+    # "dinner Wednesday at 7pm", "coffee with Mike Mon 9am", "block off
+    # Thursday for vacation", "call Bill tomorrow at 3pm" all classify
+    # as calendar entries (previously fell through to quick-note).
+    r"lunch|dinner|breakfast|coffee|drinks|"
+    r"call|meeting|"
+    r"block\s+off)\s+(.+?)\s+"
     r"(?:on\s+|at\s+|for\s+)(.+)$",
+    re.IGNORECASE,
+)
+
+# Frank 2026-06-23: separate pattern for the "block off all day X" /
+# "block off X for vacation" all-day form, which doesn't have an "at <time>"
+# clause. Captured as an all-day calendar event.
+_BLOCK_OFF_ALLDAY_RE = re.compile(
+    r"^block\s+off\s+(?:all\s+day\s+)?"
+    r"(?P<day>monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
+    r"tomorrow|today|next\s+\w+)"
+    r"(?:\s+(?:for|to)\s+(?P<reason>.+))?$",
     re.IGNORECASE,
 )
 
@@ -173,6 +191,17 @@ def capture(user_dir: Path, text: str) -> dict:
         item = mod_reminders.add(user_dir, body, due_iso)
         return {"kind": "reminder", "item": item,
                 "summary": f"Reminder set: \"{item['text']}\" for {_iso_to_local_display(due_iso)}"}
+
+    # Try ALL-DAY BLOCK ("block off Thursday for vacation")
+    m = _BLOCK_OFF_ALLDAY_RE.match(text)
+    if m:
+        day_phrase = m.group("day").strip().lower()
+        reason = (m.group("reason") or "").strip() or "blocked"
+        start_iso = _parse_when(day_phrase) or _default_tomorrow_9am()
+        title = f"{reason}" if reason != "blocked" else "blocked off"
+        item = mod_calendar.add(user_dir, title, start_iso, all_day=True)
+        return {"kind": "calendar", "item": item,
+                "summary": f"Added to your calendar (all day): \"{title}\" on {_iso_to_local_display(start_iso)[:10]}"}
 
     # Try APPOINTMENT
     m = _APPT_RE.match(text)
@@ -420,6 +449,25 @@ def _parse_when(phrase: str) -> str | None:
             day_offset = off
             time_part = time_part[:-len(word)].strip()
             break
+    # Frank 2026-06-23: "Friday at 10am" was falling through to default
+    # 9am-tomorrow because the day-strip only knew today/tomorrow/tonight.
+    # Extend to weekday names so "Friday 10am" → day_offset=days-to-Fri,
+    # time=10am. Same for trailing form ("10am Friday").
+    if day_offset is None:
+        for day_name, weekday_num in (("monday", 0), ("tuesday", 1),
+                                       ("wednesday", 2), ("thursday", 3),
+                                       ("friday", 4), ("saturday", 5),
+                                       ("sunday", 6)):
+            now_local = datetime.now().astimezone()
+            days_ahead = (weekday_num - now_local.weekday()) % 7 or 7
+            if time_part.startswith(day_name + " "):
+                day_offset = days_ahead
+                time_part = time_part[len(day_name) + 1:].strip()
+                break
+            if time_part.endswith(" " + day_name):
+                day_offset = days_ahead
+                time_part = time_part[:-len(day_name) - 1].strip()
+                break
     # Allow "at 5:45" / "at 1:00 p.m."
     if time_part.startswith("at "):
         time_part = time_part[3:].strip()

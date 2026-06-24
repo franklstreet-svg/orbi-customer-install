@@ -14788,7 +14788,13 @@ def _try_personal_assistant_read(message: str, user_dir: Path) -> str | None:
 # normal questions don't accidentally get filed as notes.
 _QC_TRIGGER_RE = _re.compile(
     r"^(?:remind\s+me|nudge\s+me|add\s+(?:to\s+)?(?:my\s+)?(?:todo|task|contact|person)|"
-    r"appointment|meeting|book|schedule\s+(?:a|me)|save\s+contact|todo:|task:)",
+    r"appointment|meeting|book|schedule\s+(?:a|me)|save\s+contact|todo:|task:|"
+    # Frank 2026-06-23: extended triggers so "block off Thursday for vacation"
+    # / "lunch with Sam Wednesday" / "dinner at Joe's Friday" / "call Bill
+    # Monday" all hit the fast-path classifier. Previously the LLM hallucinated
+    # successful adds without persisting.
+    r"block\s+off|lunch|dinner|breakfast|coffee|call\s+\w+|"
+    r"take\s+(?:a\s+)?note|note(?:\s+to\s+self)?:?\s)",
     _re.IGNORECASE,
 )
 
