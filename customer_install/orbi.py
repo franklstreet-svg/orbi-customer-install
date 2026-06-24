@@ -5812,6 +5812,33 @@ def owner_chat():
         return jsonify({"reply": qc_result["summary"], "tier": "local", "latency_ms": 0,
                         "source": "quick_capture", "captured_as": qc_result["kind"]})
 
+    # Frank 2026-06-23: SYNCHRONOUS memory save for explicit "remember that X" /
+    # "don't forget that X" / "make a note that X" requests. Was relying on a
+    # background async extractor that took several seconds AND sometimes
+    # judged the fact as "not durable enough" — owner would get a confident
+    # "I've got that noted" and then Orby would deny knowing the fact moments
+    # later. Now: if the explicit memory verb fires, save the rest of the
+    # sentence directly to mod_memory and return a clean confirmation.
+    _MEMORY_VERB_RE = _re.match(
+        r"^(?:remember\s+(?:that\s+)?|don'?t\s+forget\s+(?:that\s+)?|"
+        r"make\s+a\s+(?:mental\s+)?note\s+(?:that\s+|to\s+)?|"
+        r"keep\s+in\s+mind\s+(?:that\s+)?|note\s+to\s+self\s*:?\s+)(.+)$",
+        user_msg.strip(), _re.IGNORECASE)
+    if _MEMORY_VERB_RE:
+        fact = _MEMORY_VERB_RE.group(1).strip().rstrip(".!?")
+        if fact and 4 < len(fact) < 500:
+            try:
+                mod_memory.remember(user_dir, fact, tier="long_term",
+                                     meta={"source": "explicit_remember"})
+                audit.log_event(DATA_DIR, actor=username, action="memory.remember",
+                                meta={"fact_preview": fact[:80]})
+                return jsonify({
+                    "reply": f"Got it — I'll remember: \"{fact[:120]}\"",
+                    "tier": "local", "latency_ms": 0, "source": "memory_explicit",
+                })
+            except Exception as e:
+                log.warning(f"explicit memory.remember failed: {e}")
+
     business = mod_business.load(DATA_DIR)
     system = prompts.build_owner_prompt(business)
     tone = ((business.get("personality") or {}).get("tone") or "friend").lower()
