@@ -251,9 +251,22 @@ def capture(user_dir: Path, text: str) -> dict:
                         f"You already have \"{existing_event['title']}\" "
                         f"at {_iso_to_local_display(existing_event['start'])}. "
                         f"No duplicate created.")}
+        # Frank 2026-06-23: conflict detection across DIFFERENT titles.
+        # The dedup above catches identical events; this catches "I already
+        # had something else at that time" without silently stacking.
+        try:
+            conflict = _find_conflict_event(user_dir, title, start_iso)
+        except Exception:
+            conflict = None
         item = mod_calendar.add(user_dir, title, start_iso)
+        conflict_warning = ""
+        if conflict:
+            conflict_warning = (f" ⚠ Note: \"{conflict['title']}\" is already "
+                                 f"at {_iso_to_local_display(conflict['start'])}. "
+                                 f"Both are on your calendar now — let me know "
+                                 f"if you want to move one.")
         return {"kind": "calendar", "item": item,
-                "summary": f"Added to your calendar: \"{item['title']}\" at {_iso_to_local_display(start_iso)}"}
+                "summary": f"Added to your calendar: \"{item['title']}\" at {_iso_to_local_display(start_iso)}{conflict_warning}"}
 
     # Try CONTACT
     m = _CONTACT_RE.match(text)
@@ -353,6 +366,35 @@ def _find_duplicate_event(user_dir: Path, title: str, start_iso: str) -> dict | 
     return None
 
 
+def _find_conflict_event(user_dir: Path, title: str, start_iso: str) -> dict | None:
+    """Frank 2026-06-23: find ANY existing event (different title) at the
+    same start time within 30 minutes. Used for conflict warnings on new
+    calendar adds. Skips the duplicate-title case (that's handled by
+    _find_duplicate_event)."""
+    norm_title = " ".join((title or "").lower().strip().split())
+    if not start_iso:
+        return None
+    try:
+        target = datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    try:
+        events = mod_calendar.list_all(user_dir) or []
+    except Exception:
+        return None
+    for e in events:
+        existing_title = " ".join((e.get("title") or "").lower().strip().split())
+        if existing_title == norm_title:
+            continue  # Same title — already handled upstream as dedup
+        try:
+            es = datetime.fromisoformat((e.get("start") or "").replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            continue
+        if abs((es - target).total_seconds()) <= 30 * 60:
+            return e
+    return None
+
+
 def _save_quick_note(user_dir: Path, text: str) -> dict:
     p = user_dir / QUICK_FILE
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -384,6 +426,15 @@ def _parse_clock(token: str, default_pm_if_low: bool = True) -> tuple[int, int] 
     """Parse '5:45', '1:00 p.m.', '4:45 pm', '13:30', '5' into (hour, minute) 24h.
     If no am/pm given and the hour is 1-7, assume PM (matches owner intent —
     nobody says 'remind me at 5' meaning 5am). 8-12 with no suffix → AM."""
+    # Frank 2026-06-23: word forms — 'noon' = 12pm, 'midnight' = 12am.
+    # Was returning None which dropped through to default 9am.
+    if not token:
+        return None
+    word = token.strip().lower().rstrip(".!?")
+    if word == "noon":
+        return 12, 0
+    if word == "midnight":
+        return 0, 0
     m = _TIME_RE.match(token or "")
     if not m:
         return None
