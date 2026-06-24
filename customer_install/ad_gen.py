@@ -292,24 +292,44 @@ def design_ad(config: dict, brief: str, business: dict | None = None,
     # Use the two-pass review path — ads are high-stakes output and the
     # quality jump is worth the ~2x LLM time. Reviewer preserves JSON
     # format so the schema is intact.
+    #
+    # Frank 2026-06-23: the reviewer pass occasionally truncates the JSON
+    # mid-headline_alts (Frank's test transcript showed exactly this).
+    # If the first attempt's JSON is unparseable, retry with single-pass
+    # (no review) — sacrifices the quality boost but at least we ship
+    # a working ad. Two failed parses = real error.
+    def _try_parse(text):
+        if not text:
+            return None
+        raw = text.strip()
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```\s*$", "", raw)
+        m = re.search(r"\{.*\}", raw, re.DOTALL)
+        if not m:
+            return None
+        try:
+            return json.loads(m.group(0))
+        except json.JSONDecodeError:
+            return None
+
     resp = llm_client.generate_with_review(
         config, system, [{"role": "user", "content": user_msg}],
         enable_review=True)
     if not resp or not resp.text:
         raise RuntimeError("ad_designer LLM unavailable")
-    raw = resp.text.strip()
-    # Be forgiving — strip code fences / leading "Here's" filler
-    raw = re.sub(r"^```(?:json)?\s*", "", raw)
-    raw = re.sub(r"\s*```\s*$", "", raw)
-    # Find the first { ... } block
-    m = re.search(r"\{.*\}", raw, re.DOTALL)
-    if not m:
-        raise RuntimeError(f"ad_designer LLM did not return JSON: {raw[:200]!r}")
-    try:
-        data = json.loads(m.group(0))
-    except json.JSONDecodeError as e:
-        raise RuntimeError(f"ad_designer returned invalid JSON ({e}): "
-                            f"{m.group(0)[:200]!r}")
+    data = _try_parse(resp.text)
+    if data is None:
+        log.warning("ad_designer review-pass produced unparseable JSON, "
+                    "retrying single-pass: raw=%r", (resp.text or "")[:200])
+        resp2 = llm_client.generate(
+            config, system, [{"role": "user", "content": user_msg}])
+        if not resp2 or not resp2.text:
+            raise RuntimeError("ad_designer LLM unavailable on retry")
+        data = _try_parse(resp2.text)
+        if data is None:
+            raise RuntimeError(
+                f"ad_designer LLM did not return parseable JSON "
+                f"(both attempts failed): {(resp2.text or '')[:300]!r}")
     # Validate
     for key in ("headline", "body", "cta", "image_brief"):
         v = data.get(key)
