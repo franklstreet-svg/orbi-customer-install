@@ -15130,7 +15130,10 @@ def _try_personal_assistant_read(message: str, user_dir: Path) -> str | None:
 # normal questions don't accidentally get filed as notes.
 _QC_TRIGGER_RE = _re.compile(
     r"^(?:remind\s+me|nudge\s+me|add\s+(?:to\s+)?(?:my\s+)?(?:todo|task|contact|person)|"
-    r"appointment|meeting|book|schedule\s+(?:a|me)|save\s+contact|todo:|task:|"
+    # Frank 2026-06-24: 'schedule dentist Friday at 2pm' was missing — the
+    # old trigger required 'schedule a' or 'schedule me'. Now accept bare
+    # 'schedule X' too.
+    r"appointment|meeting|book|schedule\s+|save\s+contact|todo:|task:|"
     # Frank 2026-06-23: extended triggers so "block off Thursday for vacation"
     # / "lunch with Sam Wednesday" / "dinner at Joe's Friday" / "call Bill
     # Monday" all hit the fast-path classifier. Previously the LLM hallucinated
