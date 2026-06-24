@@ -28,6 +28,7 @@ from pathlib import Path
 
 from modules import calendar as mod_calendar
 from modules import contacts as mod_contacts
+from modules import notes as mod_notes
 from modules import reminders as mod_reminders
 from modules import tasks as mod_tasks
 
@@ -153,7 +154,12 @@ def capture(user_dir: Path, text: str) -> dict:
             when_phrase = m.group("when").strip()
             # Body sometimes absorbs the day word: "call John tomorrow" + "1:00 p.m."
             # Move trailing day-word from body into the front of when_phrase.
-            for day_word in ("tomorrow", "today", "tonight"):
+            # Frank 2026-06-23: extended to weekday names too — was leaking
+            # 'pay rent Friday' as the reminder body with time 'tomorrow 9am'
+            # instead of 'pay rent' on Friday at 9am.
+            for day_word in ("tomorrow", "today", "tonight",
+                              "monday", "tuesday", "wednesday", "thursday",
+                              "friday", "saturday", "sunday"):
                 if body.lower().endswith(" " + day_word):
                     body = body[: -(len(day_word) + 1)].strip()
                     when_phrase = day_word + " at " + when_phrase
@@ -260,6 +266,25 @@ def capture(user_dir: Path, text: str) -> dict:
                                 notes=rest, source="manual")
         return {"kind": "contact", "item": item,
                 "summary": f"Saved contact: {item['name']}"}
+
+    # Frank 2026-06-23: if the user explicitly said "take a note: X" or
+    # "note to self: X", route to the regular notes module so it shows up
+    # in the same notes Orby reads from when answering "what notes do I
+    # have about X". Quick-notes are a separate bucket she doesn't search.
+    note_match = re.match(
+        r"^(?:take\s+a\s+note|note\s+to\s+self|note)\s*:?\s+(.+)$",
+        text, re.IGNORECASE)
+    if note_match:
+        # The user_dir here is the user's per-user folder. mod_notes.add
+        # writes to data_dir (the SHARED data root) so all users / Orby
+        # can see the same note. user_dir's parent.parent IS data_dir.
+        try:
+            data_dir = user_dir.parent.parent  # users/<name>/ → data root
+        except Exception:
+            data_dir = user_dir
+        item = mod_notes.add(data_dir, content=note_match.group(1).strip())
+        return {"kind": "note", "item": item,
+                "summary": f"Got it — noted: \"{item.get('content','')[:80]}\""}
 
     # Fallback — generic quick note
     item = _save_quick_note(user_dir, text)
