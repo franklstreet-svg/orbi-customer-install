@@ -5651,6 +5651,17 @@ def owner_chat():
     if sim_lead_resp is not None:
         return jsonify(sim_lead_resp)
 
+    # Frank 2026-06-23: explicit delete-contact / delete-task fast paths
+    # MUST fire before _try_cancel_appointment, because the calendar
+    # cancel regex used to slurp "delete the contact Lisa Chen" and
+    # report "I don't see an appointment matching 'contact Lisa Chen'".
+    contact_del_resp = _try_delete_contact(user_msg, user_dir)
+    if contact_del_resp is not None:
+        return jsonify(contact_del_resp)
+    task_del_resp = _try_delete_task(user_msg, user_dir)
+    if task_del_resp is not None:
+        return jsonify(task_del_resp)
+
     # Calendar CANCEL — "cancel my Tuesday appointment" — actually
     # removes the event from the calendar (was returning fake "done" via
     # the LLM before, never wrote anything).
@@ -10076,6 +10087,11 @@ def _send_co_for_signature_email(co: dict, project: dict,
 _CANCEL_APPT_RE = _re.compile(
     r"^\s*(?:cancel|delete|remove|drop)\s+"
     r"(?:my\s+|the\s+)?"
+    # Frank 2026-06-23: negative lookahead — don't catch contact/task/note/
+    # reminder operations as appointment cancellations. The next phase
+    # explicitly handles those domain words. Without this, "delete the
+    # contact Lisa Chen" was being routed at calendar_cancel_no_match.
+    r"(?!contact\b|task\b|todo\b|note\b|reminder\b)"
     # Stop the `what` capture at compound conjunctions ("and tell joe ...",
     # "and let him know ...") so we don't try to match the message half
     # as an event title.
@@ -10083,6 +10099,22 @@ _CANCEL_APPT_RE = _re.compile(
     r"(?:\s+appointment|\s+meeting|\s+event|\s+booking)?"
     r"(?:\s+and\s+(?:tell|let|send|email|text|message|notify|forward|relay|call|ping)\b.+)?"
     r"\s*[.?!]?\s*$",
+    _re.IGNORECASE,
+)
+# Frank 2026-06-23: explicit delete-contact intent (was falling through
+# to calendar_cancel which didn't match anything → confused "I don't see
+# an appointment matching 'contact Lisa Chen'" response). Now matches
+# clean and calls mod_contacts.remove via _try_delete_contact.
+_DELETE_CONTACT_RE = _re.compile(
+    r"^\s*(?:delete|remove|drop)\s+(?:the\s+|my\s+)?contact\s+"
+    r"(?:named\s+|called\s+|for\s+)?"
+    r"(?P<name>.+?)\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+_DELETE_TASK_RE = _re.compile(
+    r"^\s*(?:delete|remove|drop|cancel)\s+(?:the\s+|my\s+)?"
+    r"(?:task|todo|reminder)\s+(?:to\s+|about\s+|for\s+|called\s+|named\s+)?"
+    r"(?P<what>.+?)\s*[?.!]?\s*$",
     _re.IGNORECASE,
 )
 _RESCHEDULE_APPT_RE = _re.compile(
@@ -10165,6 +10197,74 @@ def _event_display(e: dict) -> str:
     except (ValueError, OSError):
         when = start
     return f"{title} ({when})"
+
+
+def _try_delete_contact(message: str, user_dir) -> dict | None:
+    """Frank 2026-06-23: explicit 'delete the contact X' fast path."""
+    stripped = _strip_polite_prefix(message or "")
+    m = _DELETE_CONTACT_RE.match(stripped)
+    if not m:
+        return None
+    name = (m.group("name") or "").strip().rstrip(".!?")
+    if not name or name.lower() in {"that", "it", "this"}:
+        return None
+    matches = mod_contacts.find_by_name(user_dir, name) or []
+    if not isinstance(matches, list):
+        matches = [matches] if matches else []
+    if not matches:
+        return {"reply": f"I don't see a contact named \"{name}\".",
+                "tier": "local", "latency_ms": 0,
+                "source": "contact_delete_no_match"}
+    if len(matches) > 1:
+        names = ", ".join(c.get("name", "?") for c in matches[:5])
+        return {"reply": (f"Multiple matches for \"{name}\": {names}. "
+                          f"Say it more specifically."),
+                "tier": "local", "latency_ms": 0,
+                "source": "contact_delete_ambiguous"}
+    contact = matches[0]
+    ok = mod_contacts.remove(user_dir, contact["id"])
+    if ok:
+        return {"reply": f"✓ Removed contact: {contact.get('name','?')}",
+                "tier": "local", "latency_ms": 0,
+                "source": "contact_delete_done"}
+    return {"reply": f"Couldn't delete {contact.get('name','?')} — try again from the dashboard.",
+            "tier": "local", "latency_ms": 0,
+            "source": "contact_delete_failed"}
+
+
+def _try_delete_task(message: str, user_dir) -> dict | None:
+    """Frank 2026-06-23: explicit 'delete task X' / 'cancel reminder X' fast path."""
+    stripped = _strip_polite_prefix(message or "")
+    m = _DELETE_TASK_RE.match(stripped)
+    if not m:
+        return None
+    what = (m.group("what") or "").strip().rstrip(".!?")
+    if not what or what.lower() in {"that", "it", "this"}:
+        return None
+    # Fuzzy match: find any open task whose text contains the query
+    open_tasks = mod_tasks.list_all(user_dir)
+    q = what.lower()
+    candidates = [t for t in open_tasks
+                  if q in (t.get("text", "") or "").lower()]
+    if not candidates:
+        return {"reply": f"I don't see a task matching \"{what}\".",
+                "tier": "local", "latency_ms": 0,
+                "source": "task_delete_no_match"}
+    if len(candidates) > 1:
+        names = "; ".join(t.get("text", "")[:50] for t in candidates[:3])
+        return {"reply": (f"Multiple tasks match \"{what}\": {names}. "
+                          f"Say it more specifically."),
+                "tier": "local", "latency_ms": 0,
+                "source": "task_delete_ambiguous"}
+    task = candidates[0]
+    ok = mod_tasks.remove(user_dir, task["id"])
+    if ok:
+        return {"reply": f"✓ Removed task: \"{task.get('text','?')[:80]}\"",
+                "tier": "local", "latency_ms": 0,
+                "source": "task_delete_done"}
+    return {"reply": f"Couldn't delete that — try again from the dashboard.",
+            "tier": "local", "latency_ms": 0,
+            "source": "task_delete_failed"}
 
 
 def _try_cancel_appointment(message: str, user_dir) -> dict | None:
