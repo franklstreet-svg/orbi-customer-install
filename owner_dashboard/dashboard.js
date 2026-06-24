@@ -791,9 +791,12 @@
       if (window.__orbiSpeakReply) window.__orbiSpeakReply(reply);
     } catch (e) {
       thinking.remove();
-      const fallback = "I'm offline right now. Try again in a moment.";
+      // Frank 2026-06-23: was 'I'm offline right now' which read robotic AND
+      // wrong (the server might not be offline — just slow, e.g. image gen
+      // hitting Cloudflare's 100s ceiling). Honest one-liner, no TTS read
+      // (silence is better than reciting an error message aloud).
+      const fallback = "Something hung on my end — try that again.";
       addOwnerBubble('assistant', fallback, { tier: 'none' });
-      if (window.__orbiSpeakReply) window.__orbiSpeakReply(fallback);
     } finally {
       state.hidden = true;
       ownerChatSending = false;
