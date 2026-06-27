@@ -2885,30 +2885,6 @@ def legal_templates_list():
     _require_legal_module()
     return jsonify({"ok": True, "templates": mod_legal.list_templates()})
 
-@app.route("/api/owner/legal/draft", methods=["POST"])
-def legal_draft_document():
-    s = _require_legal_module()
-    body = request.get_json(force=True) or {}
-    template_key = body.get("template", "")
-    fields = body.get("fields", {})
-    draft_prompt = mod_legal.build_draft_prompt(template_key, fields)
-    if not draft_prompt:
-        return jsonify({"ok": False, "error": "unknown template"}), 400
-    system = (
-        "You are a paralegal assistant. Draft the requested legal document "
-        "professionally and completely. Mark any section requiring attorney "
-        "judgment with [ATTORNEY REVIEW]. Never give legal advice to opposing "
-        "parties. The attorney will review everything before use."
-    )
-    try:
-        draft = llm_client.chat(system=system, user=draft_prompt)
-    except Exception as e:
-        log.exception("legal draft failed")
-        return jsonify({"ok": False, "error": str(e)}), 500
-    audit.log(s["username"], action="legal.draft",
-              detail=template_key)
-    return jsonify({"ok": True, "template": template_key, "draft": draft})
-
 # Dashboard summary
 
 @app.route("/api/owner/legal/dashboard", methods=["GET"])
@@ -2941,7 +2917,7 @@ def legal_research():
         "unsettled law. Never give advice directly to clients."
     )
     try:
-        memo = llm_client.chat(system=system, user=research_prompt)
+        memo = llm_client.generate(CONFIG, system, [{"role":"user","content":research_prompt}]).text
     except Exception as e:
         log.exception("legal research failed")
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -2961,7 +2937,7 @@ def legal_intake():
         "Be thorough, flag every risk, mark every SOL estimate for attorney verification."
     )
     try:
-        memo = llm_client.chat(system=system, user=intake_prompt)
+        memo = llm_client.generate(CONFIG, system, [{"role":"user","content":intake_prompt}]).text
     except Exception as e:
         log.exception("legal intake failed")
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -3016,9 +2992,10 @@ def legal_draft_revise(draft_id):
 def legal_draft_document():
     s = _require_legal_module()
     body = request.get_json(force=True) or {}
-    template_key = body.get("template", "")
-    fields = body.get("fields", {})
-    matter_id = body.get("matter_id", "")
+    template_key = body.get("template_key") or body.get("template", "")
+    fields = body.get("field_values") or body.get("fields", {})
+    matter_id = body.get("matter_id", "") or ""
+    matter_title_override = body.get("matter_title", "")
 
     draft_prompt = mod_legal.build_draft_prompt(template_key, fields)
     if not draft_prompt:
@@ -3026,7 +3003,8 @@ def legal_draft_document():
 
     tmpl = mod_legal.get_template(template_key)
     matter = mod_legal.get_matter(DATA_DIR, matter_id) if matter_id else None
-    matter_title = matter.get("title", "") if matter else fields.get("case_title", "")
+    matter_title = (matter.get("title", "") if matter else
+                    matter_title_override or fields.get("case_title", ""))
 
     system = (
         "You are a highly experienced paralegal. Draft the complete legal document "
@@ -3037,7 +3015,7 @@ def legal_draft_document():
         "review and approval only. Not for distribution without attorney authorization.'"
     )
     try:
-        content = llm_client.chat(system=system, user=draft_prompt)
+        content = llm_client.generate(CONFIG, system, [{"role":"user","content":draft_prompt}]).text
     except Exception as e:
         log.exception("legal draft failed")
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -16078,7 +16056,7 @@ def _try_legal_chat(message: str, user_rec: dict,
             "Always end with: 'Attorney should verify all citations before relying on this memo.'"
         )
         try:
-            memo = llm_client.chat(system=system, user=research_prompt)
+            memo = llm_client.generate(CONFIG, system, [{"role":"user","content":research_prompt}]).text
         except Exception:
             log.exception("legal research via chat failed")
             return None

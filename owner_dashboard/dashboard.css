@@ -2208,3 +2208,71 @@ dialog .form-actions {
 }
 .secondary-btn:hover { background: rgba(255,255,255,0.10); }
 .secondary-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* ===== LEGAL MODULE ===== */
+.legal-input {
+  background: #0d1626;
+  color: #eaf0ff;
+  border: 1px solid #2a3554;
+  border-radius: 8px;
+  padding: 10px 14px;
+  font-size: 13.5px;
+  font-family: inherit;
+  outline: none;
+  width: 100%;
+  box-sizing: border-box;
+}
+.legal-input:focus { border-color: #3a7af0; }
+.legal-snav {
+  background: none;
+  border: none;
+  color: #8fa3c7;
+  font-size: 13.5px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  cursor: pointer;
+  text-align: left;
+  width: 100%;
+  transition: background 0.15s;
+}
+.legal-snav:hover { background: rgba(58,122,240,0.1); color: #c0d0f0; }
+.legal-snav.active { background: rgba(58,122,240,0.18); color: #6ea2ff; font-weight: 600; }
+.legal-matter-card {
+  background: rgba(255,255,255,0.02);
+  border: 1px solid #2a3554;
+  border-radius: 10px;
+  padding: 14px 16px;
+  margin-bottom: 10px;
+  cursor: pointer;
+}
+.legal-matter-card:hover { border-color: #3a7af0; }
+.legal-dl-card {
+  background: rgba(255,255,255,0.02);
+  border: 1px solid #2a3554;
+  border-radius: 10px;
+  padding: 14px 16px;
+  margin-bottom: 10px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+.legal-dl-overdue { border-color: #dc3545 !important; }
+.legal-dl-soon    { border-color: #ffc107 !important; }
+.legal-draft-card {
+  background: rgba(255,255,255,0.02);
+  border: 1px solid #2a3554;
+  border-radius: 10px;
+  padding: 14px 16px;
+  margin-bottom: 10px;
+}
+.legal-status-draft    { background: rgba(58,122,240,0.2);  color: #6ea2ff; font-size:11px; padding:2px 8px; border-radius:12px; font-weight:600; }
+.legal-status-approved { background: rgba(40,167,69,0.2);   color: #4cbb70; font-size:11px; padding:2px 8px; border-radius:12px; font-weight:600; }
+.legal-status-revised  { background: rgba(255,193,7,0.2);   color: #ffc107; font-size:11px; padding:2px 8px; border-radius:12px; font-weight:600; }
+.legal-time-row {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  padding: 10px 14px;
+  border-bottom: 1px solid #1e2d4d;
+  font-size: 13px;
+}

@@ -745,6 +745,7 @@
     // own voice as if it were the user's next input. The 400ms-after-
     // speak restart in speakReply's finish() will turn it back on.
     try { if (typeof recognition !== 'undefined' && recognition) recognition.stop(); } catch {}
+    try { if (typeof clearPendingSpeech === 'function') clearPendingSpeech(); } catch {}
 
     const input  = document.getElementById('owner-chat-input');
     const send   = document.getElementById('owner-chat-send');
@@ -770,14 +771,23 @@
     const thinking = addOwnerThinking();
 
     try {
+      // Email/inbox requests can take 60-90s on slow IMAP providers (Yahoo).
+      // Everything else gets 45s. Use AbortController so we get a clean error
+      // rather than a browser-level "failed to fetch" that shows offline mode.
+      const isEmailMsg = /\b(?:email|inbox|gmail|yahoo mail|check mail|my mail)\b/i.test(text);
+      const timeoutMs = isEmailMsg ? 120000 : 45000;
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), timeoutMs);
       const res = await fetch('/api/owner/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           message: text,
           history: ownerChatHistory.slice(-30)
-        })
+        }),
+        signal: ctrl.signal
       });
+      clearTimeout(timer);
       if (res.status === 401) { window.location.href = '/owner/login'; return; }
       const data = await res.json();
       thinking.remove();
@@ -795,7 +805,9 @@
       // wrong (the server might not be offline — just slow, e.g. image gen
       // hitting Cloudflare's 100s ceiling). Honest one-liner, no TTS read
       // (silence is better than reciting an error message aloud).
-      const fallback = "Something hung on my end — try that again.";
+      const fallback = e.name === 'AbortError'
+        ? "That took too long — Yahoo mail can be slow. Try again and it'll use the cached inbox."
+        : "Something hung on my end — try that again.";
       addOwnerBubble('assistant', fallback, { tier: 'none' });
     } finally {
       state.hidden = true;
@@ -1279,6 +1291,7 @@
   let myDayLoaded = false, contactsLoaded = false, peopleLoaded = false;
 
   let marketingLoaded = false;
+  let legalLoaded = false;
 
   document.addEventListener('DOMContentLoaded', async () => {
     // Discover who's logged in (role determines People-tab visibility)
@@ -1301,12 +1314,16 @@
       if (mods.includes('marketing_image')) {
         document.querySelectorAll('.module-marketing-image').forEach(el => el.hidden = false);
       }
+      if (mods.includes('legal')) {
+        document.querySelectorAll('.module-legal').forEach(el => el.hidden = false);
+      }
     } catch {}
 
     wireMyDayForms();
     wireContacts();
     wirePeople();
     wireMarketing();
+    wireLegal();
 
     document.querySelectorAll('.tab').forEach(t => {
       t.addEventListener('click', () => {
@@ -1315,6 +1332,7 @@
         if (which === 'contacts' && !contactsLoaded) { loadContacts(); contactsLoaded = true; }
         if (which === 'people' && !peopleLoaded)   { loadPeople();  peopleLoaded = true; }
         if (which === 'marketing' && !marketingLoaded) { loadMarketingLibrary(); marketingLoaded = true; }
+        if (which === 'legal'    && !legalLoaded)    { loadLegal();           legalLoaded = true; }
       });
     });
   });
@@ -1337,6 +1355,8 @@
     try { return localStorage.getItem('orbi_speak_replies') !== '0'; }
     catch { return true; }
   })();
+  // Match the My Orby voice used on twickell.com.
+  const ORBI_TTS_VOICE = 'en-US-AvaNeural';
   // One-time banner suggesting Chrome on iOS Safari users. Apple's
   // standalone PWA audio sandbox blocks Orby's voice; Chrome's shortcut
   // opens as a regular tab and works fully. Banner dismissible.
@@ -1413,11 +1433,10 @@
       // don't get a wrong-accent fallback. Order matters: try US voices
       // first, fall back to en-* female only as a last resort, never to
       // a non-female or non-English voice.
-      const enUS = _ssVoices.filter(v => /^en-US/i.test(v.lang));
-      const female = enUS.find(v => /samantha|ava|aria|nora|jenny|female/i.test(v.name))
-                  || enUS.find(v => /zira|hazel|david/i.test(v.name) === false)
-                  || _ssVoices.find(v => /^en-US/i.test(v.lang))
-                  || _ssVoices.find(v => /samantha|ava|aria|nora|jenny/i.test(v.name) && /^en/i.test(v.lang));
+      const blocked = /david|mark|daniel|alex|fred|tom|guy|brian|andrew|male/i;
+      const enUS = _ssVoices.filter(v => /^en-US/i.test(v.lang) && !blocked.test(v.name));
+      const female = enUS.find(v => /samantha|ava|aria|nora|jenny|zira|female/i.test(v.name))
+                  || _ssVoices.find(v => /samantha|ava|aria|nora|jenny|zira|female/i.test(v.name) && /^en/i.test(v.lang) && !blocked.test(v.name));
       if (female) u.voice = female;
       u.onend = onDone || (() => {});
       u.onerror = () => {
@@ -1574,7 +1593,8 @@
           || window.navigator.standalone === true;
         debug(`Testing audio... UA: ${(/iPhone/.test(ua) ? 'iPhone' : /Android/.test(ua) ? 'Android' : 'Desktop')}, standalone PWA: ${standalone}`, 'info');
         // Try server /tts first
-        const url = '/tts?text=' + encodeURIComponent("Hi Frank, this is Orby. Can you hear me?");
+        const url = '/tts?voice=' + encodeURIComponent(ORBI_TTS_VOICE)
+          + '&text=' + encodeURIComponent("Hi Frank, this is Orby. Can you hear me?");
 
         // After playback, restore mic if voice mode was on — iOS routes
         // audio to OUTPUT during playback and the SpeechRecognition can
@@ -1599,18 +1619,8 @@
           if (p && typeof p.then === 'function') {
             p.then(() => debug('▶ Server audio started playing — you should hear Orby now', 'ok'))
               .catch((err) => {
-                debug(`❌ Server audio rejected: ${err.name} — trying iOS built-in voice...`, 'err');
-                if (window.speechSynthesis) {
-                  const u = new SpeechSynthesisUtterance("Hi Frank, this is Orby. Can you hear me?");
-                  u.lang = 'en-US';
-                  u.onend = () => { debug('✓ Built-in iOS voice played. Server /tts is blocked.', 'ok'); restoreMic(); };
-                  u.onerror = () => { debug('❌ Both server AND iOS voice failed. Check phone volume/silent switch.', 'err'); restoreMic(); };
-                  window.speechSynthesis.cancel();
-                  window.speechSynthesis.speak(u);
-                } else {
-                  debug('❌ No speechSynthesis available either', 'err');
-                  restoreMic();
-                }
+                debug(`❌ Server audio rejected: ${err.name}. I will not use the browser's built-in voice.`, 'err');
+                restoreMic();
               });
           }
         } catch (e) {
@@ -1625,8 +1635,11 @@
   let isSpeaking = false;
   let wantsListening = false;
   let restartTimer = null;
+  let speechSendTimer = null;
+  let speechBuffer = '';
   let currentAudio = null;
   let currentAudioUrl = null;
+  const VOICE_SILENCE_BEFORE_SEND_MS = 8000;
   const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
 
   function setupOwnerVoice() {
@@ -1666,7 +1679,7 @@
       const r = new Recognition();
       r.lang = 'en-US';
       r.continuous = true;
-      r.interimResults = false;
+      r.interimResults = true;
       r.onstart = recognition?.onstart;
       r.onend = recognition?.onend;
       r.onerror = recognition?.onerror;
@@ -1681,7 +1694,7 @@
     recognition = new Recognition();
     recognition.lang = 'en-US';
     recognition.continuous = true;
-    recognition.interimResults = false;
+    recognition.interimResults = true;
 
     recognition.onstart = () => {
       isListening = true;
@@ -1710,19 +1723,38 @@
     };
     recognition.onresult = (event) => {
       let finalText = '';
+      let interimText = '';
       for (let i = event.resultIndex; i < event.results.length; i++) {
         if (event.results[i].isFinal) finalText += event.results[i][0].transcript;
+        else interimText += event.results[i][0].transcript;
       }
       if (finalText.trim()) {
-        // Drop it into the input and fire send like the user typed it
-        const input = document.getElementById('owner-chat-input');
-        if (input) {
-          input.value = finalText.trim();
-          input.dispatchEvent(new Event('input', { bubbles: true }));
-          document.getElementById('owner-chat-send')?.click();
-        }
+        speechBuffer = (speechBuffer + ' ' + finalText.trim()).trim();
+        scheduleVoiceSend();
       }
+      const preview = (speechBuffer + ' ' + interimText.trim()).trim();
+      if (preview) setVoiceState(`Listening — ${preview}`, 'listening');
     };
+  }
+
+  function scheduleVoiceSend() {
+    clearTimeout(speechSendTimer);
+    speechSendTimer = setTimeout(() => {
+      const text = speechBuffer.trim();
+      speechBuffer = '';
+      if (!text || isSpeaking) return;
+      const input = document.getElementById('owner-chat-input');
+      if (!input) return;
+      input.value = text;
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      document.getElementById('owner-chat-send')?.click();
+    }, VOICE_SILENCE_BEFORE_SEND_MS);
+  }
+
+  function clearPendingSpeech() {
+    clearTimeout(speechSendTimer);
+    speechSendTimer = null;
+    speechBuffer = '';
   }
 
   function setVoiceMode(on) {
@@ -1735,6 +1767,7 @@
       safeStartMic();
     } else {
       wantsListening = false;
+      clearPendingSpeech();
       stopSpeaking();
       try { recognition && recognition.stop(); } catch {}
       setVoiceState(null);
@@ -1773,9 +1806,13 @@
   async function speakReply(text) {
     if ((!voiceOn && !speakRepliesOn) || !text) return;
     stopSpeaking();
+    clearPendingSpeech();
     isSpeaking = true;
     // Mute the mic while Orbi talks so we don't echo-loop her own voice
-    try { recognition && recognition.stop(); } catch {}
+    try {
+      if (recognition && typeof recognition.abort === 'function') recognition.abort();
+      else if (recognition) recognition.stop();
+    } catch {}
     document.getElementById('owner-stop-speaking').hidden = false;
     setVoiceState('Orbi is speaking...', 'speaking');
 
@@ -1815,7 +1852,8 @@
     // reliably enough that we don't need a forced finish. The complexity
     // was causing timing conflicts with the rebuild logic.)
 
-    const url = '/tts?text=' + encodeURIComponent(cleanText);
+    const url = '/tts?voice=' + encodeURIComponent(ORBI_TTS_VOICE)
+      + '&text=' + encodeURIComponent(cleanText);
 
     // Strategy 1 (preferred): Web Audio API. Once AudioContext is resumed
     // inside a user gesture (handled by _unlockAudio on first tap), it
@@ -1867,7 +1905,9 @@
       if (playPromise && typeof playPromise.catch === 'function') {
         playPromise.catch((err) => {
           console.warn('[Orbi] Audio() blocked or failed:', err);
-          _speakViaSpeechSynthesis(cleanText, finish);
+          setVoiceState('Voice playback unavailable — text reply still works.', 'error');
+          setTimeout(() => { try { setVoiceState(null); } catch {} }, 5000);
+          finish();
         });
       }
     } catch (err) {
@@ -4443,7 +4483,8 @@
 
   function _speakReminder(text) {
     try {
-      const a = new Audio('/tts?text=' + encodeURIComponent(text));
+      const a = new Audio('/tts?voice=' + encodeURIComponent(ORBI_TTS_VOICE)
+        + '&text=' + encodeURIComponent(text));
       a.volume = 1.0;
       // Browsers can block auto-play until the user has interacted with
       // the page. A user who's been clicking around the dashboard will
@@ -6128,6 +6169,527 @@
     if (gen)   gen.addEventListener('click', _generateCampaign);
     if (img)   img.addEventListener('click', _generateImage);
     if (fresh) fresh.addEventListener('click', _newCampaign);
+  }
+
+  // ==================================================================
+  // LEGAL MODULE
+  // ==================================================================
+
+  const _lesc = s => String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+
+  function _legalSwitchSec(name) {
+    document.querySelectorAll('.legal-snav').forEach(b => b.classList.toggle('active', b.dataset.sec === name));
+    document.querySelectorAll('.legal-sec').forEach(s => s.hidden = s.id !== 'lsec-' + name);
+  }
+
+  let _legalMattersCache = [];
+
+  function _legalPopulateMattersDatalist(ids) {
+    ids.forEach(id => {
+      const dl = document.getElementById(id);
+      if (!dl) return;
+      dl.innerHTML = _legalMattersCache.map(m =>
+        `<option value="${_lesc(m.matter_number)} ${_lesc(m.title)}">${_lesc(m.matter_number)} — ${_lesc(m.title)}</option>`
+      ).join('');
+    });
+  }
+
+  function _legalMatterByQuery(q) {
+    if (!q) return null;
+    q = q.toLowerCase();
+    return _legalMattersCache.find(m =>
+      m.id === q ||
+      (m.matter_number || '').toLowerCase() === q ||
+      (m.matter_number + ' ' + m.title).toLowerCase().includes(q) ||
+      m.title.toLowerCase().includes(q) ||
+      (m.client_name || '').toLowerCase().includes(q)
+    ) || null;
+  }
+
+  async function loadLegal() {
+    try {
+      const data = await api('/api/owner/legal/matters');
+      _legalMattersCache = data.matters || [];
+      _legalRenderMatters(_legalMattersCache);
+      _legalPopulateMattersDatalist(['dl-matters-list','draft-matters-list','time-matters-list']);
+      // populate time filter select
+      const sel = document.getElementById('time-filter-matter');
+      if (sel) {
+        sel.innerHTML = '<option value="">All matters</option>' +
+          _legalMattersCache.map(m => `<option value="${_lesc(m.id)}">${_lesc(m.matter_number)} — ${_lesc(m.title)}</option>`).join('');
+      }
+    } catch(e) {
+      const el = document.getElementById('legal-matters-list');
+      if (el) el.innerHTML = '<p class="muted">Could not load matters.</p>';
+    }
+  }
+
+  function _legalRenderMatters(matters) {
+    const el = document.getElementById('legal-matters-list');
+    if (!el) return;
+    if (!matters.length) { el.innerHTML = '<p class="muted">No matters yet. Click "+ Open Matter" to start one.</p>'; return; }
+    const statusColor = { active:'#4cbb70', closed:'#8fa3c7', archived:'#666' };
+    el.innerHTML = matters.map(m => `
+      <div class="legal-matter-card" data-id="${_lesc(m.id)}">
+        <div style="flex:1;min-width:0">
+          <div style="display:flex;align-items:center;gap:10px;margin-bottom:4px">
+            <strong style="font-size:14px">${_lesc(m.title)}</strong>
+            <span style="font-size:11px;color:${statusColor[m.status]||'#6ea2ff'};text-transform:uppercase;font-weight:600">${_lesc(m.status||'active')}</span>
+          </div>
+          <div style="font-size:12px;color:#8fa3c7;display:flex;gap:16px;flex-wrap:wrap">
+            <span>${_lesc(m.matter_number)}</span>
+            <span>${_lesc(m.client_name||'')}</span>
+            <span>${_lesc((m.practice_area||m.matter_type||'').replace(/_/g,' '))}</span>
+            ${m.rate ? `<span>$${Number(m.rate).toFixed(2)}/hr</span>` : ''}
+          </div>
+        </div>
+        <button class="text-btn legal-close-matter-btn" data-id="${_lesc(m.id)}" style="font-size:12px;color:#8fa3c7" title="Close matter">Close</button>
+      </div>
+    `).join('');
+    el.querySelectorAll('.legal-close-matter-btn').forEach(btn => {
+      btn.addEventListener('click', async e => {
+        e.stopPropagation();
+        if (!confirm('Close this matter?')) return;
+        try {
+          await api(`/api/owner/legal/matters/${btn.dataset.id}/close`, { method:'POST' });
+          loadLegal();
+        } catch { alert('Could not close matter.'); }
+      });
+    });
+  }
+
+  function _legalRenderDeadlines(deadlines) {
+    const el = document.getElementById('legal-deadlines-list');
+    if (!el) return;
+    if (!deadlines.length) { el.innerHTML = '<p class="muted">No upcoming deadlines.</p>'; return; }
+    const today = new Date(); today.setHours(0,0,0,0);
+    el.innerHTML = deadlines.map(d => {
+      const due = new Date(d.due_date + 'T00:00:00');
+      const diff = Math.ceil((due - today) / 86400000);
+      const cls = diff < 0 ? 'legal-dl-overdue' : diff <= 7 ? 'legal-dl-soon' : '';
+      const label = diff < 0 ? `<span style="color:#dc3545;font-weight:700">${Math.abs(diff)}d overdue</span>`
+                  : diff === 0 ? `<span style="color:#ffc107;font-weight:700">Today</span>`
+                  : `<span style="color:#8fa3c7">${diff}d</span>`;
+      return `
+        <div class="legal-dl-card ${cls}" data-id="${_lesc(d.id)}">
+          <div style="flex:1;min-width:0">
+            <div style="font-size:14px;font-weight:600;margin-bottom:2px">${_lesc(d.title)}</div>
+            <div style="font-size:12px;color:#8fa3c7">${_lesc(d.matter_title||'')} &nbsp;·&nbsp; Due ${_lesc(d.due_date)}</div>
+          </div>
+          ${label}
+          ${d.status !== 'done' ? `<button class="primary-btn legal-dl-done" data-id="${_lesc(d.id)}" style="font-size:12px;padding:5px 12px">Done</button>` : '<span style="color:#4cbb70;font-size:12px">✓ Done</span>'}
+        </div>`;
+    }).join('');
+    el.querySelectorAll('.legal-dl-done').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        try {
+          await api(`/api/owner/legal/deadlines/${btn.dataset.id}/complete`, { method:'POST' });
+          _loadDeadlines();
+        } catch { alert('Could not mark deadline done.'); }
+      });
+    });
+  }
+
+  async function _loadDeadlines() {
+    const days = document.getElementById('legal-dl-filter')?.value || '30';
+    try {
+      const data = await api(`/api/owner/legal/deadlines${days !== '0' ? `?upcoming_days=${days}` : ''}`);
+      _legalRenderDeadlines(data.deadlines || []);
+    } catch {
+      const el = document.getElementById('legal-deadlines-list');
+      if (el) el.innerHTML = '<p class="muted">Could not load deadlines.</p>';
+    }
+  }
+
+  function _legalStatusBadge(status) {
+    return `<span class="legal-status-${_lesc(status)}">${_lesc((status||'').toUpperCase())}</span>`;
+  }
+
+  function _legalRenderDrafts(drafts) {
+    const el = document.getElementById('legal-drafts-list');
+    if (!el) return;
+    if (!drafts.length) { el.innerHTML = '<p class="muted">No documents yet. Click "+ Draft Document" to generate one for attorney review.</p>'; return; }
+    el.innerHTML = drafts.map(d => `
+      <div class="legal-draft-card">
+        <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:10px">
+          <div style="flex:1;min-width:0">
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+              <strong style="font-size:14px">${_lesc(d.title||d.template_key||'Document')}</strong>
+              ${_legalStatusBadge(d.status)}
+            </div>
+            <div style="font-size:12px;color:#8fa3c7">${_lesc(d.matter_title||'')} &nbsp;·&nbsp; ${_lesc(d.created_at ? d.created_at.slice(0,10) : '')}</div>
+          </div>
+          <div style="display:flex;gap:8px;flex-shrink:0">
+            <button class="text-btn legal-view-draft" data-id="${_lesc(d.id)}" style="font-size:12px">View</button>
+            ${d.status !== 'approved' ? `<button class="primary-btn legal-approve-draft" data-id="${_lesc(d.id)}" style="font-size:12px;padding:5px 12px">Approve</button>` : ''}
+            <button class="secondary-btn legal-revise-draft" data-id="${_lesc(d.id)}" style="font-size:12px;padding:5px 12px">Edit</button>
+          </div>
+        </div>
+      </div>
+    `).join('');
+    el.querySelectorAll('.legal-view-draft').forEach(btn => btn.addEventListener('click', () => _openDocViewer(btn.dataset.id, false)));
+    el.querySelectorAll('.legal-approve-draft').forEach(btn => btn.addEventListener('click', async () => {
+      try {
+        await api(`/api/owner/legal/drafts/${btn.dataset.id}/approve`, { method:'POST' });
+        _loadDrafts();
+      } catch { alert('Could not approve document.'); }
+    }));
+    el.querySelectorAll('.legal-revise-draft').forEach(btn => btn.addEventListener('click', () => _openDocViewer(btn.dataset.id, true)));
+  }
+
+  async function _loadDrafts() {
+    const filter = document.getElementById('draft-filter')?.value || '';
+    try {
+      const data = await api('/api/owner/legal/drafts' + (filter ? `?status=${filter}` : ''));
+      _legalRenderDrafts(data.drafts || []);
+    } catch {
+      const el = document.getElementById('legal-drafts-list');
+      if (el) el.innerHTML = '<p class="muted">Could not load documents.</p>';
+    }
+  }
+
+  let _currentDocId = null;
+
+  async function _openDocViewer(draftId, startInRevise) {
+    _currentDocId = draftId;
+    const viewer = document.getElementById('legal-doc-viewer');
+    viewer.hidden = false;
+    document.getElementById('doc-viewer-content').textContent = 'Loading…';
+    document.getElementById('doc-viewer-actions').innerHTML = '';
+    document.getElementById('doc-revise-form').hidden = true;
+    try {
+      const data = await api(`/api/owner/legal/drafts/${draftId}`);
+      const d = data.draft;
+      document.getElementById('doc-viewer-title').textContent = d.title || d.template_key || 'Document';
+      const statusEl = document.getElementById('doc-viewer-status');
+      statusEl.className = 'legal-status-' + (d.status||'draft');
+      statusEl.textContent = (d.status||'draft').toUpperCase();
+      document.getElementById('doc-viewer-content').textContent = d.content || '(empty)';
+      // Build action buttons
+      const actions = document.getElementById('doc-viewer-actions');
+      actions.innerHTML = '';
+      if (d.status !== 'approved') {
+        const appBtn = document.createElement('button');
+        appBtn.className = 'primary-btn'; appBtn.style.fontSize = '13px';
+        appBtn.textContent = '✓ Approve';
+        appBtn.addEventListener('click', async () => {
+          try {
+            await api(`/api/owner/legal/drafts/${draftId}/approve`, { method:'POST' });
+            viewer.hidden = true; _loadDrafts();
+          } catch { alert('Could not approve.'); }
+        });
+        actions.appendChild(appBtn);
+      }
+      const revBtn = document.createElement('button');
+      revBtn.className = 'secondary-btn'; revBtn.style.fontSize = '13px';
+      revBtn.textContent = '✏ Edit / Revise';
+      revBtn.addEventListener('click', () => {
+        const rf = document.getElementById('doc-revise-form');
+        rf.hidden = false;
+        document.getElementById('doc-revise-text').value = d.content || '';
+        document.getElementById('doc-revise-notes').value = '';
+      });
+      actions.appendChild(revBtn);
+      const copyBtn = document.createElement('button');
+      copyBtn.className = 'text-btn'; copyBtn.style.fontSize = '12px';
+      copyBtn.textContent = 'Copy text';
+      copyBtn.addEventListener('click', () => navigator.clipboard.writeText(d.content || ''));
+      actions.appendChild(copyBtn);
+      if (startInRevise) revBtn.click();
+    } catch {
+      document.getElementById('doc-viewer-content').textContent = 'Could not load document.';
+    }
+  }
+
+  function _legalRenderTimeEntries(entries) {
+    const el = document.getElementById('legal-time-list');
+    if (!el) return;
+    if (!entries.length) { el.innerHTML = '<p class="muted">No time entries yet.</p>'; return; }
+    const totalH = entries.reduce((s,e) => s + (e.hours||0), 0);
+    const totalAmt = entries.reduce((s,e) => s + ((e.hours||0)*(e.rate||0)), 0);
+    el.innerHTML = `
+      <div style="display:flex;justify-content:space-between;padding:8px 14px;background:#0d1626;border-radius:8px;margin-bottom:8px;font-size:13px;font-weight:600">
+        <span>${entries.length} entries &nbsp;·&nbsp; ${totalH.toFixed(2)}h total</span>
+        <span>${totalAmt > 0 ? '$'+totalAmt.toFixed(2) : ''}</span>
+      </div>
+      ${entries.map(e => `
+        <div class="legal-time-row">
+          <div style="flex:1;min-width:0">
+            <div style="font-size:13px;font-weight:500">${_lesc(e.description||'')}</div>
+            <div style="font-size:11px;color:#8fa3c7">${_lesc(e.matter_title||'')} &nbsp;·&nbsp; ${_lesc(e.date||'')}</div>
+          </div>
+          <span style="font-size:13px;font-weight:600;white-space:nowrap">${Number(e.hours||0).toFixed(2)}h</span>
+          ${e.rate ? `<span style="font-size:12px;color:#8fa3c7;white-space:nowrap">$${(Number(e.hours||0)*Number(e.rate||0)).toFixed(2)}</span>` : ''}
+          ${e.billed ? '<span style="font-size:11px;color:#4cbb70">Billed</span>' : '<span style="font-size:11px;color:#8fa3c7">Unbilled</span>'}
+        </div>`).join('')}`;
+  }
+
+  async function _loadTimeEntries() {
+    const matterId = document.getElementById('time-filter-matter')?.value || '';
+    const unbilled = document.getElementById('time-filter-unbilled')?.checked;
+    let url = '/api/owner/legal/time';
+    const params = [];
+    if (matterId) params.push(`matter_id=${encodeURIComponent(matterId)}`);
+    if (unbilled) params.push('billed=false');
+    if (params.length) url += '?' + params.join('&');
+    try {
+      const data = await api(url);
+      _legalRenderTimeEntries(data.entries || []);
+    } catch {
+      const el = document.getElementById('legal-time-list');
+      if (el) el.innerHTML = '<p class="muted">Could not load time entries.</p>';
+    }
+  }
+
+  function wireLegal() {
+    // Sub-nav section switching
+    document.querySelectorAll('.legal-snav').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const sec = btn.dataset.sec;
+        _legalSwitchSec(sec);
+        if (sec === 'deadlines') _loadDeadlines();
+        if (sec === 'drafts')    _loadDrafts();
+        if (sec === 'time')      _loadTimeEntries();
+      });
+    });
+
+    // === MATTERS ===
+    const newMatterBtn = document.getElementById('legal-new-matter-btn');
+    const newMatterForm = document.getElementById('legal-new-matter-form');
+    if (newMatterBtn) newMatterBtn.addEventListener('click', () => { newMatterForm.hidden = false; newMatterBtn.hidden = true; });
+    const nmCancel = document.getElementById('nm-cancel');
+    if (nmCancel) nmCancel.addEventListener('click', () => { newMatterForm.hidden = true; newMatterBtn.hidden = false; });
+    const nmSubmit = document.getElementById('nm-submit');
+    if (nmSubmit) nmSubmit.addEventListener('click', async () => {
+      const title = document.getElementById('nm-title').value.trim();
+      const client = document.getElementById('nm-client').value.trim();
+      if (!title || !client) { document.getElementById('nm-status').textContent = 'Title and client name are required.'; return; }
+      const status = document.getElementById('nm-status');
+      status.textContent = 'Opening…';
+      nmSubmit.disabled = true;
+      try {
+        await api('/api/owner/legal/matters', {
+          method: 'POST',
+          body: JSON.stringify({
+            title,
+            client_name: client,
+            matter_type: document.getElementById('nm-type').value || 'other',
+            rate: document.getElementById('nm-rate').value || null,
+            client_email: document.getElementById('nm-email').value || '',
+            client_phone: document.getElementById('nm-phone').value || '',
+            notes: document.getElementById('nm-notes').value || '',
+          })
+        });
+        newMatterForm.hidden = true; newMatterBtn.hidden = false;
+        ['nm-title','nm-client','nm-email','nm-phone','nm-notes'].forEach(id => { const el = document.getElementById(id); if(el) el.value=''; });
+        document.getElementById('nm-rate').value = '';
+        document.getElementById('nm-type').value = '';
+        status.textContent = '';
+        loadLegal();
+      } catch(e) {
+        status.textContent = 'Error opening matter.';
+      }
+      nmSubmit.disabled = false;
+    });
+
+    // === DEADLINES ===
+    const dlFilter = document.getElementById('legal-dl-filter');
+    if (dlFilter) dlFilter.addEventListener('change', _loadDeadlines);
+    const addDlBtn = document.getElementById('legal-add-dl-btn');
+    const addDlForm = document.getElementById('legal-add-dl-form');
+    if (addDlBtn) addDlBtn.addEventListener('click', () => { addDlForm.hidden = false; addDlBtn.hidden = true; });
+    const dlCancel = document.getElementById('dl-cancel');
+    if (dlCancel) dlCancel.addEventListener('click', () => { addDlForm.hidden = true; addDlBtn.hidden = false; });
+    const dlSubmit = document.getElementById('dl-submit');
+    if (dlSubmit) dlSubmit.addEventListener('click', async () => {
+      const title = document.getElementById('dl-title').value.trim();
+      const matterQ = document.getElementById('dl-matter').value.trim();
+      const due = document.getElementById('dl-due').value;
+      if (!title || !due) { document.getElementById('dl-status').textContent = 'Title and due date are required.'; return; }
+      const matter = _legalMatterByQuery(matterQ);
+      document.getElementById('dl-status').textContent = 'Saving…';
+      dlSubmit.disabled = true;
+      try {
+        await api('/api/owner/legal/deadlines', {
+          method: 'POST',
+          body: JSON.stringify({
+            title, due_date: due,
+            deadline_type: document.getElementById('dl-type').value || 'other',
+            matter_id: matter?.id || null,
+            matter_title: matter?.title || matterQ || '',
+          })
+        });
+        addDlForm.hidden = true; addDlBtn.hidden = false;
+        ['dl-title','dl-matter','dl-due'].forEach(id => { const el = document.getElementById(id); if(el) el.value=''; });
+        document.getElementById('dl-status').textContent = '';
+        _loadDeadlines();
+      } catch { document.getElementById('dl-status').textContent = 'Error adding deadline.'; }
+      dlSubmit.disabled = false;
+    });
+
+    // === DRAFTS / DOCUMENTS ===
+    const newDraftBtn = document.getElementById('legal-new-draft-btn');
+    const draftForm = document.getElementById('legal-draft-form');
+    if (newDraftBtn) newDraftBtn.addEventListener('click', () => { draftForm.hidden = false; newDraftBtn.hidden = true; });
+    const draftCancel = document.getElementById('draft-cancel');
+    if (draftCancel) draftCancel.addEventListener('click', () => { draftForm.hidden = true; newDraftBtn.hidden = false; });
+    const draftFilter = document.getElementById('draft-filter');
+    if (draftFilter) draftFilter.addEventListener('change', _loadDrafts);
+    const draftSubmit = document.getElementById('draft-submit');
+    if (draftSubmit) draftSubmit.addEventListener('click', async () => {
+      const template = document.getElementById('draft-template').value;
+      const matterQ = document.getElementById('draft-matter').value.trim();
+      if (!template) { document.getElementById('draft-status').textContent = 'Choose a template.'; return; }
+      const matter = _legalMatterByQuery(matterQ);
+      const status = document.getElementById('draft-status');
+      status.textContent = 'Generating draft — this may take 20–40 seconds…';
+      draftSubmit.disabled = true;
+      try {
+        await api('/api/owner/legal/draft', {
+          method: 'POST',
+          body: JSON.stringify({
+            template_key: template,
+            matter_id: matter?.id || null,
+            matter_title: matter?.title || matterQ || '',
+            field_values: {
+              special_instructions: document.getElementById('draft-instructions').value || '',
+              client_name: matter?.client_name || '',
+            }
+          })
+        });
+        draftForm.hidden = true; newDraftBtn.hidden = false;
+        document.getElementById('draft-template').value = '';
+        document.getElementById('draft-matter').value = '';
+        document.getElementById('draft-instructions').value = '';
+        status.textContent = '';
+        _loadDrafts();
+      } catch { status.textContent = 'Error generating draft.'; }
+      draftSubmit.disabled = false;
+    });
+
+    // Document viewer overlay
+    const docViewer = document.getElementById('legal-doc-viewer');
+    const docViewerClose = document.getElementById('doc-viewer-close');
+    if (docViewerClose) docViewerClose.addEventListener('click', () => { docViewer.hidden = true; });
+    docViewer?.addEventListener('click', e => { if (e.target === docViewer) docViewer.hidden = true; });
+    const docReviseSave = document.getElementById('doc-revise-save');
+    if (docReviseSave) docReviseSave.addEventListener('click', async () => {
+      const content = document.getElementById('doc-revise-text').value;
+      const notes = document.getElementById('doc-revise-notes').value;
+      const st = document.getElementById('doc-revise-status');
+      st.textContent = 'Saving…';
+      try {
+        await api(`/api/owner/legal/drafts/${_currentDocId}/revise`, {
+          method: 'POST',
+          body: JSON.stringify({ content, notes })
+        });
+        docViewer.hidden = true;
+        _loadDrafts();
+      } catch { st.textContent = 'Error saving revision.'; }
+    });
+    const docReviseCancel = document.getElementById('doc-revise-cancel');
+    if (docReviseCancel) docReviseCancel.addEventListener('click', () => { document.getElementById('doc-revise-form').hidden = true; });
+
+    // === TIME ===
+    const timeToday = document.getElementById('time-date');
+    if (timeToday) timeToday.valueAsDate = new Date();
+    const timeSubmit = document.getElementById('time-submit');
+    if (timeSubmit) timeSubmit.addEventListener('click', async () => {
+      const matterQ = document.getElementById('time-matter').value.trim();
+      const hours = parseFloat(document.getElementById('time-hours').value);
+      const desc = document.getElementById('time-desc').value.trim();
+      if (!matterQ || !hours || !desc) { document.getElementById('time-status').textContent = 'Matter, hours, and description are required.'; return; }
+      const matter = _legalMatterByQuery(matterQ);
+      if (!matter) { document.getElementById('time-status').textContent = `Matter "${matterQ}" not found.`; return; }
+      document.getElementById('time-status').textContent = 'Logging…';
+      timeSubmit.disabled = true;
+      try {
+        await api('/api/owner/legal/time', {
+          method: 'POST',
+          body: JSON.stringify({
+            matter_id: matter.id,
+            matter_title: matter.title,
+            hours,
+            description: desc,
+            rate: document.getElementById('time-rate').value || matter.rate || null,
+            date: document.getElementById('time-date').value || null,
+          })
+        });
+        document.getElementById('time-status').textContent = `Logged ${hours}h to ${matter.title}.`;
+        ['time-hours','time-desc','time-rate','time-matter'].forEach(id => { const el=document.getElementById(id); if(el) el.value=''; });
+        document.getElementById('time-date').valueAsDate = new Date();
+        _loadTimeEntries();
+      } catch { document.getElementById('time-status').textContent = 'Error logging time.'; }
+      timeSubmit.disabled = false;
+    });
+    const timeMatterFilter = document.getElementById('time-filter-matter');
+    const timeUnbilledFilter = document.getElementById('time-filter-unbilled');
+    if (timeMatterFilter) timeMatterFilter.addEventListener('change', _loadTimeEntries);
+    if (timeUnbilledFilter) timeUnbilledFilter.addEventListener('change', _loadTimeEntries);
+
+    // === RESEARCH ===
+    const researchBtn = document.getElementById('legal-research-btn');
+    if (researchBtn) researchBtn.addEventListener('click', async () => {
+      const q = document.getElementById('legal-research-q').value.trim();
+      if (!q) { document.getElementById('legal-research-status').textContent = 'Enter a research question.'; return; }
+      const status = document.getElementById('legal-research-status');
+      const result = document.getElementById('legal-research-result');
+      status.textContent = 'Researching — this may take 30–60 seconds…';
+      researchBtn.disabled = true; result.hidden = true;
+      try {
+        const data = await api('/api/owner/legal/research', {
+          method: 'POST',
+          body: JSON.stringify({
+            question: q,
+            practice_area: document.getElementById('legal-research-area').value || '',
+            jurisdiction: document.getElementById('legal-research-jurisdiction').value || '',
+          })
+        });
+        document.getElementById('legal-research-text').textContent = data.memo || '';
+        result.hidden = false;
+        status.textContent = '';
+      } catch { status.textContent = 'Research failed — try again.'; }
+      researchBtn.disabled = false;
+    });
+    const researchCopy = document.getElementById('legal-research-copy');
+    if (researchCopy) researchCopy.addEventListener('click', () => {
+      const text = document.getElementById('legal-research-text').textContent;
+      navigator.clipboard.writeText(text);
+      researchCopy.textContent = 'Copied!';
+      setTimeout(() => { researchCopy.textContent = 'Copy'; }, 2000);
+    });
+
+    // === CONFLICT CHECK ===
+    const conflictBtn = document.getElementById('conflict-check-btn');
+    if (conflictBtn) conflictBtn.addEventListener('click', async () => {
+      const name = document.getElementById('conflict-name').value.trim();
+      if (!name) { document.getElementById('conflict-status').textContent = 'Enter a name to check.'; return; }
+      const status = document.getElementById('conflict-status');
+      const result = document.getElementById('conflict-result');
+      status.textContent = 'Checking…'; conflictBtn.disabled = true; result.hidden = true;
+      try {
+        const data = await api('/api/owner/legal/conflict_check', {
+          method: 'POST',
+          body: JSON.stringify({ name })
+        });
+        const hits = data.conflicts || [];
+        if (hits.length === 0) {
+          result.style.borderColor = '#4cbb70';
+          result.innerHTML = `<span style="color:#4cbb70;font-weight:600">✓ No conflicts found</span> — "${_lesc(name)}" is clear to open a new matter.`;
+        } else {
+          result.style.borderColor = '#dc3545';
+          result.innerHTML = `<span style="color:#dc3545;font-weight:700">⚠ CONFLICT — ${hits.length} match(es)</span><br><br>` +
+            hits.map(h => `<div style="margin-bottom:8px;padding:10px;background:#1a0d0d;border-radius:8px">
+              <strong>${_lesc(h.matter_number||'')} ${_lesc(h.title)}</strong><br>
+              <span style="font-size:12px;color:#8fa3c7">${_lesc(h.conflict_type)} &nbsp;·&nbsp; ${_lesc(h.status)}</span>
+            </div>`).join('');
+        }
+        result.hidden = false; status.textContent = '';
+      } catch { status.textContent = 'Check failed.'; }
+      conflictBtn.disabled = false;
+    });
+    const conflictInput = document.getElementById('conflict-name');
+    if (conflictInput) conflictInput.addEventListener('keydown', e => { if (e.key === 'Enter') conflictBtn?.click(); });
   }
 
 })();
