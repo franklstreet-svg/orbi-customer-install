@@ -41,6 +41,7 @@ import os
 import re as _re
 import threading
 import time
+from datetime import datetime as _datetime, timedelta as _timedelta, timezone as _timezone
 from pathlib import Path
 
 from flask import (Flask, Response, abort, jsonify, make_response, request,
@@ -84,8 +85,10 @@ import notifications as notify
 import pre_execute as pre_exec
 import prompts
 import rate_limit
+import sms_sender
 import users as users_mod
 import voice
+import voicemail as voicemail_mod
 import wellbeing
 from modules import business_info as mod_business
 from modules import calendar as mod_calendar
@@ -120,6 +123,7 @@ from modules import pricing as mod_pricing
 from modules import line_items as mod_line_items
 from tools import url_fetch as tool_url_fetch
 from tools import web_search as tool_web_search
+from modules import legal as mod_legal
 
 # ---------------------------------------------------------------------------
 # Paths and config
@@ -1383,9 +1387,18 @@ def tts():
 @app.route("/api/voices", methods=["GET"])
 def list_voices():
     """A curated list of nice-sounding English voices."""
+    kokoro = []
+    try:
+        import kokoro_tts
+        kokoro = [
+            {"id": v.get("id"), "label": f"{v.get('label')} ({v.get('gender')})"}
+            for v in kokoro_tts.available_voices()
+        ]
+    except Exception:
+        kokoro = []
     return jsonify({
         "default": _DEFAULT_VOICE,
-        "voices": [
+        "voices": kokoro + [
             {"id": "en-US-AvaNeural",    "label": "Ava (female, warm, conversational)"},
             {"id": "en-US-AriaNeural",   "label": "Aria (female, professional)"},
             {"id": "en-US-JennyNeural",  "label": "Jenny (female, friendly)"},
@@ -2665,6 +2678,387 @@ def owner_marketing_image_fetch(filename):
                        as_attachment=False, download_name=filename)
 
 
+# ── LEGAL PARALEGAL MODULE ────────────────────────────────────────────────────
+# Gated by enabled_modules("legal"). Routes cover matter management, deadlines,
+# time tracking, conflict checks, and document drafting.
+# Attorney supervises all output — Idunn works FOR the attorney, not the client.
+
+def _require_legal_module():
+    owner_session = _require_owner()
+    if not is_module_enabled("legal"):
+        abort(402, "Legal module not enabled — subscribe at billing.twickell.com")
+    return owner_session
+
+# Matters
+
+@app.route("/api/owner/legal/matters", methods=["GET"])
+def legal_matters_list():
+    _require_legal_module()
+    status = request.args.get("status")
+    search = request.args.get("q")
+    matters = mod_legal.list_matters(DATA_DIR, status=status, search=search)
+    return jsonify({"ok": True, "matters": matters})
+
+@app.route("/api/owner/legal/matters", methods=["POST"])
+def legal_matters_create():
+    s = _require_legal_module()
+    body = request.get_json(force=True) or {}
+    matter = mod_legal.open_matter(
+        DATA_DIR,
+        title=body.get("title", ""),
+        client_name=body.get("client_name", ""),
+        matter_type=body.get("type", "other"),
+        practice_area=body.get("practice_area", ""),
+        client_phone=body.get("client_phone", ""),
+        client_email=body.get("client_email", ""),
+        opposing_party=body.get("opposing_party", ""),
+        opposing_counsel=body.get("opposing_counsel", ""),
+        opposing_firm=body.get("opposing_firm", ""),
+        court=body.get("court", ""),
+        judge=body.get("judge", ""),
+        case_number=body.get("case_number", ""),
+        jurisdiction=body.get("jurisdiction", ""),
+        retainer=float(body.get("retainer", 0)),
+        rate=float(body.get("rate", 0)),
+        notes=body.get("notes", ""),
+        tags=body.get("tags", []),
+    )
+    audit.log(s["username"], action="legal.matter.open",
+              detail=matter.get("matter_number"))
+    return jsonify({"ok": True, "matter": matter}), 201
+
+@app.route("/api/owner/legal/matters/<matter_id>", methods=["GET"])
+def legal_matter_get(matter_id):
+    _require_legal_module()
+    m = mod_legal.get_matter(DATA_DIR, matter_id)
+    if not m:
+        return jsonify({"ok": False, "error": "not_found"}), 404
+    return jsonify({"ok": True, "matter": m})
+
+@app.route("/api/owner/legal/matters/<matter_id>", methods=["PATCH"])
+def legal_matter_update(matter_id):
+    s = _require_legal_module()
+    body = request.get_json(force=True) or {}
+    m = mod_legal.update_matter(DATA_DIR, matter_id, **body)
+    if not m:
+        return jsonify({"ok": False, "error": "not_found"}), 404
+    audit.log(s["username"], action="legal.matter.update",
+              detail=matter_id)
+    return jsonify({"ok": True, "matter": m})
+
+@app.route("/api/owner/legal/matters/<matter_id>/close", methods=["POST"])
+def legal_matter_close(matter_id):
+    s = _require_legal_module()
+    body = request.get_json(force=True) or {}
+    m = mod_legal.close_matter(DATA_DIR, matter_id,
+                                status=body.get("status", "closed"))
+    if not m:
+        return jsonify({"ok": False, "error": "not_found"}), 404
+    audit.log(s["username"], action="legal.matter.close", detail=matter_id)
+    return jsonify({"ok": True, "matter": m})
+
+# Conflict check
+
+@app.route("/api/owner/legal/conflict_check", methods=["POST"])
+def legal_conflict_check():
+    _require_legal_module()
+    body = request.get_json(force=True) or {}
+    name = body.get("name", "").strip()
+    if not name:
+        return jsonify({"ok": False, "error": "name required"}), 400
+    hits = mod_legal.conflict_check(DATA_DIR, name)
+    return jsonify({"ok": True, "name": name, "conflicts": hits,
+                    "clear": len(hits) == 0})
+
+# Deadlines
+
+@app.route("/api/owner/legal/deadlines", methods=["GET"])
+def legal_deadlines_list():
+    _require_legal_module()
+    matter_id = request.args.get("matter_id")
+    days = request.args.get("days", type=int)
+    status = request.args.get("status")
+    deadlines = mod_legal.list_deadlines(DATA_DIR, matter_id=matter_id,
+                                          upcoming_days=days, status=status)
+    return jsonify({"ok": True, "deadlines": deadlines})
+
+@app.route("/api/owner/legal/deadlines", methods=["POST"])
+def legal_deadlines_create():
+    s = _require_legal_module()
+    body = request.get_json(force=True) or {}
+    matter_id = body.get("matter_id", "")
+    matter = mod_legal.get_matter(DATA_DIR, matter_id)
+    matter_title = matter.get("title", "") if matter else body.get("matter_title", "")
+    d = mod_legal.add_deadline(
+        DATA_DIR,
+        matter_id=matter_id,
+        matter_title=matter_title,
+        title=body.get("title", ""),
+        due_date=body.get("due_date", ""),
+        deadline_type=body.get("type", "other"),
+        due_time=body.get("due_time", ""),
+        location=body.get("location", ""),
+        notes=body.get("notes", ""),
+        reminder_days=body.get("reminder_days"),
+    )
+    audit.log(s["username"], action="legal.deadline.add", detail=d.get("id"))
+    return jsonify({"ok": True, "deadline": d}), 201
+
+@app.route("/api/owner/legal/deadlines/<deadline_id>/complete", methods=["POST"])
+def legal_deadline_complete(deadline_id):
+    s = _require_legal_module()
+    d = mod_legal.complete_deadline(DATA_DIR, deadline_id)
+    if not d:
+        return jsonify({"ok": False, "error": "not_found"}), 404
+    audit.log(s["username"], action="legal.deadline.complete",
+              detail=deadline_id)
+    return jsonify({"ok": True, "deadline": d})
+
+# Time tracking
+
+@app.route("/api/owner/legal/time", methods=["GET"])
+def legal_time_list():
+    _require_legal_module()
+    matter_id = request.args.get("matter_id")
+    billed = request.args.get("billed")
+    billed_filter = None
+    if billed == "true":
+        billed_filter = True
+    elif billed == "false":
+        billed_filter = False
+    entries = mod_legal.list_time(DATA_DIR, matter_id=matter_id,
+                                   billed=billed_filter)
+    return jsonify({"ok": True, "entries": entries})
+
+@app.route("/api/owner/legal/time", methods=["POST"])
+def legal_time_log():
+    s = _require_legal_module()
+    body = request.get_json(force=True) or {}
+    matter_id = body.get("matter_id", "")
+    matter = mod_legal.get_matter(DATA_DIR, matter_id)
+    matter_title = matter.get("title", "") if matter else body.get("matter_title", "")
+    rate = float(body.get("rate") or (matter.get("rate", 0) if matter else 0))
+    entry = mod_legal.log_time(
+        DATA_DIR,
+        matter_id=matter_id,
+        matter_title=matter_title,
+        hours=float(body.get("hours", 0)),
+        description=body.get("description", ""),
+        entry_date=body.get("date"),
+        rate=rate,
+    )
+    audit.log(s["username"], action="legal.time.log",
+              detail=f"{entry['hours']}h on {matter_title}")
+    return jsonify({"ok": True, "entry": entry}), 201
+
+@app.route("/api/owner/legal/time/summary/<matter_id>", methods=["GET"])
+def legal_time_summary(matter_id):
+    _require_legal_module()
+    summary = mod_legal.matter_time_summary(DATA_DIR, matter_id)
+    return jsonify({"ok": True, "summary": summary})
+
+@app.route("/api/owner/legal/time/bill/<matter_id>", methods=["POST"])
+def legal_time_mark_billed(matter_id):
+    s = _require_legal_module()
+    count = mod_legal.mark_time_billed(DATA_DIR, matter_id)
+    audit.log(s["username"], action="legal.time.bill",
+              detail=f"{count} entries on {matter_id}")
+    return jsonify({"ok": True, "marked_billed": count})
+
+# SOL calculator
+
+@app.route("/api/owner/legal/sol", methods=["POST"])
+def legal_sol():
+    _require_legal_module()
+    body = request.get_json(force=True) or {}
+    result = mod_legal.sol_deadline_estimate(
+        body.get("incident_date", ""),
+        body.get("practice_area", ""),
+        body.get("jurisdiction", ""),
+    )
+    return jsonify({"ok": True, "sol": result})
+
+# Document drafting
+
+@app.route("/api/owner/legal/templates", methods=["GET"])
+def legal_templates_list():
+    _require_legal_module()
+    return jsonify({"ok": True, "templates": mod_legal.list_templates()})
+
+@app.route("/api/owner/legal/draft", methods=["POST"])
+def legal_draft_document():
+    s = _require_legal_module()
+    body = request.get_json(force=True) or {}
+    template_key = body.get("template", "")
+    fields = body.get("fields", {})
+    draft_prompt = mod_legal.build_draft_prompt(template_key, fields)
+    if not draft_prompt:
+        return jsonify({"ok": False, "error": "unknown template"}), 400
+    system = (
+        "You are a paralegal assistant. Draft the requested legal document "
+        "professionally and completely. Mark any section requiring attorney "
+        "judgment with [ATTORNEY REVIEW]. Never give legal advice to opposing "
+        "parties. The attorney will review everything before use."
+    )
+    try:
+        draft = llm_client.chat(system=system, user=draft_prompt)
+    except Exception as e:
+        log.exception("legal draft failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
+    audit.log(s["username"], action="legal.draft",
+              detail=template_key)
+    return jsonify({"ok": True, "template": template_key, "draft": draft})
+
+# Dashboard summary
+
+@app.route("/api/owner/legal/dashboard", methods=["GET"])
+def legal_dashboard():
+    _require_legal_module()
+    summary = mod_legal.dashboard_summary(DATA_DIR)
+    upcoming = mod_legal.upcoming_deadlines_summary(DATA_DIR, days=30)
+    return jsonify({"ok": True, "summary": summary,
+                    "upcoming_deadlines": upcoming})
+
+# Legal research
+
+@app.route("/api/owner/legal/research", methods=["POST"])
+def legal_research():
+    s = _require_legal_module()
+    body = request.get_json(force=True) or {}
+    question = body.get("question", "").strip()
+    if not question:
+        return jsonify({"ok": False, "error": "question required"}), 400
+    research_prompt = mod_legal.build_research_prompt(
+        question,
+        jurisdiction=body.get("jurisdiction", ""),
+        practice_area=body.get("practice_area", ""),
+        matter_context=body.get("matter_context", ""),
+    )
+    system = (
+        "You are an experienced paralegal with expertise in legal research. "
+        "Produce thorough, well-organized research memos for attorney review. "
+        "Cite real cases and statutes. Always flag SOL issues and areas of "
+        "unsettled law. Never give advice directly to clients."
+    )
+    try:
+        memo = llm_client.chat(system=system, user=research_prompt)
+    except Exception as e:
+        log.exception("legal research failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
+    audit.log(s["username"], action="legal.research",
+              detail=question[:80])
+    return jsonify({"ok": True, "question": question, "memo": memo})
+
+# Client intake analysis
+
+@app.route("/api/owner/legal/intake", methods=["POST"])
+def legal_intake():
+    s = _require_legal_module()
+    body = request.get_json(force=True) or {}
+    intake_prompt = mod_legal.build_intake_prompt(body)
+    system = (
+        "You are an experienced paralegal preparing intake memos for attorney review. "
+        "Be thorough, flag every risk, mark every SOL estimate for attorney verification."
+    )
+    try:
+        memo = llm_client.chat(system=system, user=intake_prompt)
+    except Exception as e:
+        log.exception("legal intake failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
+    audit.log(s["username"], action="legal.intake", detail="intake memo")
+    return jsonify({"ok": True, "memo": memo})
+
+# Document drafts — approval workflow
+
+@app.route("/api/owner/legal/drafts", methods=["GET"])
+def legal_drafts_list():
+    _require_legal_module()
+    matter_id = request.args.get("matter_id")
+    status = request.args.get("status")
+    drafts = mod_legal.list_drafts(DATA_DIR, matter_id=matter_id, status=status)
+    return jsonify({"ok": True, "drafts": drafts})
+
+@app.route("/api/owner/legal/drafts/<draft_id>", methods=["GET"])
+def legal_draft_get(draft_id):
+    _require_legal_module()
+    d = mod_legal.get_draft(DATA_DIR, draft_id)
+    if not d:
+        return jsonify({"ok": False, "error": "not_found"}), 404
+    return jsonify({"ok": True, "draft": d})
+
+@app.route("/api/owner/legal/drafts/<draft_id>/approve", methods=["POST"])
+def legal_draft_approve(draft_id):
+    s = _require_legal_module()
+    d = mod_legal.approve_draft(DATA_DIR, draft_id)
+    if not d:
+        return jsonify({"ok": False, "error": "not_found"}), 404
+    audit.log(s["username"], action="legal.draft.approve", detail=draft_id)
+    return jsonify({"ok": True, "draft": d})
+
+@app.route("/api/owner/legal/drafts/<draft_id>/revise", methods=["POST"])
+def legal_draft_revise(draft_id):
+    s = _require_legal_module()
+    body = request.get_json(force=True) or {}
+    new_content = body.get("content", "")
+    notes = body.get("notes", "")
+    if not new_content:
+        return jsonify({"ok": False, "error": "content required"}), 400
+    d = mod_legal.revise_draft(DATA_DIR, draft_id,
+                                new_content=new_content, notes=notes)
+    if not d:
+        return jsonify({"ok": False, "error": "not_found"}), 404
+    audit.log(s["username"], action="legal.draft.revise", detail=draft_id)
+    return jsonify({"ok": True, "draft": d})
+
+# Regenerate draft with LLM + save to drafts
+
+@app.route("/api/owner/legal/draft", methods=["POST"])
+def legal_draft_document():
+    s = _require_legal_module()
+    body = request.get_json(force=True) or {}
+    template_key = body.get("template", "")
+    fields = body.get("fields", {})
+    matter_id = body.get("matter_id", "")
+
+    draft_prompt = mod_legal.build_draft_prompt(template_key, fields)
+    if not draft_prompt:
+        return jsonify({"ok": False, "error": "unknown template"}), 400
+
+    tmpl = mod_legal.get_template(template_key)
+    matter = mod_legal.get_matter(DATA_DIR, matter_id) if matter_id else None
+    matter_title = matter.get("title", "") if matter else fields.get("case_title", "")
+
+    system = (
+        "You are a highly experienced paralegal. Draft the complete legal document "
+        "requested — not a shell, not an outline, a finished draft ready for attorney "
+        "review. Be thorough and professional. Use proper legal formatting. Mark any "
+        "section where attorney judgment is required with [ATTORNEY REVIEW NEEDED]. "
+        "End every document with: 'Prepared by Idunn AI Paralegal — for attorney "
+        "review and approval only. Not for distribution without attorney authorization.'"
+    )
+    try:
+        content = llm_client.chat(system=system, user=draft_prompt)
+    except Exception as e:
+        log.exception("legal draft failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+    saved = mod_legal.save_draft(
+        DATA_DIR,
+        matter_id=matter_id,
+        matter_title=matter_title,
+        template_key=template_key,
+        template_name=tmpl.get("name", template_key) if tmpl else template_key,
+        content=content,
+        fields=fields,
+    )
+    audit.log(s["username"], action="legal.draft.create",
+              detail=f"{template_key} for {matter_title}")
+    return jsonify({"ok": True, "template": template_key,
+                    "draft": saved})
+
+# ── END LEGAL MODULE ──────────────────────────────────────────────────────────
+
+
 @app.route("/api/public/business_summary")
 def public_business_summary():
     """Lightweight, no-auth snapshot for the visitor-facing chat shell.
@@ -2695,6 +3089,58 @@ def public_business_summary():
 # Public chat
 # ---------------------------------------------------------------------------
 
+def _try_public_lead_capture(message: str, visitor: dict | None = None) -> dict | None:
+    """Capture visitor contact info from public chat without invoking owner
+    SMS/email workflows. Handles natural lead replies like:
+    'My name is Test Lead and my phone is 775-555-1212'."""
+    text = " ".join(str(message or "").split()).strip()
+    visitor = visitor or {}
+    phone_m = _re.search(r"(\+?\d[\d\-\(\)\s]{7,}\d)", text)
+    email_m = _re.search(r"[\w.\-+]+@[\w.\-]+\.\w+", text)
+    name = str(visitor.get("name") or "").strip()
+    name_m = _re.search(
+        r"\b(?:my\s+name\s+is|name\s+is|i\s+am|i'm)\s+"
+        r"(?P<name>[A-Z][A-Za-z'\-]+(?:\s+[A-Z][A-Za-z'\-]+){0,3})\b",
+        text,
+    )
+    if name_m:
+        name = name_m.group("name").strip()
+    phone = str(visitor.get("phone") or "").strip()
+    if phone_m:
+        phone = phone_m.group(1).strip()
+    email_addr = str(visitor.get("email") or "").strip()
+    if email_m:
+        email_addr = email_m.group(0).strip()
+    if not (phone or email_addr):
+        return None
+    try:
+        captured = mod_messages.capture(
+            DATA_DIR,
+            msg_type="lead",
+            from_name=name or None,
+            from_phone=phone or None,
+            from_email=email_addr or None,
+            body=text[:500],
+            source="public_chat",
+            config=CONFIG,
+        )
+        try:
+            notify.send(
+                CONFIG, DATA_DIR, event="new_lead",
+                title=f"New lead: {name or phone or email_addr}",
+                body=text[:200], url="/owner",
+            )
+        except Exception:
+            pass
+        label = name or phone or email_addr
+        return {"reply": f"Thanks, {label}. I have your contact info and will pass it to the owner.",
+                "tier": "local", "source": "public_lead_captured",
+                "message_id": captured.get("id")}
+    except Exception as e:
+        log.warning(f"public lead capture failed: {e}")
+        return {"reply": "I had trouble saving that contact info. Please call or try again.",
+                "tier": "local", "source": "public_lead_capture_error"}
+
 @app.route("/chat", methods=["POST"])
 def public_chat():
     if not BILLING_STATUS.get("active", True):
@@ -2723,6 +3169,27 @@ def public_chat():
     business = _resolve_business_profile_for_request(request)
     _biz_name_norm = str((business.get("name") or "")).strip().lower().replace(" ", "")
     _is_sales_bot = _biz_name_norm == "myorbi"
+
+    # Public chat is a visitor/sales surface. Owner-only actions such as
+    # sending texts must happen in the signed-in owner dashboard, otherwise
+    # the sales bot can produce confusing "I can't send texts" answers that
+    # look like the personal Orbi is broken.
+    _PUBLIC_SMS_ACTION_RE = _re.compile(
+        r"\b(?:send|text|message|sms)\b.*\b(?:text|message|sms)\b"
+        r"|\b(?:text|message|sms)\b.*\b(?:send|tell|ask|say|saying|let|notify)\b",
+        _re.IGNORECASE,
+    )
+    if _PUBLIC_SMS_ACTION_RE.search(user_msg):
+        return jsonify({
+            "reply": (
+                "I can't send owner texts from this public website chat. "
+                "Use the signed-in owner dashboard and ask Orbi there. "
+                "If you're a visitor and want the business to text you, "
+                "leave your name and phone number."
+            ),
+            "tier": "local",
+            "source": "public_owner_sms_action_blocked",
+        }), 200
 
     # ─── PRIVACY GUARD ───────────────────────────────────────────────────
     # Public visitors must NOT be able to fish for owner-only data —
@@ -2782,6 +3249,10 @@ def public_chat():
             "tier": "local",
             "source": "personal_intent_blocked",
         }), 200
+
+    lead_capture = _try_public_lead_capture(user_msg, visitor)
+    if lead_capture is not None:
+        return jsonify(lead_capture), 200
 
     # Multi-tenant routing: business profile already resolved above (the
     # privacy guard needed it to detect sales-bot mode).
@@ -3839,12 +4310,16 @@ def owner_report_issue():
 def owner_status():
     user = auth.require_user(ORBI_DIR, DATA_DIR)
     business = mod_business.load(DATA_DIR)
+    enabled_mods = CONFIG.get("enabled_modules") or []
+    if not isinstance(enabled_mods, list):
+        enabled_mods = []
     return jsonify({
         "username":      user["username"],
         "role":          user.get("role", "staff"),
         "display_name":  user.get("display_name"),
         "business_name": business.get("name") or CONFIG.get("business", {}).get("name", ""),
         "tier":          BILLING_STATUS.get("tier"),
+        "enabled_modules": [str(m).strip().lower() for m in enabled_mods if m],
         "active":        BILLING_STATUS.get("active"),
         "warning":       BILLING_STATUS.get("warning"),
         "period_end":    None,
@@ -5574,9 +6049,21 @@ def owner_chat():
     if vague_more_resp is not None:
         return jsonify(vague_more_resp)
 
+    notes_search_resp = _try_notes_search(user_msg, user_rec)
+    if notes_search_resp is not None:
+        return jsonify(notes_search_resp)
+
+    # Voicemails — check real data, never guess.
+    vm_resp = _try_voicemail_check(user_msg, user_rec)
+    if vm_resp is not None:
+        return jsonify(vm_resp)
+
     # Email handlers FIRST — must beat the contacts regex which can
     # match "find emails from <Name>" by greedy name-matching the
     # "from <Name>" tail. Email intent is more specific.
+    email_direct_resp = _try_email_raw_or_needs_contact(user_msg, user_rec)
+    if email_direct_resp is not None:
+        return jsonify(email_direct_resp)
     email_check_resp = _try_email_check_inbox(user_msg, user_rec)
     if email_check_resp is not None:
         return jsonify(email_check_resp)
@@ -5596,6 +6083,60 @@ def owner_chat():
     email_read_resp = _try_email_read(user_msg, user_rec)
     if email_read_resp is not None:
         return jsonify(email_read_resp)
+
+    email_followup_resp = _try_email_body_followup(user_msg, user_rec, history)
+    if email_followup_resp is not None:
+        return jsonify(email_followup_resp)
+
+    # READ patterns must beat broad "done/complete" handlers so questions
+    # like "what tasks are done" don't get interpreted as a completion command.
+    pa_direct = _try_personal_assistant_read(user_msg, user_dir)
+    if pa_direct is not None:
+        return jsonify({"reply": pa_direct, "tier": "local", "latency_ms": 0,
+                        "source": "personal_assistant"})
+
+    task_done_resp = _try_task_complete(user_msg, user_rec)
+    if task_done_resp is not None:
+        return jsonify(task_done_resp)
+
+    if is_module_enabled("legal"):
+        legal_resp = _try_legal_chat(user_msg, user_rec, history)
+        if legal_resp is not None:
+            return jsonify(legal_resp)
+
+    reminders_chat_resp = _try_reminders_chat(user_msg, user_rec, history)
+    if reminders_chat_resp is not None:
+        return jsonify(reminders_chat_resp)
+
+    meeting_flow_resp = _try_calendar_meeting_flow(user_msg, user_dir, history)
+    if meeting_flow_resp is not None:
+        return jsonify(meeting_flow_resp)
+
+    cal_day_followup = _try_calendar_day_followup(user_msg, user_dir, history)
+    if cal_day_followup is not None:
+        return jsonify(cal_day_followup)
+
+    sms_pending_resp = _try_sms_pending_confirmation(user_msg, user_rec, history)
+    if sms_pending_resp is not None:
+        return jsonify(sms_pending_resp)
+    sms_clarify_resp = _try_sms_clarification_followup(user_msg, user_rec, history)
+    if sms_clarify_resp is not None:
+        return jsonify(sms_clarify_resp)
+    sms_me_or_that_resp = _try_sms_to_me_or_that_one(user_msg, user_rec, history)
+    if sms_me_or_that_resp is not None:
+        return jsonify(sms_me_or_that_resp)
+    sms_send_resp = _try_sms_send(user_msg, user_rec)
+    if sms_send_resp is not None:
+        return jsonify(sms_send_resp)
+    sms_person_resp = _try_sms_to_person(user_msg, user_rec)
+    if sms_person_resp is not None:
+        return jsonify(sms_person_resp)
+    sms_broad_resp = _try_sms_broad_intent(user_msg, user_rec)
+    if sms_broad_resp is not None:
+        return jsonify(sms_broad_resp)
+    sms_needs_number_resp = _try_sms_needs_number(user_msg, user_rec)
+    if sms_needs_number_resp is not None:
+        return jsonify(sms_needs_number_resp)
 
     # Contacts ADD — "add Bill Henry, billh@example.com, 555-0142, electrician".
     # Was previously falling to the LLM which faked the confirmation
@@ -5667,6 +6208,9 @@ def owner_chat():
     contact_del_resp = _try_delete_contact(user_msg, user_dir)
     if contact_del_resp is not None:
         return jsonify(contact_del_resp)
+    rem_remove_resp = _try_reminder_remove(user_msg, user_rec)
+    if rem_remove_resp is not None:
+        return jsonify(rem_remove_resp)
     task_del_resp = _try_delete_task(user_msg, user_dir)
     if task_del_resp is not None:
         return jsonify(task_del_resp)
@@ -5760,10 +6304,6 @@ def owner_chat():
     # Task completion — "done with X", "finished X", "completed the supplier
     # call". Has to run BEFORE friend-mode context-loading so she doesn't
     # turn it into conversation instead of marking it done.
-    task_done_resp = _try_task_complete(user_msg, user_rec)
-    if task_done_resp is not None:
-        return jsonify(task_done_resp)
-
     # Reminder removal — "don't remind me about X" / "cancel the reminder
     # about Y". Has to run before friend-mode context-loading so she
     # actually deletes the reminder instead of conversational acknowledgment.
@@ -6261,10 +6801,24 @@ _PA_TASKS_RE = _re.compile(
     r"(?:todo|to[\s-]?do|tasks?)(?:\s+list)?\b",
     _re.IGNORECASE,
 )
+_PA_TASKS_DONE_RE = _re.compile(
+    r"\b(?:show|list|what(?:'s|s| are)|what\s+tasks?\s+are)\s+"
+    r"(?:me\s+)?(?:my\s+)?(?:done|completed|complete|finished)\s+"
+    r"(?:todo|to[\s-]?do|tasks?)?\b"
+    r"|\b(?:what|show|list)\s+(?:tasks?|todos?)\s+(?:are\s+)?(?:done|completed|finished)\b",
+    _re.IGNORECASE,
+)
 _PA_REMINDERS_RE = _re.compile(
     r"\b(?:show|list|what(?:'s|s| are))\s+(?:me\s+)?(?:my\s+)?(?:pending\s+)?"
     r"reminders?\b"
     r"|\bwhat\s+do\s+i\s+need\s+to\s+be\s+reminded\s+(?:about|of)\b",
+    _re.IGNORECASE,
+)
+_PA_REMINDERS_DONE_RE = _re.compile(
+    r"\b(?:show|list|what(?:'s|s| are)|what\s+reminders?\s+are)\s+"
+    r"(?:me\s+)?(?:my\s+)?(?:done|completed|complete|finished)\s+"
+    r"reminders?\b"
+    r"|\b(?:what|show|list)\s+reminders?\s+(?:are\s+)?(?:done|completed|finished)\b",
     _re.IGNORECASE,
 )
 _PA_WHO_IS_RE = _re.compile(
@@ -6473,7 +7027,8 @@ def _try_recovery_command(message: str, username: str, user_dir: Path) -> dict |
                     return {"reply": "No backup directory found. Nothing to restore from.",
                             "tier": "local", "latency_ms": 0,
                             "source": "recovery_no_backup"}
-                snapshots = sorted(
+                current_backup = bk_dir / backup._current_local_backup_name(CONFIG)
+                snapshots = [current_backup] if current_backup.exists() else sorted(
                     [p for p in bk_dir.iterdir() if p.suffix == ".enc"],
                     key=lambda p: p.stat().st_mtime, reverse=True)
                 if not snapshots:
@@ -6551,8 +7106,9 @@ def _try_recovery_command(message: str, username: str, user_dir: Path) -> dict |
 # ── Update commands ────────────────────────────────────────────────────────
 # "is there an update?" / "check for updates" → quick answer from cached state
 # (or live check if last_check > 24h ago).
-# "install update" / "apply update" / "update orbi" → download to staging,
-# tell owner where to run the install (root permissions needed for binary swap).
+# Local-install only: "install update" / "apply update" / "update orbi" →
+# download to staging and tell owner where to run the installer.
+# Cloud tenants are operator-managed until the self-update service exists.
 
 _UPDATE_CHECK_RE = _re.compile(
     r"^\s*(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?"
@@ -6568,6 +7124,18 @@ _UPDATE_INSTALL_RE = _re.compile(
     r"upgrade\s+(?:orbi|yourself|now))",
     _re.IGNORECASE,
 )
+
+
+def _is_cloud_tenant_runtime() -> bool:
+    """True for cloud-v1 tenant processes under ~/orbi-tenants.
+
+    The GitHub binary updater belongs to the old local-install product.
+    Cloud tenants run shared server code and must be updated by the
+    operator/deploy path, not by asking the owner to run an installer.
+    """
+    tenant_id = os.environ.get("ORBI_TENANT_ID") or (CONFIG or {}).get("tenant_id")
+    orbi_dir = Path(os.environ.get("ORBI_DIR") or "").expanduser()
+    return bool(tenant_id) and "orbi-tenants" in orbi_dir.parts
 
 
 # Match a capitalized 1-3 word name. Case-sensitive so we don't slurp
@@ -10129,7 +10697,7 @@ _CANCEL_APPT_RE = _re.compile(
 # an appointment matching 'contact Lisa Chen'" response). Now matches
 # clean and calls mod_contacts.remove via _try_delete_contact.
 _DELETE_CONTACT_RE = _re.compile(
-    r"^\s*(?:delete|remove|drop)\s+(?:the\s+|my\s+)?contact\s+"
+    r"^\s*(?:delete|remove|drop)\s+(?:the\s+|my\s+)?(?:contact\s+)?"
     r"(?:named\s+|called\s+|for\s+)?"
     r"(?P<name>.+?)\s*[?.!]?\s*$",
     _re.IGNORECASE,
@@ -10147,7 +10715,7 @@ _CONTACT_PERSONAL_NOTE_RE = _re.compile(
 )
 _DELETE_TASK_RE = _re.compile(
     r"^\s*(?:delete|remove|drop|cancel)\s+(?:the\s+|my\s+)?"
-    r"(?:task|todo|reminder)\s+(?:to\s+|about\s+|for\s+|called\s+|named\s+)?"
+    r"(?:task|todo)\s+(?:to\s+|about\s+|for\s+|called\s+|named\s+)?"
     r"(?P<what>.+?)\s*[?.!]?\s*$",
     _re.IGNORECASE,
 )
@@ -10426,6 +10994,11 @@ def _try_contact_personal_note(message: str, user_dir) -> dict | None:
 def _try_delete_contact(message: str, user_dir) -> dict | None:
     """Frank 2026-06-23: explicit 'delete the contact X' fast path."""
     stripped = _strip_polite_prefix(message or "")
+    explicit_contact = bool(_re.search(r"\bcontact\b", stripped, _re.IGNORECASE))
+    if not _re.search(r"\bcontact\b", stripped, _re.IGNORECASE):
+        if _re.search(r"\b(?:task|todo|reminder|appointment|meeting|event)\b",
+                      stripped, _re.IGNORECASE):
+            return None
     m = _DELETE_CONTACT_RE.match(stripped)
     if not m:
         return None
@@ -10436,6 +11009,8 @@ def _try_delete_contact(message: str, user_dir) -> dict | None:
     if not isinstance(matches, list):
         matches = [matches] if matches else []
     if not matches:
+        if not explicit_contact:
+            return None
         return {"reply": f"I don't see a contact named \"{name}\".",
                 "tier": "local", "latency_ms": 0,
                 "source": "contact_delete_no_match"}
@@ -10866,6 +11441,20 @@ def _try_update_command(message: str, username: str) -> dict | None:
     msg = (message or "").strip()
     if not msg:
         return None
+
+    if _is_cloud_tenant_runtime() and (
+        _UPDATE_CHECK_RE.match(msg) or _UPDATE_INSTALL_RE.match(msg)
+    ):
+        current = (CONFIG or {}).get("version", "0.1.0")
+        return {"reply": (
+                    f"You're on the cloud version of Orbi ({current}). "
+                    "I can't safely install cloud updates by myself yet. "
+                    "I can explain what update is available and how Frank "
+                    "applies it on the server. After Frank deploys the fix, "
+                    "refresh the dashboard and I will use the updated code."
+                ),
+                "tier": "local", "latency_ms": 0,
+                "source": "update_cloud_managed"}
 
     # "Is there an update?" — check + report
     if _UPDATE_CHECK_RE.match(msg):
@@ -12277,6 +12866,17 @@ def _try_search_everything(message: str, user_rec: dict) -> dict | None:
     except Exception as e:
         log.debug(f"search_everything emails: {e}")
 
+    # Owner notes
+    try:
+        nhits = mod_notes.search(DATA_DIR, query) or []
+        if nhits:
+            total += len(nhits)
+            sections.append(f"📝 Notes ({len(nhits)}):")
+            for n in nhits[:5]:
+                sections.append(f"  · {(n.get('content') or '')[:140]}")
+    except Exception as e:
+        log.debug(f"search_everything notes: {e}")
+
     # Memory
     try:
         from modules import memory as mod_memory
@@ -12291,7 +12891,7 @@ def _try_search_everything(message: str, user_rec: dict) -> dict | None:
 
     if total == 0:
         return {"reply": (
-            f"Nothing in your files, contacts, emails, or memory matched "
+            f"Nothing in your files, contacts, emails, notes, or memory matched "
             f"\"{query}\"."
         ), "tier": "local", "latency_ms": 0,
            "source": "search_everything_empty"}
@@ -12613,7 +13213,7 @@ def _try_lead_add(message: str, user_rec: dict) -> dict | None:
 _EMAIL_CHECK_RE = _re.compile(
     r"^\s*(?:"
     r"(?:show|list|read|get|check)\s+(?:me\s+)?(?:my\s+)?"
-    r"(?:today'?s\s+)?(?:important\s+|recent\s+|new\s+|unread\s+)?emails?\b"
+    r"(?:today'?s\s+)?(?:important\s+|recent\s+|new\s+|unread\s+|last\s+\d+\s+)?emails?\b"
     r"|what(?:'s| is)\s+(?:important|in|new)\s+in\s+(?:my\s+)?(?:inbox|email)"
     r"|any(?:thing)?\s+important\s+in\s+(?:my\s+)?(?:inbox|email)"
     r"|read\s+(?:me\s+)?(?:my\s+)?inbox"
@@ -12656,6 +13256,39 @@ _EMAIL_REPLY_RE = _re.compile(
 )
 
 
+_VOICEMAIL_CHECK_RE = _re.compile(
+    r"\b(?:voicemail|voice\s+mail|voice\s+message|missed\s+call)s?\b",
+    _re.IGNORECASE,
+)
+
+
+def _try_voicemail_check(message: str, user_rec: dict) -> dict | None:
+    """Return actual voicemail count from disk instead of letting the LLM guess."""
+    if not _VOICEMAIL_CHECK_RE.search(message):
+        return None
+    try:
+        vms = voicemail_mod.list_voicemails(DATA_DIR, limit=20)
+    except Exception:
+        return None
+    unhandled = [v for v in vms if not v.get("handled")]
+    if not vms:
+        reply = "No voicemails — your inbox is clear."
+    elif not unhandled:
+        reply = f"You have {len(vms)} voicemail{'s' if len(vms) != 1 else ''}, all already handled."
+    else:
+        lines = []
+        for v in unhandled[:5]:
+            caller = v.get("caller_name") or v.get("from_number") or "Unknown caller"
+            ts = v.get("received_at", "")[:16].replace("T", " ")
+            summary = v.get("summary") or v.get("transcript", "")[:80]
+            lines.append(f"  · {caller} ({ts}) — {summary}" if summary else f"  · {caller} ({ts})")
+        more = f"\n  …and {len(unhandled) - 5} more." if len(unhandled) > 5 else ""
+        reply = (f"You have {len(unhandled)} unhandled voicemail{'s' if len(unhandled) != 1 else ''}:\n"
+                 + "\n".join(lines) + more
+                 + "\n\nOpen the Voicemails tab to listen or mark them handled.")
+    return {"reply": reply, "tier": "local", "latency_ms": 0, "source": "voicemail_check"}
+
+
 def _try_email_check_inbox(message: str, user_rec: dict) -> dict | None:
     """Triage: "what's important in my inbox" / "show me my email" — fetches
     the inbox, lists top unread + flagged messages with sender + subject +
@@ -12675,16 +13308,42 @@ def _try_email_check_inbox(message: str, user_rec: dict) -> dict | None:
     except Exception:
         return None
     try:
+        limit_m = _re.search(r"\blast\s+(\d+)\s+emails?\b", msg, _re.IGNORECASE)
+        display_limit = max(1, min(25, int(limit_m.group(1)))) if limit_m else 10
+        fetch_limit = max(20, display_limit)
+        # Use cache if it's under 5 minutes old — avoids hanging the browser
+        # on slow IMAP providers (Yahoo can take 30s+). Only force a live
+        # refresh when the user explicitly asks ("refresh my email") or
+        # specifies a count (they expect fresh data).
+        refresh_words = _re.search(r"\b(?:refresh|reload|update|new|latest|fresh)\b",
+                                   msg, _re.IGNORECASE)
+        force = bool(limit_m or refresh_words)
+        if not force:
+            cached = email_inbox._read_cache(user_dir)
+            cache_age = _time.time() - (cached or {}).get("ts", 0) if cached else 999
+            force = cache_age > 300  # refresh if cache is older than 5 minutes
         result = email_inbox.fetch_inbox(CONFIG, user_dir,
-                                          source="all", limit=10)
+                                          source="all", limit=fetch_limit,
+                                          force_refresh=force)
     except Exception as e:
         log.warning(f"email fetch failed: {e}")
-        return {"reply": (
-            "I couldn't reach your email right now. Check your "
-            "connection or reconnect your account in Settings → Integrations."
-        ), "tier": "local", "latency_ms": 0, "source": "email_fetch_error"}
+        # Try returning stale cache rather than a hard error
+        try:
+            cached = email_inbox._read_cache(user_dir)
+            if cached and cached.get("data", {}).get("messages"):
+                stale = cached["data"]
+                stale["from_cache"] = True
+                result = stale
+            else:
+                raise
+        except Exception:
+            return {"reply": (
+                "I couldn't reach your email right now — Yahoo IMAP is slow to respond. "
+                "Try again in a moment, or say \"refresh my email\" to force a new fetch."
+            ), "tier": "local", "latency_ms": 0, "source": "email_fetch_error"}
 
     msgs = result.get("messages") or []
+    msgs = msgs[:display_limit]
     if not msgs:
         # No connector or empty inbox
         if result.get("errors"):
@@ -12745,26 +13404,21 @@ def _try_email_search(message: str, user_rec: dict) -> dict | None:
         user_dir = users_mod.get_user_dir(DATA_DIR, username)
     except Exception:
         return None
+    # Search owner chat from the latest cached inbox snapshot. A fresh IMAP
+    # pull can take longer than the chat UI timeout on Yahoo/iCloud, which
+    # looks like Orbi froze. "Check my email" refreshes the snapshot; search
+    # stays instant and deterministic.
     try:
-        # Pull a wider net than before — no provider-specific query, just
-        # the recent 100 messages. We'll filter in Python so the result
-        # actually matches what the user asked for (the previous code
-        # ran an IMAP SUBJECT search which missed sender hits entirely).
-        result = email_inbox.fetch_inbox(CONFIG, user_dir,
-                                          source="all", limit=100,
-                                          force_refresh=False)
-    except Exception as e:
-        log.warning(f"email search failed: {e}")
-        return {"reply": (
-            "I couldn't reach your email to search. Two things to check:\n"
-            "  · Is your Yahoo/Gmail/Outlook connection still active? "
-            "Open Settings → Email Accounts and look for a red status.\n"
-            "  · If it's marked active, the IMAP server may be slow right "
-            "now — wait a minute and try again.\n"
-            "If neither works, click \"Test connection\" in Email Accounts "
-            "to see the exact error."
-        ), "tier": "local", "latency_ms": 0, "source": "email_search_error"}
+        cached = email_inbox._read_cache(user_dir)  # local module helper
+    except Exception:
+        cached = None
+    result = (cached or {}).get("data") or {}
     all_msgs = result.get("messages") or []
+    if not all_msgs:
+        return {"reply": (
+            "I don't have a recent inbox snapshot to search yet. Say "
+            "\"check my email\" first, then ask me to search it."
+        ), "tier": "local", "latency_ms": 0, "source": "email_search_no_cache"}
     q_low = query.lower()
     def _matches(item: dict) -> bool:
         return (q_low in (item.get("from") or "").lower()
@@ -12773,10 +13427,13 @@ def _try_email_search(message: str, user_rec: dict) -> dict | None:
     msgs = [x for x in all_msgs if _matches(x)]
     if not msgs:
         return {"reply": f"No emails found matching \"{query}\" "
-                          f"(searched the last {len(all_msgs)} messages).",
+                          f"(searched the latest cached {len(all_msgs)} messages). "
+                          f"Say \"check my email\" to refresh the cache, then search again.",
                 "tier": "local", "latency_ms": 0,
                 "source": "email_search_empty"}
-    lines = [f"📧 Found {len(msgs)} email(s) matching \"{query}\":"]
+    else:
+        source_label = "cached"
+    lines = [f"📧 Found {len(msgs)} {source_label} email(s) matching \"{query}\":"]
     for m_ in msgs[:8]:
         lines.append(
             f"  · {m_.get('from','?').split('<')[0].strip()} — "
@@ -13094,6 +13751,138 @@ _UNWIRED_SMS_RE = _re.compile(
     r")",
     _re.IGNORECASE,
 )
+_SMS_SEND_DIRECT_RE = _re.compile(
+    r"^\s*(?:send\s+(?:a\s+)?(?:text|sms|message)|text|message)\s+"
+    r"(?:to\s+)?(?P<to>\+?[\d\-\(\)\s]{7,}\d)\s+"
+    r"(?:saying|that|with|:|-)\s*(?P<body>.+?)\s*[.?!]?\s*$",
+    _re.IGNORECASE | _re.DOTALL,
+)
+_SMS_SEND_BODY_TO_NUMBER_RE = _re.compile(
+    r"^\s*(?:send\s+)?(?:a\s+)?(?:text|sms|message)\s+"
+    r"(?P<body>.+?)\s+to\s+(?P<to>\+?[\d\-\(\)\s]{7,}\d)\s*[.?!]?\s*$",
+    _re.IGNORECASE | _re.DOTALL,
+)
+_SMS_SEND_TO_ME_RE = _re.compile(
+    r"^\s*(?:can\s+you\s+|could\s+you\s+|please\s+)?(?:"
+    r"(?:send\s+)?(?:a\s+)?(?:text|sms|message)\s+(?:me|myself)\s+"
+    r"|send\s+(?:me|myself)\s+(?:a\s+)?(?:text|sms|message)\s+"
+    r")(?:(?:that\s+)?(?:saying|says|say|with)\s+)?(?P<body>.+?)\s*[.?!]?\s*$",
+    _re.IGNORECASE | _re.DOTALL,
+)
+_SMS_SEND_TO_ME_NEEDS_BODY_RE = _re.compile(
+    r"^\s*(?:can\s+you\s+|could\s+you\s+|please\s+)?(?:"
+    r"(?:send\s+)?(?:a\s+)?(?:text|sms|message)\s+(?:me|myself)"
+    r"|send\s+(?:me|myself)\s+(?:a\s+)?(?:text|sms|message)"
+    r")\s*[.?!]?\s*$",
+    _re.IGNORECASE,
+)
+_SMS_SEND_TO_PERSON_PATTERNS = [
+    _re.compile(
+        r"^\s*(?:send\s+)?(?:a\s+)?(?:text|sms|message)\s+to\s+"
+        r"(?P<who>[A-Za-z][A-Za-z .'\-]{0,60}?)\s+"
+        r"(?:(?:that\s+)?(?:saying|says|say)|with|:|-|and\s+say)\s+"
+        r"(?P<body>.+?)\s*[.?!]?\s*$",
+        _re.IGNORECASE | _re.DOTALL,
+    ),
+    _re.compile(
+        r"^\s*send\s+(?P<who>[A-Za-z][A-Za-z .'\-]{0,60}?)\s+"
+        r"(?:a\s+)?(?:text|sms|message)\s+"
+        r"(?:(?:that\s+)?(?:saying|says|say)|with|:|-|and\s+say)\s+"
+        r"(?P<body>.+?)\s*[.?!]?\s*$",
+        _re.IGNORECASE | _re.DOTALL,
+    ),
+    _re.compile(
+        r"^\s*(?:text|message)\s+(?P<who>[A-Za-z][A-Za-z .'\-]{0,60}?)\s*[:\-]\s*"
+        r"(?P<body>.+?)\s*[.?!]?\s*$",
+        _re.IGNORECASE | _re.DOTALL,
+    ),
+    _re.compile(
+        r"^\s*(?:text|message)\s+(?P<who>[A-Za-z][A-Za-z .'\-]{0,60}?)\s+"
+        r"(?:(?:that\s+)?(?:saying|says|say)|with|:|-)?\s*"
+        r"(?P<body>.+?)\s*[.?!]?\s*$",
+        _re.IGNORECASE | _re.DOTALL,
+    ),
+]
+_SMS_PERSON_NEEDS_BODY_PATTERNS = [
+    _re.compile(
+        r"^\s*(?:send\s+)?(?:a\s+)?(?:text|sms|message)\s+to\s+"
+        r"(?P<who>[A-Za-z][A-Za-z .'\-]{1,60})\s*[.?!]?\s*$",
+        _re.IGNORECASE,
+    ),
+    _re.compile(
+        r"^\s*send\s+(?P<who>[A-Za-z][A-Za-z .'\-]{1,60})\s+"
+        r"(?:a\s+)?(?:text|sms|message)\s*[.?!]?\s*$",
+        _re.IGNORECASE,
+    ),
+]
+_SMS_SEND_TO_THAT_ONE_RE = _re.compile(
+    r"^\s*(?:yes\s+|yeah\s+|yep\s+|ok(?:ay)?\s+|sure\s+)?"
+    r"(?:(?:send\s+)?(?:it|that|the\s+(?:text|sms|message))\s+)?"
+    r"(?:(?:send\s+)?(?:a\s+)?(?:text|sms|message)\s+)?"
+    r"(?:to\s+)?(?:that\s+one|that\s+number|it)\s+"
+    r"(?:and\s+)?(?:just\s+)?"
+    r"(?:(?:saying|say|with|:|-)|(?:send\s+(?:a\s+)?(?:text|sms|message)))\s*"
+    r"(?P<body>.*?)\s*[.?!]?\s*$",
+    _re.IGNORECASE | _re.DOTALL,
+)
+_SMS_CONTINUE_PARTIAL_NUMBER_RE = _re.compile(
+    r"^\s*(?P<tail>\d{1,4})\s+(?:and\s+)?"
+    r"(?:saying|say|with|:|-)\s*(?P<body>.+?)\s*[.?!]?\s*$",
+    _re.IGNORECASE | _re.DOTALL,
+)
+_SMS_PARTIAL_NUMBER_RE = _re.compile(
+    r"^\s*(?:send\s+(?:a\s+)?(?:text|sms|message)|text|message)\s+"
+    r"(?:to\s+)?(?P<partial>\+?[\d\-\(\)\s]{5,})\s*[.?!]?\s*$",
+    _re.IGNORECASE,
+)
+_SMS_NEEDS_NUMBER_RE = _re.compile(
+    r"^\s*(?:send\s+(?:a\s+)?(?:text|sms|message)|text|message)\s+"
+    r"(?:to\s+)?(?P<who>[A-Za-z][A-Za-z .'\-]{1,50})\s*[.?!]?\s*$",
+    _re.IGNORECASE,
+)
+_SMS_BROAD_INTENT_RE = _re.compile(
+    r"\b(?:send|sent|text|message|sms|notify)\b.*\b(?:text|message|sms)\b"
+    r"|\b(?:text|message|sms)\b.*\b(?:send|tell|ask|let|notify|about)\b",
+    _re.IGNORECASE,
+)
+_SMS_BROAD_RECIPIENT_RE = _re.compile(
+    r"\b(?:to|for)\s+(?P<who>[A-Za-z][A-Za-z .'\-]{0,60}?)(?:\s+(?:about|that|saying|say|with|because|to)\b|$)",
+    _re.IGNORECASE,
+)
+_SMS_BROAD_ABOUT_RE = _re.compile(r"\babout\s+(?P<topic>.+?)\s*[.?!]?$", _re.IGNORECASE)
+_SMS_BROAD_BODY_RE = _re.compile(
+    r"\b(?:that\s+)?(?:saying|says|say|with)\s+(?P<body>.+?)\s*[.?!]?$",
+    _re.IGNORECASE | _re.DOTALL,
+)
+_SMS_CONFIRM_SEND_RE = _re.compile(
+    r"^\s*(?:yes|yeah|yep|ok|okay|sure|please|do\s+it|send\s+it|send\s+that|"
+    r"yes\s+send\s+(?:it|that)|go\s+ahead(?:\s+and\s+send\s+it)?)\s*[.?!]?\s*$",
+    _re.IGNORECASE,
+)
+_EMAIL_RAW_ADDRESS_RE = _re.compile(
+    r"^\s*(?:also\s+)?(?:send\s+)?(?:an?\s+)?(?P<test>test\s+)?email\s+to\s+"
+    r"(?P<to>.+?)"
+    r"(?:\s+(?:saying|that|with|:|-)\s*(?P<body>.+?))?\s*[.?!]?\s*$",
+    _re.IGNORECASE | _re.DOTALL,
+)
+_EMAIL_RAW_BODY_FIRST_RE = _re.compile(
+    r"^\s*(?:also\s+)?(?:send\s+)?(?:an?\s+)?(?P<test>test\s+)?email\s+"
+    r"(?:that\s+)?(?:just\s+)?(?:says?|saying|with)\s+"
+    r"(?P<body>.+?)\s+to\s+(?P<to>.+?)\s*[.?!]?\s*$",
+    _re.IGNORECASE | _re.DOTALL,
+)
+_EMAIL_NEEDS_CONTACT_RE = _re.compile(
+    r"^\s*email\s+(?:my\s+|the\s+)?(?P<who>[A-Za-z][A-Za-z .'\-]{1,50})\s*[.?!]?\s*$",
+    _re.IGNORECASE,
+)
+_NOTES_SEARCH_RE = _re.compile(
+    r"^\s*(?:"
+    r"(?:search|find|look\s+for)\s+(?:my\s+)?notes?\s+(?:for|about)\s+(?P<q1>.+?)"
+    r"|what\s+did\s+i\s+write\s+about\s+(?P<q2>.+?)"
+    r"|what\s+notes?\s+do\s+i\s+have\s+(?:for|about)\s+(?P<q3>.+?)"
+    r")\s*[.?!]?\s*$",
+    _re.IGNORECASE | _re.DOTALL,
+)
 _UNWIRED_FILES_RE = _re.compile(
     r"^\s*(?:"
     r"(?:find|locate|get|fetch)\s+(?:the\s+)?(?P<q>.+?)\s+(?:contract|agreement|document|file|proposal|invoice|change[\s-]order|estimate)(?:s)?"
@@ -13103,6 +13892,867 @@ _UNWIRED_FILES_RE = _re.compile(
     r")",
     _re.IGNORECASE,
 )
+
+
+def _try_notes_search(message: str, user_rec: dict) -> dict | None:
+    """Search owner-authored notes deterministically."""
+    if not message:
+        return None
+    msg = _strip_polite_prefix(" ".join(str(message).split()))
+    m = _NOTES_SEARCH_RE.match(msg)
+    if not m:
+        return None
+    query = (m.group("q1") or m.group("q2") or m.group("q3") or "").strip().strip('"')
+    if not query:
+        return None
+    hits = mod_notes.search(DATA_DIR, query)
+    if not hits:
+        return {"reply": f"I didn't find \"{query}\" in your notes.",
+                "tier": "local", "latency_ms": 0,
+                "source": "notes_search_empty"}
+    lines = [f"I found {len(hits)} note{'s' if len(hits) != 1 else ''} about \"{query}\":"]
+    for n in sorted(hits, key=lambda x: x.get("ts", 0), reverse=True)[:5]:
+        content = (n.get("content") or "").strip()
+        if content:
+            lines.append(f"- {content}")
+    return {"reply": "\n".join(lines),
+            "tier": "local", "latency_ms": 0,
+            "source": "notes_search"}
+
+
+def _normalize_email_address(raw: str) -> str | None:
+    """Normalize typed or spoken email addresses.
+
+    Examples:
+      frank@example.com
+      Frank R Street at yahoo.com -> frankrstreet@yahoo.com
+      frank l street at icloud dot com -> franklstreet@icloud.com
+    """
+    s = (raw or "").strip().strip("<>\"' ").rstrip(".?!,;:")
+    if not s:
+        return None
+    typed = _re.fullmatch(r"[\w.\-+]+@[\w.\-]+\.\w+", s, _re.IGNORECASE)
+    if typed:
+        return s.lower()
+
+    spoken = _re.fullmatch(
+        r"(?P<local>[A-Za-z0-9 ._\-+']+?)\s+at\s+(?P<domain>[A-Za-z0-9 .\-]+)",
+        s,
+        _re.IGNORECASE,
+    )
+    if not spoken:
+        return None
+    local = _re.sub(r"[^a-z0-9._+-]", "", spoken.group("local").lower())
+    domain = spoken.group("domain").lower()
+    domain = _re.sub(r"\s+dot\s+", ".", domain)
+    domain = _re.sub(r"[^a-z0-9.-]", "", domain)
+    addr = f"{local}@{domain}"
+    if _re.fullmatch(r"[\w.\-+]+@[\w.\-]+\.\w+", addr, _re.IGNORECASE):
+        return addr
+    return None
+
+
+def _try_email_raw_or_needs_contact(message: str, user_rec: dict) -> dict | None:
+    """Handle email intents that should not fall into file search.
+    Raw-address sends require a connected mailbox; contact-only asks request
+    the missing address/contact instead of searching files."""
+    if not message:
+        return None
+    msg = _strip_polite_prefix(" ".join(str(message).split()))
+    m = _EMAIL_RAW_ADDRESS_RE.match(msg) or _EMAIL_RAW_BODY_FIRST_RE.match(msg)
+    if m:
+        to_email = _normalize_email_address(m.group("to") or "")
+        if not to_email:
+            return None
+        body = (m.group("body") or "").strip()
+        is_test = bool((m.group("test") or "").strip())
+        if is_test and not body:
+            body = "This is a test email from Orbi."
+        if not body:
+            return {"reply": (
+                f"What should the email to {to_email} say?"
+            ), "tier": "local", "latency_ms": 0,
+               "source": "email_needs_body"}
+        username = user_rec.get("username", "owner")
+        user_dir = users_mod.get_user_dir(DATA_DIR, username)
+        try:
+            import imap_smtp
+            accts = imap_smtp.list_accounts(user_dir)
+        except Exception:
+            accts = []
+        if not accts:
+            draft = f"\n\nDraft:\nTo: {to_email}\nSubject: Orbi owner email test\n\n{body}" if body else ""
+            return {"reply": (
+                "I don't have a connected mailbox for you yet, so I can't send "
+                "that email from owner chat. Connect Gmail, Outlook, Yahoo, or "
+                f"another SMTP account in Settings -> Integrations first.{draft}"
+            ), "tier": "local", "latency_ms": 0,
+               "source": "email_no_connected_mailbox"}
+        subject_words = body.split()[:8]
+        subject = " ".join(subject_words).rstrip(".,!?") or "Message from Orbi"
+        if is_test:
+            subject = "Orbi test email"
+        try:
+            sent = imap_smtp.send_email(
+                user_dir, accts[0]["id"], to=to_email,
+                subject=subject, body=body,
+            )
+        except Exception as e:
+            sent = {"ok": False, "error": str(e)}
+        if sent.get("ok"):
+            return {"reply": (
+                f"Email sent to {to_email}.\nSubject: {subject}"
+            ), "tier": "local", "latency_ms": 0,
+               "source": "email_sent_raw"}
+        return {"reply": (
+            f"I couldn't send that email to {to_email}: "
+            f"{sent.get('error', 'email send failed')}."
+        ), "tier": "local", "latency_ms": 0,
+           "source": "email_send_failed"}
+    m = _EMAIL_NEEDS_CONTACT_RE.match(msg)
+    if m:
+        who = (m.group("who") or "").strip().rstrip(".?!")
+        return {"reply": (
+            f"I need an email address or saved contact for {who} before I can "
+            f"help with that. Try: 'Add {who} as a contact. Their email is name@example.com.'"
+        ), "tier": "local", "latency_ms": 0,
+           "source": "email_needs_contact"}
+    return None
+
+
+def _extract_pending_email_body_to(history: list[dict]) -> str:
+    """Return the recipient from the latest email body question, if active."""
+    if not isinstance(history, list):
+        return ""
+    for item in reversed(history[-8:]):
+        if (item or {}).get("role") != "assistant":
+            continue
+        text = " ".join(str((item or {}).get("content") or "").split())
+        text_l = text.lower()
+        if "email sent to " in text_l or "couldn't send that email" in text_l:
+            return ""
+        m = _re.search(r"what should the email to ([\w.\-+]+@[\w.\-]+\.\w+) say\?", text, _re.IGNORECASE)
+        if m:
+            return m.group(1).strip().lower()
+        # A newer non-email assistant turn means the old email question is stale.
+        if text:
+            return ""
+    return ""
+
+
+def _looks_like_new_owner_command(message: str) -> bool:
+    msg = _strip_polite_prefix(" ".join(str(message or "").split()))
+    if not msg:
+        return False
+    return bool(_re.match(
+        r"^(?:"
+        r"remind|nudge|schedule|book|block\s+off|meeting|appointment|cancel|delete|remove|drop|"
+        r"what(?:'s| is)|who|when|where|why|how|show|list|find|search|mark|check|"
+        r"add\s+(?:task|contact|note|reminder)|take\s+(?:a\s+)?note|"
+        r"remember|my\s+name\s+is|send\s+(?:a\s+)?(?:text|sms|message|email)|text|message|email"
+        r")\b",
+        msg,
+        _re.IGNORECASE,
+    ))
+
+
+def _is_bulk_sms_target(who: str) -> bool:
+    target = " ".join(str(who or "").lower().split()).strip(" .?!")
+    return bool(_re.match(
+        r"^(?:every|everyone|everybody|all|all\s+contacts|all\s+leads|"
+        r"lead|leads|customers?|clients?|the\s+team|team)\b",
+        target,
+        _re.IGNORECASE,
+    ))
+
+
+def _sms_prompt_label(who: str, label: str) -> str:
+    """Use 'you' for explicit self-texts, but preserve named owner aliases.
+
+    Frank's owner profile resolves "Frank" to the owner phone, which is
+    correct for sending, but asking "What should the text to you say?"
+    after "text Frank" sounds like Orbi lost the name.
+    """
+    who_l = " ".join(str(who or "").lower().split())
+    if who_l in ("me", "myself", "my cell", "my cell phone", "my phone"):
+        return "you"
+    return (who or label or "them").strip()
+
+
+def _send_raw_email(to_email: str, body: str, user_rec: dict,
+                    *, is_test: bool = False) -> dict:
+    body = (body or "").strip()
+    username = user_rec.get("username", "owner")
+    user_dir = users_mod.get_user_dir(DATA_DIR, username)
+    try:
+        import imap_smtp
+        accts = imap_smtp.list_accounts(user_dir)
+    except Exception:
+        accts = []
+    if not accts:
+        draft = f"\n\nDraft:\nTo: {to_email}\nSubject: Orbi owner email test\n\n{body}" if body else ""
+        return {"reply": (
+            "I don't have a connected mailbox for you yet, so I can't send "
+            "that email from owner chat. Connect Gmail, Outlook, Yahoo, or "
+            f"another SMTP account in Settings -> Integrations first.{draft}"
+        ), "tier": "local", "latency_ms": 0,
+           "source": "email_no_connected_mailbox"}
+    subject_words = body.split()[:8]
+    subject = " ".join(subject_words).rstrip(".,!?") or "Message from Orbi"
+    if is_test:
+        subject = "Orbi test email"
+    try:
+        sent = imap_smtp.send_email(
+            user_dir, accts[0]["id"], to=to_email,
+            subject=subject, body=body,
+        )
+    except Exception as e:
+        sent = {"ok": False, "error": str(e)}
+    if sent.get("ok"):
+        return {"reply": (
+            f"Email sent to {to_email}.\nSubject: {subject}"
+        ), "tier": "local", "latency_ms": 0,
+           "source": "email_sent_raw"}
+    return {"reply": (
+        f"I couldn't send that email to {to_email}: "
+        f"{sent.get('error', 'email send failed')}."
+    ), "tier": "local", "latency_ms": 0,
+       "source": "email_send_failed"}
+
+
+def _try_email_body_followup(message: str, user_rec: dict,
+                             history: list[dict]) -> dict | None:
+    to_email = _extract_pending_email_body_to(history)
+    if not to_email:
+        return None
+    msg = " ".join(str(message or "").split()).strip()
+    if not msg:
+        return None
+    if _looks_like_new_owner_command(msg):
+        return None
+    body = _re.sub(r"^(?:that\s+)?(?:it\s+)?(?:says?|saying|with)\s+", "", msg, flags=_re.IGNORECASE).strip()
+    if not body:
+        return {"reply": f"What should the email to {to_email} say?",
+                "tier": "local", "latency_ms": 0,
+                "source": "email_needs_body"}
+    return _send_raw_email(to_email, body, user_rec)
+
+
+def _try_sms_send(message: str, user_rec: dict) -> dict | None:
+    """Send a plain outbound SMS when the tenant has Twilio configured.
+    Only handles explicit phone-number recipients to avoid guessing contacts."""
+    if not message:
+        return None
+    msg = _strip_polite_prefix(" ".join(str(message).split()))
+    m = _SMS_SEND_DIRECT_RE.match(msg) or _SMS_SEND_BODY_TO_NUMBER_RE.match(msg)
+    if not m:
+        return None
+    to_number = (m.group("to") or "").strip()
+    body = (m.group("body") or "").strip()
+    if not body:
+        return {"reply": "What should the text say?",
+                "tier": "local", "latency_ms": 0,
+                "source": "sms_needs_body"}
+    result = sms_sender.send(CONFIG, to_number, body)
+    if result.get("ok"):
+        audit.log_event(DATA_DIR, actor=user_rec.get("username", "?"),
+                        action="sms.sent",
+                        meta={"to": to_number, "sid_prefix": (result.get("sid") or "")[:8]})
+        return {"reply": f"Text sent to {to_number}.",
+                "tier": "local", "latency_ms": 0,
+                "source": "sms_sent"}
+    err = result.get("detail") or result.get("error") or "unknown error"
+    return {"reply": f"I couldn't send that text: {err}",
+            "tier": "local", "latency_ms": 0,
+            "source": "sms_send_failed"}
+
+
+def _owner_sms_number(user_rec: dict) -> str:
+    """Return the safest known owner SMS destination, if configured."""
+    for raw in (
+        (user_rec or {}).get("phone"),
+        ((CONFIG.get("owner") or {}).get("phone")),
+        ((CONFIG.get("notifications") or {}).get("owner_sms")),
+    ):
+        val = str(raw or "").strip()
+        if val:
+            return val
+    return ""
+
+
+def _owner_sms_aliases(user_rec: dict) -> set[str]:
+    aliases = {"me", "myself", "my cell", "my cell phone", "my phone"}
+    raw_names = [
+        (user_rec or {}).get("display_name"),
+        ((CONFIG.get("owner") or {}).get("name")),
+    ]
+    try:
+        biz = mod_business.load(DATA_DIR)
+        raw_names.extend([
+            biz.get("owner_name"),
+            ((biz.get("personality") or {}).get("owner_name")),
+        ])
+    except Exception:
+        pass
+    for raw in raw_names:
+        name = " ".join(str(raw or "").lower().split())
+        if not name:
+            continue
+        aliases.add(name)
+        first = name.split()[0]
+        if len(first) > 1:
+            aliases.add(first)
+    return aliases
+
+
+def _extract_recent_phone_from_history(history: list[dict]) -> str:
+    if not isinstance(history, list):
+        return ""
+    for item in reversed(history[-8:]):
+        text = str((item or {}).get("content") or "")
+        phone_m = _re.search(r"(\+?1?[\s.-]?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4})", text)
+        if phone_m:
+            return phone_m.group(1).strip()
+    return ""
+
+
+def _digits_only(value: str) -> str:
+    return _re.sub(r"\D+", "", str(value or ""))
+
+
+def _extract_partial_sms_number_from_history(history: list[dict]) -> str:
+    if not isinstance(history, list):
+        return ""
+    for item in reversed(history[-8:]):
+        if (item or {}).get("role") != "user":
+            continue
+        text = " ".join(str((item or {}).get("content") or "").split())
+        m = _SMS_PARTIAL_NUMBER_RE.match(_strip_polite_prefix(text))
+        if not m:
+            continue
+        partial = (m.group("partial") or "").strip()
+        digits = _digits_only(partial)
+        if 5 <= len(digits) < 10:
+            return partial
+    return ""
+
+
+def _resolve_sms_number_from_partial(partial: str, tail: str,
+                                     user_rec: dict) -> str:
+    combined = _digits_only(partial) + _digits_only(tail)
+    if len(combined) == 10:
+        return combined
+    if len(combined) == 11 and combined.startswith("1"):
+        return "+" + combined
+    owner = _owner_sms_number(user_rec)
+    owner_digits = _digits_only(owner)
+    owner_local = owner_digits[-10:] if len(owner_digits) >= 10 else owner_digits
+    if owner_local.startswith(_digits_only(partial)) and owner_local.endswith(_digits_only(tail)):
+        return owner
+    return ""
+
+
+def _send_sms_reply(to_number: str, body: str, user_rec: dict,
+                    source: str) -> dict:
+    body = (body or "").strip()
+    if body.lower() == "a test":
+        body = "test"
+    if body.lower() in ("for me", "for myself", "please", "for me please"):
+        body = ""
+    if not body:
+        return {"reply": "What should the text say?",
+                "tier": "local", "latency_ms": 0,
+                "source": "sms_needs_body"}
+    result = sms_sender.send(CONFIG, to_number, body)
+    if result.get("ok"):
+        audit.log_event(DATA_DIR, actor=(user_rec or {}).get("username", "?"),
+                        action="sms.sent",
+                        meta={"to": to_number,
+                              "sid_prefix": (result.get("sid") or "")[:8],
+                              "via": source})
+        return {"reply": f"Text sent to {to_number}.",
+                "tier": "local", "latency_ms": 0,
+                "source": source}
+    err = result.get("detail") or result.get("error") or "unknown error"
+    return {"reply": f"I couldn't send that text: {err}",
+            "tier": "local", "latency_ms": 0,
+            "source": f"{source}_failed"}
+
+
+def _clean_sms_who(who: str) -> str:
+    who = " ".join(str(who or "").split()).strip().rstrip(".?!")
+    who = _re.sub(r"^(?:my|the)\s+", "", who, flags=_re.IGNORECASE).strip()
+    return who
+
+
+def _resolve_sms_recipient(who: str, user_rec: dict) -> tuple[str, str]:
+    """Return (phone, display_name) for owner/name/number recipients."""
+    who = _clean_sms_who(who)
+    if not who:
+        return "", ""
+    if _digits_only(who):
+        digits = _digits_only(who)
+        if len(digits) >= 10:
+            return who, who
+    if who.lower() in _owner_sms_aliases(user_rec):
+        phone = _owner_sms_number(user_rec)
+        return phone, "you"
+    username = (user_rec or {}).get("username", "owner")
+    user_dir = users_mod.get_user_dir(DATA_DIR, username)
+    contact = None
+    try:
+        contact = mod_contacts.find_by_name(user_dir, who)
+        if contact is None:
+            hits = mod_contacts.search(user_dir, who)
+            contact = hits[0] if hits else None
+    except Exception:
+        contact = None
+    if contact and contact.get("phone"):
+        return str(contact.get("phone") or "").strip(), contact.get("name") or who
+    try:
+        memory_path = user_dir / "memory.json"
+        if memory_path.exists():
+            mem = json.loads(memory_path.read_text(encoding="utf-8"))
+            who_tokens = {t for t in _re.findall(r"[a-z0-9]+", who.lower()) if len(t) > 1}
+            for tier in ("long_term", "mid_term", "short_term", "concerns"):
+                for item in mem.get(tier, []) or []:
+                    content = str(item.get("content") or "")
+                    content_l = content.lower()
+                    if not who_tokens or not all(t in content_l for t in who_tokens):
+                        continue
+                    # Do not borrow a phone number from nearby unrelated
+                    # memory text. Require "<name> ... phone/number ... N".
+                    if not _re.search(
+                        r"\b" + _re.escape(who.lower()) + r"\b.{0,80}\b(?:phone|number|cell|mobile)\b",
+                        content_l,
+                    ):
+                        continue
+                    phone_m = _re.search(r"(\+?1?[\s.-]?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4})", content)
+                    if phone_m:
+                        return phone_m.group(1).strip(), who
+    except Exception:
+        pass
+    return "", who
+
+
+def _try_sms_to_person(message: str, user_rec: dict) -> dict | None:
+    if not message:
+        return None
+    msg = _strip_polite_prefix(" ".join(str(message).split()))
+    for rx in _SMS_SEND_TO_PERSON_PATTERNS:
+        m = rx.match(msg)
+        if not m:
+            continue
+        who = _clean_sms_who(m.group("who"))
+        body = (m.group("body") or "").strip()
+        if body.lower() in ("for me", "for myself", "please", "for me please"):
+            body = ""
+        if who.lower() in ("me", "myself", "my cell", "my cell phone", "my phone"):
+            return None
+        if _is_bulk_sms_target(who):
+            return {"reply": (
+                "I can send one text at a time right now. Who should I text, and what should it say?"
+            ), "tier": "local", "latency_ms": 0,
+               "source": "sms_bulk_guard"}
+        phone, label = _resolve_sms_recipient(who, user_rec)
+        prompt_label = _sms_prompt_label(who, label)
+        if not phone:
+            if body:
+                return {"reply": (
+                    f"I need a phone number for {prompt_label} before I can send that text. "
+                    f"You can say: 'Text {body} to 7755280574.'"
+                ), "tier": "local", "latency_ms": 0,
+                   "source": "sms_needs_number"}
+            return {"reply": (
+                f"I need a phone number for {prompt_label}, and what should the text say?"
+            ), "tier": "local", "latency_ms": 0,
+               "source": "sms_needs_number_and_body"}
+        if not body:
+            return {"reply": f"What should the text to {prompt_label} say?",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "sms_needs_body"}
+        return _send_sms_reply(phone, body, user_rec, "sms_sent")
+    for rx in _SMS_PERSON_NEEDS_BODY_PATTERNS:
+        if _re.search(r"\babout\b", msg, _re.IGNORECASE):
+            return None
+        m = rx.match(msg)
+        if not m:
+            continue
+        who = _clean_sms_who(m.group("who"))
+        if who.lower() in ("me", "myself", "my cell", "my cell phone", "my phone"):
+            return None
+        if _is_bulk_sms_target(who):
+            return {"reply": (
+                "I can send one text at a time right now. Who should I text, and what should it say?"
+            ), "tier": "local", "latency_ms": 0,
+               "source": "sms_bulk_guard"}
+        phone, label = _resolve_sms_recipient(who, user_rec)
+        prompt_label = _sms_prompt_label(who, label)
+        if not phone:
+            return {"reply": (
+                f"I need a phone number for {prompt_label} before I can send a text."
+            ), "tier": "local", "latency_ms": 0,
+               "source": "sms_needs_number"}
+        return {"reply": f"What should the text to {prompt_label} say?",
+                "tier": "local", "latency_ms": 0,
+                "source": "sms_needs_body"}
+    return None
+
+
+def _try_sms_broad_intent(message: str, user_rec: dict) -> dict | None:
+    """Catch natural SMS requests and ask for missing safe-send details.
+
+    This intentionally does not let the LLM improvise SMS actions. If the
+    owner says "send a text" in any normal phrasing, Orbi must either send
+    through the deterministic SMS path or ask what is missing.
+    """
+    if not message:
+        return None
+    msg = _strip_polite_prefix(" ".join(str(message).split()))
+    if not _SMS_BROAD_INTENT_RE.search(msg):
+        return None
+    lower = msg.lower()
+    if any(x in lower for x in ("show my texts", "list my texts", "show me texts",
+                                "text every", "text all", "every lead", "all leads",
+                                "everyone", "everybody")):
+        return {"reply": (
+            "I can send one text at a time right now. Who should I text, and what should it say?"
+        ), "tier": "local", "latency_ms": 0,
+           "source": "sms_needs_recipient_or_body"}
+
+    who = ""
+    m_named = _re.search(
+        r"\bsend\s+(?P<who>[A-Z][A-Za-z .'\-]{1,40}?)\s+"
+        r"(?:a\s+)?(?:text|sms|message)\b",
+        msg,
+    )
+    if m_named:
+        who = _clean_sms_who(m_named.group("who"))
+    m_who = _SMS_BROAD_RECIPIENT_RE.search(msg)
+    if not who and m_who:
+        who = _clean_sms_who(m_who.group("who"))
+        if who.lower() in ("me", "myself") and _re.search(r"\bfor\s+(?:me|myself)\b", msg, _re.IGNORECASE):
+            who = ""
+    elif not who and _re.search(r"\b(?:me|myself|my cell|my phone)\b", msg, _re.IGNORECASE):
+        who = "me"
+
+    body = ""
+    m_body = _SMS_BROAD_BODY_RE.search(msg)
+    if m_body:
+        body = (m_body.group("body") or "").strip()
+
+    m_about = _SMS_BROAD_ABOUT_RE.search(msg)
+    topic = (m_about.group("topic").strip() if m_about else "")
+
+    if not who and not body:
+        return {"reply": "Who should I text, and what should it say?",
+                "tier": "local", "latency_ms": 0,
+                "source": "sms_needs_recipient_or_body"}
+    if not who:
+        return {"reply": f"Who should I text this to: \"{body}\"?",
+                "tier": "local", "latency_ms": 0,
+                "source": "sms_needs_recipient"}
+    phone, label = _resolve_sms_recipient(who, user_rec)
+    prompt_label = _sms_prompt_label(who, label)
+    if not phone:
+        if topic:
+            return {"reply": f"What phone number should I use for {who}, and what exactly should I say about {topic}?",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "sms_needs_number_and_body"}
+        return {"reply": f"What phone number should I use for {who}?",
+                "tier": "local", "latency_ms": 0,
+                "source": "sms_needs_number"}
+    if body:
+        return _send_sms_reply(phone, body, user_rec, "sms_sent")
+    if topic:
+        return {"reply": f"What exactly should I say to {prompt_label} about {topic}?",
+                "tier": "local", "latency_ms": 0,
+                "source": "sms_needs_body"}
+    return {"reply": f"What should the text to {prompt_label} say?",
+            "tier": "local", "latency_ms": 0,
+            "source": "sms_needs_body"}
+
+
+def _try_sms_to_me_or_that_one(message: str, user_rec: dict,
+                               history: list[dict]) -> dict | None:
+    if not message:
+        return None
+    msg = _strip_polite_prefix(" ".join(str(message).split()))
+    m = _SMS_SEND_TO_ME_RE.match(msg)
+    if m:
+        to_number = _owner_sms_number(user_rec)
+        if not to_number:
+            return {"reply": (
+                "What phone number should I text? "
+                "You can say: 'Text test to 7755280574.'"
+            ), "tier": "local", "latency_ms": 0,
+               "source": "sms_needs_number"}
+        return _send_sms_reply(to_number, m.group("body"), user_rec, "sms_sent")
+    if _SMS_SEND_TO_ME_NEEDS_BODY_RE.match(msg):
+        return {"reply": "What should the text say?",
+                "tier": "local", "latency_ms": 0,
+                "source": "sms_needs_body"}
+    m = _SMS_SEND_TO_THAT_ONE_RE.match(msg)
+    if m:
+        to_number = _extract_recent_phone_from_history(history) or _owner_sms_number(user_rec)
+        if not to_number:
+            return {"reply": (
+                "Which number should I text? "
+                "You can say: 'Text test to 7755280574.'"
+            ), "tier": "local", "latency_ms": 0,
+               "source": "sms_needs_number"}
+        return _send_sms_reply(to_number, m.group("body"), user_rec, "sms_sent")
+    m = _SMS_CONTINUE_PARTIAL_NUMBER_RE.match(msg)
+    if m:
+        partial = _extract_partial_sms_number_from_history(history)
+        to_number = _resolve_sms_number_from_partial(partial, m.group("tail"), user_rec)
+        if not to_number:
+            return {"reply": (
+                "I did not get the full phone number. Please send it in one message, "
+                "like: 'Text test to 7755280574.'"
+            ), "tier": "local", "latency_ms": 0,
+               "source": "sms_needs_full_number"}
+        return _send_sms_reply(to_number, m.group("body"), user_rec, "sms_sent")
+    return None
+
+
+def _extract_pending_sms_from_history(history: list[dict]) -> tuple[str, str] | None:
+    """Find the most recent assistant SMS draft in chat history.
+
+    This supports natural follow-ups like "yes send that" after Orbi says:
+    `I'll send a text to Kathy at 775-622-5299. Here it is: "Hi Kathy..."`.
+    It deliberately requires both a phone number and quoted message body.
+    """
+    if not isinstance(history, list):
+        return None
+    for item in reversed(history[-8:]):
+        if (item or {}).get("role") != "assistant":
+            continue
+        text = str((item or {}).get("content") or "")
+        if not _re.search(r"\b(?:text|sms|message)\b", text, _re.IGNORECASE):
+            continue
+        phone_m = _re.search(r"(\+?1?[\s.-]?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4})", text)
+        if not phone_m:
+            continue
+        # Prefer curly/straight quoted drafts. Use the last quoted block so
+        # explanatory text before it does not become the outgoing SMS.
+        quoted = _re.findall(r"[\"“](.{4,500}?)[\"”]", text, flags=_re.DOTALL)
+        if not quoted:
+            quoted = _re.findall(r"'(.{4,500}?)'", text, flags=_re.DOTALL)
+        if not quoted:
+            continue
+        body = " ".join(str(quoted[-1]).split()).strip()
+        if not body:
+            continue
+        return phone_m.group(1).strip(), body
+    return None
+
+
+def _extract_pending_sms_clarification(history: list[dict]) -> dict | None:
+    """Read the latest assistant SMS clarification question.
+
+    Supports follow-ups where the owner does not repeat "text", e.g.
+    Orbi: "What phone number should I use for James, and what exactly
+    should I say about our fishing trip?"
+    Owner: "775-555-1212 and tell him I got the boat ready"
+    """
+    if not isinstance(history, list):
+        return None
+    for item in reversed(history[-8:]):
+        if (item or {}).get("role") != "assistant":
+            continue
+        text = " ".join(str((item or {}).get("content") or "").split())
+        text_l = text.lower()
+        if ("text sent to " in text_l
+                or "couldn't send that text" in text_l
+                or "what should the email to " in text_l
+                or "email sent to " in text_l
+                or "scheduled meeting with" in text_l):
+            return None
+        if not any(marker in text_l for marker in (
+            "who should i text", "what should the text", "what phone number should i use",
+            "what phone number should i text", "what exactly should i say",
+            "which number should i text",
+        )):
+            return None
+        pending = {"who": "", "topic": "", "needs_phone": False, "needs_body": False}
+        m = _re.search(r"phone number should i use for ([^,?]+)", text, _re.IGNORECASE)
+        if m:
+            pending["who"] = _clean_sms_who(m.group(1))
+            pending["needs_phone"] = True
+        m = _re.search(r"text to ([^?]+?) say", text, _re.IGNORECASE)
+        if m:
+            pending["who"] = _clean_sms_who(m.group(1))
+            pending["needs_body"] = True
+        m = _re.search(r"say to ([^?]+?) about", text, _re.IGNORECASE)
+        if m:
+            pending["who"] = _clean_sms_who(m.group(1))
+            pending["needs_body"] = True
+        m = _re.search(r"say about ([^?]+)", text, _re.IGNORECASE)
+        if m:
+            pending["topic"] = m.group(1).strip()
+            pending["needs_body"] = True
+        if "who should i text" in text_l:
+            pending["needs_phone"] = True
+            pending["needs_body"] = True
+        if "what should the text" in text_l or "what exactly should i say" in text_l:
+            pending["needs_body"] = True
+        if "what phone number" in text_l or "which number" in text_l:
+            pending["needs_phone"] = True
+        return pending
+    return None
+
+
+def _extract_sms_body_from_followup(msg: str) -> str:
+    msg = (msg or "").strip()
+    m = _re.search(
+        r"\b(?:tell|saying|say|message|text)\s+(?:him|her|them|it|that)?\s*(?:to\s+)?(?P<body>.+)$",
+        msg, _re.IGNORECASE | _re.DOTALL,
+    )
+    if m:
+        return (m.group("body") or "").strip().strip('"')
+    # "775-555-1212 and I will be there at 6"
+    msg = _re.sub(r"^\+?1?[\s.-]?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}\s*(?:and|,)?\s*", "", msg).strip()
+    return msg.strip('"')
+
+
+def _is_new_sms_request(message: str) -> bool:
+    """True when the current message is a fresh SMS command.
+
+    This prevents an old clarification like "What phone number should I use
+    for James?" from stealing a new command such as "Text Kathy..." or
+    "Send a text to Bob".
+    """
+    msg = _strip_polite_prefix(" ".join(str(message or "").split()))
+    if not msg:
+        return False
+    explicit_patterns = [
+        _SMS_SEND_TO_ME_RE,
+        _SMS_SEND_TO_ME_NEEDS_BODY_RE,
+        _SMS_SEND_DIRECT_RE,
+        _SMS_SEND_BODY_TO_NUMBER_RE,
+        _SMS_NEEDS_NUMBER_RE,
+    ]
+    if any(rx.match(msg) for rx in explicit_patterns):
+        return True
+    if any(rx.match(msg) for rx in _SMS_SEND_TO_PERSON_PATTERNS):
+        return True
+    if any(rx.match(msg) for rx in _SMS_PERSON_NEEDS_BODY_PATTERNS):
+        return True
+    return False
+
+
+def _try_sms_clarification_followup(message: str, user_rec: dict,
+                                    history: list[dict]) -> dict | None:
+    if _is_new_sms_request(message):
+        return None
+    pending = _extract_pending_sms_clarification(history)
+    if not pending:
+        return None
+    msg = " ".join(str(message or "").split()).strip()
+    if not msg:
+        return None
+
+    phone_m = _re.search(r"(\+?1?[\s.-]?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4})", msg)
+    to_number = phone_m.group(1).strip() if phone_m else ""
+    has_sms_followup_cue = bool(
+        phone_m
+        or _re.search(r"\b(?:tell|say|saying|text|message|sms|phone|number)\b", msg, _re.IGNORECASE)
+        or _re.match(r"^\s*[A-Za-z][A-Za-z .'\-]{1,40}\s*,", msg)
+    )
+
+    if pending.get("needs_phone") and not to_number and not has_sms_followup_cue:
+        return None
+    if not pending.get("needs_phone") and pending.get("needs_body"):
+        # Body-only follow-ups can be plain speech, but not obvious small talk
+        # or questions unrelated to the pending text.
+        if (_re.search(r"\?$", msg)
+                or _looks_like_new_owner_command(msg)
+                or _re.search(r"\b(?:my\s+name\s+is|my\s+phone\s+is|my\s+email\s+is)\b", msg, _re.IGNORECASE)
+                or _re.match(r"^(?:hello|hi|hey|babe)\b", msg, _re.IGNORECASE)):
+            return None
+
+    who = pending.get("who") or ""
+    if not who:
+        m_to = _re.search(r"^(?:to\s+)?(?P<who>[A-Za-z][A-Za-z .'\-]{0,40}?)(?:,|\s+(?:tell|say|saying|that|with)\b)", msg, _re.IGNORECASE)
+        if m_to:
+            who = _clean_sms_who(m_to.group("who"))
+    if not to_number and who:
+        to_number, label = _resolve_sms_recipient(who, user_rec)
+    else:
+        label = who or to_number
+
+    body = _extract_sms_body_from_followup(msg)
+    if phone_m:
+        body = _extract_sms_body_from_followup(msg.replace(phone_m.group(1), "", 1))
+    if body.lower() in ("yes", "yeah", "yep", "ok", "okay", "sure"):
+        body = ""
+
+    if not to_number and not who:
+        return {"reply": "Who should I text, and what should it say?",
+                "tier": "local", "latency_ms": 0,
+                "source": "sms_needs_recipient_or_body"}
+    if not to_number:
+        if pending.get("topic"):
+            return {"reply": f"What phone number should I use for {who}, and what exactly should I say about {pending['topic']}?",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "sms_needs_number_and_body"}
+        return {"reply": f"What phone number should I use for {who}?",
+                "tier": "local", "latency_ms": 0,
+                "source": "sms_needs_number"}
+    if not body:
+        if pending.get("topic"):
+            return {"reply": f"What exactly should I say to {label} about {pending['topic']}?",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "sms_needs_body"}
+        return {"reply": f"What should the text to {label} say?",
+                "tier": "local", "latency_ms": 0,
+                "source": "sms_needs_body"}
+    return _send_sms_reply(to_number, body, user_rec, "sms_sent")
+
+
+def _try_sms_pending_confirmation(message: str, user_rec: dict,
+                                  history: list[dict]) -> dict | None:
+    if not message:
+        return None
+    msg = _strip_polite_prefix(" ".join(str(message).split()))
+    if not _SMS_CONFIRM_SEND_RE.match(msg):
+        return None
+    pending = _extract_pending_sms_from_history(history)
+    if not pending:
+        return None
+    to_number, body = pending
+    result = sms_sender.send(CONFIG, to_number, body)
+    if result.get("ok"):
+        audit.log_event(DATA_DIR, actor=user_rec.get("username", "?"),
+                        action="sms.sent",
+                        meta={"to": to_number,
+                              "sid_prefix": (result.get("sid") or "")[:8],
+                              "via": "pending_sms_confirmation"})
+        return {"reply": f"Text sent to {to_number}.",
+                "tier": "local", "latency_ms": 0,
+                "source": "sms_pending_sent"}
+    err = result.get("detail") or result.get("error") or "unknown error"
+    return {"reply": f"I couldn't send that text: {err}",
+            "tier": "local", "latency_ms": 0,
+            "source": "sms_pending_send_failed"}
+
+
+def _try_sms_needs_number(message: str, user_rec: dict) -> dict | None:
+    if not message:
+        return None
+    msg = _strip_polite_prefix(" ".join(str(message).split()))
+    m = _SMS_NEEDS_NUMBER_RE.match(msg)
+    if not m:
+        return None
+    who = (m.group("who") or "").strip().rstrip(".?!")
+    if who.lower() in ("every", "everyone", "everybody", "lead", "leads", "every lead", "all leads"):
+        return None
+    return {"reply": (
+        f"What phone number should I text for {who}? "
+        f"You can say: 'Send a text to 7755280574 saying ...'"
+    ), "tier": "local", "latency_ms": 0,
+       "source": "sms_needs_number"}
 
 
 def _try_unwired_channel(message: str, user_rec: dict) -> dict | None:
@@ -13125,13 +14775,10 @@ def _try_unwired_channel(message: str, user_rec: dict) -> dict | None:
            "source": "unwired_email"}
     if _UNWIRED_SMS_RE.match(msg):
         return {"reply": (
-            "I don't have SMS sending wired yet — Twilio is set up for the "
-            "phone receptionist (incoming calls) but outbound texts from the "
-            "owner dashboard aren't built.\n"
-            "What works today: incoming customer texts to your business "
-            "number show up in your messages inbox. You can reply from there."
+            "I can send texts, but I need both a recipient and the exact message. "
+            "Try: 'Text test to 7755280574' or 'Send Kathy a text saying I am running late.'"
         ), "tier": "local", "latency_ms": 0,
-           "source": "unwired_sms"}
+           "source": "sms_needs_recipient_or_body"}
     if _UNWIRED_FILES_RE.match(msg):
         # Workspace search IS wired — mod_workspace indexes ~/Orby/ files
         # (PDFs, DOCX, TXT, CSV) and supports keyword search. Extract the
@@ -14107,7 +15754,7 @@ _TASK_COMPLETE_RE = _re.compile(
     r"^\s*(?:"
     r"(?:i'?m\s+)?done\s+(?:with\s+)?(?P<body>.+?)"
     r"|(?:i\s+)?(?:finished|completed|did)\s+(?:with\s+)?(?P<body2>.+?)"
-    r"|(?:mark|check)\s+(?:off\s+)?(?P<body3>.+?)\s+(?:as\s+)?(?:done|complete|completed|finished)"
+    r"|(?:mark|march|check)\s+(?:off\s+)?(?P<body3>.+?)\s+(?:as\s+)?(?:done|complete|completed|finished)"
     r"|(?P<body4>.+?)\s+(?:is\s+)?(?:done|complete|completed|finished|wrapped)"
     r")\s*[?.!]?\s*$",
     _re.IGNORECASE,
@@ -14121,6 +15768,8 @@ def _try_task_complete(message: str, user_rec: dict) -> dict | None:
     if not message:
         return None
     msg = _strip_polite_prefix(message)
+    if _re.match(r"^\s*(?:what|show|list|which|do|does|did)\b", msg, _re.IGNORECASE):
+        return None
     m = _TASK_COMPLETE_RE.match(msg)
     if not m:
         return None
@@ -14162,7 +15811,12 @@ def _try_task_complete(message: str, user_rec: dict) -> dict | None:
     top_score = scored[0][0]
     # If top match is much stronger than second-best (or only one match),
     # take it. Otherwise ask which.
-    if len(scored) == 1 or top_score >= scored[1][0] * 2 or top_score >= 2:
+    exactish = any(
+        body_l in ((t.get("text") or "").lower())
+        or ((t.get("text") or "").lower() in body_l and len((t.get("text") or "")) >= 6)
+        for _, t in scored[:1]
+    )
+    if top_score >= 2 or exactish:
         target = scored[0][1]
         try:
             mod_tasks.mark_done(user_dir, target["id"])
@@ -14180,6 +15834,380 @@ def _try_task_complete(message: str, user_rec: dict) -> dict | None:
     return {"reply": f"A few tasks could match \"{body}\":\n{listed}\nWhich one?",
             "tier": "local", "latency_ms": 0,
             "source": "task_done_ambiguous"}
+
+
+_REMINDERS_LIST_RE = _re.compile(
+    r"^\s*(?:"
+    r"what\s+reminders?\s+do\s+i\s+have"
+    r"|show\s+(?:me\s+)?(?:my\s+)?reminders?"
+    r"|list\s+(?:my\s+)?reminders?"
+    r"|any\s+reminders?"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+_REMINDER_DONE_RE = _re.compile(
+    r"^\s*(?:"
+    r"(?:mark|check)\s+(?:off\s+)?(?P<body>.+?)\s+(?:as\s+)?(?:done|dunn|complete|completed|finished)"
+    r"|(?:mark|check)\s+(?:it|that|this)\s+(?:as\s+)?(?:done|dunn|complete|completed|finished)"
+    r"|(?P<body2>.+?)\s+(?:is\s+)?(?:done|complete|completed|finished)"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+
+
+def _fmt_reminder_due(due_iso: str) -> str:
+    try:
+        s = str(due_iso or "").replace("Z", "+00:00")
+        dt = _datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=_timezone.utc)
+        local = dt.astimezone()
+        return local.strftime("%a %b %-d at %-I:%M %p")
+    except Exception:
+        return due_iso or "unknown time"
+
+
+def _reminder_tokens(text: str) -> set[str]:
+    stop = {"the", "and", "for", "with", "from", "this", "that", "about",
+            "into", "your", "their", "our", "you", "me", "my", "any", "all",
+            "now", "out", "off", "but", "not", "one", "two", "are", "was",
+            "were", "has", "had", "will", "as", "done", "dunn", "complete",
+            "completed", "finished", "mark", "check"}
+    return {w for w in _re.split(r"\W+", (text or "").lower())
+            if len(w) >= 3 and w not in stop}
+
+
+def _find_matching_reminders(user_dir: Path, query: str) -> list[dict]:
+    try:
+        open_rem = [r for r in mod_reminders.list_all(user_dir)
+                    if r.get("status") in (None, "pending", "snoozed")]
+    except Exception:
+        return []
+    q_tokens = _reminder_tokens(query)
+    if not q_tokens:
+        return []
+    scored: list[tuple[int, dict]] = []
+    for r in open_rem:
+        overlap = len(q_tokens & _reminder_tokens(r.get("text") or ""))
+        if overlap:
+            scored.append((overlap, r))
+    scored.sort(key=lambda x: (-x[0], x[1].get("due", "")))
+    return [r for _, r in scored]
+
+
+def _recent_reminder_query_from_history(history: list[dict]) -> str:
+    if not isinstance(history, list):
+        return ""
+    for item in reversed(history[-6:]):
+        if (item or {}).get("role") != "assistant":
+            continue
+        text = str((item or {}).get("content") or "")
+        m = _re.search(r"reminder\s+(?:for|to)\s+\"?([^\".]+)\"?", text, _re.IGNORECASE)
+        if m:
+            return m.group(1).strip()
+        m = _re.search(r"\"([^\"]{3,80})\"", text)
+        if m and "reminder" in text.lower():
+            return m.group(1).strip()
+    return ""
+
+
+_LEGAL_LOG_TIME_RE = _re.compile(
+    r"^log\s+(?P<hours>[\d\.]+)\s+hours?\s+(?:to|on|for)\s+(?P<matter>.+?)(?:\s*[-—:]\s*(?P<desc>.+))?$",
+    _re.IGNORECASE,
+)
+_LEGAL_CONFLICT_RE = _re.compile(
+    r"^(?:run\s+a?\s*)?conflict\s*(?:check|search)\s+(?:for\s+)?(?P<name>.+)$",
+    _re.IGNORECASE,
+)
+_LEGAL_OPEN_MATTER_RE = _re.compile(
+    r"^(?:open|create|new)\s+(?:a\s+)?(?:new\s+)?(?:matter|case|file)\s+(?:for\s+)?(?P<client>.+)$",
+    _re.IGNORECASE,
+)
+_LEGAL_DEADLINES_RE = _re.compile(
+    r"^(?:what(?:'s|\s+are)?\s+my\s+)?(?:upcoming\s+)?(?:legal\s+)?deadlines?(?:\s+(?:this\s+week|this\s+month|next\s+\d+\s+days?|\s*in\s+the\s+next.+))?",
+    _re.IGNORECASE,
+)
+_LEGAL_MATTERS_RE = _re.compile(
+    r"^(?:list|show|what(?:'s|\s+are)?)\s+(?:my\s+)?(?:active\s+)?(?:matters?|cases?|files?)(?:\s+|$)",
+    _re.IGNORECASE,
+)
+_LEGAL_RESEARCH_RE = _re.compile(
+    r"^(?:research|look\s+up|find\s+case\s+law\s+on|what(?:'s|\s+is)\s+the\s+law\s+on)\s+(?P<question>.+)$",
+    _re.IGNORECASE,
+)
+_LEGAL_DRAFT_RE = _re.compile(
+    r"^(?:draft|write|create|prepare)\s+(?:a\s+|an\s+)?(?P<doc>demand\s+letter|retainer\s+agreement?|motion\s+to\s+dismiss|discovery\s+request|settlement\s+letter|client\s+intake|intake\s+summary)",
+    _re.IGNORECASE,
+)
+_LEGAL_SOL_RE = _re.compile(
+    r"(?:sol|statute\s+of\s+limitations?)\s+(?:for\s+|on\s+)?(?P<area>.+?)(?:\s+(?:in|from)\s+(?P<date>\d{4}[-/]\d{2}[-/]\d{2}|\w+\s+\d+,?\s*\d{4}))?$",
+    _re.IGNORECASE,
+)
+_LEGAL_DASHBOARD_RE = _re.compile(
+    r"^(?:legal\s+)?(?:dashboard|summary|overview|status)$",
+    _re.IGNORECASE,
+)
+
+_DOC_KEY_MAP = {
+    "demand letter":       "demand_letter",
+    "retainer agreement":  "retainer_agreement",
+    "retainer agreement":  "retainer_agreement",
+    "motion to dismiss":   "motion_to_dismiss",
+    "discovery request":   "discovery_request",
+    "settlement letter":   "settlement_letter",
+    "client intake":       "client_intake",
+    "intake summary":      "client_intake",
+}
+
+
+def _try_legal_chat(message: str, user_rec: dict,
+                    history: list) -> dict | None:
+    """Deterministic handler for natural-language legal paralegal commands."""
+    msg = message.strip()
+
+    # Log time
+    m = _LEGAL_LOG_TIME_RE.match(msg)
+    if m:
+        try:
+            hours = float(m.group("hours"))
+        except ValueError:
+            return None
+        matter_q = (m.group("matter") or "").strip()
+        desc = (m.group("desc") or "").strip() or f"Work on {matter_q}"
+        matters = mod_legal.list_matters(DATA_DIR, search=matter_q)
+        if matters:
+            matter = matters[0]
+            entry = mod_legal.log_time(
+                DATA_DIR,
+                matter_id=matter["id"],
+                matter_title=matter["title"],
+                hours=hours,
+                description=desc,
+                rate=float(matter.get("rate") or 0),
+            )
+            return {
+                "reply": (
+                    f"Logged {hours}h to {matter['title']} "
+                    f"({matter['matter_number']}) — {desc}."
+                ),
+                "source": "legal.time",
+            }
+        return {
+            "reply": f"I don't have a matter matching \"{matter_q}\". Want me to open one?",
+            "source": "legal.time",
+        }
+
+    # Conflict check
+    m = _LEGAL_CONFLICT_RE.match(msg)
+    if m:
+        name = (m.group("name") or "").strip()
+        hits = mod_legal.conflict_check(DATA_DIR, name)
+        if not hits:
+            return {
+                "reply": f"No conflicts found for \"{name}\". Clear to open a matter.",
+                "source": "legal.conflict",
+            }
+        lines = [f"CONFLICT FLAG — \"{name}\" found in {len(hits)} matter(s):"]
+        for h in hits:
+            lines.append(
+                f"  • {h['matter_number']} {h['title']} — "
+                f"{h['conflict_type']} ({h['status']})"
+            )
+        lines.append("Attorney must review before opening a new matter.")
+        return {"reply": "\n".join(lines), "source": "legal.conflict"}
+
+    # Open new matter
+    m = _LEGAL_OPEN_MATTER_RE.match(msg)
+    if m:
+        client = (m.group("client") or "").strip()
+        return {
+            "reply": (
+                f"Got it — opening a matter for {client}. "
+                f"What's the case title (e.g. \"{client} v. [opposing party]\"), "
+                f"the practice area, and their contact info?"
+            ),
+            "source": "legal.matter.open_prompt",
+            "pending": {"action": "open_matter", "client_name": client},
+        }
+
+    # List matters
+    if _LEGAL_MATTERS_RE.match(msg):
+        matters = mod_legal.list_matters(DATA_DIR, status="active")
+        if not matters:
+            matters = mod_legal.list_matters(DATA_DIR)
+        if not matters:
+            return {
+                "reply": "No matters on file yet. Say \"open a matter for [client name]\" to start one.",
+                "source": "legal.matters",
+            }
+        lines = [f"You have {len(matters)} matter(s):"]
+        for mat in matters[:10]:
+            lines.append(
+                f"  • {mat['matter_number']} — {mat['title']} "
+                f"({mat.get('status','?')}, {mat.get('practice_area') or mat.get('type','?')})"
+            )
+        if len(matters) > 10:
+            lines.append(f"  … and {len(matters) - 10} more.")
+        return {"reply": "\n".join(lines), "source": "legal.matters"}
+
+    # Upcoming deadlines
+    if _LEGAL_DEADLINES_RE.match(msg):
+        summary = mod_legal.upcoming_deadlines_summary(DATA_DIR, days=30)
+        return {"reply": summary, "source": "legal.deadlines"}
+
+    # Legal dashboard
+    if _LEGAL_DASHBOARD_RE.match(msg) and "legal" in msg.lower():
+        data = mod_legal.dashboard_summary(DATA_DIR)
+        upcoming = mod_legal.upcoming_deadlines_summary(DATA_DIR, days=7)
+        reply = (
+            f"Legal summary: {data['active_matters']} active matter(s), "
+            f"{data['deadlines_next_7']} deadline(s) in the next 7 days, "
+            f"${data['unbilled_amount']:.2f} unbilled ({data['unbilled_hours']}h).\n\n"
+            f"Next 7 days:\n{upcoming}"
+        )
+        return {"reply": reply, "source": "legal.dashboard"}
+
+    # Legal research
+    m = _LEGAL_RESEARCH_RE.match(msg)
+    if m:
+        question = (m.group("question") or "").strip()
+        research_prompt = mod_legal.build_research_prompt(question)
+        system = (
+            "You are an experienced paralegal preparing a legal research memo "
+            "for attorney review. Cite real statutes and cases. Be thorough. "
+            "Always end with: 'Attorney should verify all citations before relying on this memo.'"
+        )
+        try:
+            memo = llm_client.chat(system=system, user=research_prompt)
+        except Exception:
+            log.exception("legal research via chat failed")
+            return None
+        return {
+            "reply": memo + "\n\n---\n*Research memo prepared for attorney review.*",
+            "source": "legal.research",
+        }
+
+    # Document drafting
+    m = _LEGAL_DRAFT_RE.match(msg)
+    if m:
+        doc_phrase = (m.group("doc") or "").strip().lower()
+        template_key = _DOC_KEY_MAP.get(doc_phrase)
+        if not template_key:
+            return None
+        tmpl = mod_legal.get_template(template_key)
+        if not tmpl:
+            return None
+        missing = [f for f in tmpl["fields"]
+                   if f not in ("attorney_name", "firm_name", "jurisdiction")]
+        fields_needed = ", ".join(missing[:4])
+        return {
+            "reply": (
+                f"I'll draft a {tmpl['name']} for you. "
+                f"I need a few details: {fields_needed}. "
+                f"Which matter is this for, and who are the parties?"
+            ),
+            "source": "legal.draft.prompt",
+            "pending": {"action": "draft_document", "template": template_key},
+        }
+
+    # SOL lookup
+    m = _LEGAL_SOL_RE.search(msg)
+    if m and any(kw in msg.lower() for kw in ("sol", "statute of limitation")):
+        area = (m.group("area") or "").strip().lower().replace(" ", "_")
+        date_str = (m.group("date") or "").strip()
+        result = mod_legal.sol_deadline_estimate(date_str, area) if date_str \
+            else mod_legal.sol_lookup(area)
+        if result:
+            if isinstance(result, dict) and "estimated_deadline" in result:
+                reply = (
+                    f"SOL estimate for {area.replace('_',' ')}: "
+                    f"{result.get('estimated_deadline','unknown')} "
+                    f"({result.get('days_remaining','?')} days remaining).\n"
+                    f"{result.get('notes','')}\n"
+                    f"⚠ {result.get('warning','Attorney must verify.')}"
+                )
+            else:
+                r = result
+                reply = (
+                    f"SOL reference for {area.replace('_',' ')}: "
+                    f"{r.get('default_years','?')} year(s) default.\n"
+                    f"{r.get('notes','')}\n"
+                    f"⚠ Attorney must verify for specific facts and jurisdiction."
+                )
+            return {"reply": reply, "source": "legal.sol"}
+
+    return None
+
+
+def _try_reminders_chat(message: str, user_rec: dict,
+                        history: list[dict]) -> dict | None:
+    if not message:
+        return None
+    msg = _strip_polite_prefix(message)
+    if _PA_REMINDERS_DONE_RE.search(msg):
+        return None
+    username = user_rec.get("username", "owner")
+    try:
+        user_dir = users_mod.get_user_dir(DATA_DIR, username)
+    except Exception:
+        return None
+
+    if _REMINDERS_LIST_RE.match(msg):
+        reminders = [r for r in mod_reminders.list_all(user_dir)
+                     if r.get("status") in (None, "pending", "snoozed")]
+        if not reminders:
+            return {"reply": "You don't have any open reminders.",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "reminders_list_empty"}
+        lines = [f"You have {len(reminders)} open reminder{'s' if len(reminders) != 1 else ''}:"]
+        for idx, r in enumerate(reminders[:10], 1):
+            lines.append(f"{idx}. {r.get('text', '')} — {_fmt_reminder_due(r.get('due', ''))}")
+        return {"reply": "\n".join(lines),
+                "tier": "local", "latency_ms": 0,
+                "source": "reminders_list"}
+
+    m = _REMINDER_DONE_RE.match(msg)
+    if not m:
+        return None
+    body = (m.group("body") or m.group("body2") or "").strip().rstrip("?.!")
+    if not body or body.lower() in {"it", "that", "this"}:
+        body = _recent_reminder_query_from_history(history)
+    if not body:
+        return {"reply": "Which reminder should I mark complete?",
+                "tier": "local", "latency_ms": 0,
+                "source": "reminder_done_needs_target"}
+    matches = _find_matching_reminders(user_dir, body)
+    if not matches:
+        return {"reply": f"I don't see an open reminder matching \"{body}\".",
+                "tier": "local", "latency_ms": 0,
+                "source": "reminder_done_no_match"}
+    if len(matches) > 1:
+        top_tokens = _reminder_tokens(matches[0].get("text") or "")
+        body_tokens = _reminder_tokens(body)
+        if len(body_tokens & top_tokens) < 2:
+            listed = "\n".join(f"  · {r.get('text','')} — {_fmt_reminder_due(r.get('due',''))}"
+                               for r in matches[:5])
+            return {"reply": f"A few reminders could match \"{body}\":\n{listed}\nWhich one?",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "reminder_done_ambiguous"}
+    target = matches[0]
+    target_text_l = (target.get("text") or "").lower()
+    body_l = body.lower()
+    exactish = body_l in target_text_l or (target_text_l in body_l and len(target_text_l) >= 6)
+    if len(_reminder_tokens(body) & _reminder_tokens(target.get("text") or "")) < 2 and not exactish:
+        return {"reply": f"I found a weak match for \"{body}\" but won't mark it complete. Which reminder should I complete?",
+                "tier": "local", "latency_ms": 0,
+                "source": "reminder_done_weak_match"}
+    if mod_reminders.mark_done(user_dir, target["id"]):
+        audit.log_event(DATA_DIR, actor=username, action="reminder.done",
+                        meta={"reminder_id": target["id"],
+                              "text": target.get("text", "")})
+        return {"reply": f"Marked reminder complete: \"{target.get('text','')}\"",
+                "tier": "local", "latency_ms": 0,
+                "source": "reminder_done"}
+    return {"reply": f"Couldn't mark reminder complete: \"{target.get('text','')}\"",
+            "tier": "local", "latency_ms": 0,
+            "source": "reminder_done_failed"}
 
 
 _REMINDER_REMOVE_RE = _re.compile(
@@ -15074,14 +17102,43 @@ def _try_personal_assistant_read(message: str, user_dir: Path) -> str | None:
             for e in events
         )
 
+    def _dedupe_items(items: list[dict], text_key: str = "text") -> list[dict]:
+        seen: set[str] = set()
+        out: list[dict] = []
+        for item in items:
+            norm = _re.sub(r"[^a-z0-9]+", " ", str(item.get(text_key) or "").lower()).strip()
+            if not norm or norm in seen:
+                continue
+            seen.add(norm)
+            out.append(item)
+        return out
+
+    if _PA_TASKS_DONE_RE.search(message):
+        items = _dedupe_items([t for t in mod_tasks.list_all(user_dir, include_done=True)
+                 if t.get("status") == "done" or t.get("done")])
+        if not items:
+            return "You don't have any completed tasks."
+        return "Completed tasks:\n" + "\n".join(f"  - {t.get('text','')}" for t in items[:20])
+
     if _PA_TASKS_RE.search(message):
-        items = mod_tasks.list_all(user_dir)
+        items = mod_tasks.list_all(user_dir, include_done=False)
         if not items:
             return "Your task list is empty."
         return "Open tasks:\n" + "\n".join(f"  - {t.get('text','')}" for t in items)
 
+    if _PA_REMINDERS_DONE_RE.search(message):
+        items = _dedupe_items([r for r in mod_reminders.list_all(user_dir, include_done=True)
+                 if r.get("status") in ("done", "completed", "complete")])
+        if not items:
+            return "You don't have any completed reminders."
+        return "Completed reminders:\n" + "\n".join(
+            f"  - {_fmt_email_date(r.get('due',''))}  {r.get('text','')}"
+            for r in items[:20]
+        )
+
     if _PA_REMINDERS_RE.search(message):
-        items = mod_reminders.list_all(user_dir)
+        items = [r for r in mod_reminders.list_all(user_dir)
+                 if r.get("status") in (None, "pending", "snoozed")]
         if not items:
             return "No pending reminders."
         return "Pending reminders:\n" + "\n".join(
@@ -15139,6 +17196,10 @@ def _try_personal_assistant_read(message: str, user_dir: Path) -> str | None:
 # normal questions don't accidentally get filed as notes.
 _QC_TRIGGER_RE = _re.compile(
     r"^(?:remind\s+me|nudge\s+me|add\s+(?:to\s+)?(?:my\s+)?(?:todo|task|contact|person)|"
+    # 'add a meeting / add an event / add an appointment' — the "add" prefix
+    # was falling through to the LLM which claimed success but never wrote
+    # the event. Now routed to quick_capture like bare 'meeting'.
+    r"add\s+(?:a\s+|an\s+)?(?:meeting|appointment|event|calendar\s+event)\b|"
     # Frank 2026-06-24: 'schedule dentist Friday at 2pm' was missing — the
     # old trigger required 'schedule a' or 'schedule me'. Now accept bare
     # 'schedule X' too.
@@ -15148,7 +17209,11 @@ _QC_TRIGGER_RE = _re.compile(
     # Monday" all hit the fast-path classifier. Previously the LLM hallucinated
     # successful adds without persisting.
     r"block\s+off|lunch|dinner|breakfast|coffee|call\s+\w+|"
-    r"take\s+(?:a\s+)?note|note(?:\s+to\s+self)?:?\s)",
+    r"take\s+(?:a\s+)?note|note(?:\s+to\s+self)?:?\s|"
+    r"log\s+(?:this|that)\b|"
+    r"add\s+(?:this\s+)?to\s+(?:my\s+)?(?:daily\s+)?(?:log|notes?)\b|"
+    r"add\s+(?:a\s+)?(?:note|entry)\s+to\s+(?:my\s+)?(?:daily\s+)?(?:log|notes?)\b|"
+    r"add\s+(?:a\s+)?(?:daily\s+)?log\s+(?:entry\b|note\b))",
     _re.IGNORECASE,
 )
 
@@ -15677,7 +17742,10 @@ def _try_office_gen(message: str, username: str) -> dict | None:
                     and not _AD_TRIGGER_RE.match(first_line)
                     and not _AD_LEARN_TRIGGER_RE.match(first_line)
                     and not _re.match(
-                        r"^\s*(?:remember|note|save|long[- ]?term\s+memory)",
+                        r"^\s*(?:remember|note|save|log\b|long[- ]?term\s+memory|"
+                        r"add\s+(?:a\s+|an\s+)?(?:note|task|reminder|contact|to[\s-]?do|log\b|"
+                        r"meeting|appointment|event|calendar\s+event)|"
+                        r"remind\s+me|schedule\b|add\s+to\s+(?:my\s+)?(?:log|notes?|tasks?|calendar|contacts?))",
                         msg, _re.IGNORECASE))
             )
         )
@@ -16094,11 +18162,524 @@ def _try_quick_capture(message: str, user_dir: Path) -> dict | None:
     stripped = _strip_polite_prefix(message)
     if not _QC_TRIGGER_RE.match(stripped):
         return None
+    multi = _re.match(
+        r"^(?P<first>remind\s+me\s+.+?)\s+and\s+also\s+"
+        r"(?:(?:add|out\s+of)\s+(?:a\s+)?task\s+(?:to\s+)?)"
+        r"(?P<task>.+?)\s*[.?!]?$",
+        stripped,
+        _re.IGNORECASE,
+    )
+    if multi:
+        try:
+            first = mod_qc.capture(user_dir, multi.group("first").strip())
+            task_text = multi.group("task").strip()
+            task = mod_tasks.add(user_dir, task_text)
+            summary_bits = []
+            if first and first.get("summary"):
+                summary_bits.append(first["summary"])
+            summary_bits.append(f"Task created: \"{task.get('text', task_text)}\"")
+            return {
+                "kind": "multi_capture",
+                "item": {"first": first, "task": task},
+                "summary": "\n".join(summary_bits),
+            }
+        except Exception as e:
+            log.warning(f"quick_capture multi failed: {e}")
+            return None
     try:
-        return mod_qc.capture(user_dir, stripped)
+        # Strip "add a/an " prefix so 'add a meeting with X on Y' reaches
+        # quick_capture as 'meeting with X on Y' which the APPT_RE can match.
+        qc_input = _re.sub(
+            r"^add\s+(?:a\s+|an\s+)?(?=meeting|appointment|event|calendar\s+event)",
+            "", stripped, count=1, flags=_re.IGNORECASE)
+        result = mod_qc.capture(user_dir, qc_input)
+        if result and result.get("kind") == "calendar_needs_time":
+            result["summary"] = _calendar_availability_followup(user_dir, stripped)
+        return result
     except Exception as e:
         log.warning(f"quick_capture failed: {e}")
         return None
+
+
+def _parse_event_dt(value: str) -> _datetime | None:
+    try:
+        s = str(value or "").replace("Z", "+00:00")
+        dt = _datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=_timezone.utc)
+        return dt.astimezone()
+    except (TypeError, ValueError):
+        return None
+
+
+def _calendar_search_window(message: str) -> tuple[_datetime, _datetime, str]:
+    now = _datetime.now().astimezone()
+    msg = (message or "").lower()
+    if "next week" in msg:
+        days_until_monday = (7 - now.weekday()) % 7
+        if days_until_monday == 0:
+            days_until_monday = 7
+        start = (now + _timedelta(days=days_until_monday)).replace(
+            hour=9, minute=0, second=0, microsecond=0)
+        end = (start + _timedelta(days=5)).replace(hour=17)
+        return start, end, "next week"
+    start = now.replace(minute=0, second=0, microsecond=0)
+    if start <= now:
+        start += _timedelta(hours=1)
+    end = start + _timedelta(days=7)
+    return start, end, "the next week"
+
+
+_WEEKDAY_TO_INDEX = {
+    "monday": 0,
+    "tuesday": 1,
+    "wednesday": 2,
+    "thursday": 3,
+    "friday": 4,
+    "saturday": 5,
+    "sunday": 6,
+}
+
+
+def _extract_weekday(message: str) -> str:
+    msg = (message or "").lower()
+    for day in _WEEKDAY_TO_INDEX:
+        if _re.search(rf"\b{day}\b", msg):
+            return day
+    return ""
+
+
+def _next_weekday_datetime(day_name: str, prefer_next_week: bool = True) -> _datetime | None:
+    idx = _WEEKDAY_TO_INDEX.get((day_name or "").lower())
+    if idx is None:
+        return None
+    now = _datetime.now().astimezone()
+    if prefer_next_week:
+        days_until_monday = (7 - now.weekday()) % 7
+        if days_until_monday == 0:
+            days_until_monday = 7
+        monday = (now + _timedelta(days=days_until_monday)).replace(
+            hour=0, minute=0, second=0, microsecond=0)
+        return monday + _timedelta(days=idx)
+    days = (idx - now.weekday()) % 7
+    if days == 0:
+        days = 7
+    return (now + _timedelta(days=days)).replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def _calendar_day_window(day: _datetime) -> tuple[_datetime, _datetime, str]:
+    start = day.replace(hour=9, minute=0, second=0, microsecond=0)
+    end = day.replace(hour=17, minute=0, second=0, microsecond=0)
+    return start, end, day.strftime("%A %b %-d")
+
+
+def _event_blocks_slot(event: dict, slot_start: _datetime, slot_end: _datetime) -> bool:
+    start_dt = _parse_event_dt(event.get("start"))
+    if not start_dt:
+        return False
+    if event.get("all_day"):
+        return start_dt.date() == slot_start.date()
+    end_dt = _parse_event_dt(event.get("end")) or (start_dt + _timedelta(hours=1))
+    if end_dt <= start_dt:
+        end_dt = start_dt + _timedelta(hours=1)
+    return start_dt < slot_end and slot_start < end_dt
+
+
+def _format_available_slot(dt: _datetime) -> str:
+    day = dt.strftime("%A")
+    hour = dt.strftime("%I").lstrip("0") or "0"
+    minute = dt.strftime(":%M") if dt.minute else ""
+    suffix = dt.strftime("%p")
+    return f"{day} at {hour}{minute} {suffix}"
+
+
+def _format_available_time(dt: _datetime) -> str:
+    hour = dt.strftime("%I").lstrip("0") or "0"
+    minute = dt.strftime(":%M") if dt.minute else ""
+    suffix = dt.strftime("%p")
+    return f"{hour}{minute} {suffix}"
+
+
+def _format_plain_time(dt: _datetime) -> str:
+    hour = dt.strftime("%I").lstrip("0") or "0"
+    minute = dt.strftime(":%M") if dt.minute else ""
+    suffix = dt.strftime("%p").lower()
+    return f"{hour}{minute} {suffix}"
+
+
+def _open_calendar_slots(user_dir: Path, start: _datetime, end: _datetime) -> list[_datetime]:
+    try:
+        events = mod_calendar.list_all(user_dir) or []
+    except Exception:
+        log.exception("calendar availability lookup failed")
+        return []
+    open_slots: list[_datetime] = []
+    cur = start
+    while cur < end:
+        if cur.weekday() < 5 and 9 <= cur.hour < 17:
+            slot_end = cur + _timedelta(hours=1)
+            if not any(_event_blocks_slot(e, cur, slot_end) for e in events):
+                open_slots.append(cur)
+        cur += _timedelta(hours=1)
+    return open_slots
+
+
+def _busy_calendar_blocks(user_dir: Path, start: _datetime, end: _datetime) -> list[dict]:
+    try:
+        events = mod_calendar.list_all(user_dir) or []
+    except Exception:
+        log.exception("calendar availability lookup failed")
+        return []
+    blocks: list[dict] = []
+    for event in events:
+        ev_start = _parse_event_dt(event.get("start"))
+        if not ev_start:
+            continue
+        if event.get("all_day") and ev_start.date() == start.date():
+            return [{"title": event.get("title") or "all-day event",
+                     "start": start, "end": end, "all_day": True}]
+        ev_end = _parse_event_dt(event.get("end")) or (ev_start + _timedelta(hours=1))
+        if ev_end <= ev_start:
+            ev_end = ev_start + _timedelta(hours=1)
+        if ev_start < end and start < ev_end:
+            blocks.append({
+                "title": event.get("title") or "meeting",
+                "start": max(ev_start, start),
+                "end": min(ev_end, end),
+                "all_day": False,
+            })
+    return sorted(blocks, key=lambda b: b["start"])
+
+
+def _availability_ranges_from_busy(start: _datetime, end: _datetime,
+                                   blocks: list[dict]) -> list[str]:
+    ranges: list[str] = []
+    cursor = start
+    for block in blocks:
+        block_start = block["start"]
+        block_end = block["end"]
+        if block_start > cursor:
+            if cursor == start:
+                ranges.append(f"before {_format_plain_time(block_start)}")
+            else:
+                ranges.append(
+                    f"between {_format_plain_time(cursor)} and {_format_plain_time(block_start)}"
+                )
+        if block_end > cursor:
+            cursor = block_end
+    if cursor < end:
+        if cursor == start:
+            ranges.append("pretty much anytime during business hours")
+        else:
+            ranges.append(f"after {_format_plain_time(cursor)}")
+    return ranges
+
+
+def _join_natural(items: list[str]) -> str:
+    if not items:
+        return ""
+    if len(items) == 1:
+        return items[0]
+    if len(items) == 2:
+        return f"{items[0]} or {items[1]}"
+    return ", ".join(items[:-1]) + f", or {items[-1]}"
+
+
+def _calendar_day_availability_reply(user_dir: Path, day_name: str,
+                                     prefer_next_week: bool = True) -> str:
+    day = _next_weekday_datetime(day_name, prefer_next_week=prefer_next_week)
+    if day is None:
+        return "What day would you like to set that up?"
+    return _calendar_exact_day_availability_reply(user_dir, day)
+
+
+def _calendar_exact_day_availability_reply(user_dir: Path, day: _datetime) -> str:
+    start, end, label = _calendar_day_window(day)
+    blocks = _busy_calendar_blocks(user_dir, start, end)
+    if blocks and any(b.get("all_day") for b in blocks):
+        title = blocks[0].get("title") or "an all-day event"
+        return f"I checked {label}. You have {title} all day. What other day should I check?"
+    if not blocks:
+        return f"I checked {label}. Your calendar looks open that day. What time would you like, and who is it with?"
+    busy = [
+        f"{b.get('title') or 'meeting'} at {_format_plain_time(b['start'])}"
+        for b in blocks[:3]
+    ]
+    busy_text = _join_natural(busy)
+    ranges = _availability_ranges_from_busy(start, end, blocks)
+    if not ranges:
+        return f"I checked {label}. You already have {busy_text}, and business hours look full. What other day should I check?"
+    return (
+        f"I checked {label}. You have {busy_text}. "
+        f"You could do {_join_natural(ranges)}. What time works, and who is it with?"
+    )
+
+
+_MEETING_SETUP_RE = _re.compile(
+    r"\b(?:set\s+me\s+up\s+(?:a\s+)?meeting|schedule\s+(?:a\s+)?meeting|"
+    r"book\s+(?:a\s+)?meeting|put\s+(?:a\s+)?meeting\s+on\s+(?:my\s+)?calendar)\b",
+    _re.IGNORECASE,
+)
+_DAY_OF_MONTH_RE = _re.compile(
+    r"\bthe\s+(?P<day>\d{1,2})(?:st|nd|rd|th)?\b"
+    r"|\b(?P<day_suffix>\d{1,2})(?:st|nd|rd|th)\b",
+    _re.IGNORECASE,
+)
+_CLOCK_IN_TEXT_RE = _re.compile(
+    r"\b(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*"
+    r"(?P<suffix>a\.?m\.?|p\.?m\.?|am|pm)?\b",
+    _re.IGNORECASE,
+)
+
+
+def _parse_meeting_day_text(text: str, prefer_next_week: bool = True) -> _datetime | None:
+    stripped = " ".join(str(text or "").lower().split())
+    day_name = _extract_weekday(stripped)
+    if day_name:
+        return _next_weekday_datetime(day_name, prefer_next_week=prefer_next_week)
+    m = _DAY_OF_MONTH_RE.search(stripped)
+    if not m:
+        return None
+    day_num = int(m.group("day") or m.group("day_suffix"))
+    now = _datetime.now().astimezone()
+    for month_offset in (0, 1):
+        year = now.year
+        month = now.month + month_offset
+        if month > 12:
+            year += 1
+            month -= 12
+        try:
+            candidate = now.replace(year=year, month=month, day=day_num,
+                                    hour=0, minute=0, second=0, microsecond=0)
+        except ValueError:
+            continue
+        if candidate.date() >= now.date():
+            return candidate
+    return None
+
+
+def _parse_meeting_time_text(text: str) -> tuple[int, int] | None:
+    m = _CLOCK_IN_TEXT_RE.search(str(text or ""))
+    if not m:
+        return None
+    hour = int(m.group("hour"))
+    minute = int(m.group("minute") or 0)
+    suffix = (m.group("suffix") or "").lower().replace(".", "")
+    if minute > 59 or hour > 23:
+        return None
+    if suffix == "am":
+        if hour == 12:
+            hour = 0
+    elif suffix == "pm":
+        if hour < 12:
+            hour += 12
+    elif 1 <= hour <= 7:
+        hour += 12
+    return hour, minute
+
+
+def _meeting_iso(day: _datetime, time_parts: tuple[int, int]) -> str:
+    local = day.replace(hour=time_parts[0], minute=time_parts[1],
+                        second=0, microsecond=0)
+    return local.astimezone(_timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _meeting_context_from_history(history: list[dict]) -> dict:
+    ctx: dict = {"day": None, "time": None, "stage": ""}
+    if not isinstance(history, list):
+        return ctx
+    for item in history[-12:]:
+        role = (item or {}).get("role")
+        text = str((item or {}).get("content") or "")
+        text_l = " ".join(text.lower().split())
+        if role == "assistant":
+            if ("scheduled meeting with" in text_l
+                    or text_l.startswith("what should the text")
+                    or text_l.startswith("what phone number should")
+                    or text_l.startswith("who should i text")
+                    or text_l.startswith("what should the email")
+                    or "text sent to " in text_l
+                    or "email sent to " in text_l):
+                ctx = {"day": None, "time": None, "stage": "done"}
+                continue
+            if ("what day would you like to set that up" in text_l
+                    or "would either of those days work" in text_l):
+                ctx["stage"] = "day"
+            elif ("what time works" in text_l
+                  or "what time would you like" in text_l):
+                ctx["stage"] = "time"
+            elif ("who is it with" in text_l
+                  or "with whom is the meeting" in text_l):
+                ctx["stage"] = "who"
+            continue
+        if role != "user":
+            continue
+        day = _parse_meeting_day_text(text, prefer_next_week=True)
+        if day:
+            ctx["day"] = day
+        time_parts = _parse_meeting_time_text(text)
+        if time_parts:
+            ctx["time"] = time_parts
+    return ctx
+
+
+def _meeting_person_from_text(text: str) -> str:
+    cleaned = _re.sub(r"^\s*(?:with\s+)?", "", str(text or "").strip(), flags=_re.IGNORECASE)
+    cleaned = cleaned.strip(" .?!")
+    lower = cleaned.lower()
+    if _re.search(r"\b(?:what|who|when|where|why|how|calendar|reminders?|tasks?|text|email|mark|done|completed)\b", lower):
+        return ""
+    if not cleaned or _parse_meeting_time_text(cleaned) or _parse_meeting_day_text(cleaned):
+        return ""
+    if len(cleaned) > 80:
+        return ""
+    return cleaned
+
+
+def _extract_meeting_person(message: str) -> str:
+    msg = str(message or "").strip()
+    m = _re.search(r"\bwith\s+([A-Za-z][A-Za-z .'\-]{1,60})\b", msg, _re.IGNORECASE)
+    if m:
+        return _meeting_person_from_text(m.group(1))
+    return _meeting_person_from_text(msg)
+
+
+def _try_calendar_meeting_flow(message: str, user_dir: Path,
+                               history: list[dict]) -> dict | None:
+    stripped = _strip_polite_prefix(" ".join(str(message or "").split()))
+    if not stripped:
+        return None
+    ctx = _meeting_context_from_history(history)
+    is_new_request = bool(_MEETING_SETUP_RE.search(stripped))
+
+    if is_new_request:
+        day = _parse_meeting_day_text(stripped, prefer_next_week=("next week" in stripped.lower()))
+        time_parts = _parse_meeting_time_text(stripped)
+        person = _extract_meeting_person(stripped)
+        if not day:
+            return {"reply": "What day would you like to set that up? I'll check what is available for that day.",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "calendar_meeting_needs_day"}
+        if not time_parts or not person:
+            day_name = day.strftime("%A").lower()
+            return {"reply": _calendar_day_availability_reply(user_dir, day_name, prefer_next_week=("next week" in stripped.lower())),
+                    "tier": "local", "latency_ms": 0,
+                    "source": "calendar_meeting_day_availability"}
+        start_iso = _meeting_iso(day, time_parts)
+        event = mod_calendar.add(user_dir, f"meeting with {person}", start_iso,
+                                 with_=[person])
+        return {"reply": f"Scheduled meeting with {person} for {_format_available_slot(day.replace(hour=time_parts[0], minute=time_parts[1]))}.",
+                "tier": "local", "latency_ms": 0,
+                "source": "calendar_meeting_created",
+                "event": event}
+
+    if ctx.get("stage") == "day":
+        if _looks_like_new_owner_command(stripped):
+            return None
+        day = _parse_meeting_day_text(stripped, prefer_next_week=True)
+        if not day:
+            return {"reply": "What day should I check?",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "calendar_meeting_needs_day"}
+        return {"reply": _calendar_exact_day_availability_reply(user_dir, day),
+                "tier": "local", "latency_ms": 0,
+                "source": "calendar_meeting_day_availability"}
+
+    if ctx.get("stage") in ("time", "who"):
+        if _looks_like_new_owner_command(stripped):
+            return None
+        day = ctx.get("day")
+        time_parts = ctx.get("time")
+        new_day = _parse_meeting_day_text(stripped, prefer_next_week=True)
+        if new_day:
+            day = new_day
+        new_time = _parse_meeting_time_text(stripped)
+        if new_time:
+            time_parts = new_time
+        person = _extract_meeting_person(stripped)
+        if not day:
+            return {"reply": "What day should I schedule it for?",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "calendar_meeting_needs_day"}
+        if not time_parts:
+            return {"reply": "What time should I schedule it for?",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "calendar_meeting_needs_time"}
+        if not person:
+            return {"reply": "Who is the meeting with?",
+                    "tier": "local", "latency_ms": 0,
+                    "source": "calendar_meeting_needs_person"}
+        start_iso = _meeting_iso(day, time_parts)
+        event = mod_calendar.add(user_dir, f"meeting with {person}", start_iso,
+                                 with_=[person])
+        return {"reply": f"Scheduled meeting with {person} for {_format_available_slot(day.replace(hour=time_parts[0], minute=time_parts[1]))}.",
+                "tier": "local", "latency_ms": 0,
+                "source": "calendar_meeting_created",
+                "event": event}
+
+    return None
+
+
+def _calendar_availability_followup(user_dir: Path, message: str) -> str:
+    """Suggest real open meeting times for vague calendar requests."""
+    msg_l = (message or "").lower()
+    day_name = _extract_weekday(message)
+    if day_name:
+        return _calendar_day_availability_reply(user_dir, day_name, prefer_next_week=("next week" in msg_l))
+    if "next week" in msg_l:
+        return "What day would you like to set that up? I'll check what is available for that day."
+
+    start, end, label = _calendar_search_window(message)
+    open_slots = _open_calendar_slots(user_dir, start, end)
+
+    if not open_slots:
+        return f"I checked your calendar and don't see a clear opening {label}. What day and time should I try?"
+    if len(open_slots) > 6:
+        return f"I checked your calendar and you have a lot of openings {label}. What day and time would you like?"
+    choices = ", ".join(_format_available_slot(s) for s in open_slots[:4])
+    if len(open_slots) == 1:
+        return f"I checked your calendar. You have {choices} open. Do you want me to schedule it then?"
+    return f"I checked your calendar. You have {choices} open. Which one works?"
+
+
+def _pending_calendar_day_question(history: list[dict]) -> bool:
+    if not isinstance(history, list):
+        return False
+    for item in reversed(history[-6:]):
+        if (item or {}).get("role") != "assistant":
+            continue
+        text = " ".join(str((item or {}).get("content") or "").lower().split())
+        if ("scheduled meeting with" in text
+                or text.startswith("next week,")
+                or text.startswith("upcoming this week")
+                or text.startswith("what should the text")
+                or text.startswith("what phone number should")
+                or text.startswith("who should i text")
+                or text.startswith("what should the email")):
+            return False
+        if ("what day would you like to set that up" in text
+                and "available for that day" in text):
+            return True
+        if text:
+            return False
+    return False
+
+
+def _try_calendar_day_followup(message: str, user_dir: Path,
+                               history: list[dict]) -> dict | None:
+    if not _pending_calendar_day_question(history):
+        return None
+    stripped = _strip_polite_prefix(" ".join(str(message or "").split()))
+    if _looks_like_new_owner_command(stripped):
+        return None
+    day_name = _extract_weekday(stripped)
+    if not day_name:
+        return {"reply": "What day should I check?",
+                "tier": "local", "latency_ms": 0,
+                "source": "calendar_needs_day"}
+    return {"reply": _calendar_day_availability_reply(user_dir, day_name, prefer_next_week=True),
+            "tier": "local", "latency_ms": 0,
+            "source": "calendar_day_availability"}
 
 
 def _try_file_fetch(message: str, username: str) -> dict | None:
@@ -18317,6 +20898,8 @@ def push_test():
 def not_found(e):
     """Stray paths (typos, /:, /foo, /bar) → bounce to the chat shell.
     Keeps the experience friendly for visitors who fat-fingered a URL."""
+    if request.path.startswith("/api/"):
+        return jsonify({"error": "not_found"}), 404
     from flask import redirect
     return redirect("/", code=302)
 
@@ -18398,8 +20981,8 @@ def main():
                 notify.send(CONFIG, DATA_DIR,
                              event="update_available",
                              title=f"Orbi {info.get('tag')} is available",
-                             body=("Say \"install update\" in chat or open "
-                                    "Settings → Updates to apply it."),
+                             body=("Ask Orbi for update instructions. Cloud "
+                                    "tenants are updated from the server."),
                              url="/owner")
             except Exception:    # noqa: BLE001
                 log.exception("update notify push failed")
