@@ -542,6 +542,19 @@ def sol_deadline_estimate(injury_date: str, practice_area: str,
 
 # ── DOCUMENT TEMPLATE LIBRARY ─────────────────────────────────────────────────
 
+_DRAFT_SYSTEM = (
+    "You are a highly experienced litigation paralegal. Draft the COMPLETE legal document "
+    "requested — not an outline, not a shell, a finished professional draft ready for "
+    "attorney review. Use proper legal formatting (caption, headings, numbered paragraphs, "
+    "signature blocks, certificate of service where applicable). "
+    "For any field the attorney has not yet provided, insert a placeholder formatted as "
+    "[FILL: brief description of what goes here] so the attorney can spot and complete it. "
+    "Never invent facts — only use information provided. "
+    "End every document with this exact line on its own: "
+    "'Prepared by myVola AI Paralegal — for attorney review and approval only. "
+    "Not for filing without attorney signature and authorization.'"
+)
+
 DOCUMENT_TEMPLATES = {
     "demand_letter": {
         "name":        "Demand Letter",
@@ -647,6 +660,289 @@ DOCUMENT_TEMPLATES = {
             "releases, and next steps (dismissal, etc.)."
         ),
     },
+
+    # ── COURT FILING DOCUMENTS ────────────────────────────────────────────────
+
+    "complaint": {
+        "name":        "Civil Complaint",
+        "description": "Complaint / petition to initiate a civil lawsuit",
+        "fields":      ["plaintiff_name", "defendant_name", "court", "jurisdiction",
+                        "claims", "incident_date", "incident_description",
+                        "injuries_damages", "relief_sought", "attorney_name", "firm_name"],
+        "prompt":      (
+            "Draft a complete civil complaint ready for attorney review. "
+            "Plaintiff: {plaintiff_name}. Defendant: {defendant_name}. "
+            "Court: {court}. Jurisdiction basis: {jurisdiction}. "
+            "Claims: {claims}. Incident date: {incident_date}. "
+            "Facts: {incident_description}. "
+            "Injuries/damages: {injuries_damages}. "
+            "Relief sought: {relief_sought}. "
+            "Attorney: {attorney_name}, {firm_name}. "
+            "Include: caption, jurisdiction and venue allegations, parties section, "
+            "factual allegations (numbered), each cause of action as a separate count "
+            "with elements pled, prayer for relief, jury demand if applicable, "
+            "signature block, and certificate of service. "
+            "Use proper federal or state civil complaint format. "
+            "Mark any element that needs attorney judgment [ATTORNEY REVIEW NEEDED]."
+        ),
+    },
+
+    "answer": {
+        "name":        "Answer to Complaint",
+        "description": "Defendant's answer and affirmative defenses",
+        "fields":      ["plaintiff_name", "defendant_name", "court", "case_number",
+                        "jurisdiction", "response_overview", "affirmative_defenses",
+                        "attorney_name", "firm_name"],
+        "prompt":      (
+            "Draft a complete answer to a civil complaint. "
+            "Plaintiff: {plaintiff_name}. Defendant: {defendant_name}. "
+            "Court: {court}, Case No. {case_number}. "
+            "Jurisdiction: {jurisdiction}. "
+            "General response: {response_overview}. "
+            "Affirmative defenses to plead: {affirmative_defenses}. "
+            "Attorney: {attorney_name}, {firm_name}. "
+            "Include: caption, numbered paragraph-by-paragraph responses "
+            "(admit/deny/lack knowledge), affirmative defenses section with each "
+            "defense stated as a separate numbered defense, any counterclaims "
+            "if applicable marked [ATTORNEY: ADD COUNTERCLAIMS IF ANY], "
+            "prayer for relief/dismissal, signature block, certificate of service."
+        ),
+    },
+
+    "motion_summary_judgment": {
+        "name":        "Motion for Summary Judgment",
+        "description": "MSJ with substantive legal argument",
+        "fields":      ["case_title", "case_number", "court", "moving_party",
+                        "opposing_party", "grounds", "key_undisputed_facts",
+                        "attorney_name", "firm_name", "jurisdiction"],
+        "prompt":      (
+            "Draft a complete motion for summary judgment — not a shell, a substantive "
+            "motion with legal argument. "
+            "Case: {case_title}, No. {case_number}. Court: {court}. "
+            "Moving party: {moving_party}. Opposing party: {opposing_party}. "
+            "Grounds: {grounds}. "
+            "Key undisputed facts: {key_undisputed_facts}. "
+            "Attorney: {attorney_name}, {firm_name}. Jurisdiction: {jurisdiction}. "
+            "Include: caption, table of contents, introduction, standard of review "
+            "(cite the correct FRCP 56 or state equivalent standard), statement of "
+            "undisputed material facts (numbered), legal argument section with "
+            "substantive analysis of each ground, conclusion, signature block, "
+            "certificate of service. Mark sections needing case-specific citations "
+            "as [ATTORNEY: INSERT SUPPORTING CASES]. "
+            "Use proper motion formatting for this jurisdiction."
+        ),
+    },
+
+    "motion_in_limine": {
+        "name":        "Motion in Limine",
+        "description": "Pre-trial motion to exclude evidence",
+        "fields":      ["case_title", "case_number", "court", "moving_party",
+                        "opposing_party", "evidence_to_exclude", "legal_basis",
+                        "prejudice_argument", "attorney_name", "firm_name"],
+        "prompt":      (
+            "Draft a complete motion in limine. "
+            "Case: {case_title}, No. {case_number}. Court: {court}. "
+            "Moving party: {moving_party}. Opposing party: {opposing_party}. "
+            "Evidence/testimony to exclude: {evidence_to_exclude}. "
+            "Legal basis for exclusion: {legal_basis}. "
+            "Prejudice argument: {prejudice_argument}. "
+            "Attorney: {attorney_name}, {firm_name}. "
+            "Include: caption, introduction identifying the evidence at issue, "
+            "factual background, legal standard (FRE or state rules), argument "
+            "section with analysis of each applicable evidentiary rule, statement "
+            "of prejudice, conclusion with specific relief requested, signature block, "
+            "certificate of service."
+        ),
+    },
+
+    "affidavit": {
+        "name":        "Affidavit / Declaration",
+        "description": "Sworn affidavit or unsworn declaration under penalty of perjury",
+        "fields":      ["affiant_name", "affiant_title", "case_title", "case_number",
+                        "court", "factual_statements", "purpose", "jurisdiction",
+                        "attorney_name"],
+        "prompt":      (
+            "Draft a complete affidavit/declaration. "
+            "Affiant: {affiant_name}, {affiant_title}. "
+            "Case: {case_title}, No. {case_number}. Court: {court}. "
+            "Purpose: {purpose}. "
+            "Factual statements: {factual_statements}. "
+            "Jurisdiction: {jurisdiction}. "
+            "Include: caption, introduction identifying the affiant and their "
+            "personal knowledge basis, numbered factual paragraphs (each fact one "
+            "paragraph), jurat/penalty-of-perjury declaration at the end "
+            "(include both sworn and unsworn versions; attorney picks which applies), "
+            "signature block and notary block. "
+            "Every statement of fact must be in first person and based on personal knowledge."
+        ),
+    },
+
+    "proposed_order": {
+        "name":        "Proposed Order",
+        "description": "Proposed court order to accompany a motion",
+        "fields":      ["case_title", "case_number", "court", "judge",
+                        "motion_type", "order_terms", "attorney_name"],
+        "prompt":      (
+            "Draft a proposed order for court signature. "
+            "Case: {case_title}, No. {case_number}. Court: {court}. Judge: {judge}. "
+            "Motion this order accompanies: {motion_type}. "
+            "Order terms/relief granted: {order_terms}. "
+            "Prepared by: {attorney_name}. "
+            "Include: caption, recitals (court having considered the motion and any "
+            "opposition), operative ordering paragraph(s) — each order on its own "
+            "numbered line, effective date, judge signature block with lines for "
+            "date and signature. Keep language concise — orders must be unambiguous."
+        ),
+    },
+
+    "notice_deposition": {
+        "name":        "Notice of Deposition",
+        "description": "Formal notice to take a deposition",
+        "fields":      ["case_title", "case_number", "court", "deponent_name",
+                        "deponent_address", "deposition_date", "deposition_time",
+                        "deposition_location", "topics", "attorney_name", "firm_name"],
+        "prompt":      (
+            "Draft a notice of deposition. "
+            "Case: {case_title}, No. {case_number}. Court: {court}. "
+            "Deponent: {deponent_name}, {deponent_address}. "
+            "Date: {deposition_date}. Time: {deposition_time}. "
+            "Location: {deposition_location}. "
+            "Topics/areas of examination: {topics}. "
+            "Noticing attorney: {attorney_name}, {firm_name}. "
+            "Include: caption, notice to all parties, deponent identification, "
+            "date/time/location, recording method (stenographic/video/both), "
+            "list of examination topics, instruction to bring documents if applicable, "
+            "signature block, certificate of service to all counsel."
+        ),
+    },
+
+    "subpoena": {
+        "name":        "Subpoena",
+        "description": "Subpoena for documents or testimony",
+        "fields":      ["case_title", "case_number", "court", "recipient_name",
+                        "recipient_address", "subpoena_type", "documents_requested",
+                        "appearance_date", "appearance_location", "attorney_name", "firm_name"],
+        "prompt":      (
+            "Draft a subpoena. "
+            "Case: {case_title}, No. {case_number}. Court: {court}. "
+            "Recipient: {recipient_name}, {recipient_address}. "
+            "Type: {subpoena_type} (documents / testimony / both). "
+            "Documents/testimony requested: {documents_requested}. "
+            "Compliance date/appearance: {appearance_date} at {appearance_location}. "
+            "Issuing attorney: {attorney_name}, {firm_name}. "
+            "Include: court caption, command to the recipient, specific documents "
+            "requested or testimony topics (numbered list), date and location for "
+            "compliance, witness fee tender notice, rights of the recipient, "
+            "penalty for non-compliance, court clerk signature block, "
+            "attorney issuing information, proof of service. "
+            "Note: attorney must have clerk sign and seal before serving."
+        ),
+    },
+
+    "settlement_agreement": {
+        "name":        "Settlement Agreement and Release",
+        "description": "Full binding settlement agreement between parties",
+        "fields":      ["plaintiff_name", "defendant_name", "case_title",
+                        "settlement_amount", "payment_schedule", "release_scope",
+                        "confidentiality_terms", "non_admission", "conditions",
+                        "dismissal_type", "jurisdiction", "attorney_plaintiff",
+                        "attorney_defendant"],
+        "prompt":      (
+            "Draft a complete settlement agreement and release. "
+            "Settling parties: {plaintiff_name} (Claimant) and {defendant_name} (Releasee). "
+            "Case/dispute: {case_title}. "
+            "Settlement amount: ${settlement_amount}. Payment schedule: {payment_schedule}. "
+            "Release scope: {release_scope}. "
+            "Confidentiality: {confidentiality_terms}. "
+            "Non-admission clause: {non_admission}. "
+            "Conditions: {conditions}. "
+            "Dismissal type: {dismissal_type}. "
+            "Governing law: {jurisdiction}. "
+            "Plaintiff's attorney: {attorney_plaintiff}. "
+            "Defendant's attorney: {attorney_defendant}. "
+            "Include: recitals, definitions, payment terms, full mutual release language, "
+            "confidentiality clause (if applicable), non-disparagement, "
+            "representations and warranties, covenant not to sue, dismissal obligation, "
+            "governing law and dispute resolution, entire agreement clause, "
+            "counterparts clause, signature blocks for all parties and their counsel. "
+            "Mark any provision needing negotiation [ATTORNEY: CONFIRM AGREED TERMS]."
+        ),
+    },
+
+    "trial_brief": {
+        "name":        "Trial Brief",
+        "description": "Pre-trial brief on legal and factual issues for the court",
+        "fields":      ["case_title", "case_number", "court", "client_name",
+                        "opposing_party", "key_facts", "legal_issues",
+                        "witnesses_overview", "evidence_overview",
+                        "attorney_name", "firm_name"],
+        "prompt":      (
+            "Draft a trial brief. "
+            "Case: {case_title}, No. {case_number}. Court: {court}. "
+            "Our client: {client_name}. Opposing party: {opposing_party}. "
+            "Key facts: {key_facts}. "
+            "Legal issues to brief: {legal_issues}. "
+            "Witnesses: {witnesses_overview}. "
+            "Evidence overview: {evidence_overview}. "
+            "Attorney: {attorney_name}, {firm_name}. "
+            "Include: introduction and summary of the case, statement of facts, "
+            "legal issues section with analysis for each issue, anticipated evidentiary "
+            "issues and requested rulings, witness list summary, conclusion. "
+            "Tone: persuasive but professional — written for a judge, not a jury. "
+            "Mark sections needing additional case citations [ATTORNEY: INSERT CITATIONS]."
+        ),
+    },
+
+    "appellate_brief": {
+        "name":        "Appellate Brief",
+        "description": "Brief for an appeals court",
+        "fields":      ["case_title", "case_number", "appellate_court",
+                        "lower_court", "appellant", "appellee",
+                        "issues_on_appeal", "standard_of_review",
+                        "lower_court_ruling", "argument_summary",
+                        "attorney_name", "firm_name"],
+        "prompt":      (
+            "Draft a complete appellate brief. "
+            "Case: {case_title}, No. {case_number}. "
+            "Appellate court: {appellate_court}. Lower court: {lower_court}. "
+            "Appellant: {appellant}. Appellee: {appellee}. "
+            "Issues on appeal: {issues_on_appeal}. "
+            "Standard of review for each issue: {standard_of_review}. "
+            "Lower court ruling being appealed: {lower_court_ruling}. "
+            "Argument summary: {argument_summary}. "
+            "Attorney: {attorney_name}, {firm_name}. "
+            "Include: cover page, table of contents, table of authorities, "
+            "statement of jurisdiction, statement of issues presented, "
+            "statement of the case (procedural history + facts), "
+            "summary of argument, argument section (one major heading per issue, "
+            "with sub-arguments), conclusion with specific relief requested, "
+            "certificate of compliance (word count), certificate of service. "
+            "Mark citation placeholders [ATTORNEY: CITE RECORD] and "
+            "[ATTORNEY: INSERT SUPPORTING CASES]."
+        ),
+    },
+
+    "opposition": {
+        "name":        "Opposition to Motion",
+        "description": "Response and opposition to opposing counsel's motion",
+        "fields":      ["case_title", "case_number", "court", "motion_type",
+                        "moving_party", "responding_party", "opposition_grounds",
+                        "key_facts_in_dispute", "attorney_name", "firm_name"],
+        "prompt":      (
+            "Draft a complete opposition to a motion. "
+            "Case: {case_title}, No. {case_number}. Court: {court}. "
+            "Motion being opposed: {motion_type}. "
+            "Moving party: {moving_party}. Responding party: {responding_party}. "
+            "Grounds for opposition: {opposition_grounds}. "
+            "Key facts in dispute: {key_facts_in_dispute}. "
+            "Attorney: {attorney_name}, {firm_name}. "
+            "Include: caption, introduction (one paragraph reframing the motion against "
+            "our client), statement of facts (our version, w/ record citations as "
+            "[ATTORNEY: CITE RECORD]), legal standard for the motion type, "
+            "argument section opposing each ground raised, conclusion with specific "
+            "relief requested (deny the motion), signature block, certificate of service."
+        ),
+    },
 }
 
 
@@ -668,11 +964,61 @@ def build_draft_prompt(template_key: str, field_values: dict) -> str | None:
         return None
     try:
         return tmpl["prompt"].format(**{
-            f: field_values.get(f, f"[{f.upper()}]")
+            f: field_values.get(f) or f"[FILL: {f.replace('_',' ')}]"
             for f in tmpl["fields"]
         })
     except KeyError:
         return tmpl["prompt"]
+
+
+def build_auto_draft_prompt(template_key: str, attorney_statement: str,
+                             db_results_block: str = "") -> str | None:
+    """
+    Generate a complete document from a natural-language attorney statement.
+    Missing fields become [FILL: ...] placeholders the attorney can correct in-chat.
+    db_results_block injects real case law (used for research-heavy docs like MSJ).
+    """
+    tmpl = DOCUMENT_TEMPLATES.get(template_key)
+    if not tmpl:
+        return None
+    db_section = f"\n\n{db_results_block}\n" if db_results_block else ""
+    field_list = ", ".join(tmpl["fields"])
+    return (
+        f"{db_section}"
+        f"You are a highly experienced litigation paralegal generating a {tmpl['name']}.\n\n"
+        f"The attorney provided this information:\n{attorney_statement}\n\n"
+        f"Fields this document needs: {field_list}\n\n"
+        f"Instructions:\n"
+        f"- Draft the COMPLETE, fully formatted {tmpl['name']} ready for attorney review.\n"
+        f"- Use every piece of information the attorney gave you.\n"
+        f"- For any field NOT mentioned, insert [FILL: brief description] as a placeholder.\n"
+        f"- Never invent facts, names, dates, or case numbers.\n"
+        f"- Use proper legal document formatting (caption, numbered paragraphs, "
+        f"signature block, certificate of service).\n"
+        f"- If real case law was provided above, cite those cases where appropriate — "
+        f"do NOT invent citations.\n\n"
+        f"Document type guidelines: {tmpl['prompt'].split('.')[0]}.\n\n"
+        f"End with this exact line:\n"
+        f"'Prepared by myVola AI Paralegal — for attorney review and approval only. "
+        f"Not for filing without attorney signature and authorization.'"
+    )
+
+
+def build_revision_prompt(existing_document: str, revision_instruction: str) -> str:
+    """Apply a revision instruction to an existing draft. Returns the full revised document."""
+    return (
+        f"You are a litigation paralegal revising a legal document per attorney instructions.\n\n"
+        f"REVISION INSTRUCTION FROM ATTORNEY:\n{revision_instruction}\n\n"
+        f"CURRENT DOCUMENT:\n{existing_document}\n\n"
+        f"Instructions:\n"
+        f"- Apply the attorney's revision(s) precisely.\n"
+        f"- Return the COMPLETE revised document — every section, not just the changed part.\n"
+        f"- Preserve all formatting, numbering, and structure.\n"
+        f"- If the instruction is ambiguous, apply the most reasonable interpretation "
+        f"and note what you changed in brackets at the top: [REVISION: brief description].\n"
+        f"- Do not add or remove any other content beyond what the attorney requested.\n"
+        f"- Keep the 'Prepared by myVola AI Paralegal' line at the end."
+    )
 
 
 # ── DASHBOARD SUMMARY ─────────────────────────────────────────────────────────
