@@ -2904,26 +2904,54 @@ def legal_research():
     question = body.get("question", "").strip()
     if not question:
         return jsonify({"ok": False, "error": "question required"}), 400
+    jurisdiction = body.get("jurisdiction", "")
+    practice_area = body.get("practice_area", "")
+    matter_context = body.get("matter_context", "")
+
+    # Search real legal databases first so the LLM cites actual cases
+    from tools import legal_research as tool_legal
+    db_results = {}
+    try:
+        db_results = tool_legal.search(question, jurisdiction=jurisdiction,
+                                       practice_area=practice_area)
+        log.info(f"legal research db: {db_results.get('total', 0)} results "
+                 f"for {question!r}")
+    except Exception as e:
+        log.warning(f"legal db search failed: {e}")
+
+    db_block = tool_legal.format_for_prompt(db_results) if db_results else ""
+
     research_prompt = mod_legal.build_research_prompt(
         question,
-        jurisdiction=body.get("jurisdiction", ""),
-        practice_area=body.get("practice_area", ""),
-        matter_context=body.get("matter_context", ""),
+        jurisdiction=jurisdiction,
+        practice_area=practice_area,
+        matter_context=matter_context,
+        db_results_block=db_block,
     )
     system = (
         "You are an experienced paralegal with expertise in legal research. "
         "Produce thorough, well-organized research memos for attorney review. "
-        "Cite real cases and statutes. Always flag SOL issues and areas of "
-        "unsettled law. Never give advice directly to clients."
+        "ONLY cite cases and statutes that appear in the REAL LEGAL RESEARCH "
+        "RESULTS block above — do NOT invent citations. If the databases "
+        "returned no results for a point, say so explicitly so the attorney "
+        "knows to search manually. Always flag SOL issues and unsettled law. "
+        "Never give legal advice directly to clients."
     )
     try:
-        memo = llm_client.generate(CONFIG, system, [{"role":"user","content":research_prompt}]).text
+        memo = llm_client.generate(CONFIG, system,
+                                   [{"role": "user", "content": research_prompt}]).text
     except Exception as e:
         log.exception("legal research failed")
         return jsonify({"ok": False, "error": str(e)}), 500
     audit.log(s["username"], action="legal.research",
               detail=question[:80])
-    return jsonify({"ok": True, "question": question, "memo": memo})
+    return jsonify({
+        "ok": True,
+        "question": question,
+        "memo": memo,
+        "sources_found": db_results.get("total", 0),
+        "cases_found": len(db_results.get("cases", [])),
+    })
 
 # Client intake analysis
 
@@ -15928,6 +15956,20 @@ _LEGAL_DASHBOARD_RE = _re.compile(
     r"^(?:legal\s+)?(?:dashboard|summary|overview|status)$",
     _re.IGNORECASE,
 )
+_LEGAL_CONTRACT_CMD_RE = _re.compile(
+    r"(?:analyze|review|examine|read|find\s+(?:an?\s+)?(?:exits?|loopholes?|way\s+out)|"
+    r"get\s+(?:(?:my|the|our)\s+)?client\s+out\s+of|exit\s+strat(?:egy)?\s+(?:for|on)|"
+    r"look\s+for\s+loopholes?\s+in|help\s+(?:me\s+)?(?:get\s+out\s+of|exit)\s+(?:this|a))\s*"
+    r"(?:this\s+|the\s+|a\s+|an?\s+)?(?:contract|agreement|lease|nda|deal|terms?|document)",
+    _re.IGNORECASE | _re.DOTALL,
+)
+_CONTRACT_PASTE_KEYWORDS = (
+    "whereas", "witnesseth", "hereinafter", "party of the first", "party of the second",
+    "in consideration of", "terms and conditions", "effective date", "governing law",
+    "dispute resolution", "indemnif", "limitation of liability", "force majeure",
+    "intellectual property", "confidentiality", "non-compete", "non-disclosure",
+    "termination", "breach of contract", "liquidated damages", "severability",
+)
 
 _DOC_KEY_MAP = {
     "demand letter":       "demand_letter",
@@ -16048,23 +16090,203 @@ def _try_legal_chat(message: str, user_rec: dict,
         )
         return {"reply": reply, "source": "legal.dashboard"}
 
+    # Contract analysis — "analyze this contract", "find loopholes", "exit strategy", etc.
+    # Also fires if a long message looks like a pasted contract (>500 chars + contract keywords)
+    is_contract_cmd = bool(_LEGAL_CONTRACT_CMD_RE.search(msg))
+    msg_lower = msg.lower()
+    is_contract_paste = (
+        len(msg) > 500
+        and any(kw in msg_lower for kw in _CONTRACT_PASTE_KEYWORDS)
+        and not is_contract_cmd
+    )
+    if is_contract_cmd or is_contract_paste:
+        # Extract contract text from the message
+        contract_text = ""
+        client_side = ""
+
+        # Look for text after "contract:" / "agreement:" / "lease:" in same message
+        paste_m = _re.search(
+            r'(?:contract|agreement|lease|nda|document|terms?)\s*[:]\s*(.{50,})$',
+            msg, _re.IGNORECASE | _re.DOTALL,
+        )
+        if paste_m:
+            contract_text = paste_m.group(1).strip()
+        elif is_contract_paste or len(msg) > 500:
+            contract_text = msg
+
+        # Try to extract who the client is ("my client is the buyer/seller/landlord/etc.")
+        client_m = _re.search(
+            r'(?:my\s+client\s+is|client\s+is\s+the|client\s*=)\s*(?:the\s+)?([a-z\s]{3,40})',
+            msg_lower,
+        )
+        if client_m:
+            client_side = client_m.group(1).strip()
+
+        # Pull jurisdiction from history
+        jurisdiction = ""
+        try:
+            import re as _re3
+            for item in reversed((history or [])[-6:]):
+                txt = str((item or {}).get("content") or "")
+                jx_m = _re3.search(r'\b(?:jurisdiction|state|court):\s*([A-Za-z\s]+)', txt, _re.I)
+                if jx_m:
+                    jurisdiction = jx_m.group(1).strip()[:40]
+                    break
+        except Exception:
+            pass
+
+        if not contract_text:
+            return {
+                "reply": (
+                    "I'll analyze the contract and map out every exit option. "
+                    "Paste the full contract text here (or the key sections you need reviewed). "
+                    "If you know which party your client is — buyer, seller, tenant, service provider, etc. — "
+                    "mention that so I can frame the analysis from their side."
+                ),
+                "source": "legal.contract.prompt",
+            }
+
+        # Phase 1 — extract parties, exit grounds, and search queries
+        extraction_prompt = mod_legal.build_contract_extraction_prompt(contract_text, client_side)
+        extraction_system = (
+            "You are a contract attorney. Extract key legal issues and potential exit grounds "
+            "from this contract precisely. Only extract what is actually in the text."
+        )
+        try:
+            extraction = llm_client.generate(
+                CONFIG, extraction_system,
+                [{"role": "user", "content": extraction_prompt}],
+            ).text
+        except Exception:
+            log.exception("contract phase-1 extraction failed")
+            return None
+
+        # Pull search terms from extraction output (Section 7: SEARCH TERMS)
+        search_terms = []
+        try:
+            sq_block = _re.search(
+                r'7\.\s*SEARCH\s*TERMS\s*[:\n]+(.+?)(?=\n\d+\.|\Z)',
+                extraction, _re.IGNORECASE | _re.DOTALL,
+            )
+            if sq_block:
+                for line in sq_block.group(1).split('\n'):
+                    term = line.strip().lstrip('-•* ').strip()
+                    if term and len(term) > 10:
+                        search_terms.append(term)
+        except Exception:
+            pass
+        if not search_terms:
+            search_terms = [f"contract exit strategy loopholes {jurisdiction}".strip()]
+
+        # Phase 2 — hit legal databases on the extracted exit grounds
+        from tools import legal_research as tool_legal
+        all_results: dict = {"cases": [], "statutes": [], "secondary": [], "total": 0,
+                             "query": search_terms[0], "jurisdiction": jurisdiction}
+        for term in search_terms[:3]:
+            try:
+                r = tool_legal.search(term, jurisdiction=jurisdiction)
+                all_results["cases"].extend(r.get("cases", []))
+                all_results["statutes"].extend(r.get("statutes", []))
+                all_results["secondary"].extend(r.get("secondary", []))
+                all_results["total"] += r.get("total", 0)
+            except Exception as e:
+                log.warning(f"contract db search failed for {term!r}: {e}")
+
+        # Deduplicate cases by citation/name
+        seen_keys: set = set()
+        unique_cases = []
+        for c in all_results["cases"]:
+            key = c.get("citation") or c.get("name", "")
+            if key and key not in seen_keys:
+                unique_cases.append(c)
+                seen_keys.add(key)
+        all_results["cases"] = unique_cases[:12]
+
+        db_block = tool_legal.format_for_prompt(all_results) if all_results["total"] > 0 else ""
+
+        # Phase 3 — synthesize full exit strategy memo
+        analysis_prompt = mod_legal.build_contract_analysis_prompt(
+            contract_text, extraction,
+            db_results_block=db_block,
+            jurisdiction=jurisdiction,
+            client_side=client_side,
+        )
+        analysis_system = (
+            "You are an experienced contract attorney. Write a thorough, practical exit strategy "
+            "memo for attorney review. Use ONLY cases from the database results — never invent citations."
+        )
+        try:
+            memo = llm_client.generate(
+                CONFIG, analysis_system,
+                [{"role": "user", "content": analysis_prompt}],
+            ).text
+        except Exception:
+            log.exception("contract phase-3 synthesis failed")
+            return None
+
+        src_note = (
+            f"\n\n*{all_results['total']} source(s) retrieved from CourtListener, "
+            f"Harvard Caselaw, Cornell LII, and Justia.*"
+            if all_results["total"] else
+            "\n\n*No results found in legal databases — verify all citations independently.*"
+        )
+        return {
+            "reply": (
+                memo
+                + "\n\n---\n*Contract exit strategy memo — prepared for attorney review. "
+                "Verify all citations before relying on this memo in practice.*"
+                + src_note
+            ),
+            "source": "legal.contract.analysis",
+        }
+
     # Legal research
     m = _LEGAL_RESEARCH_RE.match(msg)
     if m:
         question = (m.group("question") or "").strip()
-        research_prompt = mod_legal.build_research_prompt(question)
+        # Pull jurisdiction hint from recent history if a matter was mentioned
+        jurisdiction = ""
+        try:
+            import re as _re2
+            for item in reversed((history or [])[-6:]):
+                txt = str((item or {}).get("content") or "")
+                jx_m = _re2.search(r'\b(?:jurisdiction|state|court):\s*([A-Za-z\s]+)', txt, _re2.I)
+                if jx_m:
+                    jurisdiction = jx_m.group(1).strip()[:40]
+                    break
+        except Exception:
+            pass
+
+        # Hit real legal databases first
+        from tools import legal_research as tool_legal
+        db_results = {}
+        try:
+            db_results = tool_legal.search(question, jurisdiction=jurisdiction)
+            log.info(f"legal chat research: {db_results.get('total',0)} db results")
+        except Exception as e:
+            log.warning(f"legal chat db search failed: {e}")
+        db_block = tool_legal.format_for_prompt(db_results) if db_results else ""
+
+        research_prompt = mod_legal.build_research_prompt(
+            question, jurisdiction=jurisdiction, db_results_block=db_block)
         system = (
             "You are an experienced paralegal preparing a legal research memo "
-            "for attorney review. Cite real statutes and cases. Be thorough. "
+            "for attorney review. ONLY cite cases and statutes from the REAL "
+            "LEGAL RESEARCH RESULTS block — do NOT invent citations. Be thorough. "
             "Always end with: 'Attorney should verify all citations before relying on this memo.'"
         )
         try:
-            memo = llm_client.generate(CONFIG, system, [{"role":"user","content":research_prompt}]).text
+            memo = llm_client.generate(CONFIG, system,
+                                       [{"role": "user", "content": research_prompt}]).text
         except Exception:
             log.exception("legal research via chat failed")
             return None
+        found_note = (f"\n\n*{db_results.get('total',0)} source(s) retrieved from "
+                      f"CourtListener, Harvard Caselaw, Cornell LII, and Justia.*"
+                      if db_results.get("total") else
+                      "\n\n*No results from legal databases — memo based on training data only. Verify all citations.*")
         return {
-            "reply": memo + "\n\n---\n*Research memo prepared for attorney review.*",
+            "reply": memo + "\n\n---\n*Research memo prepared for attorney review.*" + found_note,
             "source": "legal.research",
         }
 

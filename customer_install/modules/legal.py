@@ -756,16 +756,19 @@ def get_draft(data_dir: Path, draft_id: str) -> dict | None:
 
 def build_research_prompt(question: str, jurisdiction: str = "",
                            practice_area: str = "",
-                           matter_context: str = "") -> str:
+                           matter_context: str = "",
+                           db_results_block: str = "") -> str:
     """
-    Build a research prompt for the LLM. The LLM does the analysis;
-    this function structures the request so the output is attorney-useful.
+    Build a research prompt for the LLM. Real database results are injected
+    above the instructions so the LLM cites actual cases, not invented ones.
     """
     jx = f" in {jurisdiction}" if jurisdiction else ""
     area = f" ({practice_area})" if practice_area else ""
     context = f"\n\nMatter context: {matter_context}" if matter_context else ""
+    db_section = f"\n\n{db_results_block}\n" if db_results_block else ""
 
     return (
+        f"{db_section}"
         f"You are a paralegal preparing a legal research memo for an attorney's review.\n\n"
         f"Research question{area}{jx}: {question}{context}\n\n"
         f"Structure your response as follows:\n\n"
@@ -774,6 +777,8 @@ def build_research_prompt(question: str, jurisdiction: str = "",
         f"3. APPLICABLE LAW\n"
         f"   - Governing statutes (cite by name and code section)\n"
         f"   - Leading cases (cite case name, court, year, and holding)\n"
+        f"   - Use ONLY cases from the REAL LEGAL RESEARCH RESULTS above — "
+        f"if no cases were found, say so and note the attorney must search manually.\n"
         f"   - Regulatory guidance if relevant\n\n"
         f"4. ANALYSIS\n"
         f"Apply the law to the facts. Address any circuit split, majority/minority "
@@ -782,11 +787,72 @@ def build_research_prompt(question: str, jurisdiction: str = "",
         f"6. CAVEATS\n"
         f"Flag: (a) any area where the law may have changed after your training "
         f"cutoff, (b) jurisdiction-specific issues the attorney must verify locally, "
-        f"(c) any unsettled areas of law.\n\n"
+        f"(c) any unsettled areas of law, (d) any citations not found in the "
+        f"database results that the attorney must independently verify.\n\n"
         f"End with: 'Attorney should verify all citations and confirm current authority "
         f"before relying on this memo in practice.'\n\n"
         f"Be thorough but practical. The attorney needs usable analysis, not general "
-        f"information. Cite real cases and statutes where you know them."
+        f"information."
+    )
+
+
+def build_contract_extraction_prompt(contract_text: str, client_side: str = "") -> str:
+    """Phase 1: Extract key legal issues and exit grounds from a contract."""
+    party_note = f"\nThe client is: {client_side}." if client_side else ""
+    return (
+        f"You are a contract attorney reviewing a contract for exit strategy analysis.{party_note}\n\n"
+        f"CONTRACT TEXT:\n{contract_text[:10000]}\n\n"
+        f"Extract and list concisely — stick to what is actually in the contract:\n\n"
+        f"1. PARTIES: Who are the parties?\n"
+        f"2. KEY OBLIGATIONS: What must each party do? (bullet points, keep brief)\n"
+        f"3. TERM AND TERMINATION: Exact quote of the termination/exit clause(s).\n"
+        f"4. BREACH PROVISIONS: What constitutes breach? Cure periods?\n"
+        f"5. EXIT GROUNDS: ALL potential grounds to exit or void this contract — "
+        f"e.g. mutual mistake, fraud, material breach by other party, impossibility, "
+        f"unconscionability, illegality, lack of consideration, force majeure, duress.\n"
+        f"6. AMBIGUOUS CLAUSES: Flag any language that could be argued in the client's favor.\n"
+        f"7. SEARCH TERMS: List 3 specific legal research queries to find relevant case law "
+        f"(format each on its own line starting with '- ', be specific, include jurisdiction if known, "
+        f"e.g. '- contract rescission mutual mistake Nevada', "
+        f"'- commercial lease early termination force majeure').\n\n"
+        f"Be factual and precise. Only extract what is in the contract text."
+    )
+
+
+def build_contract_analysis_prompt(contract_text: str, extraction: str,
+                                    db_results_block: str = "",
+                                    jurisdiction: str = "",
+                                    client_side: str = "") -> str:
+    """Phase 2: Full exit strategy memo using extraction + real database results."""
+    jx = f" in {jurisdiction}" if jurisdiction else ""
+    party_note = f"\nClient: {client_side}" if client_side else ""
+    db_section = f"\n\n{db_results_block}\n" if db_results_block else ""
+
+    return (
+        f"{db_section}"
+        f"You are an experienced contract attorney preparing an exit strategy analysis{jx}.{party_note}\n\n"
+        f"ISSUES IDENTIFIED FROM CONTRACT:\n{extraction}\n\n"
+        f"CONTRACT EXCERPT:\n{contract_text[:3000]}\n\n"
+        f"Prepare a CONTRACT EXIT STRATEGY MEMO:\n\n"
+        f"1. SITUATION SUMMARY\nParties, what the contract does, what the client needs.\n\n"
+        f"2. EXIT OPTIONS (ranked best to least viable)\n"
+        f"For each viable exit route:\n"
+        f"   a) Legal theory (breach, rescission, frustration of purpose, etc.)\n"
+        f"   b) Required facts/evidence\n"
+        f"   c) Strength: Strong / Moderate / Weak — and why\n"
+        f"   d) Supporting case law from the REAL LEGAL RESEARCH RESULTS above "
+        f"(cite ONLY cases found there — if none found, say so)\n"
+        f"   e) Risks and downsides\n\n"
+        f"3. BEST STRATEGY\nOne clear recommended path with specific next steps.\n\n"
+        f"4. LEVERAGE POINTS\n"
+        f"Provisions, ambiguities, or counterclaims the client can use as negotiating "
+        f"leverage even without a clean exit.\n\n"
+        f"5. IMMEDIATE ACTION ITEMS\nWhat the attorney must do in the next 7-30 days.\n\n"
+        f"6. RISKS AND CAVEATS\n"
+        f"What could go wrong, jurisdiction-specific issues, anything requiring independent "
+        f"verification. Use ONLY cases from the database results. Never invent citations.\n\n"
+        f"End with: 'Prepared for attorney review — verify all citations before relying "
+        f"on this memo in practice.'"
     )
 
 
