@@ -3756,9 +3756,12 @@ def public_chat():
     # learning loop: capture the question for the owner to answer, ask
     # the visitor for their contact info, and override Orby's bluff
     # with a clear "I'll find out and get back to you" reply.
+    # EXCEPTION: never trigger for general knowledge questions (weather,
+    # facts, how-to, geography, science, etc.) — the LLM handles those.
     pending_record = None
     if (mod_learning.reply_indicates_unknown(resp.text or "")
-        and mod_learning.is_question_form(user_msg)):
+        and mod_learning.is_question_form(user_msg)
+        and not mod_learning.is_general_knowledge_question(user_msg)):
         try:
             asker = {
                 "name":  (visitor.get("name") or "").strip(),

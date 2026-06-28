@@ -296,6 +296,38 @@ def is_question_form(message: str) -> bool:
     return any(msg.startswith(s) for s in starters)
 
 
+_GENERAL_KNOWLEDGE_KEYWORDS = (
+    "weather", "forecast", "temperature", "rain", "snow", "sunny", "cloudy",
+    "hot", "cold", "humid", "wind",
+    "recipe", "how to cook", "how do i cook", "how do i make",
+    "what is ", "what's a ", "what are ", "who is ", "who was ",
+    "when did ", "when was ", "where is ", "where was ",
+    "why does ", "why do ", "why is ", "why was ",
+    "how does ", "how do ", "how is ",
+    "define ", "definition", "meaning of", "explain ",
+    "history of", "capital of", "population of",
+    "math", "calculate", "formula",
+    "sports", "score", "game", "team",
+    "movie", "book", "song", "artist", "actor",
+    "joke", "riddle", "fun fact",
+    "translate", "language",
+    "science", "biology", "chemistry", "physics",
+    "planet", "space", "star", "galaxy",
+    "country", "continent", "ocean", "river", "mountain",
+)
+
+
+def is_general_knowledge_question(message: str) -> bool:
+    """Return True if the message is asking about general world knowledge
+    (weather, facts, how-to, geography, science, etc.) rather than something
+    specific to the business.  These should NEVER trigger the learning loop —
+    the LLM can answer them directly."""
+    if not message:
+        return False
+    m = message.strip().lower()
+    return any(kw in m for kw in _GENERAL_KNOWLEDGE_KEYWORDS)
+
+
 # ── Internals ────────────────────────────────────────────────────────────
 
 
