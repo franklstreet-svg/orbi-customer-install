@@ -1639,7 +1639,7 @@
   let speechBuffer = '';
   let currentAudio = null;
   let currentAudioUrl = null;
-  const VOICE_SILENCE_BEFORE_SEND_MS = 8000;
+  const VOICE_SILENCE_BEFORE_SEND_MS = 700;
   const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
 
   function setupOwnerVoice() {
