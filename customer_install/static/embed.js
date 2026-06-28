@@ -149,7 +149,7 @@
   frame.allow = 'microphone; clipboard-read; clipboard-write; autoplay';
   // We lazy-load the iframe source on first open to keep page load light
   frame.dataset.src = chatSrc;
-  frame.title = 'Orbi chat assistant';
+  frame.title = 'Vola chat assistant';
   document.body.appendChild(frame);
 
   // ----- Behavior -----

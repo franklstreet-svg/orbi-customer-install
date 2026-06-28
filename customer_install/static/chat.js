@@ -123,7 +123,7 @@
     } else {
       // Standalone (visiting / directly in a browser/desktop app window).
       // Keep launcher visible and landing card shown until user clicks
-      // "Talk to Orbi" — that click is the user-gesture context that
+      // "Talk to Vola" — that click is the user-gesture context that
       // unlocks audio so the proactive greeting actually plays out loud.
       panel.classList.add('standalone-mode');
       panelClose.style.display = 'none';
@@ -219,7 +219,7 @@
     });
     window.addEventListener('offline', () => {
       console.log('[Orbi] gone offline');
-      showOfflineBanner("You're offline. Orbi will reconnect when your internet is back.");
+      showOfflineBanner("You're offline. Vola will reconnect when your internet is back.");
     });
   }
 
@@ -248,7 +248,7 @@
     panel.classList.add('open');
     panel.setAttribute('aria-hidden', 'false');
     launcher.classList.add('open');
-    launcher.setAttribute('aria-label', 'Close chat with Orbi');
+    launcher.setAttribute('aria-label', 'Close chat with Vola');
     // In standalone mode, take over the screen (drop the landing card
     // + go fullscreen). Embed mode is already auto-fullpage at boot.
     if (!IS_EMBED) {
@@ -396,7 +396,7 @@ _audioEl.src = '/tts?text=%20&silent=1';
     panel.classList.remove('open');
     panel.setAttribute('aria-hidden', 'true');
     launcher.classList.remove('open');
-    launcher.setAttribute('aria-label', 'Open chat with Orbi');
+    launcher.setAttribute('aria-label', 'Open chat with Vola');
     // Closing the panel does NOT turn off mic/speaker toggles — they stay sticky
     // as Frank requested. Only stop active listening so we're not eavesdropping.
     stopListening();
