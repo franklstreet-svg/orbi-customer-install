@@ -551,7 +551,7 @@ _DRAFT_SYSTEM = (
     "[FILL: brief description of what goes here] so the attorney can spot and complete it. "
     "Never invent facts — only use information provided. "
     "End every document with this exact line on its own: "
-    "'Prepared by myVola AI Paralegal — for attorney review and approval only. "
+    "'Prepared by myOrby AI Paralegal — for attorney review and approval only. "
     "Not for filing without attorney signature and authorization.'"
 )
 
@@ -999,7 +999,7 @@ def build_auto_draft_prompt(template_key: str, attorney_statement: str,
         f"do NOT invent citations.\n\n"
         f"Document type guidelines: {tmpl['prompt'].split('.')[0]}.\n\n"
         f"End with this exact line:\n"
-        f"'Prepared by myVola AI Paralegal — for attorney review and approval only. "
+        f"'Prepared by myOrby AI Paralegal — for attorney review and approval only. "
         f"Not for filing without attorney signature and authorization.'"
     )
 
@@ -1017,7 +1017,7 @@ def build_revision_prompt(existing_document: str, revision_instruction: str) -> 
         f"- If the instruction is ambiguous, apply the most reasonable interpretation "
         f"and note what you changed in brackets at the top: [REVISION: brief description].\n"
         f"- Do not add or remove any other content beyond what the attorney requested.\n"
-        f"- Keep the 'Prepared by myVola AI Paralegal' line at the end."
+        f"- Keep the 'Prepared by myOrby AI Paralegal' line at the end."
     )
 
 

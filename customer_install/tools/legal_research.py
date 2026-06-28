@@ -60,7 +60,7 @@ def _courtlistener_search(query: str, jurisdiction: str = "",
     url = "https://www.courtlistener.com/api/rest/v4/search/?" + urllib.parse.urlencode(params)
     try:
         req = urllib.request.Request(url, headers={
-            "User-Agent": "myVola Legal Research / educational use",
+            "User-Agent": "myOrby Legal Research / educational use",
             "Accept": "application/json",
         })
         with urllib.request.urlopen(req, timeout=_TIMEOUT) as r:
@@ -127,7 +127,7 @@ def _cap_search(query: str, jurisdiction: str = "", limit: int = 5) -> list[dict
     url = "https://api.case.law/v1/cases/?" + urllib.parse.urlencode(params)
     try:
         req = urllib.request.Request(url, headers={
-            "User-Agent": "myVola Legal Research / educational use",
+            "User-Agent": "myOrby Legal Research / educational use",
             "Accept": "application/json",
         })
         with urllib.request.urlopen(req, timeout=_TIMEOUT) as r:
