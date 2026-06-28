@@ -3011,7 +3011,7 @@ def legal_draft_document():
         "requested — not a shell, not an outline, a finished draft ready for attorney "
         "review. Be thorough and professional. Use proper legal formatting. Mark any "
         "section where attorney judgment is required with [ATTORNEY REVIEW NEEDED]. "
-        "End every document with: 'Prepared by Idunn AI Paralegal — for attorney "
+        "End every document with: 'Prepared by Brindy AI Paralegal — for attorney "
         "review and approval only. Not for distribution without attorney authorization.'"
     )
     try:
