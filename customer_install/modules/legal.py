@@ -497,11 +497,79 @@ SOL_REFERENCE = {
         "default_years": 2,
         "notes": "Federal § 1983 claims borrow state personal injury SOL. NV: 2 years. CA: 2 years.",
     },
+    "products_liability": {
+        "default_years": 2,
+        "notes": "Most states: 2-3 years from injury or discovery. NV: 3 years (NRS 11.190). CA: 2 years. TX: 2 years. Statute of repose may also apply (caps at 10-15 years from manufacture).",
+    },
+    "breach_of_contract": {
+        "default_years": 6,
+        "notes": "Written contracts: NV 6 years (NRS 11.190(1)(b)). CA 4 years. NY 6 years. TX 4 years. Oral contracts shorter — verify type.",
+    },
+    "contract": {
+        "default_years": 6,
+        "notes": "Written contracts: NV 6 years. CA 4 years. NY 6 years. Oral contracts shorter. Verify written vs. oral and jurisdiction.",
+    },
+    "negligence": {
+        "default_years": 2,
+        "notes": "General negligence: 2 years in most states from date of injury or discovery. NV: 2 years (NRS 11.190). CA: 2 years. NY: 3 years.",
+    },
+    "premises_liability": {
+        "default_years": 2,
+        "notes": "Treated as personal injury in most jurisdictions. NV: 2 years. CA: 2 years. TX: 2 years.",
+    },
+    "slip_and_fall": {
+        "default_years": 2,
+        "notes": "Same as personal injury / premises liability. NV: 2 years. CA: 2 years. TX: 2 years.",
+    },
+    "wrongful_termination": {
+        "default_years": 2,
+        "notes": "State tort claims: 2-3 years. Federal discrimination claims: 180-300 days to file EEOC charge first. Verify applicable theory.",
+    },
+    "employment": {
+        "default_years": 2,
+        "notes": "Varies by claim type. Discrimination: EEOC first. Wage claims: NV 2 years, CA 3 years. Wrongful termination: 2-3 years.",
+    },
+    "intellectual_property": {
+        "default_years": 3,
+        "notes": "Copyright infringement: 3 years (federal). Patent: 6 years. Trademark: 3-6 years (Lanham Act). Trade secret: varies (DTSA 3 years).",
+    },
+    "trade_secret": {
+        "default_years": 3,
+        "notes": "Federal DTSA: 3 years from discovery. State law varies — NV: 3 years. CA: 3 years.",
+    },
+    "assault_battery": {
+        "default_years": 2,
+        "notes": "Most states: 2 years. NV: 2 years (NRS 11.190). Intentional torts often shorter than negligence.",
+    },
+    "real_estate": {
+        "default_years": 6,
+        "notes": "Real property actions: NV 6 years for contract, 3 years for fraud. CA 3-5 years. Quiet title: often longer.",
+    },
+    "insurance_bad_faith": {
+        "default_years": 4,
+        "notes": "NV: 6 years (contract) or 3 years (tort). CA: 2 years (tort theory) or 4 years (contract). Verify controlling theory.",
+    },
+    "dui": {
+        "default_years": 0,
+        "notes": "Criminal DUI: no civil SOL — governed by criminal statute of limitations (typically 1-3 years). Civil injury from DUI driver: treat as personal injury (2 years most states).",
+    },
+    "criminal_defense": {
+        "default_years": 0,
+        "notes": "No civil SOL for criminal cases — criminal charges governed by criminal statute of limitations. Felonies: NV 3 years. Misdemeanors: 1 year. Murder: no SOL.",
+    },
 }
 
 
 def sol_lookup(practice_area: str) -> dict | None:
-    return SOL_REFERENCE.get(practice_area.lower().replace(" ", "_"))
+    normalized = practice_area.lower().replace(" ", "_").replace("-", "_")
+    result = SOL_REFERENCE.get(normalized)
+    if result:
+        return result
+    # Fuzzy fallback — find closest key
+    for key in SOL_REFERENCE:
+        if key in normalized or normalized in key:
+            return SOL_REFERENCE[key]
+    return None
 
 
 def sol_deadline_estimate(injury_date: str, practice_area: str,
@@ -530,7 +598,7 @@ def sol_deadline_estimate(injury_date: str, practice_area: str,
             "days_remaining":     days_remaining,
             "years":              ref["default_years"],
             "notes":              ref["notes"],
-            "warning":            "VERIFY: SOL varies by jurisdiction, tolling, and specific facts. Attorney must confirm.",
+            "warning":            "VERIFY: SOL varies by jurisdiction, tolling, and specific facts. Attorney must verify before relying on this estimate.",
         }
     except (ValueError, OverflowError) as e:
         return {
@@ -768,9 +836,12 @@ DOCUMENT_TEMPLATES = {
             "Purpose: {purpose}. "
             "Factual statements: {factual_statements}. "
             "Jurisdiction: {jurisdiction}. "
-            "Include: caption, introduction identifying the affiant and their "
-            "personal knowledge basis, numbered factual paragraphs (each fact one "
-            "paragraph), jurat/penalty-of-perjury declaration at the end "
+            "Include: caption, introduction that explicitly states the purpose "
+            "of this affidavit (quote the purpose directly, e.g. 'This affidavit is "
+            "submitted in support of defendant\\'s alibi motion' or the relevant purpose), "
+            "identification of the affiant and their personal knowledge basis, "
+            "numbered factual paragraphs (each fact one paragraph), "
+            "jurat/penalty-of-perjury declaration at the end "
             "(include both sworn and unsworn versions; attorney picks which applies), "
             "signature block and notary block. "
             "Every statement of fact must be in first person and based on personal knowledge."

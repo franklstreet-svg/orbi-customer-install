@@ -10782,11 +10782,20 @@ _DELETE_CONTACT_RE = _re.compile(
 # being called after 8pm" — captures a preference statement about a known
 # contact, routes to mod_contacts.append_personal_note.
 _CONTACT_PERSONAL_NOTE_RE = _re.compile(
-    r"^\s*(?P<name>[A-Z][A-Za-z'\-]+(?:\s+[A-Z][A-Za-z'\-]+){0,2})\s+"
+    # Use (?-i:[A-Z]) to require ACTUAL uppercase — re.IGNORECASE would make
+    # [A-Z] match lowercase too, letting "birthday" or "anniversary" become
+    # part of the name and "is coming up" match the verb.
+    r"^\s*(?P<name>(?-i:[A-Z])[A-Za-z'\-]+(?:\s+(?-i:[A-Z])[A-Za-z'\-]+){0,2})\s+"
     r"(?:prefers?|likes?|loves?|hates?|wants?|needs?|always|never|usually|"
     r"can'?t|cannot|won'?t|will\s+not|doesn'?t|does\s+not|is|has)\s+"
     r"(?P<rest>.+?)\s*[?.!]?\s*$",
     _re.IGNORECASE,
+)
+_CONTACT_NOTE_ADD_RE = _re.compile(
+    r"^\s*(?:add|append|write|put)\s+a?\s*(?:personal\s+)?note\s+"
+    r"(?:to|on|for)\s+(?P<name>[A-Z][A-Za-z'\-]+(?:\s+[A-Z][A-Za-z'\-]+){0,2})"
+    r"(?:'s\s+contact|'s\s+record|'s\s+file)?\s*[:\-]\s*(?P<note>.+?)\s*$",
+    _re.IGNORECASE | _re.DOTALL,
 )
 _DELETE_TASK_RE = _re.compile(
     r"^\s*(?:delete|remove|drop|cancel)\s+(?:the\s+|my\s+)?"
@@ -11034,11 +11043,29 @@ def _try_business_info_update(message: str) -> dict | None:
 
 
 def _try_contact_personal_note(message: str, user_dir) -> dict | None:
-    """Frank 2026-06-23: 'Lisa Chen prefers email over phone' / 'Bob likes
-    oat milk' → append to that contact's personal_notes if the name matches
-    a known contact. If no contact match, return None so the message
-    falls through to the memory fast path."""
+    """Append a personal note to a contact's record.
+    Handles two forms:
+      • "Jennifer Walsh prefers morning meetings — always call her directly"
+      • "Add a personal note to Jennifer Walsh's contact: She prefers morning meetings"
+    Falls through if contact not found (memory fast path picks it up)."""
     stripped = _strip_polite_prefix(message or "")
+    # Try the explicit "add a note to X: content" form first
+    m2 = _CONTACT_NOTE_ADD_RE.match(stripped)
+    if m2:
+        name = (m2.group("name") or "").strip()
+        note_text = (m2.group("note") or "").strip().rstrip(".!?")
+        if name and note_text:
+            contact = mod_contacts.find_by_name(user_dir, name)
+            if contact:
+                try:
+                    mod_contacts.append_personal_note(user_dir, contact["id"], note_text)
+                    return {"reply": f"Got it — noted on {contact.get('name','?')}'s record: \"{note_text[:120]}\"",
+                            "tier": "local", "latency_ms": 0,
+                            "source": "contact_personal_note_done"}
+                except Exception as e:
+                    log.warning(f"append_personal_note failed: {e}")
+                    return None
+    # Try the natural-language form: "Jennifer Walsh prefers..."
     m = _CONTACT_PERSONAL_NOTE_RE.match(stripped)
     if not m:
         return None
@@ -11049,9 +11076,7 @@ def _try_contact_personal_note(message: str, user_dir) -> dict | None:
     contact = mod_contacts.find_by_name(user_dir, name)
     if not contact:
         return None  # Fall through — memory fast path will catch via "remember that"
-    # Save the FULL statement minus the contact's name as the note. Including
-    # the verb ('prefers', 'likes', 'hates') is critical — 'oat milk' alone is
-    # ambiguous; 'likes oat milk' / 'hates oat milk' is useful.
+    # Save the FULL statement minus the contact's name as the note.
     name_len = len(m.group("name"))
     note_text = stripped[name_len:].strip().rstrip(".!?")
     if not note_text:
@@ -11147,6 +11172,14 @@ def _try_cancel_appointment(message: str, user_dir) -> dict | None:
     # Strip polite prefix so "I need to cancel..." / "Can you cancel..."
     # both reach the cancel regex (which requires the verb up-front).
     stripped = _strip_polite_prefix(message or "")
+    # Guard: don't swallow bulk-data operations as appointment cancels.
+    # "delete all my contacts/tasks/reminders/leads" was matching because
+    # the negative lookahead only blocked the word immediately after the verb.
+    if _re.search(
+        r'\b(?:contacts?|tasks?|todos?|notes?|reminders?|leads?|files?)\b',
+        stripped, _re.IGNORECASE,
+    ):
+        return None
     m = _CANCEL_APPT_RE.match(stripped)
     if not m:
         return None
@@ -12076,9 +12109,10 @@ _CONTACTS_ADD_RE = _re.compile(
 )
 _CONTACTS_FIND_RE = _re.compile(
     r"^\s*(?:"
-    r"find\s+(?:contact\s+)?(?P<name>[A-Za-z][A-Za-z'\-]+(?:\s+[A-Za-z][A-Za-z'\-]+){0,3})"
-    r"|look\s*up\s+(?:contact\s+)?(?P<name2>[A-Za-z][A-Za-z'\-]+(?:\s+[A-Za-z][A-Za-z'\-]+){0,3})"
+    r"find\s+(?:contact\s+)?(?!my\b|the\b|all\b|your\b)(?P<name>[A-Za-z][A-Za-z'\-]+(?:\s+[A-Za-z][A-Za-z'\-]+){0,3})"
+    r"|look\s*up\s+(?:contact\s+)?(?!my\b|the\b|all\b)(?P<name2>[A-Za-z][A-Za-z'\-]+(?:\s+[A-Za-z][A-Za-z'\-]+){0,3})"
     r"|(?:show|get)\s+(?:me\s+)?(?P<name4>[A-Za-z][A-Za-z'\-]+(?:\s+[A-Za-z][A-Za-z'\-]+){0,3})(?:'s)?\s+(?:contact\s+(?:info|details|card)|info|details)"
+    r"|what'?s\s+(?P<name5>[A-Za-z][A-Za-z'\-]+(?:\s+[A-Za-z][A-Za-z'\-]+){0,3})'s?\s+(?:phone(?:\s+number)?|email(?:\s+address)?|number|address)"
     r")\s*[?.!]?\s*$",
     _re.IGNORECASE,
 )
@@ -12087,7 +12121,10 @@ _CONTACTS_LIST_FOR_RE = _re.compile(
     _re.IGNORECASE,
 )
 _CONTACTS_ALL_RE = _re.compile(
-    r"^\s*(?:show|list|give)\s+(?:me\s+)?(?:all\s+)?(?:my\s+|the\s+)?contacts?\s*[?.!]?\s*$",
+    r"^\s*(?:"
+    r"(?:show|list|give)\s+(?:me\s+)?(?:all\s+)?(?:my\s+|the\s+)?contacts?"
+    r"|who\s+are\s+(?:all\s+)?(?:my\s+|the\s+)?contacts?"
+    r")\s*[?.!]?\s*$",
     _re.IGNORECASE,
 )
 _CONTACTS_CONVO_RE = _re.compile(
@@ -12527,14 +12564,24 @@ def _try_contact_add(message: str, user_rec: dict) -> dict | None:
     # First-pass: must start with one of the add verbs AND contain a
     # capitalized name (so "add the bills to my calendar" doesn't match).
     m = _re.match(
-        r"^\s*(?:add|save|store|new|create)\s+(?:a\s+new\s+|new\s+|the\s+)?"
-        r"(?:contact\s+(?:named\s+|called\s+|for\s+)?)?"
+        r"^\s*(?:add|save|store|new|create)\s+(?:a\s+new\s+|a\s+|new\s+|the\s+)?"
+        r"(?:contact\s*[:\s]+(?:named\s+|called\s+|for\s+)?)?"
         r"(?P<rest>.+)$",
         msg, _re.IGNORECASE,
     )
     if not m:
         return None
     rest = m.group("rest").strip()
+    # Strip honorific prefix ("Dr.", "Mr.", "Mrs.", "Ms.", "Prof.", "Rev.")
+    # so "Dr. Sandra Kim" → rest starts at "Sandra Kim".
+    honorific_m = _re.match(
+        r"^(?:Dr|Mr|Mrs|Ms|Miss|Prof|Rev|Capt|Lt|Sgt|Cpl)\.\s+", rest,
+    )
+    if honorific_m:
+        honorific_prefix = honorific_m.group(0).rstrip()
+        rest = rest[honorific_m.end():]
+    else:
+        honorific_prefix = ""
     # The first thing in `rest` must look like a proper name (2 capitalized
     # words OR 1 capitalized word with at least 3 chars). Otherwise this
     # is probably "add a task" / "add a meeting" / etc.
@@ -12547,6 +12594,9 @@ def _try_contact_add(message: str, user_rec: dict) -> dict | None:
     if not name_m:
         return None
     name = name_m.group("name").strip()
+    # Restore honorific prefix if present ("Dr. Sandra Kim")
+    if honorific_prefix:
+        name = honorific_prefix + " " + name
     # Reject obvious false positives — words that LOOK capitalized but
     # are actually verbs/nouns at the start of a sentence (e.g., "Add"
     # following a polite prefix won't trip this because we already
@@ -12870,8 +12920,10 @@ def _try_contact_update(message: str, user_rec: dict) -> dict | None:
 _SEARCH_EVERYTHING_RE = _re.compile(
     r"^\s*(?:"
     r"search\s+(?:everything|all|across\s+everything)\s+(?:for\s+)?"
-    r"|find\s+(?:anything|everything)\s+(?:about|on|for|matching|with)\s+"
+    r"|find\s+(?:anything|everything)\s+(?:I\s+have\s+)?(?:about|on|for|matching|with)\s+"
+    r"|find\s+(?:anything|everything)\s+(?:I\s+know\s+)?(?:about|on)\s+"
     r"|look\s+(?:everywhere|across\s+everything)\s+for\s+"
+    r"|pull\s+(?:up\s+)?(?:everything|all)\s+(?:I\s+have\s+)?(?:on|about|for)\s+"
     r")(?P<q>.+?)\s*[.?!]?\s*$",
     _re.IGNORECASE,
 )
@@ -13017,11 +13069,11 @@ def _try_contacts_chat(message: str, user_rec: dict) -> dict | None:
             return {"reply": "\n".join(lines), "tier": "local",
                     "latency_ms": 0, "source": "contacts_list_for"}
 
-    # FIND <name> — "find Sarah Jones"
+    # FIND <name> — "find Sarah Jones" / "What's Jennifer Walsh's phone number?"
     m = _CONTACTS_FIND_RE.match(msg)
     if m:
-        name = (m.group("name") or m.group("name2") or m.group("name3")
-                or m.group("name4") or "").strip()
+        name = (m.group("name") or m.group("name2")
+                or m.group("name4") or m.group("name5") or "").strip()
         if name:
             c = mod_contacts.find_by_name(user_dir, name)
             if c:
@@ -13111,7 +13163,7 @@ def _try_contacts_chat(message: str, user_rec: dict) -> dict | None:
         ), "tier": "local", "latency_ms": 0,
            "source": "contacts_convo_unknown"}
 
-    # ALL CONTACTS — "show me my contacts"
+    # ALL CONTACTS — "show me my contacts" / "who are all my contacts?"
     if _CONTACTS_ALL_RE.match(msg):
         all_c = mod_contacts.list_all(user_dir)
         if not all_c:
@@ -13127,14 +13179,70 @@ def _try_contacts_chat(message: str, user_rec: dict) -> dict | None:
             lines.append("  · " + " — ".join(bits))
         return {"reply": "\n".join(lines), "tier": "local",
                 "latency_ms": 0, "source": "contacts_all"}
+
+    # ROLE/TAG SEARCH — "find my attorney contacts" / "show me plumber contacts"
+    m_role = _re.match(
+        r"^\s*(?:find|show|list|get)\s+(?:me\s+)?(?:all\s+)?(?:my\s+)?"
+        r"(?P<role>[a-z][a-z\s'\-]{2,30}?)\s+contacts?\s*[?.!]?\s*$",
+        msg, _re.IGNORECASE,
+    )
+    if m_role:
+        role = (m_role.group("role") or "").strip().lower()
+        if role and role not in {"new", "all", "my", "recent", "the"}:
+            all_c = mod_contacts.list_all(user_dir)
+            hits = [c for c in all_c if
+                    role in (c.get("notes") or "").lower()
+                    or role in (c.get("company") or "").lower()
+                    or any(role in t.lower() for t in (c.get("tags") or []))
+                    or any(role in w for w in (c.get("name") or "").lower().split())]
+            if not hits:
+                return {"reply": f"No contacts found matching \"{role}\".",
+                        "tier": "local", "latency_ms": 0,
+                        "source": "contacts_not_found"}
+            lines = [f"Contacts matching \"{role}\" ({len(hits)}):"]
+            for c in hits[:20]:
+                bits = [c.get("name", "?")]
+                if c.get("company"): bits.append(c["company"])
+                if c.get("phone"):   bits.append(c["phone"])
+                lines.append("  · " + " — ".join(bits))
+            return {"reply": "\n".join(lines), "tier": "local",
+                    "latency_ms": 0, "source": "contacts_found"}
+
+    # LOCATION SEARCH — "do I have any contacts in Sparks?"
+    m_loc = _re.match(
+        r"^\s*(?:do\s+i\s+have|are\s+there|show|find|list)\s+(?:any\s+)?(?:my\s+)?contacts?\s+"
+        r"(?:in|from|at|near)\s+(?P<loc>.+?)\s*[?.!]?\s*$",
+        msg, _re.IGNORECASE,
+    )
+    if m_loc:
+        loc = (m_loc.group("loc") or "").strip().lower()
+        if loc:
+            all_c = mod_contacts.list_all(user_dir)
+            hits = [c for c in all_c if
+                    loc in (c.get("notes") or "").lower()
+                    or loc in (c.get("address") or "").lower()
+                    or loc in (c.get("company") or "").lower()
+                    or loc in (c.get("name") or "").lower()]
+            if not hits:
+                return {"reply": f"No contacts found in \"{loc}\".",
+                        "tier": "local", "latency_ms": 0,
+                        "source": "contacts_not_found"}
+            lines = [f"Contacts in \"{loc}\" ({len(hits)}):"]
+            for c in hits[:20]:
+                bits = [c.get("name", "?")]
+                if c.get("company"): bits.append(c["company"])
+                if c.get("phone"):   bits.append(c["phone"])
+                lines.append("  · " + " — ".join(bits))
+            return {"reply": "\n".join(lines), "tier": "local",
+                    "latency_ms": 0, "source": "contacts_found"}
     return None
 
 
 _LEADS_RECENT_RE = _re.compile(
     r"^\s*(?:"
-    r"(?:show|list|give)\s+(?:me\s+)?(?:all\s+)?(?:my\s+|the\s+)?(?:new\s+)?leads?"
-    r"\s+(?:from\s+|in\s+|for\s+)?(?:the\s+)?(?:this|past|last|recent)?\s*"
-    r"(?P<period>week|month|day|today|24\s*hours?|hours?|overnight)?"
+    r"(?:show|list|give)\s+(?:me\s+)?(?:all\s+)?(?:my\s+|the\s+)?(?:new\s+|recent\s+)?leads?"
+    r"(?:\s+(?:from\s+|in\s+|for\s+)?(?:the\s+)?(?:this|past|last|recent)?\s*"
+    r"(?P<period>week|month|day|today|24\s*hours?|hours?|overnight)?)?"
     r"|(?:what|any)\s+(?:new\s+)?leads?\s+(?:came\s+in\s+)?(?P<period2>overnight|today|this\s+week|this\s+month)"
     r"|recent\s+leads?"
     r"|new\s+leads?(?:\s+this\s+(?P<period3>week|month))?"
@@ -13207,6 +13315,7 @@ _LEAD_ADD_RE = _re.compile(
     r"^\s*(?:"
     r"add\s+(?:me|us|(?P<who>[A-Z][A-Za-z'\-]+(?:\s+[A-Z][A-Za-z'\-]+){0,3}))\s+(?:as\s+)?(?:a\s+)?(?:new\s+)?lead"
     r"|(?:log|create|record|file)\s+(?:a\s+)?(?:new\s+)?lead"
+    r"|add\s+a\s+(?:new\s+)?lead[:\s]+"
     r")",
     _re.IGNORECASE,
 )
@@ -13222,14 +13331,26 @@ def _try_lead_add(message: str, user_rec: dict) -> dict | None:
     if not _LEAD_ADD_RE.match(msg):
         return None
     # Pull name from explicit "My name is X" / "named X" / regex 'who' group
+    # Also handles "add a lead: Brian Castellano from Apex..." — first capitalized
+    # name phrase after "lead:" is the lead's name.
     name = ""
     name_m = _re.search(r"(?:my\s+name\s+is|name\s+is|named|name[:\s]+)\s+([A-Z][A-Za-z'\-]+(?:\s+[A-Z][A-Za-z'\-]+){0,3})", message)
     if name_m:
         name = name_m.group(1).strip()
     else:
         who_m = _LEAD_ADD_RE.match(msg)
-        if who_m and who_m.group("who"):
+        if who_m and who_m.groupdict().get("who"):
             name = who_m.group("who").strip()
+        else:
+            # "add a lead: Brian Castellano from Apex..." — extract first proper name
+            after_colon = _re.search(r'lead[:\s]+\s*(.+)', msg, _re.IGNORECASE)
+            if after_colon:
+                first_name_m = _re.match(
+                    r'([A-Z][A-Za-z\'\-]+(?:\s+[A-Z][A-Za-z\'\-]+){0,3})',
+                    after_colon.group(1).strip()
+                )
+                if first_name_m:
+                    name = first_name_m.group(1).strip()
     phone = ""
     phone_m = _re.search(r"(\+?\d[\d\-\(\)\s]{7,}\d)", message)
     if phone_m:
@@ -13238,10 +13359,9 @@ def _try_lead_add(message: str, user_rec: dict) -> dict | None:
     email_m = _re.search(r"[\w\.-]+@[\w\.-]+\.\w+", message)
     if email_m:
         email = email_m.group(0).strip()
-    if not (phone or email):
-        return {"reply": ("I need a phone number or email to add a lead — what's the "
-                          "best way to reach them? E.g. \"add lead: name John "
-                          "Smith, phone 775-555-1212\"."),
+    if not (phone or email or name):
+        return {"reply": ("I need at least a name, phone number or email to add a lead — "
+                          "e.g. \"add lead: John Smith, phone 775-555-1212\"."),
                 "tier": "local", "latency_ms": 0,
                 "source": "lead_add_no_contact"}
     try:
@@ -15244,8 +15364,8 @@ _MODULES_INTRO_RE = _re.compile(
     r"^\s*(?:"
     r"(?:do\s+(?:you|i)\s+have|do\s+you\s+know\s+anything\s+about|is\s+(?:there|the)|do\s+i\s+(?:have\s+)?the)\s+(?:a\s+|an\s+|the\s+)?"
     r"(?P<mod_q>" + _MODULE_ALIAS_PATTERN + r")\s*(?:module|add[\s-]?on|plan|package|feature|attached)?"
-    r"|what\s+(?:modules?|add[\s-]?ons?|plans?|features?|packages?)\s+(?:do\s+i\s+have|am\s+i\s+(?:on|using|subscribed\s+to)|are\s+(?:enabled|installed|active))"
-    r"|which\s+(?:modules?|add[\s-]?ons?|plans?|features?)\s+(?:do\s+i\s+have|am\s+i\s+(?:on|using))"
+    r"|what\s+(?:modules?|add[\s-]?ons?|plans?|features?|packages?)\s+(?:do\s+i\s+have(?:\s+(?:enabled|active|installed))?|am\s+i\s+(?:on|using|subscribed\s+to)|are\s+(?:enabled|installed|active))"
+    r"|which\s+(?:modules?|add[\s-]?ons?|plans?|features?)\s+(?:do\s+i\s+have(?:\s+(?:enabled|active|installed))?|am\s+i\s+(?:on|using))"
     r"|(?:show|list|tell\s+me)\s+(?:me\s+)?(?:my\s+)?(?:enabled\s+|active\s+|installed\s+)?(?:modules?|add[\s-]?ons?|features?)"
     r"|am\s+i\s+(?:on|subscribed\s+to|using)\s+(?:the\s+)?(?P<mod_q2>" + _MODULE_ALIAS_PATTERN + r")\s*(?:module|add[\s-]?on|plan|package)?"
     r"|what'?s\s+(?:my\s+)?(?:subscription|plan)"
@@ -15913,10 +16033,11 @@ def _try_task_complete(message: str, user_rec: dict) -> dict | None:
 
 _REMINDERS_LIST_RE = _re.compile(
     r"^\s*(?:"
-    r"what\s+reminders?\s+do\s+i\s+have"
-    r"|show\s+(?:me\s+)?(?:my\s+)?reminders?"
+    r"what\s+reminders?\s+do\s+i\s+have(?:\s+(?:coming\s+up|this\s+week|today|upcoming|soon|scheduled))?"
+    r"|show\s+(?:me\s+)?(?:my\s+)?(?:upcoming\s+|open\s+)?reminders?"
     r"|list\s+(?:my\s+)?reminders?"
-    r"|any\s+reminders?"
+    r"|any\s+(?:upcoming\s+|open\s+)?reminders?"
+    r"|what\s+(?:are\s+)?my\s+(?:upcoming\s+|open\s+)?reminders?"
     r")\s*[?.!]?\s*$",
     _re.IGNORECASE,
 )
@@ -16003,7 +16124,7 @@ _LEGAL_DEADLINES_RE = _re.compile(
     _re.IGNORECASE,
 )
 _LEGAL_MATTERS_RE = _re.compile(
-    r"^(?:list|show|what(?:'s|\s+are)?)\s+(?:my\s+)?(?:active\s+)?(?:matters?|cases?|files?)(?:\s+|$)",
+    r"^(?:list|show|what(?:'s|\s+are)?)\s+(?:me\s+)?(?:all\s+)?(?:my\s+)?(?:active\s+|open\s+|current\s+)?(?:matters?|cases?|files?)(?:\s+|$)",
     _re.IGNORECASE,
 )
 _LEGAL_RESEARCH_RE = _re.compile(
@@ -16234,6 +16355,8 @@ def _try_legal_chat(message: str, user_rec: dict,
         len(msg) > 500
         and any(kw in msg_lower for kw in _CONTRACT_PASTE_KEYWORDS)
         and not is_contract_cmd
+        and not _LEGAL_DRAFT_RE.match(msg)
+        and not _LEGAL_FILING_RE.search(msg)
     )
     if is_contract_cmd or is_contract_paste:
         # Extract contract text from the message
@@ -16351,14 +16474,22 @@ def _try_legal_chat(message: str, user_rec: dict,
             "You are an experienced contract attorney. Write a thorough, practical exit strategy "
             "memo for attorney review. Use ONLY cases from the database results — never invent citations."
         )
-        try:
-            memo = llm_client.generate(
-                CONFIG, analysis_system,
-                [{"role": "user", "content": analysis_prompt}],
-            ).text
-        except Exception:
-            log.exception("contract phase-3 synthesis failed")
-            return None
+        memo = ""
+        for _attempt in range(2):
+            try:
+                memo = llm_client.generate(
+                    CONFIG, analysis_system,
+                    [{"role": "user", "content": analysis_prompt}],
+                ).text or ""
+                if len(memo) > 200:
+                    break
+                log.warning(f"contract phase-3 attempt {_attempt+1} returned short content ({len(memo)} chars), retrying")
+            except Exception:
+                log.exception("contract phase-3 synthesis failed")
+                if _attempt == 1:
+                    return None
+        if len(memo) < 200:
+            return {"reply": "I had trouble generating the contract analysis — the AI returned empty content. Please try again.", "source": "legal.contract.error"}
 
         src_note = (
             f"\n\n*{all_results['total']} source(s) retrieved from CourtListener, "
@@ -16444,14 +16575,20 @@ def _try_legal_chat(message: str, user_rec: dict,
         )
         if not draft_prompt:
             return None
-        try:
-            content = llm_client.generate(
-                CONFIG, mod_legal._DRAFT_SYSTEM,
-                [{"role": "user", "content": draft_prompt}],
-            ).text
-        except Exception:
-            log.exception("filing complaint generation failed")
-            return None
+        content = ""
+        for _attempt in range(2):
+            try:
+                content = (llm_client.generate(
+                    CONFIG, mod_legal._DRAFT_SYSTEM,
+                    [{"role": "user", "content": draft_prompt}],
+                ).text or "").strip()
+                if len(content) > 100:
+                    break
+                log.warning(f"draft generation attempt {_attempt+1} returned short content ({len(content)} chars), retrying")
+            except Exception:
+                log.exception("filing complaint generation failed")
+        if len(content) < 100:
+            return {"reply": "I had trouble generating the draft — the AI returned empty content. Please try again.", "source": "legal.draft.error"}
         saved = mod_legal.save_draft(
             DATA_DIR,
             matter_id="",
@@ -16508,14 +16645,20 @@ def _try_legal_chat(message: str, user_rec: dict,
             if db_block:
                 draft_prompt = mod_legal.build_auto_draft_prompt(template_key, msg, db_results_block=db_block)
 
-        try:
-            content = llm_client.generate(
-                CONFIG, mod_legal._DRAFT_SYSTEM,
-                [{"role": "user", "content": draft_prompt}],
-            ).text
-        except Exception:
-            log.exception("legal draft generation failed")
-            return None
+        content = ""
+        for _attempt in range(2):
+            try:
+                content = (llm_client.generate(
+                    CONFIG, mod_legal._DRAFT_SYSTEM,
+                    [{"role": "user", "content": draft_prompt}],
+                ).text or "").strip()
+                if len(content) > 100:
+                    break
+                log.warning(f"draft generation attempt {_attempt+1} returned short content ({len(content)} chars), retrying")
+            except Exception:
+                log.exception("legal draft generation failed")
+        if len(content) < 100:
+            return {"reply": "I had trouble generating the draft — the AI returned empty content. Please try again.", "source": "legal.draft.error"}
 
         saved = mod_legal.save_draft(
             DATA_DIR,
@@ -17712,6 +17855,10 @@ _QC_TRIGGER_RE = _re.compile(
     # was falling through to the LLM which claimed success but never wrote
     # the event. Now routed to quick_capture like bare 'meeting'.
     r"add\s+(?:a\s+|an\s+)?(?:meeting|appointment|event|calendar\s+event)\b|"
+    # 'add a task:' / 'add a new task:' — must reach quick_capture._TASK_RE.
+    r"add\s+a\s+(?:new\s+)?task\b|"
+    # 'set a reminder for X: body' — must reach quick_capture._SET_REMINDER_RE.
+    r"set\s+a\s+reminder\b|"
     # Frank 2026-06-24: 'schedule dentist Friday at 2pm' was missing — the
     # old trigger required 'schedule a' or 'schedule me'. Now accept bare
     # 'schedule X' too.

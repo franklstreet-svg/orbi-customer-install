@@ -42,8 +42,11 @@ QUICK_FILE = "quick_notes.json"
 
 # Require an explicit preposition (on / at / by / in) OR a known time phrase
 # at end-of-string. Otherwise the non-greedy body would steal half the sentence.
-_TIME_WORDS = (r"tomorrow|today|tonight|next\s+week|monday|tuesday|wednesday|"
-               r"thursday|friday|saturday|sunday|in\s+\d+\s+(?:min|minute|hour|day|week)s?")
+_TIME_WORDS = (r"tomorrow(?:\s+(?:morning|afternoon|evening|night))?|"
+               r"today(?:\s+(?:morning|afternoon|evening))?|tonight|"
+               r"next\s+(?:week|monday|tuesday|wednesday|thursday|friday|saturday|sunday)|"
+               r"monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
+               r"in\s+\d+\s+(?:min|minute|hour|day|week)s?")
 _REMIND_RE = re.compile(
     r"^(?:remind|nudge|ping)\s+me\s+(?:to\s+)?(?P<body>.+?)\s+"
     r"(?:on\s+|at\s+|by\s+|in\s+)(?P<when>.+)$",
@@ -68,6 +71,36 @@ _REMIND_END_TIME_RE = re.compile(
 _REMIND_SIMPLE_RE = re.compile(
     r"^(?:remind|nudge)\s+me\s+(?:to\s+)?(.+)$", re.IGNORECASE,
 )
+# "Set a reminder for July 15th at 8am: call the broker"
+# "Set a reminder: back up files tomorrow at 9am"
+_SET_REMINDER_RE = re.compile(
+    r"^(?:set|add|create|schedule)\s+a\s+reminder\s+"
+    r"(?:for\s+)?(?P<when>.+?)\s*[:\-]\s*(?P<body>.+)$",
+    re.IGNORECASE,
+)
+_SET_REMINDER_SIMPLE_RE = re.compile(
+    r"^(?:set|add|create)\s+a\s+reminder\s+(?:to\s+)(?P<body>.+)$",
+    re.IGNORECASE,
+)
+_CALL_REMINDER_RE = re.compile(
+    r"^call\s+(?P<body>.+?)\s+"
+    r"(?:on\s+|at\s+|by\s+|in\s+|for\s+)(?P<when>.+)$",
+    re.IGNORECASE,
+)
+_CALL_VAGUE_RE = re.compile(
+    r"^call\s+(?P<body>.+?)\s+(?P<when>later|soon|sometime|some\s+time|asap)$",
+    re.IGNORECASE,
+)
+_VAGUE_CALENDAR_RE = re.compile(
+    r"^(?:appointment|meeting|event|book|schedule)\b.+\b"
+    r"(?:sometime|some\s+time|next\s+week|next\s+month|later)\b",
+    re.IGNORECASE,
+)
+_VAGUE_REMINDER_TIME_RE = re.compile(
+    r"^(?:later|soon|sometime|some\s+time|asap|when\s+you\s+can|"
+    r"in\s+a\s+(?:bit|while|minute|second|moment))$",
+    re.IGNORECASE,
+)
 # Does the message body contain ANY hint of when the reminder should fire?
 # If not, we ASK instead of silently defaulting to tomorrow 9am. Hints:
 #   - any digit (5, 5:45, 4pm, in 30 min)
@@ -88,7 +121,7 @@ _HAS_TIME_SIGNAL_RE = re.compile(
 )
 
 _TASK_RE = re.compile(
-    r"^(?:add|put)\s+(?:to\s+)?(?:my\s+)?(?:todo|to[\s-]?do|task)s?\s*(?:list)?[:\s]+(.+)$",
+    r"^(?:add|put|create)\s+(?:a\s+new\s+|a\s+|new\s+)?(?:to\s+)?(?:my\s+)?(?:todo|to[\s-]?do|task)s?\s*(?:list)?[:\s]+(.+)$",
     re.IGNORECASE,
 )
 _TASK_SIMPLE_RE = re.compile(
@@ -122,7 +155,8 @@ _BLOCK_OFF_ALLDAY_RE = re.compile(
 _CONTACT_RE = re.compile(
     r"^(?:add|save)\s+(?:contact|person)[:\s]+"
     r"(?P<name>[A-Z][a-zA-Z\-']+(?:\s+[A-Z][a-zA-Z\-']+){0,2})"
-    r"(?:\s+(?P<rest>.+))?$",
+    r"(?:[,\s]+(?P<rest>.+))?$",   # comma OR space allowed as separator
+    re.IGNORECASE,
 )
 
 
@@ -145,13 +179,30 @@ def capture(user_dir: Path, text: str) -> dict:
                 "summary": f"Added to your tasks: \"{item['text']}\""}
 
     # Try REMINDER — try the strict patterns first so we don't truncate.
-    # Order: time-first ("remind me at 5:45 to call") > explicit preposition
+    # Order: "set a reminder for X: body" > time-first > explicit preposition
     # > known time at end > simple fallback.
+    m = _SET_REMINDER_RE.match(text)
+    if m:
+        when_phrase = m.group("when").strip()
+        body = m.group("body").strip()
+        due_iso = _parse_when(when_phrase) or _default_tomorrow_9am()
+        item = mod_reminders.add(user_dir, body, due_iso)
+        note = _rollover_note(when_phrase, due_iso)
+        return {"kind": "reminder", "item": item,
+                "summary": f"Reminder set: \"{item['text']}\" for {_iso_to_local_display(due_iso)}{note}"}
     for pattern in (_REMIND_AT_FIRST_RE, _REMIND_RE, _REMIND_END_TIME_RE):
         m = pattern.match(text)
         if m:
             body = m.group("body").strip()
             when_phrase = m.group("when").strip()
+            if _VAGUE_REMINDER_TIME_RE.match(when_phrase):
+                return {
+                    "kind": "reminder_needs_time",
+                    "item": None,
+                    "summary": (
+                        f"Sure — what exact time should I remind you to {body}?"
+                    ),
+                }
             # Body sometimes absorbs the day word: "call John tomorrow" + "1:00 p.m."
             # Move trailing day-word from body into the front of when_phrase.
             # Frank 2026-06-23: extended to weekday names too — was leaking
@@ -190,13 +241,51 @@ def capture(user_dir: Path, text: str) -> dict:
             return {
                 "kind":    "reminder_needs_time",
                 "item":    None,
-                "summary": ask + (" (try 'at 4:45 today', 'tomorrow at 9 AM',"
-                                  " or 'in 30 minutes')"),
+                "summary": ask,
             }
-        due_iso = _default_tomorrow_9am()
+        body, when_phrase = _split_trailing_when(body)
+        due_iso = _parse_when(when_phrase) if when_phrase else None
+        if not due_iso:
+            due_iso = _default_tomorrow_9am()
         item = mod_reminders.add(user_dir, body, due_iso)
         return {"kind": "reminder", "item": item,
                 "summary": f"Reminder set: \"{item['text']}\" for {_iso_to_local_display(due_iso)}"}
+
+    # Try CALL REMINDER ("call the bank Tuesday at 3pm")
+    m = _CALL_REMINDER_RE.match(text)
+    if m:
+        body = m.group("body").strip()
+        when_phrase = m.group("when").strip()
+        if _VAGUE_REMINDER_TIME_RE.match(when_phrase):
+            return {
+                "kind": "reminder_needs_time",
+                "item": None,
+                "summary": (
+                    f"Sure — what exact time should I remind you to call {body}?"
+                ),
+            }
+        for day_word in ("tomorrow", "today", "tonight",
+                         "monday", "tuesday", "wednesday", "thursday",
+                         "friday", "saturday", "sunday"):
+            if body.lower().endswith(" " + day_word):
+                body = body[: -(len(day_word) + 1)].strip()
+                when_phrase = day_word + " at " + when_phrase
+                break
+        due_iso = _parse_when(when_phrase) or _default_tomorrow_9am()
+        item = mod_reminders.add(user_dir, f"call {body}", due_iso)
+        note = _rollover_note(when_phrase, due_iso)
+        return {"kind": "reminder", "item": item,
+                "summary": f"Reminder set: \"{item['text']}\" for {_iso_to_local_display(due_iso)}{note}"}
+    m = _CALL_VAGUE_RE.match(text)
+    if m:
+        body = m.group("body").strip()
+        return {
+            "kind": "reminder_needs_time",
+            "item": None,
+            "summary": (
+                f"Sure — what exact time should I remind you to call {body}?"
+            ),
+        }
 
     # Try ALL-DAY BLOCK ("block off Thursday for vacation")
     m = _BLOCK_OFF_ALLDAY_RE.match(text)
@@ -207,7 +296,16 @@ def capture(user_dir: Path, text: str) -> dict:
         title = f"{reason}" if reason != "blocked" else "blocked off"
         item = mod_calendar.add(user_dir, title, start_iso, all_day=True)
         return {"kind": "calendar", "item": item,
-                "summary": f"Added to your calendar (all day): \"{title}\" on {_iso_to_local_display(start_iso)[:10]}"}
+                "summary": f"Added to your calendar (all day): \"{title}\" on {_iso_to_local_date_display(start_iso)}"}
+
+    # Vague calendar asks ("schedule a meeting sometime next week") need
+    # a follow-up, not a quick note. A quick note makes it look handled.
+    if _VAGUE_CALENDAR_RE.match(text):
+        return {
+            "kind": "calendar_needs_time",
+            "item": None,
+            "summary": "What exact day and time should I schedule that for?",
+        }
 
     # Try APPOINTMENT
     m = _APPT_RE.match(text)
@@ -464,6 +562,32 @@ def _local_at(days_offset: int, hour: int, minute: int = 0) -> str:
     return target_local.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+_TRAILING_WHEN_RE = re.compile(
+    r"\b(?P<when>"
+    r"tomorrow(?:\s+(?:morning|afternoon|evening|night))?|"
+    r"today(?:\s+(?:morning|afternoon|evening))?|tonight|"
+    r"next\s+(?:week|monday|tuesday|wednesday|thursday|friday|saturday|sunday)|"
+    r"(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)"
+    r"(?:\s+(?:morning|afternoon|evening|night))?|"
+    r"in\s+\d+\s+(?:sec|second|min|minute|hour|hr|day|week|month|mo)s?"
+    r")$",
+    re.IGNORECASE,
+)
+
+
+def _split_trailing_when(text: str) -> tuple[str, str]:
+    """Return (body, when_phrase) for simple reminders like
+    'call the bank tomorrow afternoon'. If no reliable trailing time phrase
+    exists, returns the original text and an empty phrase."""
+    body = (text or "").strip()
+    m = _TRAILING_WHEN_RE.search(body)
+    if not m:
+        return body, ""
+    when_phrase = m.group("when").strip()
+    clean_body = body[:m.start("when")].strip(" ,")
+    return (clean_body or body), when_phrase
+
+
 def _parse_when(phrase: str) -> str | None:
     """Lightweight natural-language → ISO. Returns None when nothing matches
     so the caller can pick a default. All clock times are interpreted in
@@ -473,8 +597,26 @@ def _parse_when(phrase: str) -> str | None:
     phrase = phrase.strip().lower().rstrip(".!?")
     now = datetime.now(timezone.utc)
 
+    time_defaults = {
+        "morning": 9,
+        "afternoon": 14,
+        "evening": 18,
+        "night": 20,
+    }
+
+    m_daypart = re.match(r"^(today|tomorrow)\s+(morning|afternoon|evening|night)$", phrase)
+    if m_daypart:
+        base_day, part = m_daypart.groups()
+        return _local_at(1 if base_day == "tomorrow" else 0, time_defaults[part])
+
     if phrase in ("tomorrow", "tomorrow morning"):
         return _local_at(1, 9)
+    if phrase == "tomorrow afternoon":
+        return _local_at(1, 14)
+    if phrase == "tomorrow evening":
+        return _local_at(1, 18)
+    if phrase == "tomorrow night":
+        return _local_at(1, 20)
     if phrase == "tonight":
         return _local_at(0, 20)
     if phrase in ("today", "later today"):
@@ -500,12 +642,17 @@ def _parse_when(phrase: str) -> str | None:
 
     weekdays = {"monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
                 "friday": 4, "saturday": 5, "sunday": 6}
+    next_weekday = phrase.startswith("next ")
     base = phrase.replace("on ", "").replace("next ", "").strip()
-    if base in weekdays:
-        target = weekdays[base]
+    weekday_part = base.split()[0] if base.split() else ""
+    daypart = base.split()[1] if len(base.split()) > 1 else ""
+    if weekday_part in weekdays and (not daypart or daypart in time_defaults):
+        target = weekdays[weekday_part]
         now_local = datetime.now().astimezone()
         days_ahead = (target - now_local.weekday()) % 7 or 7
-        return _local_at(days_ahead, 9)
+        if next_weekday and days_ahead < 7:
+            days_ahead += 7
+        return _local_at(days_ahead, time_defaults.get(daypart, 9))
 
     # Time-of-day phrases — "5:45", "1:00 p.m.", "4:45 today", "1pm tomorrow",
     # "tomorrow at 1:00 p.m.", "today at 4:45". Crucially these are parsed in
@@ -536,6 +683,10 @@ def _parse_when(phrase: str) -> str | None:
                                        ("sunday", 6)):
             now_local = datetime.now().astimezone()
             days_ahead = (weekday_num - now_local.weekday()) % 7 or 7
+            if time_part.startswith("next " + day_name + " "):
+                day_offset = days_ahead + (7 if days_ahead < 7 else 0)
+                time_part = time_part[len("next " + day_name) + 1:].strip()
+                break
             if time_part.startswith(day_name + " "):
                 day_offset = days_ahead
                 time_part = time_part[len(day_name) + 1:].strip()
@@ -635,6 +786,20 @@ def _iso_to_local_display(due_iso: str) -> str:
     except (ValueError, TypeError) as e:
         log.warning(f"_iso_to_local_display failed for {due_iso!r}: {e}")
         return due_iso[:16].replace("T", " ")
+
+
+def _iso_to_local_date_display(due_iso: str) -> str:
+    if not due_iso:
+        return ""
+    try:
+        s = due_iso.replace("Z", "+00:00")
+        dt_utc = datetime.fromisoformat(s)
+        if dt_utc.tzinfo is None:
+            dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+        return dt_utc.astimezone().strftime("%A %b %d")
+    except (ValueError, TypeError) as e:
+        log.warning(f"_iso_to_local_date_display failed for {due_iso!r}: {e}")
+        return due_iso[:10]
 
 
 def _extract_phone(s: str) -> str:
