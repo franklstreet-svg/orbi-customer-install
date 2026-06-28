@@ -5012,7 +5012,7 @@ def owner_setup_initial_password():
     data = request.get_json(silent=True) or {}
     new_pw = data.get("new_password") or data.get("password") or ""
     display_name = (data.get("display_name") or "").strip()[:80]
-    assistant_name = (data.get("assistant_name") or "").strip()[:32] or "Orbi"
+    assistant_name = (data.get("assistant_name") or "").strip()[:32] or "Brindy"
     if len(new_pw) < 6:
         return jsonify({"error": "Password must be at least 6 characters."}), 400
     user_rec = users_mod.load_users(DATA_DIR).get(username)
@@ -7145,10 +7145,10 @@ _NAME_AFTER_FILLER = (
 # has its own follow-up questions appropriate to the use case.
 ONBOARDING_STEPS_PERSONAL = [
     ("assistant_name",
-     "Hi — I'm Orbi, your new assistant.\n\n"
+     "Hi — I'm Brindy, your new assistant.\n\n"
      "If you'd like to call me something else, just type the name "
      "you'd prefer (Sarah, Maya, anything that fits). Otherwise, "
-     "type **keep** and I'll stay Orbi."),
+     "type **keep** and I'll stay Brindy."),
     ("website",
      "Do you have a website I can read to learn your business? "
      "Paste the URL — something like 'yourbusiness.com' — and I'll "
@@ -7202,7 +7202,7 @@ def _needs_onboarding() -> bool:
     name = (biz.get("name") or "").strip()
     # Sentinel names for Frank's own install (skip onboarding wizard).
     # Old names kept for backward compat with stale local data.
-    frank_install_sentinels = {"myOrbi", "Orbi", "My Orbi AI Solutions", "My Orby AI Solutions"}
+    frank_install_sentinels = {"myOrbi", "Orbi", "Brindy", "My Orbi AI Solutions", "My Orby AI Solutions"}
     if not name or name.startswith("REPLACE_") or name in frank_install_sentinels:
         if name in frank_install_sentinels:
             return False
@@ -7239,7 +7239,7 @@ def _try_onboarding(message: str, user_rec: dict) -> dict | None:
         owner_first = ((biz.get("personality") or {}).get("owner_name")
                         or biz.get("owner_name") or "").strip().split()
         owner_first = owner_first[0] if owner_first else ""
-        hello = f"Hi{', ' + owner_first if owner_first else ''}! I'm Orbi — your new assistant."
+        hello = f"Hi{', ' + owner_first if owner_first else ''}! I'm Brindy — your new assistant."
         # Did the install actually scrape a website? Only claim "I read your
         # website" if there's real scrape evidence. Otherwise the customer
         # gets a misleading "I just read your website" greeting when no scrape
@@ -7335,7 +7335,7 @@ def _try_onboarding(message: str, user_rec: dict) -> dict | None:
                             "no thank you", "nope", "stay", "stay orbi",
                             "you're fine", "you are fine", "default")
             if low in keep_signals:
-                collected["assistant_name"] = "Orbi"
+                collected["assistant_name"] = "Brindy"
             else:
                 # Strip common filler ("call me sarah" → "sarah") and clip
                 # to a reasonable length. Names beyond 32 chars are almost
@@ -7347,7 +7347,7 @@ def _try_onboarding(message: str, user_rec: dict) -> dict | None:
                     if cleaned.lower().startswith(prefix):
                         cleaned = cleaned[len(prefix):].strip()
                         break
-                collected["assistant_name"] = cleaned[:32].strip() or "Orbi"
+                collected["assistant_name"] = cleaned[:32].strip() or "Brindy"
         elif key == "website":
             low = answer.lower().strip()
             no_signals = ("", "no", "no website", "skip", "none",
@@ -7452,7 +7452,7 @@ def _try_onboarding(message: str, user_rec: dict) -> dict | None:
     try:
         biz = mod_business.load(DATA_DIR) or {}
         personality = biz.get("personality") or {}
-        assistant_name = (collected.get("assistant_name") or "Orbi").strip() or "Orbi"
+        assistant_name = (collected.get("assistant_name") or "Brindy").strip() or "Brindy"
         personality["name"] = assistant_name
         # Reasonable defaults — customer can change these in Settings.
         personality.setdefault("tone", "friend")
@@ -7475,7 +7475,7 @@ def _try_onboarding(message: str, user_rec: dict) -> dict | None:
             f"details under Settings instead, no harm done."
         ), "tier": "local", "latency_ms": 0,
                 "source": "onboarding_save_error"}
-    assistant_name = (collected.get("assistant_name") or "Orbi").strip() or "Orbi"
+    assistant_name = (collected.get("assistant_name") or "Brindy").strip() or "Brindy"
     if collected.get("website"):
         ready_line = (f"I'm reading {collected['website']} right now and "
                       f"learning your business — it'll keep filling in "

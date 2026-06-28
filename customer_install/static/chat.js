@@ -694,7 +694,7 @@ _audioEl.src = '/tts?text=%20&silent=1';
 
       // Speak the reply if speaker is on
       if (prefs.speakerOn) {
-        speak(reply);
+        await speak(reply);
       } else {
         setStateBar(null);
         // Re-arm listening if mic was on
@@ -905,9 +905,13 @@ _audioEl.src = '/tts?text=%20&silent=1';
   function stopListening() {
     wantsListening = false;
     clearTimeout(restartTimer);
-    if (recognition && isListening) {
-      try { recognition.stop(); } catch {}
+    if (recognition) {
+      try {
+        if (typeof recognition.abort === 'function') recognition.abort();
+        else if (isListening) recognition.stop();
+      } catch {}
     }
+    isListening = false;
     clearInterim();
     micToggle.classList.remove('listening', 'muted-while-speaking');
     if (stateBar.classList.contains('listening')) setStateBar(null);
@@ -940,7 +944,7 @@ _audioEl.src = '/tts?text=%20&silent=1';
   async function deliverSpokenWelcome() {
     if (_welcomeDelivered) return;
     _welcomeDelivered = true;
-    const welcomeText = "Hi, welcome to myOrbi. How can I help you today?";
+    const welcomeText = "Hi, welcome to Brindy. How can I help you today?";
     // Remove the static placeholder card now that real conversation starts
     welcomeEl?.remove();
     // Create the bubble empty, then type characters in while speech plays
@@ -976,6 +980,7 @@ _audioEl.src = '/tts?text=%20&silent=1';
   let isSpeaking = false;
   let currentAudio = null;
   let currentAudioUrl = null;
+  const ORBI_TTS_VOICE = 'en-US-AvaNeural';
   // Browser fallback (only if server TTS fails)
   const browserSynth = window.speechSynthesis;
 
@@ -1011,7 +1016,8 @@ _audioEl.src = '/tts?text=%20&silent=1';
       // GET caps text at ~2000 chars (URL length safety); the server
       // /tts handler also caps at 12000 internally. The LLM's replies
       // are typically <500 chars so this is non-binding in practice.
-      const ttsUrl = '/tts?text=' + encodeURIComponent(cleanText.slice(0, 2000));
+      const ttsUrl = '/tts?voice=' + encodeURIComponent(ORBI_TTS_VOICE)
+        + '&text=' + encodeURIComponent(cleanText.slice(0, 2000));
 
       if (_audioUnlocked) {
         await new Promise((resolve) => {
@@ -1288,7 +1294,7 @@ _audioEl.src = '/tts?text=%20&silent=1';
         if (data.tagline) landingTagline.textContent = data.tagline;
         if (data.name) {
           document.getElementById('welcome-title').textContent =
-            `Hi! I'm Orbi at ${data.name}.`;
+            `Hi! I'm Brindy at ${data.name}.`;
         }
         renderQuickActions(data.quick_actions || []);
         // Proactive greeting — Orbi speaks first when the chat opens
@@ -1469,8 +1475,8 @@ _audioEl.src = '/tts?text=%20&silent=1';
       // sounds dumb. Drop the "at X" suffix in that case.
       const isOrbiSite = /^(orbi|orbi ai|myorbi)$/i.test((businessName || '').trim());
       greeting = isOrbiSite
-        ? `Hi! I'm Orbi — how can I help?`
-        : `Hi! I'm Orbi at ${businessName} — how can I help?`;
+        ? `Hi! I'm Brindy — how can I help?`
+        : `Hi! I'm Brindy at ${businessName} — how can I help?`;
     }
     // Remove the welcome bubble (replaced by Orby's actual first message)
     document.getElementById('welcome')?.remove();
