@@ -132,13 +132,13 @@
   // ----- DOM -----
   const launcher = document.createElement('button');
   launcher.id = 'orbi-embed-launcher';
-  launcher.setAttribute('aria-label', 'Talk to Brindy');
+  launcher.setAttribute('aria-label', 'Talk to Vola');
   launcher.innerHTML = `
     <svg class="icon-orbi" viewBox="0 0 40 40" xmlns="http://www.w3.org/2000/svg" style="width:40px;height:40px;border-radius:50%;background:rgba(255,255,255,0.15);flex:0 0 auto;">
       <circle cx="20" cy="20" r="18" fill="rgba(255,255,255,0.20)"/>
-      <text x="20" y="26" text-anchor="middle" font-size="18" font-family="system-ui,sans-serif" font-weight="700" fill="#fff">B</text>
+      <text x="20" y="26" text-anchor="middle" font-size="18" font-family="system-ui,sans-serif" font-weight="700" fill="#fff">V</text>
     </svg>
-    <span class="launcher-text">Talk to Brindy</span>
+    <span class="launcher-text">Talk to Vola</span>
     <svg class="icon-close" viewBox="0 0 24 24"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
     <span id="orbi-embed-badge" style="display:none;">1</span>
   `;

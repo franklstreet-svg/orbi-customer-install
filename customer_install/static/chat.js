@@ -944,7 +944,7 @@ _audioEl.src = '/tts?text=%20&silent=1';
   async function deliverSpokenWelcome() {
     if (_welcomeDelivered) return;
     _welcomeDelivered = true;
-    const welcomeText = "Hi, welcome to Brindy. How can I help you today?";
+    const welcomeText = "Hi, welcome to myVola. How can I help you today?";
     // Remove the static placeholder card now that real conversation starts
     welcomeEl?.remove();
     // Create the bubble empty, then type characters in while speech plays
@@ -1294,7 +1294,7 @@ _audioEl.src = '/tts?text=%20&silent=1';
         if (data.tagline) landingTagline.textContent = data.tagline;
         if (data.name) {
           document.getElementById('welcome-title').textContent =
-            `Hi! I'm Brindy at ${data.name}.`;
+            `Hi! I'm Vola at ${data.name}.`;
         }
         renderQuickActions(data.quick_actions || []);
         // Proactive greeting — Orbi speaks first when the chat opens
@@ -1473,10 +1473,10 @@ _audioEl.src = '/tts?text=%20&silent=1';
       // doesn't need to re-introduce. Special case: when the business
       // IS Orbi (her own website / sales bot), saying "Orbi at Orbi"
       // sounds dumb. Drop the "at X" suffix in that case.
-      const isOrbiSite = /^(orbi|orbi ai|myorbi)$/i.test((businessName || '').trim());
+      const isOrbiSite = /^(vola|myvola|orbi|myorbi)$/i.test((businessName || '').trim());
       greeting = isOrbiSite
-        ? `Hi! I'm Brindy — how can I help?`
-        : `Hi! I'm Brindy at ${businessName} — how can I help?`;
+        ? `Hi! I'm Vola — how can I help?`
+        : `Hi! I'm Vola at ${businessName} — how can I help?`;
     }
     // Remove the welcome bubble (replaced by Orby's actual first message)
     document.getElementById('welcome')?.remove();
