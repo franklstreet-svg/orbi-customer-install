@@ -403,7 +403,7 @@ def _pull_one(account: dict, limit: int, query: str) -> list[dict]:
         need IMAP-side sort here.
     """
     out = []
-    timeout_s = 40  # generous — Yahoo + 20 large headers can be slow
+    timeout_s = 10  # owner-chat must fail fast instead of hanging into offline mode
     try:
         m = imaplib.IMAP4_SSL(account["imap_host"], int(account["imap_port"]),
                               timeout=timeout_s) \
@@ -414,28 +414,47 @@ def _pull_one(account: dict, limit: int, query: str) -> list[dict]:
             m.starttls()
         m.login(account["email"], account["password"])
         try:
-            m.select("INBOX", readonly=True)
-            criteria = f'(SUBJECT "{query}")' if query else "ALL"
-            typ, data = m.uid("search", None, criteria)
-            if typ != "OK" or not data or not data[0]:
-                return []
-            uids = data[0].split()
-            uids = list(reversed(uids))[:limit]  # highest UIDs are newest
-            for uid in uids:
-                typ, msg_data = m.uid(
-                    "fetch", uid,
-                    "(FLAGS BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE MESSAGE-ID)])",
+            folders = ["INBOX"]
+            if query:
+                folders.extend(["Sent", "Sent Messages", "Sent Items", "[Gmail]/Sent Mail"])
+            seen_keys: set[tuple[str, str]] = set()
+            for folder in folders:
+                try:
+                    typ, _ = m.select(folder, readonly=True)
+                except Exception:
+                    continue
+                if typ != "OK":
+                    continue
+                safe_q = str(query or "").replace("\\", "\\\\").replace('"', '\\"')
+                criteria = (
+                    f'(OR (OR SUBJECT "{safe_q}" FROM "{safe_q}") TEXT "{safe_q}")'
+                    if safe_q else "ALL"
                 )
-                if typ != "OK" or not msg_data:
+                typ, data = m.uid("search", None, criteria)
+                if typ != "OK" or not data or not data[0]:
                     continue
-                raw = next((x[1] for x in msg_data if isinstance(x, tuple)), None)
-                flags_raw = b"".join(x for x in msg_data if isinstance(x, bytes))
-                if not raw:
-                    continue
-                msg = email.message_from_bytes(raw)
-                # uid here is bytes (e.g. b'12345'); _format_message stores
-                # it as the message id so fetch_one_body can re-fetch it.
-                out.append(_format_message(account, uid, msg, flags_raw))
+                uids = list(reversed(data[0].split()))[:limit]
+                for uid in uids:
+                    typ, msg_data = m.uid(
+                        "fetch", uid,
+                        "(FLAGS BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE MESSAGE-ID)])",
+                    )
+                    if typ != "OK" or not msg_data:
+                        continue
+                    raw = next((x[1] for x in msg_data if isinstance(x, tuple)), None)
+                    flags_raw = b"".join(x for x in msg_data if isinstance(x, bytes))
+                    if not raw:
+                        continue
+                    msg = email.message_from_bytes(raw)
+                    key = (folder, (uid.decode() if isinstance(uid, bytes) else str(uid)))
+                    if key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+                    formatted = _format_message(account, uid, msg, flags_raw)
+                    formatted["folder"] = folder
+                    out.append(formatted)
+                    if len(out) >= limit:
+                        return out
         finally:
             try: m.logout()
             except Exception: pass
@@ -456,10 +475,10 @@ def fetch_one_body(user_dir: Path, account_id: str, uid,
     m = None
     try:
         m = imaplib.IMAP4_SSL(account["imap_host"], int(account["imap_port"]),
-                              timeout=40) \
+                              timeout=15) \
             if account.get("imap_ssl", True) \
             else imaplib.IMAP4(account["imap_host"], int(account["imap_port"]),
-                               timeout=40)
+                               timeout=15)
         if not account.get("imap_ssl", True):
             m.starttls()
         m.login(account["email"], account["password"])

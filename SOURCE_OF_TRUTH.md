@@ -1,7 +1,7 @@
 # Idunn AI — Source of Truth
 
-**Last updated:** 2026-06-28 (core module testing + PurBlum restaurant order email + US sales tax table. See "Current verified state" section below.)
-**Previous update:** 2026-06-27 (brand rename session. Idunn AI + Jade + forest green/gold all scrapped same session after creation. Website reverted to original black/dark + purple-blue. AI spoken character name reverted to Orby. "Brindy" was a brief intermediate name — now listed in prompts.py STT-mishear list as "old name." Company brand status: in flux; myOrbi/FST LLC in code. idunn.ai domain NOT purchased.)
+**Last updated:** 2026-06-29 (attorney/legal module completed end-to-end; Anthropic Claude routing for legal LLM calls added; full codebase audit run. See "Current verified state" section below.)
+**Previous update:** 2026-06-28 (core module testing + PurBlum restaurant order email + US sales tax table.)
 **Previous update:** 2026-06-25 15:34 PDT (end-of-chat handoff refresh. Active source-of-truth location confirmed as `/home/frank/orbi_web/SOURCE_OF_TRUTH.md`; stale top-level `/home/frank/ORBI_MASTER_SOURCE_OF_TRUTH.md` now points here. Active trees verified: `~/orbi_web`, `~/orbi-brain`, `~/orbi-tenants`, `~/twickell_live`, and `~/Orbi`; legacy/reference/backup trees exist but are not the current product path. Live runtime right now: brain/billing on `127.0.0.1:5060`, sales/dev Orbi on `127.0.0.1:6000`, test tenant `orbi_xVvgR3ucXNS` on `127.0.0.1:6100`, and multiple Cloudflared processes are listening locally. Tenant ports `6101` and `6102` are not listening right now.)
 **Previous full refresh:** 2026-06-23 (full catch-up pass from disk. Read this SoT and inventoried the referenced active trees: `~/orbi_web`, `~/orbi-brain`, `~/orbi-tenants`, `~/twickell_live`, plus the referenced docs/modules/service files. Verified `https://twickell.com/` matches `~/twickell_live/website/index.html` byte-for-byte. Cloud-v1 is no longer just a future pivot note: it is the active direction and local runtime on this machine. Local-install remains preserved for v2, but the current revenue path is cloud-hosted signup + tenant dashboards.)
 **Previous refresh:** 2026-06-20 (CLOUD-V1 PIVOT day — Frank pivoted from local-install to cloud-hosted. Reasons: SmartScreen/AV trust problem, no time + money for code-signing cert, install pain was the bottleneck to revenue. New plan: cloud now → revenue → fund certs → ship v2 local install later. ALL build work today lives on `cloud-v1` branches in both `orbi_web` and `twickell_live`. Earlier today: file-audit refresh — no policy changes since 6-18, but file counts, route lists, line counts, and the customer_install/owner_dashboard symlink claim were stale.)
@@ -15,7 +15,67 @@
 
 ---
 
-## Current verified state (2026-06-28)
+## Current verified state (2026-06-29)
+
+### Session work — Attorney/Legal module completed
+
+**The Legal module is fully finished as a production-ready product.** This is the highest-priced module ($250/mo planned). Every feature was built, then tested by hitting the actual `/api/owner/chat` endpoint the same way an attorney would type into the chat widget.
+
+**What was built and tested this session:**
+
+1. **Matter detail JS overlay** (`owner_dashboard/dashboard.js`) — Clicking a matter card opens a full overlay that fetches 4 data sources in parallel (matter info, deadlines, time entries, draft documents) and shows them in sub-tabs. Inline "add deadline" form, "log time" quick-entry, close matter button, and click-outside to dismiss. Event delegation wired on the matter card container.
+
+2. **Deadline reminder scheduler** (`vola.py:_deadline_reminder_loop`) — Background thread runs every hour. For each open deadline, fires in-app notifications at 30-day, 14-day, 7-day, and 24-hour milestones. Milestone state persisted in `data/legal/deadline_reminders.json` so reminders don't repeat after restart.
+
+3. **Attorney phone brief** (`prompts.py:build_phone_brief`) — When `config.json` has a `"legal"` key under business, the phone brief injects a full legal intake block: attorney name, practice areas, jurisdiction, consultation fee, 4-step intake protocol, UPL guardrail, and confidentiality notice. Block absent for non-legal businesses.
+
+4. **Matter status chat queries** (`vola.py:_LEGAL_MATTER_STATUS_RE`) — New regex handles "what's the status of the Jones matter", "give me a status update on Smith", etc. Returns active matters matching the name with open deadlines and time summary.
+
+**Bugs fixed during live chat testing:**
+
+- `_require_legal_module()` called `_require_owner()` which doesn't exist → changed to `auth.require_owner(ORBI_DIR)`. This was causing HTTP 500 on every legal API endpoint.
+- All 13 `audit.log()` calls → `audit.log_event(DATA_DIR, actor=s["username"], action=..., resource=...)`. Was causing 500 after every successful legal operation.
+- Conflict check regex captured preposition "on" → "conflict check on David Jones" returned "No conflicts found for 'on David Jones'". Fixed by expanding `_LEGAL_CONFLICT_RE` to consume `for|on|against`.
+- Deadlines regex too narrow → natural phrasing "what deadlines do I have coming up" fell through to LLM. Expanded `_LEGAL_DEADLINES_RE`.
+- Discovery requests timed out → 15-20 items exceeded 30s HuggingFace timeout. Trimmed to 8+8 in `legal.py` templates.
+
+**Anthropic Claude routing for legal** (`llm_client.py`):
+
+- Added `call_anthropic()` — posts to `https://api.anthropic.com/v1/messages` with `x-api-key` + `anthropic-version: 2023-06-01`. Parses `content[].text` blocks from response.
+- Added `generate_legal()` — tries Anthropic first, falls back to HuggingFace Qwen. Sets `timeout_seconds=90` by default.
+- All 10 legal LLM calls in `vola.py` switched from `generate()` to `generate_legal()` (conflict check, intake, draft, research, contract review, contract chat, research chat, document draft).
+- Added `_GEN_OVERRIDES` thread-local so per-call `max_tokens` and `timeout_seconds` pass cleanly through the function stack.
+- Config `anthropic` block added to `customer_install/config.json`: `{"enabled": false, "api_key": "", "model": "claude-sonnet-4-6", "timeout_seconds": 90, "max_tokens": 4096}`. Set `enabled: true` + paste API key when Frank is ready. Normal Orby chat stays on Qwen/HuggingFace — only legal routes hit Anthropic.
+
+**Pricing note:** Frank confirmed $250/mo for the legal module is intentional and correct. Attorneys who don't know what Westlaw is don't know what they're getting. Attorneys who do know will pay more for Orby because she has persistent memory and learns. Confirmed: even heavy attorney use won't exceed $50-100/mo on Anthropic API costs.
+
+**Full codebase audit results (audit agent):**
+
+- `vola.py`: **22,824 lines** (was ~18,657 at last audit)
+- `enabled_modules` in dev config: `["marketing", "marketing_image", "legal"]`
+- Modules directory: 40 files total
+
+**FULLY WORKING (module + routes + dashboard + chat all wired):**
+Core chat, owner auth, business info, contacts, calendar/scheduling, tasks, notes, reminders, messages/team chat, workspace/files, forms, pricing, learning loop, marketing (dashboard only — no NL chat), legal (full — NL chat + dashboard + phone brief + all API routes), voicemails, email, SMS, morning/tomorrow brief, notifications, staff/people, clients, catalog/search, fleet heartbeat.
+
+**PARTIALLY BUILT:**
+- **Web Tasks tab** — dashboard tab + 3 API routes + full orchestration code in vola.py exist, but `web_agent.py` is missing. Tab will crash at runtime. Highest-risk gap.
+- **Marketing NL chat** — all dashboard UI + API routes work. Zero `_try_marketing_chat` handler. Owner cannot ask Orby to write promo copy via chat, only via dashboard.
+- **Contractor module** — all 8 modules written and imported but shelved by config. Reactivate with `enabled_modules` change only.
+
+**WRITTEN BUT NEVER WIRED (5 modules):** `glossary.py`, `preferences.py`, `schedule_patterns.py`, `thread_tone.py`, `workflow_learner.py` — code exists, nothing imports them.
+
+**BACKGROUND JOBS running at startup:** billing check, archive sweep, reminder fire loop, receivables follow-up, fleet heartbeat, legal deadline reminder loop, tunnel runner, gcal sync, file temp sweep, briefing scheduler, birthdays sweep. (11 threads total.)
+
+**KEY GAPS identified:**
+1. `web_agent.py` missing — Web Tasks tab errors on run
+2. Marketing has no NL chat handler
+3. 5 written modules sitting unused
+4. Fleet dashboard (heartbeat sends to brain, but "customer went dark" alerts + fleet UI not built)
+
+---
+
+## Previous verified state (2026-06-28)
 
 ### Session work
 

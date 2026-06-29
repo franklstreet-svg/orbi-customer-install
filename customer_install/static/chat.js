@@ -1415,6 +1415,39 @@ _audioEl.src = '/tts?text=%20&silent=1';
   async function _submitCartFromChat() {
     const btn = document.getElementById('orbi-cart-submit');
     if (!btn) return;
+
+    // Before submitting, make sure we have the customer's name + phone.
+    // If not collected from the conversation, show a small inline form
+    // right in the cart panel so they can fill it before we hit the API.
+    if (!visitor.phone) {
+      const panel = document.getElementById('orbi-cart-panel');
+      if (panel && !document.getElementById('orbi-contact-form')) {
+        const form = document.createElement('div');
+        form.id = 'orbi-contact-form';
+        form.style.cssText = 'margin-top:10px;padding-top:10px;border-top:1px dashed #e6e8ec;';
+        form.innerHTML = `
+          <div style="font-size:12px;color:#555;margin-bottom:6px">We need your name and phone number to send the order:</div>
+          <input id="orbi-cf-name" placeholder="Your name" style="width:100%;box-sizing:border-box;padding:7px 9px;border:1px solid #ccc;border-radius:5px;font-size:13px;margin-bottom:6px">
+          <input id="orbi-cf-phone" placeholder="Phone number" type="tel" style="width:100%;box-sizing:border-box;padding:7px 9px;border:1px solid #ccc;border-radius:5px;font-size:13px;margin-bottom:8px">
+          <button id="orbi-cf-submit" style="width:100%;padding:8px;background:#1a8e3a;color:#fff;border:none;border-radius:5px;font-size:13px;font-weight:700;cursor:pointer">Send Order</button>
+        `;
+        panel.appendChild(form);
+        btn.style.display = 'none';
+        document.getElementById('orbi-cf-submit').addEventListener('click', () => {
+          const name  = (document.getElementById('orbi-cf-name').value || '').trim();
+          const phone = (document.getElementById('orbi-cf-phone').value || '').trim();
+          if (!phone) { document.getElementById('orbi-cf-phone').style.borderColor = '#c00'; return; }
+          if (name && !visitor.name)  { visitor.name  = name;  }
+          if (phone && !visitor.phone){ visitor.phone = phone; }
+          saveVisitorInfo();
+          form.remove();
+          btn.style.display = '';
+          _submitCartFromChat();
+        });
+      }
+      return;
+    }
+
     btn.disabled = true;
     btn.style.opacity = '0.7';
     btn.textContent = 'Submitting…';

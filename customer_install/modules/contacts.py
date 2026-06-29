@@ -200,6 +200,11 @@ def search(user_dir: Path, query: str) -> list[dict]:
             c.get("name", ""), c.get("phone", ""), c.get("email", ""),
             c.get("company", ""), c.get("notes", ""),
             " ".join(c.get("tags", []) or []),
+            " ".join(
+                str(n.get("note", ""))
+                for n in (c.get("personal_notes", []) or [])
+                if isinstance(n, dict)
+            ),
         ]).lower()
         if q in haystack:
             hits.append(c)

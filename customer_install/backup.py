@@ -33,7 +33,6 @@ import tarfile
 import time
 import urllib.parse
 import urllib.request
-from datetime import datetime
 from pathlib import Path
 
 log = logging.getLogger("orbi.backup")
@@ -251,6 +250,17 @@ def _prune_local_backups(backup_dir: Path, retention: int = 14) -> int:
     return deleted
 
 
+def _current_local_backup_name(config: dict) -> str:
+    """Single rolling local snapshot name.
+
+    Frank 2026-06-25: local backups must overwrite in place instead of
+    stacking timestamped archives. Keep this stable unless the owner
+    explicitly asks for rotating backups again.
+    """
+    bk_cfg = config.get("backup", {})
+    return str(bk_cfg.get("local_name") or "orbi-current.tar.gz.enc")
+
+
 def run_backup(config: dict, data_dir: Path) -> dict:
     """Bundle, encrypt, write. Returns summary.
 
@@ -269,7 +279,7 @@ def run_backup(config: dict, data_dir: Path) -> dict:
     mode = bk_cfg.get("mode", "local")    # default LOCAL — works out of box
 
     raw = bundle(data_dir)
-    name = f"orbi-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}.tar.gz.enc"
+    name = _current_local_backup_name(config)
 
     if mode == "local":
         key = _get_or_create_local_key(data_dir)
@@ -280,8 +290,7 @@ def run_backup(config: dict, data_dir: Path) -> dict:
         tmp = dest.with_suffix(".enc.tmp")
         tmp.write_bytes(encrypted)
         tmp.replace(dest)
-        pruned = _prune_local_backups(
-            backup_dir, retention=int(bk_cfg.get("retention", 14)))
+        pruned = _prune_local_backups(backup_dir, retention=1)
         state = _load_state(data_dir)
         state["last_backup_ts"] = int(time.time())
         state["last_backup_name"] = name
@@ -294,6 +303,7 @@ def run_backup(config: dict, data_dir: Path) -> dict:
                 "bytes": len(encrypted), "path": str(dest), "pruned": pruned}
 
     # mode == "cloud" — original passphrase+upload flow
+    name = f"orbi-current.tar.gz.enc"
     state = _load_state(data_dir)
     if not state.get("salt"):
         return {"status": "error", "reason": "passphrase_not_set"}

@@ -56,9 +56,14 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 def workspace_path(config: dict | None = None) -> Path:
+    import os
     if config and (config.get("workspace") or {}).get("path"):
         return Path(config["workspace"]["path"]).expanduser()
-    # Default: ~/Orbi/ — easy for the owner to find
+    # Multi-tenant: ORBI_DIR is set per-tenant, so files stay isolated.
+    orbi_dir = os.environ.get("ORBI_DIR")
+    if orbi_dir:
+        return Path(orbi_dir) / "workspace"
+    # Single customer install fallback: ~/Orbi/ — easy for the owner to find
     return Path.home() / "Orbi"
 
 def index_path(data_dir: Path) -> Path:

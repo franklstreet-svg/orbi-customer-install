@@ -47,9 +47,15 @@ _KNOWLEDGE_KEYWORDS = (
 
 def needs_web_search(query: str) -> bool:
     """Cheap check — should we even try the web for this?"""
+    import re as _re
     q = (query or "").lower().strip()
     if not q:
         return False
+    # Explicit "search the web / look this up" commands always get a real search
+    if _re.match(r"(?:search\s+(?:the\s+)?(?:web|online|internet)\s+for\b|"
+                 r"(?:look|find)\s+(?:it\s+)?(?:up|online)\b|"
+                 r"google\b|search\s+for\b)", q):
+        return True
     if any(k in q for k in _FRESH_KEYWORDS):
         return True
     # Knowledge-shaped questions get the web only if they don't seem to be
