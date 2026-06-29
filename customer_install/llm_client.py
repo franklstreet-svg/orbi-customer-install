@@ -148,7 +148,8 @@ def call_huggingface(config: dict, system: str, messages: list[dict]) -> LLMResp
     }
     timeout = _GEN_OVERRIDES.get("timeout_seconds") or cfg.get("timeout_seconds", 15)
 
-    # Attempt 1: router (Inference Providers — requires paid HF Pro)
+    # Attempt 1: featherless-ai (Qwen 2.5 72B dropped off all HF providers 2026-06-29;
+    # featherless-ai serves Llama 3.3 70B, ~3-4s, cost unlisted but HF-billed).
     payload = {
         "model": model,
         "messages": [{"role": "system", "content": system}] + messages,
@@ -156,14 +157,14 @@ def call_huggingface(config: dict, system: str, messages: list[dict]) -> LLMResp
         "max_tokens": _GEN_OVERRIDES.get("max_tokens") or 4096,
         "stream": False,
     }
-    resp = _http_chat("https://router.huggingface.co/v1/chat/completions",
+    resp = _http_chat("https://router.huggingface.co/featherless-ai/v1/chat/completions",
                       payload, headers, timeout, tier="huggingface")
     if resp:
         return resp
 
-    # Attempt 2: direct model endpoint (older free tier — model is in URL path)
-    url = f"https://api-inference.huggingface.co/models/{model}/v1/chat/completions"
-    resp = _http_chat(url, payload, headers, timeout, tier="huggingface")
+    # Attempt 2: auto-router fallback (provider selection varies by availability)
+    resp = _http_chat("https://router.huggingface.co/v1/chat/completions",
+                      payload, headers, timeout, tier="huggingface")
     return resp
 
 

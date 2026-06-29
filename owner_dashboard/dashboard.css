@@ -2353,3 +2353,5 @@ dialog .form-actions {
 .badge-blue   { background: rgba(58,122,240,0.2);  color: #6ea2ff; font-size:11px; padding:2px 8px; border-radius:12px; font-weight:600; }
 .badge-yellow { background: rgba(255,193,7,0.2);   color: #ffc107; font-size:11px; padding:2px 8px; border-radius:12px; font-weight:600; }
 .badge-gray   { background: rgba(136,152,192,0.2); color: #8898c0; font-size:11px; padding:2px 8px; border-radius:12px; font-weight:600; }
+
+@keyframes spin360 { to { transform: rotate(360deg); } }

@@ -6050,14 +6050,16 @@
 
   async function _generateCampaign() {
     const ta = document.getElementById('marketing-brief');
-    const status = document.getElementById('marketing-status');
+    const statusBar = document.getElementById('marketing-status-bar');
+    const statusMsg = document.getElementById('marketing-status');
     const btn = document.getElementById('marketing-generate');
     const brief = (ta && ta.value || '').trim();
     if (brief.length < 8) {
-      if (status) status.textContent = 'Tell me a bit more about the campaign first.';
+      showToast('Give me a little more detail about the campaign first.');
       return;
     }
-    if (status) status.textContent = 'Generating… (10-20 seconds)';
+    if (statusBar) { statusBar.hidden = false; statusBar.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }
+    if (statusMsg) statusMsg.textContent = 'Writing 7 platform assets — usually 5–15 seconds';
     if (btn) btn.disabled = true;
     try {
       const r = await api('/api/owner/marketing/generate', {
@@ -6074,10 +6076,13 @@
       _renderCampaignResults(_currentCampaign.title,
                               _currentCampaign.assets,
                               _currentCampaign.images);
-      if (status) status.textContent = '';
+      if (statusBar) statusBar.hidden = true;
+      const results = document.getElementById('marketing-results');
+      if (results) results.scrollIntoView({ behavior: 'smooth', block: 'start' });
     } catch (e) {
       console.error('marketing generate failed', e);
-      if (status) status.textContent = 'Generation failed — try again or rephrase.';
+      if (statusBar) statusBar.hidden = true;
+      showToast('Generation failed — try again or rephrase your brief.');
     } finally {
       if (btn) btn.disabled = false;
     }
