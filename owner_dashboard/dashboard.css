@@ -2355,3 +2355,54 @@ dialog .form-actions {
 .badge-gray   { background: rgba(136,152,192,0.2); color: #8898c0; font-size:11px; padding:2px 8px; border-radius:12px; font-weight:600; }
 
 @keyframes spin360 { to { transform: rotate(360deg); } }
+
+/* ── Retail module ──────────────────────────────────────────────────────── */
+.retail-layout {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 24px;
+  align-items: start;
+}
+@media (max-width: 860px) {
+  .retail-layout { grid-template-columns: 1fr; }
+}
+.retail-section {
+  background: rgba(255,255,255,0.02);
+  border: 1px solid #2a3554;
+  border-radius: 14px;
+  padding: 20px;
+}
+.retail-section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 4px;
+}
+.retail-item-list { display: flex; flex-direction: column; gap: 8px; }
+.retail-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: rgba(255,255,255,0.04);
+  border: 1px solid #2a3554;
+  border-radius: 10px;
+  padding: 12px 14px;
+  gap: 10px;
+}
+.retail-item-info { flex: 1; min-width: 0; }
+.retail-item-name { font-weight: 600; font-size: 14px; color: #eaf0ff; }
+.retail-item-meta { font-size: 12px; color: #8899cc; margin-top: 2px; }
+.retail-item-price { font-weight: 700; font-size: 15px; color: #4cbb70; white-space: nowrap; }
+.retail-item-actions { display: flex; gap: 6px; flex-shrink: 0; }
+.retail-form { display: flex; flex-direction: column; gap: 8px; }
+.retail-form-row { display: flex; flex-direction: column; gap: 4px; }
+.retail-form-row label { font-size: 12px; font-weight: 600; color: #8899cc; }
+.retail-form-row input {
+  background: #0f1525;
+  border: 1px solid #2a3554;
+  border-radius: 8px;
+  color: #eaf0ff;
+  font-size: 14px;
+  padding: 9px 12px;
+}
+.retail-empty { color: #8899cc; font-size: 13px; padding: 12px 0; }

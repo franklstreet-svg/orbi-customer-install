@@ -1319,6 +1319,7 @@
   let marketingLoaded = false;
   let legalLoaded = false;
   let contractorLoaded = false;
+  let retailLoaded = false;
 
   document.addEventListener('DOMContentLoaded', async () => {
     // Discover who's logged in (role determines People-tab visibility)
@@ -1347,6 +1348,9 @@
       if (mods.includes('contractor')) {
         document.querySelectorAll('.module-contractor').forEach(el => el.hidden = false);
       }
+      if (mods.includes('retail')) {
+        document.querySelectorAll('.module-retail').forEach(el => el.hidden = false);
+      }
     } catch {}
 
     wireMyDayForms();
@@ -1355,6 +1359,7 @@
     wireMarketing();
     wireLegal();
     wireContractor();
+    wireRetail();
 
     document.querySelectorAll('.tab').forEach(t => {
       t.addEventListener('click', () => {
@@ -1365,6 +1370,7 @@
         if (which === 'marketing' && !marketingLoaded) { loadMarketingLibrary(); marketingLoaded = true; }
         if (which === 'legal'    && !legalLoaded)    { loadLegal();           legalLoaded = true; }
         if (which === 'contractor' && !contractorLoaded) { loadContractor(); contractorLoaded = true; }
+        if (which === 'retail' && !retailLoaded) { loadRetail(); retailLoaded = true; }
       });
     });
   });
@@ -7355,5 +7361,224 @@
       } catch { showToast('Failed to add subcontractor.'); }
     });
   }
+
+  // ── Retail module ──────────────────────────────────────────────────────────
+
+  function wireRetail() {
+    document.getElementById('retail-add-svc-btn')?.addEventListener('click', () => {
+      _retailClearSvcForm();
+      document.getElementById('retail-svc-form-wrap').open = true;
+      document.getElementById('retail-svc-name')?.focus();
+    });
+    document.getElementById('retail-add-prod-btn')?.addEventListener('click', () => {
+      _retailClearProdForm();
+      document.getElementById('retail-prod-form-wrap').open = true;
+      document.getElementById('retail-prod-name')?.focus();
+    });
+    document.getElementById('retail-svc-save')?.addEventListener('click', _retailSaveSvc);
+    document.getElementById('retail-svc-cancel')?.addEventListener('click', () => {
+      _retailClearSvcForm();
+      document.getElementById('retail-svc-form-wrap').open = false;
+    });
+    document.getElementById('retail-prod-save')?.addEventListener('click', _retailSaveProd);
+    document.getElementById('retail-prod-cancel')?.addEventListener('click', () => {
+      _retailClearProdForm();
+      document.getElementById('retail-prod-form-wrap').open = false;
+    });
+  }
+
+  async function loadRetail() {
+    await Promise.all([_retailLoadSvcs(), _retailLoadProds()]);
+  }
+
+  async function _retailLoadSvcs() {
+    const list = document.getElementById('retail-svc-list');
+    if (!list) return;
+    try {
+      const r = await api('/api/owner/retail/services');
+      const svcs = r.services || [];
+      if (!svcs.length) {
+        list.innerHTML = '<div class="retail-empty">No services yet — add your first one above.</div>';
+        return;
+      }
+      list.innerHTML = '';
+      svcs.forEach(s => list.appendChild(_retailSvcCard(s)));
+    } catch { list.innerHTML = '<div class="retail-empty">Could not load services.</div>'; }
+  }
+
+  async function _retailLoadProds() {
+    const list = document.getElementById('retail-prod-list');
+    if (!list) return;
+    try {
+      const r = await api('/api/owner/retail/products');
+      const prods = r.products || [];
+      if (!prods.length) {
+        list.innerHTML = '<div class="retail-empty">No products yet — add your first one above.</div>';
+        return;
+      }
+      list.innerHTML = '';
+      prods.forEach(p => list.appendChild(_retailProdCard(p)));
+    } catch { list.innerHTML = '<div class="retail-empty">Could not load products.</div>'; }
+  }
+
+  function _retailSvcCard(s) {
+    const el = document.createElement('div');
+    el.className = 'retail-item';
+    const dur = s.duration_min ? ` · ${s.duration_min} min` : '';
+    const cat = s.category ? ` · ${_esc(s.category)}` : '';
+    el.innerHTML = `
+      <div class="retail-item-info">
+        <div class="retail-item-name">${_esc(s.name)}</div>
+        <div class="retail-item-meta">${cat}${dur}${s.description ? ' · ' + _esc(s.description.slice(0, 60)) : ''}</div>
+      </div>
+      <div class="retail-item-price">$${parseFloat(s.price).toFixed(2)}</div>
+      <div class="retail-item-actions">
+        <button class="secondary-btn" style="padding:5px 10px;font-size:12px" onclick="window.retailEditSvc('${s.id}')">Edit</button>
+        <button class="secondary-btn" style="padding:5px 10px;font-size:12px;color:#e06070" onclick="window.retailDeleteSvc('${s.id}')">Remove</button>
+      </div>`;
+    return el;
+  }
+
+  function _retailProdCard(p) {
+    const el = document.createElement('div');
+    el.className = 'retail-item';
+    const sku = p.sku ? ` · SKU: ${_esc(p.sku)}` : '';
+    const cat = p.category ? ` · ${_esc(p.category)}` : '';
+    el.innerHTML = `
+      <div class="retail-item-info">
+        <div class="retail-item-name">${_esc(p.name)}</div>
+        <div class="retail-item-meta">${cat}${sku}${p.description ? ' · ' + _esc(p.description.slice(0, 60)) : ''}</div>
+      </div>
+      <div class="retail-item-price">$${parseFloat(p.price).toFixed(2)}</div>
+      <div class="retail-item-actions">
+        <button class="secondary-btn" style="padding:5px 10px;font-size:12px" onclick="window.retailEditProd('${p.id}')">Edit</button>
+        <button class="secondary-btn" style="padding:5px 10px;font-size:12px;color:#e06070" onclick="window.retailDeleteProd('${p.id}')">Remove</button>
+      </div>`;
+    return el;
+  }
+
+  async function _retailSaveSvc() {
+    const id    = document.getElementById('retail-svc-id').value;
+    const name  = document.getElementById('retail-svc-name').value.trim();
+    const price = document.getElementById('retail-svc-price').value;
+    const status = document.getElementById('retail-svc-status');
+    if (!name || !price) { if (status) status.textContent = 'Name and price are required.'; return; }
+    try {
+      if (id) {
+        await api(`/api/owner/retail/services/${id}`, { method: 'PUT', body: JSON.stringify({
+          name, price: parseFloat(price),
+          category: document.getElementById('retail-svc-category').value.trim(),
+          duration_min: parseInt(document.getElementById('retail-svc-duration').value) || 0,
+          description: document.getElementById('retail-svc-description').value.trim(),
+        })});
+      } else {
+        await api('/api/owner/retail/services', { method: 'POST', body: JSON.stringify({
+          name, price: parseFloat(price),
+          category: document.getElementById('retail-svc-category').value.trim(),
+          duration_min: parseInt(document.getElementById('retail-svc-duration').value) || 0,
+          description: document.getElementById('retail-svc-description').value.trim(),
+        })});
+      }
+      _retailClearSvcForm();
+      document.getElementById('retail-svc-form-wrap').open = false;
+      await _retailLoadSvcs();
+    } catch (e) { if (status) status.textContent = 'Save failed: ' + e.message; }
+  }
+
+  async function _retailSaveProd() {
+    const id    = document.getElementById('retail-prod-id').value;
+    const name  = document.getElementById('retail-prod-name').value.trim();
+    const price = document.getElementById('retail-prod-price').value;
+    const status = document.getElementById('retail-prod-status');
+    if (!name || !price) { if (status) status.textContent = 'Name and price are required.'; return; }
+    try {
+      if (id) {
+        await api(`/api/owner/retail/products/${id}`, { method: 'PUT', body: JSON.stringify({
+          name, price: parseFloat(price),
+          category: document.getElementById('retail-prod-category').value.trim(),
+          sku: document.getElementById('retail-prod-sku').value.trim(),
+          description: document.getElementById('retail-prod-description').value.trim(),
+        })});
+      } else {
+        await api('/api/owner/retail/products', { method: 'POST', body: JSON.stringify({
+          name, price: parseFloat(price),
+          category: document.getElementById('retail-prod-category').value.trim(),
+          sku: document.getElementById('retail-prod-sku').value.trim(),
+          description: document.getElementById('retail-prod-description').value.trim(),
+        })});
+      }
+      _retailClearProdForm();
+      document.getElementById('retail-prod-form-wrap').open = false;
+      await _retailLoadProds();
+    } catch (e) { if (status) status.textContent = 'Save failed: ' + e.message; }
+  }
+
+  function _retailClearSvcForm() {
+    ['retail-svc-id','retail-svc-name','retail-svc-price','retail-svc-category',
+     'retail-svc-duration','retail-svc-description'].forEach(id => {
+      const el = document.getElementById(id);
+      if (el) el.value = '';
+    });
+    const st = document.getElementById('retail-svc-status');
+    if (st) st.textContent = '';
+  }
+
+  function _retailClearProdForm() {
+    ['retail-prod-id','retail-prod-name','retail-prod-price','retail-prod-category',
+     'retail-prod-sku','retail-prod-description'].forEach(id => {
+      const el = document.getElementById(id);
+      if (el) el.value = '';
+    });
+    const st = document.getElementById('retail-prod-status');
+    if (st) st.textContent = '';
+  }
+
+  window.retailEditSvc = async function(id) {
+    try {
+      const r = await api('/api/owner/retail/services');
+      const s = (r.services || []).find(x => x.id === id);
+      if (!s) return;
+      document.getElementById('retail-svc-id').value = s.id;
+      document.getElementById('retail-svc-name').value = s.name;
+      document.getElementById('retail-svc-price').value = s.price;
+      document.getElementById('retail-svc-category').value = s.category || '';
+      document.getElementById('retail-svc-duration').value = s.duration_min || '';
+      document.getElementById('retail-svc-description').value = s.description || '';
+      document.getElementById('retail-svc-form-wrap').open = true;
+      document.getElementById('retail-svc-name')?.focus();
+    } catch { showToast('Could not load service.'); }
+  };
+
+  window.retailDeleteSvc = async function(id) {
+    if (!confirm('Remove this service?')) return;
+    try {
+      await api(`/api/owner/retail/services/${id}`, { method: 'DELETE' });
+      await _retailLoadSvcs();
+    } catch { showToast('Could not remove service.'); }
+  };
+
+  window.retailEditProd = async function(id) {
+    try {
+      const r = await api('/api/owner/retail/products');
+      const p = (r.products || []).find(x => x.id === id);
+      if (!p) return;
+      document.getElementById('retail-prod-id').value = p.id;
+      document.getElementById('retail-prod-name').value = p.name;
+      document.getElementById('retail-prod-price').value = p.price;
+      document.getElementById('retail-prod-category').value = p.category || '';
+      document.getElementById('retail-prod-sku').value = p.sku || '';
+      document.getElementById('retail-prod-description').value = p.description || '';
+      document.getElementById('retail-prod-form-wrap').open = true;
+      document.getElementById('retail-prod-name')?.focus();
+    } catch { showToast('Could not load product.'); }
+  };
+
+  window.retailDeleteProd = async function(id) {
+    if (!confirm('Remove this product?')) return;
+    try {
+      await api(`/api/owner/retail/products/${id}`, { method: 'DELETE' });
+      await _retailLoadProds();
+    } catch { showToast('Could not remove product.'); }
+  };
 
 })();

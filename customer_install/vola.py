@@ -114,6 +114,8 @@ from modules import subcontractors as mod_subs
 from modules import invoice_pdf as mod_invoice_pdf
 from modules import closeout_pdf as mod_closeout_pdf
 from modules import bids as mod_bids
+# Retail module (paid add-on, gated via is_module_enabled('retail')).
+from modules import retail as mod_retail
 from modules import reviews as mod_reviews
 from modules import proposal_pdf as mod_proposal_pdf
 from modules import clients as mod_clients
@@ -3602,6 +3604,123 @@ def gc_summary():
     })
 
 
+# ============================================================================
+# RETAIL MODULE — services & products catalog
+# ============================================================================
+
+def _require_retail_module():
+    owner_session = auth.require_owner(ORBI_DIR)
+    if not is_module_enabled("retail"):
+        abort(402, "Retail module not enabled")
+    return owner_session
+
+
+# ── Services ─────────────────────────────────────────────────────────────────
+
+@app.route("/api/owner/retail/services", methods=["GET"])
+def retail_services_list():
+    _require_retail_module()
+    services = mod_retail.list_services(DATA_DIR)
+    return jsonify({"ok": True, "services": services})
+
+
+@app.route("/api/owner/retail/services", methods=["POST"])
+def retail_services_create():
+    _require_retail_module()
+    body = request.get_json(force=True) or {}
+    name = (body.get("name") or "").strip()
+    if not name:
+        return jsonify({"ok": False, "error": "name required"}), 400
+    try:
+        price = float(body.get("price") or 0)
+    except (ValueError, TypeError):
+        return jsonify({"ok": False, "error": "invalid price"}), 400
+    svc = mod_retail.add_service(
+        DATA_DIR, name=name, price=price,
+        category=body.get("category", ""),
+        duration_min=int(body.get("duration_min") or 0),
+        description=body.get("description", ""),
+    )
+    return jsonify({"ok": True, "service": svc}), 201
+
+
+@app.route("/api/owner/retail/services/<svc_id>", methods=["PUT"])
+def retail_services_update(svc_id):
+    _require_retail_module()
+    body = request.get_json(force=True) or {}
+    allowed = ("name", "category", "price", "duration_min", "description", "active")
+    fields = {k: body[k] for k in allowed if k in body}
+    updated = mod_retail.update_service(DATA_DIR, svc_id, **fields)
+    if not updated:
+        return jsonify({"ok": False, "error": "not found"}), 404
+    return jsonify({"ok": True, "service": updated})
+
+
+@app.route("/api/owner/retail/services/<svc_id>", methods=["DELETE"])
+def retail_services_delete(svc_id):
+    _require_retail_module()
+    if mod_retail.delete_service(DATA_DIR, svc_id):
+        return jsonify({"ok": True})
+    return jsonify({"ok": False, "error": "not found"}), 404
+
+
+# ── Products ─────────────────────────────────────────────────────────────────
+
+@app.route("/api/owner/retail/products", methods=["GET"])
+def retail_products_list():
+    _require_retail_module()
+    products = mod_retail.list_products(DATA_DIR)
+    return jsonify({"ok": True, "products": products})
+
+
+@app.route("/api/owner/retail/products", methods=["POST"])
+def retail_products_create():
+    _require_retail_module()
+    body = request.get_json(force=True) or {}
+    name = (body.get("name") or "").strip()
+    if not name:
+        return jsonify({"ok": False, "error": "name required"}), 400
+    try:
+        price = float(body.get("price") or 0)
+    except (ValueError, TypeError):
+        return jsonify({"ok": False, "error": "invalid price"}), 400
+    product = mod_retail.add_product(
+        DATA_DIR, name=name, price=price,
+        category=body.get("category", ""),
+        sku=body.get("sku", ""),
+        description=body.get("description", ""),
+    )
+    return jsonify({"ok": True, "product": product}), 201
+
+
+@app.route("/api/owner/retail/products/<prod_id>", methods=["PUT"])
+def retail_products_update(prod_id):
+    _require_retail_module()
+    body = request.get_json(force=True) or {}
+    allowed = ("name", "category", "price", "sku", "description", "active")
+    fields = {k: body[k] for k in allowed if k in body}
+    updated = mod_retail.update_product(DATA_DIR, prod_id, **fields)
+    if not updated:
+        return jsonify({"ok": False, "error": "not found"}), 404
+    return jsonify({"ok": True, "product": updated})
+
+
+@app.route("/api/owner/retail/products/<prod_id>", methods=["DELETE"])
+def retail_products_delete(prod_id):
+    _require_retail_module()
+    if mod_retail.delete_product(DATA_DIR, prod_id):
+        return jsonify({"ok": True})
+    return jsonify({"ok": False, "error": "not found"}), 404
+
+
+# ── Summary ───────────────────────────────────────────────────────────────────
+
+@app.route("/api/owner/retail/summary", methods=["GET"])
+def retail_summary():
+    _require_retail_module()
+    return jsonify({"ok": True, **mod_retail.summary(DATA_DIR)})
+
+
 
 @app.route("/api/owner/legal/contract_review", methods=["POST"])
 def legal_contract_review():
@@ -4028,6 +4147,15 @@ def public_chat():
             log.info("public catalog hits: %d strong matches for %r", len(strong_cat), user_msg[:60])
     except Exception as e:
         log.warning(f"public catalog lookup failed: {e}")
+
+    if is_module_enabled("retail"):
+        try:
+            retail_ctx = mod_retail.context_block(DATA_DIR)
+            if retail_ctx:
+                extras.append(retail_ctx)
+        except Exception as e:
+            log.warning(f"retail context failed: {e}")
+
     # Priority decision — three-way:
     #   STRONG workspace match (score >= 3) → workspace wins, even for fresh queries.
     #     "What's special right now?" → workspace has a high-scoring "promotion" file → use it.
@@ -7181,6 +7309,11 @@ def owner_chat():
                        mod_contacts.context_block(user_dir)):
         if module_ctx:
             extras.append(module_ctx)
+
+    if is_module_enabled("retail"):
+        retail_ctx = mod_retail.context_block(DATA_DIR)
+        if retail_ctx:
+            extras.append(retail_ctx)
 
     # ALWAYS-ON self-context: which add-on modules are enabled. Tiny
     # block, but it stops the LLM from claiming "I don't have a
