@@ -503,7 +503,13 @@ def build_public_prompt(business: dict, scope: dict | None = None,
 
     capabilities = []
     if scope.get("public_can_take_orders"):
-        capabilities.append("- Take orders from customers. Always confirm name, phone, items, and pickup/delivery time. Then say 'I've sent your order to {}.'".format(name))
+        capabilities.append(
+            "- Take orders from customers. BEFORE confirming or saying you'll text anything, "
+            "collect: (1) their name, (2) their phone number, (3) pickup time. "
+            "Ask for these ONE AT A TIME if not yet provided — name first, then phone, then time. "
+            "Only after you have all three say: 'Got it — I'll send that to the kitchen now.' "
+            "NEVER say 'I'll text you' or 'I'll send a confirmation' unless you already have their phone number."
+        )
     if scope.get("public_can_book_appointments"):
         capabilities.append("- Book appointments. Always confirm name, phone, service, date and time.")
     if scope.get("public_can_request_quotes"):
@@ -1996,8 +2002,45 @@ POLICIES:
     # AND customer-facing) sees the same product capabilities + how-tos.
     product_knowledge_block = _format_product_knowledge_block()
 
+    # Attorney profile — injected when the business has legal data filled in.
+    legal_profile_block = ""
+    legal_data = business.get("legal") or {}
+    if legal_data:
+        atty_name  = legal_data.get("attorney_name", "")
+        bar_num    = legal_data.get("bar_number", "")
+        areas      = legal_data.get("practice_areas") or []
+        jx         = legal_data.get("default_jurisdiction", "")
+        rate       = legal_data.get("default_hourly_rate")
+        consult    = legal_data.get("consultation_fee", "")
+        fee_struct = legal_data.get("fee_structure", "")
+        disclaimer = legal_data.get("conflict_disclaimer", "")
+        areas_str  = ", ".join(areas) if isinstance(areas, list) else str(areas)
+
+        parts = []
+        if atty_name:
+            parts.append(f"Lead attorney: {atty_name}" + (f" ({bar_num})" if bar_num else ""))
+        if areas_str:
+            parts.append(f"Practice areas: {areas_str}")
+        if jx:
+            parts.append(f"Primary jurisdiction: {jx}")
+        if rate:
+            parts.append(f"Standard hourly rate: ${rate}/hr")
+        if fee_struct:
+            parts.append(f"Fee structure: {fee_struct}")
+        if consult:
+            parts.append(f"Initial consultation: {consult}")
+        if disclaimer and disclaimer != "standard":
+            parts.append(f"Conflict check response: {disclaimer}")
+
+        if parts:
+            legal_profile_block = (
+                "\n\nATTORNEY PROFILE (use these facts when callers ask about the firm):\n"
+                + "\n".join(f"- {p}" for p in parts)
+                + "\n"
+            )
+
     return f"""{intro}
-{profile}
+{profile}{legal_profile_block}
 {product_knowledge_block}
 
 CONVERSATIONAL TONE WITH THE OWNER (read this carefully)

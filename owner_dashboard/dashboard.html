@@ -911,7 +911,9 @@
           <button class="legal-snav" data-sec="drafts">Documents</button>
           <button class="legal-snav" data-sec="time">Time</button>
           <button class="legal-snav" data-sec="research">Research</button>
+          <button class="legal-snav" data-sec="contract">Contract Review</button>
           <hr style="border:none;border-top:1px solid #2a3554;margin:8px 0">
+          <button class="legal-snav" data-sec="billing">Billing</button>
           <button class="legal-snav" data-sec="conflict">Conflict Check</button>
         </nav>
 
@@ -941,11 +943,21 @@
                   <option value="estate_planning">Estate Planning</option>
                   <option value="immigration">Immigration</option>
                   <option value="bankruptcy">Bankruptcy</option>
+                  <option value="intellectual_property">Intellectual Property</option>
+                  <option value="medical_malpractice">Medical Malpractice</option>
                   <option value="other">Other</option>
                 </select>
                 <input id="nm-rate" class="legal-input" type="number" placeholder="Hourly rate ($)" min="0" step="0.01">
                 <input id="nm-email" class="legal-input" placeholder="Client email" type="email">
                 <input id="nm-phone" class="legal-input" placeholder="Client phone">
+                <input id="nm-opposing" class="legal-input" placeholder="Opposing party" style="grid-column:1/-1">
+                <input id="nm-opp-counsel" class="legal-input" placeholder="Opposing counsel">
+                <input id="nm-opp-firm" class="legal-input" placeholder="Opposing firm">
+                <input id="nm-court" class="legal-input" placeholder="Court (e.g. Washoe County District Court)">
+                <input id="nm-case-number" class="legal-input" placeholder="Case / docket number">
+                <input id="nm-judge" class="legal-input" placeholder="Judge">
+                <input id="nm-jurisdiction" class="legal-input" placeholder="Jurisdiction (e.g. NV)">
+                <input id="nm-retainer" class="legal-input" type="number" placeholder="Retainer amount ($)" min="0" step="0.01">
               </div>
               <textarea id="nm-notes" class="legal-input" rows="2" placeholder="Initial notes (optional)" style="margin-top:10px;resize:vertical"></textarea>
               <div style="display:flex;gap:10px;margin-top:12px;align-items:center">
@@ -1005,12 +1017,34 @@
               <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
                 <select id="draft-template" class="legal-input">
                   <option value="">Choose template…</option>
-                  <option value="demand_letter">Demand Letter</option>
-                  <option value="retainer_agreement">Retainer Agreement</option>
-                  <option value="client_intake">Client Intake Summary</option>
-                  <option value="motion_to_dismiss">Motion to Dismiss</option>
-                  <option value="discovery_request">Discovery Request</option>
-                  <option value="settlement_letter">Settlement Letter</option>
+                  <optgroup label="── Client-Facing ──">
+                    <option value="demand_letter">Demand Letter</option>
+                    <option value="retainer_agreement">Retainer Agreement</option>
+                    <option value="settlement_letter">Settlement Confirmation Letter</option>
+                    <option value="settlement_agreement">Settlement Agreement &amp; Release</option>
+                    <option value="client_intake">Client Intake Summary</option>
+                  </optgroup>
+                  <optgroup label="── Pleadings ──">
+                    <option value="complaint">Civil Complaint</option>
+                    <option value="answer">Answer to Complaint</option>
+                    <option value="motion_to_dismiss">Motion to Dismiss</option>
+                    <option value="motion_summary_judgment">Motion for Summary Judgment</option>
+                    <option value="motion_in_limine">Motion in Limine</option>
+                    <option value="opposition">Opposition to Motion</option>
+                    <option value="proposed_order">Proposed Order</option>
+                  </optgroup>
+                  <optgroup label="── Discovery ──">
+                    <option value="discovery_request">Discovery Request Set</option>
+                    <option value="notice_deposition">Notice of Deposition</option>
+                    <option value="subpoena">Subpoena</option>
+                  </optgroup>
+                  <optgroup label="── Trial &amp; Appeal ──">
+                    <option value="trial_brief">Trial Brief</option>
+                    <option value="appellate_brief">Appellate Brief</option>
+                  </optgroup>
+                  <optgroup label="── Other ──">
+                    <option value="affidavit">Affidavit / Declaration</option>
+                  </optgroup>
                 </select>
                 <input id="draft-matter" class="legal-input" placeholder="Matter name or number" list="draft-matters-list">
                 <datalist id="draft-matters-list"></datalist>
@@ -1102,6 +1136,49 @@
               <span id="conflict-status" class="muted" style="font-size:13px"></span>
             </div>
             <div id="conflict-result" hidden style="margin-top:16px;border-radius:10px;padding:16px;border:1px solid #2a3554;font-size:14px"></div>
+          </div>
+
+          <!-- BILLING — generate invoices from logged time entries -->
+          <div class="legal-sec" id="lsec-billing" hidden>
+            <h2 style="margin:0 0 6px">Billing</h2>
+            <p class="muted" style="font-size:13.5px;margin:0 0 16px">Select a matter and generate a billing invoice from all logged, unbilled time entries. Ready to copy, print, or email to the client.</p>
+            <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:14px">
+              <select id="billing-matter-select" class="legal-input" style="max-width:320px">
+                <option value="">Select matter…</option>
+              </select>
+              <button id="billing-generate-btn" class="primary-btn" style="font-size:13px">Generate Invoice</button>
+              <span id="billing-status" class="muted" style="font-size:13px"></span>
+            </div>
+            <div id="billing-invoice-panel" hidden>
+              <div style="display:flex;gap:10px;margin-bottom:12px;align-items:center">
+                <strong id="billing-invoice-title" style="font-size:15px"></strong>
+                <button id="billing-copy-btn" class="text-btn" style="font-size:12px">Copy</button>
+                <button id="billing-mark-billed-btn" class="secondary-btn" style="font-size:12px;padding:4px 12px">Mark All Billed</button>
+              </div>
+              <div id="billing-invoice-text" style="white-space:pre-wrap;font-size:13px;line-height:1.8;color:#d0d8f0;background:#0d1626;border-radius:10px;padding:20px;border:1px solid #2a3554;font-family:monospace"></div>
+            </div>
+          </div>
+
+          <!-- CONTRACT REVIEW — paste contract text, get exit strategy analysis -->
+          <div class="legal-sec" id="lsec-contract" hidden>
+            <h2 style="margin:0 0 6px">Contract Review</h2>
+            <p class="muted" style="font-size:13.5px;margin:0 0 16px">Paste a contract and I'll identify exit routes, leverage points, and flag risky clauses — ready for attorney review.</p>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px">
+              <input id="contract-client-side" class="legal-input" placeholder="Which party is our client? (e.g. Buyer, Tenant, Employee)">
+              <input id="contract-jurisdiction" class="legal-input" placeholder="Jurisdiction (e.g. Nevada)">
+            </div>
+            <textarea id="contract-text" class="legal-input" rows="12" placeholder="Paste the full contract text here…" style="resize:vertical;font-family:monospace;font-size:12px"></textarea>
+            <div style="display:flex;gap:10px;margin-top:12px;align-items:center">
+              <button id="contract-analyze-btn" class="primary-btn" style="font-size:13px">Analyze Contract</button>
+              <span id="contract-status" class="muted" style="font-size:13px"></span>
+            </div>
+            <div id="contract-result" hidden style="margin-top:20px">
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+                <strong style="font-size:14px">Exit Strategy Memo</strong>
+                <button id="contract-copy-btn" class="text-btn" style="font-size:12px">Copy</button>
+              </div>
+              <div id="contract-result-text" style="white-space:pre-wrap;font-size:13px;line-height:1.7;color:#d0d8f0;background:#0d1626;border-radius:10px;padding:18px;border:1px solid #2a3554"></div>
+            </div>
           </div>
 
         </div><!-- end main content -->

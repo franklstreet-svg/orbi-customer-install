@@ -6500,14 +6500,25 @@
             title,
             client_name: client,
             matter_type: document.getElementById('nm-type').value || 'other',
-            rate: document.getElementById('nm-rate').value || null,
+            rate: parseFloat(document.getElementById('nm-rate').value) || null,
+            retainer: parseFloat(document.getElementById('nm-retainer').value) || null,
             client_email: document.getElementById('nm-email').value || '',
             client_phone: document.getElementById('nm-phone').value || '',
+            opposing_party: document.getElementById('nm-opposing').value || '',
+            opposing_counsel: document.getElementById('nm-opp-counsel').value || '',
+            opposing_firm: document.getElementById('nm-opp-firm').value || '',
+            court: document.getElementById('nm-court').value || '',
+            case_number: document.getElementById('nm-case-number').value || '',
+            judge: document.getElementById('nm-judge').value || '',
+            jurisdiction: document.getElementById('nm-jurisdiction').value || '',
             notes: document.getElementById('nm-notes').value || '',
           })
         });
         newMatterForm.hidden = true; newMatterBtn.hidden = false;
-        ['nm-title','nm-client','nm-email','nm-phone','nm-notes'].forEach(id => { const el = document.getElementById(id); if(el) el.value=''; });
+        ['nm-title','nm-client','nm-email','nm-phone','nm-notes',
+         'nm-opposing','nm-opp-counsel','nm-opp-firm','nm-court',
+         'nm-case-number','nm-judge','nm-jurisdiction','nm-retainer']
+          .forEach(id => { const el = document.getElementById(id); if(el) el.value=''; });
         document.getElementById('nm-rate').value = '';
         document.getElementById('nm-type').value = '';
         status.textContent = '';
@@ -6716,6 +6727,89 @@
     });
     const conflictInput = document.getElementById('conflict-name');
     if (conflictInput) conflictInput.addEventListener('keydown', e => { if (e.key === 'Enter') conflictBtn?.click(); });
+
+    // === BILLING ===
+    async function _loadBillingMatters() {
+      const sel = document.getElementById('billing-matter-select');
+      if (!sel) return;
+      try {
+        const data = await api('/api/owner/legal/matters');
+        const active = (data.matters || []).filter(m => !['closed','settled'].includes(m.status));
+        sel.innerHTML = '<option value="">Select matter…</option>' +
+          active.map(m => `<option value="${m.id}">${_lesc(m.matter_number||'')} ${_lesc(m.title)}</option>`).join('');
+      } catch {}
+    }
+    _loadBillingMatters();
+
+    const billingBtn = document.getElementById('billing-generate-btn');
+    if (billingBtn) billingBtn.addEventListener('click', async () => {
+      const matterId = document.getElementById('billing-matter-select').value;
+      if (!matterId) { document.getElementById('billing-status').textContent = 'Select a matter first.'; return; }
+      const status = document.getElementById('billing-status');
+      status.textContent = 'Generating…'; billingBtn.disabled = true;
+      try {
+        const data = await api(`/api/owner/legal/billing/invoice/${matterId}`);
+        document.getElementById('billing-invoice-title').textContent = data.matter_title || 'Invoice';
+        document.getElementById('billing-invoice-text').textContent = data.invoice_text || '';
+        document.getElementById('billing-invoice-panel').hidden = false;
+        status.textContent = data.entry_count ? `${data.entry_count} entries, $${data.total.toFixed(2)} total` : '';
+        document.getElementById('billing-mark-billed-btn').dataset.matterId = matterId;
+      } catch (e) {
+        status.textContent = 'Could not generate invoice.';
+      }
+      billingBtn.disabled = false;
+    });
+
+    const billingCopy = document.getElementById('billing-copy-btn');
+    if (billingCopy) billingCopy.addEventListener('click', () => {
+      navigator.clipboard.writeText(document.getElementById('billing-invoice-text').textContent);
+      billingCopy.textContent = 'Copied!';
+      setTimeout(() => { billingCopy.textContent = 'Copy'; }, 2000);
+    });
+
+    const markBilledBtn = document.getElementById('billing-mark-billed-btn');
+    if (markBilledBtn) markBilledBtn.addEventListener('click', async () => {
+      const matterId = markBilledBtn.dataset.matterId;
+      if (!matterId) return;
+      if (!confirm('Mark all displayed time entries as billed? This cannot be undone.')) return;
+      try {
+        await api(`/api/owner/legal/time/bill/${matterId}`, { method: 'POST' });
+        document.getElementById('billing-status').textContent = 'All entries marked billed.';
+        document.getElementById('billing-invoice-panel').hidden = true;
+      } catch { document.getElementById('billing-status').textContent = 'Error marking billed.'; }
+    });
+
+    // === CONTRACT REVIEW ===
+    const contractBtn = document.getElementById('contract-analyze-btn');
+    if (contractBtn) contractBtn.addEventListener('click', async () => {
+      const text = document.getElementById('contract-text').value.trim();
+      if (!text) { document.getElementById('contract-status').textContent = 'Paste contract text first.'; return; }
+      const status = document.getElementById('contract-status');
+      const result = document.getElementById('contract-result');
+      status.textContent = 'Analyzing — this takes 60–90 seconds…';
+      contractBtn.disabled = true; result.hidden = true;
+      try {
+        const data = await api('/api/owner/legal/contract_review', {
+          method: 'POST',
+          body: JSON.stringify({
+            contract_text: text,
+            client_side: document.getElementById('contract-client-side').value || '',
+            jurisdiction: document.getElementById('contract-jurisdiction').value || '',
+          })
+        });
+        document.getElementById('contract-result-text').textContent = data.memo || '';
+        result.hidden = false;
+        status.textContent = '';
+      } catch { status.textContent = 'Analysis failed — try again.'; }
+      contractBtn.disabled = false;
+    });
+
+    const contractCopy = document.getElementById('contract-copy-btn');
+    if (contractCopy) contractCopy.addEventListener('click', () => {
+      navigator.clipboard.writeText(document.getElementById('contract-result-text').textContent);
+      contractCopy.textContent = 'Copied!';
+      setTimeout(() => { contractCopy.textContent = 'Copy'; }, 2000);
+    });
   }
 
 })();

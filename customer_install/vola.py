@@ -2905,9 +2905,26 @@ def legal_research():
     question = body.get("question", "").strip()
     if not question:
         return jsonify({"ok": False, "error": "question required"}), 400
-    jurisdiction = body.get("jurisdiction", "")
-    practice_area = body.get("practice_area", "")
-    matter_context = body.get("matter_context", "")
+    jurisdiction = (body.get("jurisdiction") or "").strip()
+    practice_area = (body.get("practice_area") or "").strip()
+    matter_context = (body.get("matter_context") or "").strip()
+
+    # If the attorney didn't fill in the jurisdiction field, try to extract it
+    # from the question text so CourtListener can filter by the right court.
+    if not jurisdiction:
+        _JX_NAMES = {
+            "nevada": "Nevada", "california": "California", "texas": "Texas",
+            "new york": "New York", "florida": "Florida", "washington": "Washington",
+            "oregon": "Oregon", "arizona": "Arizona", "colorado": "Colorado",
+            "utah": "Utah", "illinois": "Illinois", "ohio": "Ohio",
+            "michigan": "Michigan", "georgia": "Georgia", "north carolina": "North Carolina",
+            "virginia": "Virginia", "federal": "federal", "ninth circuit": "9th circuit",
+        }
+        q_lower = question.lower()
+        for phrase, jx_val in _JX_NAMES.items():
+            if phrase in q_lower:
+                jurisdiction = jx_val
+                break
 
     # Search real legal databases first so the LLM cites actual cases
     from tools import legal_research as tool_legal
@@ -3127,6 +3144,154 @@ def legal_draft_export(draft_id):
     from flask import Response
     return Response(html, mimetype="text/html",
                     headers={"Content-Disposition": f'inline; filename="{name.replace(" ","_")}.html"'})
+
+
+@app.route("/api/owner/legal/billing/invoice/<matter_id>", methods=["GET"])
+def legal_billing_invoice(matter_id):
+    """Generate a plain-text billing invoice from all unbilled time entries
+    for a matter. Returns the formatted invoice text + totals."""
+    s = _require_legal_module()
+    matter = mod_legal.get_matter(DATA_DIR, matter_id)
+    if not matter:
+        return jsonify({"error": "matter not found"}), 404
+
+    entries = mod_legal.list_time(DATA_DIR, matter_id=matter_id, billed=False)
+    if not entries:
+        return jsonify({"ok": True, "invoice_text": "No unbilled time entries found for this matter.",
+                        "entry_count": 0, "total": 0.0, "matter_title": matter.get("title", "")})
+
+    from datetime import date as _date
+    today = _date.today().isoformat()
+    firm_name = matter.get("firm_name") or (CONFIG.get("business") or {}).get("name") or "Law Office"
+    atty_name = matter.get("attorney_name") or ""
+    client    = matter.get("client_name") or "Client"
+    rate      = float(matter.get("rate") or 0)
+
+    lines = [
+        f"{'=' * 62}",
+        f"  LEGAL BILLING STATEMENT",
+        f"  {firm_name}",
+        (f"  {atty_name}" if atty_name else ""),
+        f"{'=' * 62}",
+        f"",
+        f"  TO:      {client}",
+        f"  MATTER:  {matter.get('matter_number', '')} — {matter.get('title', '')}",
+        f"  COURT:   {matter.get('court', '') or 'N/A'}",
+        f"  CASE #:  {matter.get('case_number', '') or 'N/A'}",
+        f"  DATE:    {today}",
+        f"",
+        f"{'─' * 62}",
+        f"  {'DATE':<12} {'DESCRIPTION':<32} {'HRS':>5} {'RATE':>8} {'AMOUNT':>9}",
+        f"{'─' * 62}",
+    ]
+    subtotal = 0.0
+    for e in sorted(entries, key=lambda x: x.get("date", "")):
+        d    = (e.get("date") or "")[:10]
+        desc = (e.get("description") or "")[:30]
+        hrs  = float(e.get("hours") or 0)
+        r    = float(e.get("rate") or rate)
+        amt  = float(e.get("amount") or (hrs * r))
+        subtotal += amt
+        lines.append(f"  {d:<12} {desc:<32} {hrs:>5.2f} ${r:>7.2f} ${amt:>8.2f}")
+
+    lines += [
+        f"{'─' * 62}",
+        f"  {'TOTAL DUE:':<51} ${subtotal:>8.2f}",
+        f"{'=' * 62}",
+        f"",
+        f"  Please remit payment within 30 days.",
+        f"  Questions: contact {firm_name}.",
+        f"",
+        f"  Prepared by myOrby AI Paralegal — attorney review required",
+        f"  before sending to client.",
+    ]
+    invoice_text = "\n".join(l for l in lines if l is not None)
+
+    return jsonify({
+        "ok": True,
+        "matter_title": matter.get("title", ""),
+        "matter_number": matter.get("matter_number", ""),
+        "invoice_text": invoice_text,
+        "entry_count": len(entries),
+        "total": round(subtotal, 2),
+        "entries": entries,
+    })
+
+
+@app.route("/api/owner/legal/contract_review", methods=["POST"])
+def legal_contract_review():
+    """Two-phase contract exit strategy analysis.
+    Phase 1: extract key issues + generate search terms.
+    Phase 2: search real case law, then produce full memo.
+    Body: {contract_text, client_side, jurisdiction}."""
+    s = _require_legal_module()
+    body = request.get_json(force=True) or {}
+    contract_text = (body.get("contract_text") or "").strip()
+    if not contract_text:
+        return jsonify({"error": "contract_text required"}), 400
+    client_side  = (body.get("client_side") or "").strip()
+    jurisdiction = (body.get("jurisdiction") or "").strip()
+
+    system_extract = (
+        "You are a contract attorney reviewing a contract for exit strategy analysis. "
+        "Extract facts precisely — do not invent information not in the contract. "
+        "Return ONLY what is actually in the document."
+    )
+    # Phase 1: extract issues and search terms
+    extract_prompt = mod_legal.build_contract_extraction_prompt(contract_text, client_side)
+    try:
+        extraction = llm_client.generate(CONFIG, system_extract,
+                                         [{"role": "user", "content": extract_prompt}]).text
+    except Exception as e:
+        log.exception("contract extraction phase 1 failed")
+        return jsonify({"error": str(e)}), 500
+
+    # Phase 2: search real case law using the search terms from extraction
+    from tools import legal_research as tool_legal
+    db_results = {}
+    try:
+        search_terms = []
+        for line in extraction.split("\n"):
+            if line.strip().startswith("- "):
+                term = line.strip()[2:].strip()
+                if term:
+                    search_terms.append(term)
+        if search_terms:
+            combined_query = " OR ".join(search_terms[:3])
+            db_results = tool_legal.search(combined_query, jurisdiction=jurisdiction)
+            log.info(f"contract review db: {db_results.get('total',0)} results")
+    except Exception as e:
+        log.warning(f"contract law search failed: {e}")
+
+    db_block = tool_legal.format_for_prompt(db_results) if db_results else ""
+
+    system_memo = (
+        "You are an experienced contract attorney preparing an exit strategy memo. "
+        "Cite ONLY cases from the REAL LEGAL RESEARCH RESULTS block — never invent citations. "
+        "If no cases were found for a point, say 'No cases found — attorney must search manually.' "
+        "This memo is for attorney review only — not for distribution to the client."
+    )
+    memo_prompt = mod_legal.build_contract_analysis_prompt(
+        contract_text, extraction,
+        db_results_block=db_block,
+        jurisdiction=jurisdiction,
+        client_side=client_side,
+    )
+    try:
+        memo = llm_client.generate(CONFIG, system_memo,
+                                   [{"role": "user", "content": memo_prompt}]).text
+    except Exception as e:
+        log.exception("contract analysis phase 2 failed")
+        return jsonify({"error": str(e)}), 500
+
+    audit.log(s["username"], action="legal.contract_review",
+              detail=f"contract ({len(contract_text)} chars), {jurisdiction}")
+    return jsonify({
+        "ok": True,
+        "memo": memo,
+        "extraction": extraction,
+        "sources_found": db_results.get("total", 0),
+    })
 
 
 # ── END LEGAL MODULE ──────────────────────────────────────────────────────────
@@ -20548,7 +20713,8 @@ def onboarding_discover():
         # any reason — owner can still onboard, just with less data.
         try:
             draft = onboarding.discover_from_url(url)
-            questions = onboarding.gap_questions(draft)
+            enabled_mods = list(CONFIG.get("enabled_modules") or [])
+            questions = onboarding.gap_questions(draft, enabled_modules=enabled_mods)
             return jsonify({"draft": draft, "gap_questions": questions,
                             "_fallback": "shallow_scraper"})
         except Exception as e2:
@@ -20598,6 +20764,36 @@ def _gap_questions_from_confidence(confidence: dict, profile: dict) -> list[dict
         out.append({"field": "policies.payment_methods", "type": "text",
                     "question": "How do customers pay? (Cash, credit, Venmo, etc.)",
                     "placeholder": "Credit cards, cash, Apple Pay"})
+
+    # Attorney module — only ask when legal is in enabled_modules
+    enabled_mods = [str(m).lower() for m in (CONFIG.get("enabled_modules") or [])]
+    if "legal" in enabled_mods:
+        legal = profile.get("legal") or {}
+        if not legal.get("attorney_name"):
+            out.append({"field": "legal.attorney_name", "type": "text",
+                        "question": "What is the lead attorney's full name and bar number? (e.g. Jane Smith, NV Bar #12345)",
+                        "placeholder": "Jane Smith, NV Bar #12345"})
+        if not legal.get("practice_areas"):
+            out.append({"field": "legal.practice_areas", "type": "textarea",
+                        "question": "What are your primary practice areas? (One per line — e.g. Personal Injury, Family Law, Criminal Defense)",
+                        "placeholder": "Personal Injury\nFamily Law\nCriminal Defense"})
+        if not legal.get("default_jurisdiction"):
+            out.append({"field": "legal.default_jurisdiction", "type": "text",
+                        "question": "What is your primary jurisdiction? (e.g. NV, California, Federal)",
+                        "placeholder": "NV"})
+        if not legal.get("default_hourly_rate"):
+            out.append({"field": "legal.default_hourly_rate", "type": "text",
+                        "question": "What is your standard hourly billing rate? (e.g. 350)",
+                        "placeholder": "350"})
+        if not legal.get("consultation_fee"):
+            out.append({"field": "legal.consultation_fee", "type": "text",
+                        "question": "Do you charge for initial consultations? If yes, how much? If free, say 'free'.",
+                        "placeholder": "free"})
+        if not legal.get("fee_structure"):
+            out.append({"field": "legal.fee_structure", "type": "text",
+                        "question": "How do you structure fees? (e.g. Hourly, Flat fee, Contingency, or a mix)",
+                        "placeholder": "Hourly"})
+
     return out
 
 

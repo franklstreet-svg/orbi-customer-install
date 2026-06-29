@@ -210,11 +210,14 @@ def apply_to_business(data_dir: Path, draft: dict, overwrite: bool = False) -> d
     return merged
 
 
-def gap_questions(draft: dict) -> list[dict]:
+def gap_questions(draft: dict, enabled_modules: list | None = None) -> list[dict]:
     """Look at the draft and return a list of targeted questions for
     fields that are missing or low-confidence. The dashboard wizard
-    walks the owner through these one at a time."""
+    walks the owner through these one at a time.
+    enabled_modules: list of module keys from config (e.g. ['legal', 'calendar'])
+    """
     qs = []
+    enabled_modules = [str(m).lower() for m in (enabled_modules or [])]
 
     if not draft.get("name"):
         qs.append({"field": "name", "question": "What's your business's name?",
@@ -284,6 +287,77 @@ def gap_questions(draft: dict) -> list[dict]:
         qs.append({"field": "tax_rate", "question": q, "type": "text",
                    "suggested": suggested})
 
+    # ── ATTORNEY / LEGAL MODULE ONBOARDING ────────────────────────────────────
+    if "legal" in enabled_modules:
+        legal = draft.get("legal") or {}
+
+        if not legal.get("firm_name") and not draft.get("name"):
+            qs.append({
+                "field": "legal.firm_name",
+                "question": "What is the name of your law firm? (e.g. Smith & Jones LLP)",
+                "type": "text",
+            })
+        if not legal.get("attorney_name"):
+            qs.append({
+                "field": "legal.attorney_name",
+                "question": "What is the lead attorney's full name and bar number? (e.g. Jane Smith, NV Bar #12345)",
+                "type": "text",
+            })
+        if not legal.get("practice_areas"):
+            qs.append({
+                "field": "legal.practice_areas",
+                "question": (
+                    "What are your primary practice areas? List them, one per line. "
+                    "(e.g. Personal Injury, Family Law, Criminal Defense, Business Law)"
+                ),
+                "type": "textarea",
+            })
+        if not legal.get("default_jurisdiction"):
+            addr = draft.get("address") or {}
+            state = addr.get("state", "")
+            hint = f" (looks like {state} based on your address)" if state else ""
+            qs.append({
+                "field": "legal.default_jurisdiction",
+                "question": f"What is your primary jurisdiction{hint}? (e.g. NV, California, Federal)",
+                "type": "text",
+            })
+        if not legal.get("default_hourly_rate"):
+            qs.append({
+                "field": "legal.default_hourly_rate",
+                "question": "What is your standard hourly billing rate? (e.g. 350 — I'll pre-fill it on every new matter)",
+                "type": "text",
+            })
+        if not legal.get("contingency_available") and not legal.get("fee_structure"):
+            qs.append({
+                "field": "legal.fee_structure",
+                "question": (
+                    "How do you typically structure fees? "
+                    "(e.g. Hourly, Flat fee, Contingency, or a mix — I'll know how to answer fee questions from potential clients)"
+                ),
+                "type": "text",
+            })
+        if not legal.get("consultation_fee"):
+            qs.append({
+                "field": "legal.consultation_fee",
+                "question": (
+                    "Do you charge for initial consultations? "
+                    "If yes, how much? If free, say 'free'. "
+                    "(Callers and website visitors will ask this.)"
+                ),
+                "type": "text",
+            })
+        if not legal.get("conflict_disclaimer"):
+            qs.append({
+                "field": "legal.conflict_disclaimer",
+                "question": (
+                    "When a caller asks if you can take their case, I'll tell them I need to run a conflict check first "
+                    "before you can confirm. Would you like me to say anything else at that point? "
+                    "(e.g. 'We typically respond within one business day' — or just say 'standard' to use that.)"
+                ),
+                "type": "text",
+                "suggested": "standard",
+            })
+
     return qs
 
 
@@ -335,6 +409,32 @@ def parse_answer(field: str, raw: str) -> dict:
         return {"faq": _parse_faq(raw)}
     if field == "tax_rate":
         return {"tax_rate": _parse_tax_rate(raw)}
+
+    # Legal module fields — stored under draft["legal"]["field_name"]
+    if field.startswith("legal."):
+        subfield = field[len("legal."):]
+        val: object = raw
+        if subfield == "default_hourly_rate":
+            try:
+                val = float(raw.replace("$", "").replace(",", "").strip())
+            except ValueError:
+                val = raw
+        elif subfield == "practice_areas":
+            val = [l.strip(" -•·") for l in raw.splitlines() if l.strip()]
+        elif subfield == "consultation_fee":
+            lower = raw.lower()
+            if lower in ("free", "no", "none", "0", "no charge"):
+                val = "free"
+        elif subfield == "conflict_disclaimer":
+            if raw.lower() in ("standard", "yes", "ok", "default"):
+                val = "We typically respond within one business day."
+        return {"legal": {subfield: val}}
+
+    # policies.* fields
+    if field.startswith("policies."):
+        subfield = field[len("policies."):]
+        return {"policies": {subfield: raw}}
+
     return {field: raw}
 
 
