@@ -1318,6 +1318,7 @@
 
   let marketingLoaded = false;
   let legalLoaded = false;
+  let contractorLoaded = false;
 
   document.addEventListener('DOMContentLoaded', async () => {
     // Discover who's logged in (role determines People-tab visibility)
@@ -1343,6 +1344,9 @@
       if (mods.includes('legal')) {
         document.querySelectorAll('.module-legal').forEach(el => el.hidden = false);
       }
+      if (mods.includes('contractor')) {
+        document.querySelectorAll('.module-contractor').forEach(el => el.hidden = false);
+      }
     } catch {}
 
     wireMyDayForms();
@@ -1350,6 +1354,7 @@
     wirePeople();
     wireMarketing();
     wireLegal();
+    wireContractor();
 
     document.querySelectorAll('.tab').forEach(t => {
       t.addEventListener('click', () => {
@@ -1359,6 +1364,7 @@
         if (which === 'people' && !peopleLoaded)   { loadPeople();  peopleLoaded = true; }
         if (which === 'marketing' && !marketingLoaded) { loadMarketingLibrary(); marketingLoaded = true; }
         if (which === 'legal'    && !legalLoaded)    { loadLegal();           legalLoaded = true; }
+        if (which === 'contractor' && !contractorLoaded) { loadContractor(); contractorLoaded = true; }
       });
     });
   });
@@ -6985,6 +6991,363 @@
       navigator.clipboard.writeText(document.getElementById('contract-result-text').textContent);
       contractCopy.textContent = 'Copied!';
       setTimeout(() => { contractCopy.textContent = 'Copy'; }, 2000);
+    });
+  }
+
+  // ==================================================================
+  // CONTRACTOR / CONSTRUCTION MODULE
+  // ==================================================================
+
+  function showToast(msg) {
+    const stack = document.getElementById('toast-stack') || document.body;
+    const el = document.createElement('div');
+    el.style.cssText = 'background:#222;color:#fff;padding:10px 16px;border-radius:8px;margin-top:8px;font-size:14px;opacity:0;transition:opacity .3s';
+    el.textContent = msg;
+    stack.appendChild(el);
+    requestAnimationFrame(() => { el.style.opacity = '1'; });
+    setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 400); }, 3000);
+  }
+
+  async function loadContractor() {
+    await _gcLoadSummary();
+    await _gcLoadProjects();
+  }
+
+  async function _gcLoadSummary() {
+    const el = document.getElementById('gc-summary');
+    if (!el) return;
+    try {
+      const d = await api('/api/owner/gc/summary');
+      el.innerHTML = `
+        <div class="gc-stat-grid">
+          <div class="gc-stat"><span class="gc-stat-num">${d.active_jobs}</span><span class="gc-stat-label">Active Jobs</span></div>
+          <div class="gc-stat"><span class="gc-stat-num">$${_fmt$(d.active_revenue)}</span><span class="gc-stat-label">Job Revenue</span></div>
+          <div class="gc-stat"><span class="gc-stat-num">${d.unpaid_invoices}</span><span class="gc-stat-label">Unpaid Invoices</span></div>
+          <div class="gc-stat"><span class="gc-stat-num">$${_fmt$(d.unpaid_amount)}</span><span class="gc-stat-label">Outstanding</span></div>
+          <div class="gc-stat"><span class="gc-stat-num">${d.pending_co_approval}</span><span class="gc-stat-label">COs Pending</span></div>
+          <div class="gc-stat"><span class="gc-stat-num">${d.cos_awaiting_sig}</span><span class="gc-stat-label">Awaiting Sig</span></div>
+        </div>`;
+    } catch { el.innerHTML = '<p class="dim">Could not load summary.</p>'; }
+  }
+
+  function _fmt$(n) {
+    const num = parseFloat(n) || 0;
+    return num.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  }
+
+  async function _gcLoadProjects(statusFilter) {
+    const el = document.getElementById('gc-projects-list');
+    if (!el) return;
+    el.innerHTML = '<p class="dim">Loading…</p>';
+    try {
+      const qs = statusFilter ? `?status=${statusFilter}` : '';
+      const d = await api('/api/owner/gc/projects' + qs);
+      if (!d.projects.length) { el.innerHTML = '<p class="dim">No projects found.</p>'; return; }
+      el.innerHTML = d.projects.map(p => {
+        const badge = { estimate: 'badge-gray', active: 'badge-green', on_hold: 'badge-yellow',
+                        completed: 'badge-blue', cancelled: 'badge-red' }[p.status] || 'badge-gray';
+        const co = parseFloat(p.co_signed_total || 0);
+        const contract = parseFloat(p.contract_amount || 0);
+        const total = contract + co;
+        const collected = parseFloat(p.amount_collected || 0);
+        const pct = total > 0 ? Math.round(collected / total * 100) : 0;
+        return `<div class="gc-project-card" data-pid="${p.id}">
+          <div class="gc-proj-header">
+            <span class="gc-proj-name">${_esc(p.label || p.address || 'Untitled')}</span>
+            <span class="badge ${badge}">${p.status}</span>
+          </div>
+          <div class="gc-proj-addr dim">${_esc(p.address || '')}</div>
+          <div class="gc-proj-money">
+            <span>Contract: <strong>$${_fmt$(contract)}</strong></span>
+            ${co ? `<span>+COs: <strong>$${_fmt$(co)}</strong></span>` : ''}
+            <span>Collected: <strong>$${_fmt$(collected)}</strong></span>
+          </div>
+          <div class="gc-prog-bar-wrap"><div class="gc-prog-bar" style="width:${pct}%"></div></div>
+          <div class="gc-proj-actions">
+            <button class="btn-sm" onclick="gcOpenProject('${p.id}')">Open</button>
+          </div>
+        </div>`;
+      }).join('');
+    } catch { el.innerHTML = '<p class="dim">Failed to load projects.</p>'; }
+  }
+
+  async function _gcLoadInvoices(projectId) {
+    const el = document.getElementById('gc-invoices-list');
+    if (!el) return;
+    el.innerHTML = '<p class="dim">Loading…</p>';
+    try {
+      const qs = projectId ? `?project_id=${projectId}` : '?unpaid=1';
+      const d = await api('/api/owner/gc/invoices' + qs);
+      if (!d.invoices.length) { el.innerHTML = '<p class="dim">No invoices.</p>'; return; }
+      el.innerHTML = `<table class="gc-table"><thead><tr>
+        <th>#</th><th>Project</th><th>Amount Due</th><th>Status</th><th></th>
+      </tr></thead><tbody>${d.invoices.map(inv => {
+        const statusClass = { paid: 'badge-green', overdue: 'badge-red', sent: 'badge-blue',
+          draft: 'badge-gray', partial: 'badge-yellow', void: 'badge-red' }[inv.status] || 'badge-gray';
+        return `<tr>
+          <td>${_esc(inv.invoice_number || inv.id.slice(0,8))}</td>
+          <td>${_esc(inv.project_id || '')}</td>
+          <td>$${_fmt$(inv.amount_due)}</td>
+          <td><span class="badge ${statusClass}">${inv.status}</span></td>
+          <td>${inv.status !== 'paid' && inv.status !== 'void'
+            ? `<button class="btn-sm" onclick="gcMarkInvoicePaid('${inv.id}',${inv.amount_due})">Mark Paid</button>`
+            : ''}</td>
+        </tr>`;
+      }).join('')}</tbody></table>`;
+    } catch { el.innerHTML = '<p class="dim">Failed to load invoices.</p>'; }
+  }
+
+  async function _gcLoadChangeOrders(projectId) {
+    const el = document.getElementById('gc-cos-list');
+    if (!el) return;
+    el.innerHTML = '<p class="dim">Loading…</p>';
+    try {
+      const qs = projectId ? `?project_id=${projectId}` : '';
+      const d = await api('/api/owner/gc/change_orders' + qs);
+      if (!d.change_orders.length) { el.innerHTML = '<p class="dim">No change orders.</p>'; return; }
+      el.innerHTML = `<table class="gc-table"><thead><tr>
+        <th>CO#</th><th>Description</th><th>Amount</th><th>Status</th><th></th>
+      </tr></thead><tbody>${d.change_orders.map(co => {
+        const statusClass = { draft: 'badge-gray', awaiting_approval: 'badge-yellow',
+          approved: 'badge-blue', sent_for_signature: 'badge-blue',
+          signed: 'badge-green', declined: 'badge-red' }[co.status] || 'badge-gray';
+        return `<tr>
+          <td>CO-${co.co_number || co.id.slice(0,6)}</td>
+          <td>${_esc(co.description || '')}</td>
+          <td>$${_fmt$(co.amount)}</td>
+          <td><span class="badge ${statusClass}">${co.status.replace(/_/g,' ')}</span></td>
+          <td>${co.status === 'awaiting_approval'
+            ? `<button class="btn-sm" onclick="gcApproveCO('${co.id}')">Approve</button>`
+            : ''}</td>
+        </tr>`;
+      }).join('')}</tbody></table>`;
+    } catch { el.innerHTML = '<p class="dim">Failed to load change orders.</p>'; }
+  }
+
+  async function _gcLoadDailyLogs(projectId) {
+    const el = document.getElementById('gc-logs-list');
+    if (!el) return;
+    el.innerHTML = '<p class="dim">Loading…</p>';
+    try {
+      const qs = projectId ? `?project_id=${projectId}` : '';
+      const d = await api('/api/owner/gc/daily_logs' + qs);
+      if (!d.logs.length) { el.innerHTML = '<p class="dim">No logs this week.</p>'; return; }
+      el.innerHTML = d.logs.map(log => `
+        <div class="gc-log-card">
+          <div class="gc-log-header"><strong>${_esc(log.date || '')}</strong> — ${_esc(log.project_id || '')}</div>
+          <div>${_esc(log.work_done || '')}</div>
+          ${log.crew && log.crew.length ? `<div class="dim">Crew: ${log.crew.map(_esc).join(', ')}</div>` : ''}
+          ${log.weather ? `<div class="dim">Weather: ${_esc(log.weather)}</div>` : ''}
+          ${log.notes ? `<div class="dim">${_esc(log.notes)}</div>` : ''}
+        </div>`).join('');
+    } catch { el.innerHTML = '<p class="dim">Failed to load logs.</p>'; }
+  }
+
+  async function _gcLoadSubs() {
+    const el = document.getElementById('gc-subs-list');
+    if (!el) return;
+    el.innerHTML = '<p class="dim">Loading…</p>';
+    try {
+      const d = await api('/api/owner/gc/subcontractors');
+      if (!d.subcontractors.length) { el.innerHTML = '<p class="dim">No subcontractors on file.</p>'; return; }
+      el.innerHTML = `<table class="gc-table"><thead><tr>
+        <th>Name</th><th>Trade</th><th>Phone</th><th>Ins. Expires</th><th>Rating</th>
+      </tr></thead><tbody>${d.subcontractors.map(s => `<tr>
+        <td>${_esc(s.name)}</td>
+        <td>${_esc(s.trade || '—')}</td>
+        <td>${_esc(s.phone || '—')}</td>
+        <td>${_esc(s.insurance_expires || '—')}</td>
+        <td>${'★'.repeat(Math.min(s.rating || 0, 5))}</td>
+      </tr>`).join('')}</tbody></table>`;
+    } catch { el.innerHTML = '<p class="dim">Failed to load subs.</p>'; }
+  }
+
+  // Global helpers called from onclick attributes
+  window.gcOpenProject = async function(pid) {
+    const panel = document.getElementById('gc-project-detail');
+    if (!panel) return;
+    panel.innerHTML = '<p class="dim">Loading project…</p>';
+    panel.hidden = false;
+    try {
+      const d = await api(`/api/owner/gc/projects/${pid}`);
+      const p = d.project;
+      const co = parseFloat(p.co_signed_total || 0);
+      const contract = parseFloat(p.contract_amount || 0);
+      panel.innerHTML = `
+        <button class="btn-sm" onclick="document.getElementById('gc-project-detail').hidden=true">← Back</button>
+        <h3>${_esc(p.label || p.address)}</h3>
+        <p>${_esc(p.address || '')}</p>
+        <p>Contract: <strong>$${_fmt$(contract)}</strong>${co ? ` + COs: <strong>$${_fmt$(co)}</strong>` : ''}</p>
+        <p>Status: <strong>${p.status}</strong></p>
+        ${p.notes ? `<p class="dim">${_esc(p.notes)}</p>` : ''}
+        <h4>Invoices</h4>
+        <div id="gc-detail-invoices">${(p.invoices||[]).length ? p.invoices.map(inv =>
+          `<div class="gc-row-item"><span>${_esc(inv.invoice_number||inv.id.slice(0,8))}</span>
+           <span>$${_fmt$(inv.amount_due)}</span>
+           <span class="badge ${ {paid:'badge-green',overdue:'badge-red',draft:'badge-gray',sent:'badge-blue'}[inv.status]||'badge-gray' }">${inv.status}</span>
+           ${inv.status!=='paid'&&inv.status!=='void' ? `<button class="btn-sm" onclick="gcMarkInvoicePaid('${inv.id}',${inv.amount_due})">Mark Paid</button>` : ''}
+           </div>`).join('') : '<p class="dim">None yet.</p>'}</div>
+        <h4>Change Orders</h4>
+        <div>${(p.change_orders||[]).length ? p.change_orders.map(co =>
+          `<div class="gc-row-item"><span>CO-${co.co_number||co.id.slice(0,6)}</span>
+           <span>${_esc(co.description||'')}</span>
+           <span>$${_fmt$(co.amount)}</span>
+           <span>${co.status.replace(/_/g,' ')}</span>
+           ${co.status==='awaiting_approval' ? `<button class="btn-sm" onclick="gcApproveCO('${co.id}')">Approve</button>` : ''}
+           </div>`).join('') : '<p class="dim">None yet.</p>'}</div>
+        <h4>Recent Daily Logs</h4>
+        <div>${(p.daily_logs||[]).length ? p.daily_logs.slice(0,5).map(log =>
+          `<div class="gc-log-card"><strong>${_esc(log.date||'')}</strong> — ${_esc(log.work_done||log.notes||'')}</div>`
+        ).join('') : '<p class="dim">No logs yet.</p>'}</div>`;
+    } catch { panel.innerHTML = '<p class="dim">Failed to load project.</p>'; }
+  };
+
+  window.gcMarkInvoicePaid = async function(invId, amount) {
+    if (!confirm(`Mark invoice paid for $${_fmt$(amount)}?`)) return;
+    try {
+      await api(`/api/owner/gc/invoices/${invId}/mark_paid`, { method: 'POST', body: JSON.stringify({ amount }) });
+      showToast('Invoice marked paid.');
+      contractorLoaded = false;
+      loadContractor();
+    } catch { showToast('Failed to mark paid.'); }
+  };
+
+  window.gcApproveCO = async function(coId) {
+    if (!confirm('Approve this change order?')) return;
+    try {
+      await api(`/api/owner/gc/change_orders/${coId}/approve`, { method: 'POST', body: JSON.stringify({}) });
+      showToast('Change order approved.');
+      contractorLoaded = false;
+      loadContractor();
+    } catch { showToast('Failed to approve CO.'); }
+  };
+
+  function wireContractor() {
+    // Sub-tab switching inside the Contractor panel
+    document.querySelectorAll('[data-gc-tab]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const tab = btn.dataset.gcTab;
+        document.querySelectorAll('[data-gc-tab]').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        document.querySelectorAll('[data-gc-panel]').forEach(p => p.hidden = true);
+        const panel = document.querySelector(`[data-gc-panel="${tab}"]`);
+        if (panel) panel.hidden = false;
+        // Lazy-load each sub-tab
+        if (tab === 'projects') _gcLoadProjects();
+        if (tab === 'invoices') _gcLoadInvoices();
+        if (tab === 'change_orders') _gcLoadChangeOrders();
+        if (tab === 'daily_logs') _gcLoadDailyLogs();
+        if (tab === 'subcontractors') _gcLoadSubs();
+      });
+    });
+
+    // Status filter for jobs
+    const statusFilter = document.getElementById('gc-status-filter');
+    if (statusFilter) statusFilter.addEventListener('change', () => {
+      _gcLoadProjects(statusFilter.value || undefined);
+    });
+
+    // New Project form
+    const npForm = document.getElementById('gc-new-project-form');
+    if (npForm) npForm.addEventListener('submit', async e => {
+      e.preventDefault();
+      const fd = new FormData(npForm);
+      const body = { label: fd.get('label'), address: fd.get('address'),
+        contract_amount: parseFloat(fd.get('contract_amount')) || 0,
+        status: fd.get('status') || 'estimate', notes: fd.get('notes') || '' };
+      try {
+        await api('/api/owner/gc/projects', { method: 'POST', body: JSON.stringify(body) });
+        npForm.reset();
+        showToast('Project created.');
+        _gcLoadProjects();
+        _gcLoadSummary();
+      } catch { showToast('Failed to create project.'); }
+    });
+
+    // New Invoice form
+    const niForm = document.getElementById('gc-new-invoice-form');
+    if (niForm) niForm.addEventListener('submit', async e => {
+      e.preventDefault();
+      const fd = new FormData(niForm);
+      const subtotal = parseFloat(fd.get('subtotal')) || 0;
+      const body = {
+        project_id: fd.get('project_id'),
+        line_items: [{ label: fd.get('description') || 'Services', amount: subtotal }],
+        subtotal,
+        due_days: parseInt(fd.get('due_days')) || 30,
+        memo: fd.get('memo') || '',
+        status: 'draft',
+      };
+      try {
+        await api('/api/owner/gc/invoices', { method: 'POST', body: JSON.stringify(body) });
+        niForm.reset();
+        showToast('Invoice created (draft).');
+        _gcLoadInvoices();
+        _gcLoadSummary();
+      } catch { showToast('Failed to create invoice.'); }
+    });
+
+    // New Change Order form
+    const coForm = document.getElementById('gc-new-co-form');
+    if (coForm) coForm.addEventListener('submit', async e => {
+      e.preventDefault();
+      const fd = new FormData(coForm);
+      const body = {
+        project_id: fd.get('project_id'),
+        description: fd.get('description'),
+        amount: parseFloat(fd.get('amount')) || 0,
+        reason: fd.get('reason') || '',
+        status: 'awaiting_approval',
+      };
+      try {
+        await api('/api/owner/gc/change_orders', { method: 'POST', body: JSON.stringify(body) });
+        coForm.reset();
+        showToast('Change order submitted.');
+        _gcLoadChangeOrders();
+        _gcLoadSummary();
+      } catch { showToast('Failed to create change order.'); }
+    });
+
+    // New Daily Log form
+    const dlForm = document.getElementById('gc-new-log-form');
+    if (dlForm) dlForm.addEventListener('submit', async e => {
+      e.preventDefault();
+      const fd = new FormData(dlForm);
+      const crewRaw = fd.get('crew') || '';
+      const body = {
+        project_id: fd.get('project_id'),
+        date_iso: fd.get('date') || new Date().toISOString().slice(0,10),
+        work_done: fd.get('work_done'),
+        crew: crewRaw.split(',').map(s => s.trim()).filter(Boolean),
+        hours: parseFloat(fd.get('hours')) || 0,
+        weather: fd.get('weather') || '',
+        notes: fd.get('notes') || '',
+      };
+      try {
+        await api('/api/owner/gc/daily_logs', { method: 'POST', body: JSON.stringify(body) });
+        dlForm.reset();
+        showToast('Log saved.');
+        _gcLoadDailyLogs();
+      } catch { showToast('Failed to save log.'); }
+    });
+
+    // New Sub form
+    const subForm = document.getElementById('gc-new-sub-form');
+    if (subForm) subForm.addEventListener('submit', async e => {
+      e.preventDefault();
+      const fd = new FormData(subForm);
+      const body = {
+        name: fd.get('name'), trade: fd.get('trade'),
+        phone: fd.get('phone'), email: fd.get('email'),
+        license: fd.get('license'), insurance_expires: fd.get('insurance_expires'),
+        notes: fd.get('notes') || '',
+      };
+      try {
+        await api('/api/owner/gc/subcontractors', { method: 'POST', body: JSON.stringify(body) });
+        subForm.reset();
+        showToast('Subcontractor added.');
+        _gcLoadSubs();
+      } catch { showToast('Failed to add subcontractor.'); }
     });
   }
 

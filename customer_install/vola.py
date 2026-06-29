@@ -3330,6 +3330,279 @@ def legal_billing_invoice(matter_id):
     })
 
 
+# ---------------------------------------------------------------------------
+# CONTRACTOR / CONSTRUCTION MODULE — REST API
+# ---------------------------------------------------------------------------
+
+def _require_contractor_module():
+    owner_session = auth.require_owner(ORBI_DIR)
+    if not is_module_enabled("contractor"):
+        abort(402, "Contractor module not enabled")
+    return owner_session
+
+
+# ── Projects ────────────────────────────────────────────────────────────────
+
+@app.route("/api/owner/gc/projects", methods=["GET"])
+def gc_projects_list():
+    _require_contractor_module()
+    status = request.args.get("status")
+    statuses = [status] if status else None
+    projects = mod_projects.list_all(DATA_DIR, statuses=statuses, limit=200)
+    # Attach CO totals and invoice totals for each project
+    for p in projects:
+        pid = p["id"]
+        p["co_signed_total"] = mod_change_orders.signed_total_for_project(DATA_DIR, pid)
+        paid = sum(float(i.get("amount_paid") or i.get("amount") or 0)
+                   for i in mod_invoices.list_for_project(DATA_DIR, pid)
+                   if i.get("status") == "paid")
+        p["amount_collected"] = round(paid, 2)
+    return jsonify({"ok": True, "projects": projects})
+
+
+@app.route("/api/owner/gc/projects", methods=["POST"])
+def gc_projects_create():
+    _require_contractor_module()
+    body = request.get_json(force=True) or {}
+    try:
+        p = mod_projects.add(
+            DATA_DIR,
+            address=body.get("address", ""),
+            label=body.get("label", ""),
+            contract_amount=body.get("contract_amount"),
+            status=body.get("status", "active"),
+            notes=body.get("notes", ""),
+        )
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify({"ok": True, "project": p}), 201
+
+
+@app.route("/api/owner/gc/projects/<pid>", methods=["GET"])
+def gc_project_detail(pid):
+    _require_contractor_module()
+    p = mod_projects.get(DATA_DIR, pid)
+    if not p:
+        return jsonify({"error": "not found"}), 404
+    p["change_orders"] = mod_change_orders.list_for_project(DATA_DIR, pid)
+    p["invoices"]      = mod_invoices.list_for_project(DATA_DIR, pid)
+    p["daily_logs"]    = mod_daily_logs.list_for_project(DATA_DIR, pid, limit=30)
+    p["co_signed_total"] = mod_change_orders.signed_total_for_project(DATA_DIR, pid)
+    return jsonify({"ok": True, "project": p})
+
+
+@app.route("/api/owner/gc/projects/<pid>", methods=["PATCH"])
+def gc_project_update(pid):
+    _require_contractor_module()
+    body = request.get_json(force=True) or {}
+    updated = mod_projects.update(DATA_DIR, pid, **{
+        k: v for k, v in body.items()
+        if k in ("label", "address", "status", "contract_amount", "notes", "stage")
+    })
+    if not updated:
+        return jsonify({"error": "not found"}), 404
+    return jsonify({"ok": True, "project": updated})
+
+
+# ── Change Orders ────────────────────────────────────────────────────────────
+
+@app.route("/api/owner/gc/change_orders", methods=["GET"])
+def gc_co_list():
+    _require_contractor_module()
+    pid = request.args.get("project_id")
+    if pid:
+        cos = mod_change_orders.list_for_project(DATA_DIR, pid)
+    else:
+        # Return pending + awaiting-sig queue by default
+        cos = mod_change_orders.list_pending_approval(DATA_DIR)
+        cos += mod_change_orders.list_awaiting_signature(DATA_DIR)
+    return jsonify({"ok": True, "change_orders": cos})
+
+
+@app.route("/api/owner/gc/change_orders", methods=["POST"])
+def gc_co_create():
+    _require_contractor_module()
+    body = request.get_json(force=True) or {}
+    try:
+        co = mod_change_orders.add(
+            DATA_DIR,
+            project_id=body.get("project_id", ""),
+            description=body.get("description", ""),
+            amount=body.get("amount", 0),
+            reason=body.get("reason", ""),
+            status=body.get("status", "draft"),
+        )
+    except (ValueError, KeyError) as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify({"ok": True, "change_order": co}), 201
+
+
+@app.route("/api/owner/gc/change_orders/<co_id>/approve", methods=["POST"])
+def gc_co_approve(co_id):
+    s = _require_contractor_module()
+    co = mod_change_orders.mark_approved(DATA_DIR, co_id, s.get("username", "owner"))
+    if not co:
+        return jsonify({"error": "not found"}), 404
+    return jsonify({"ok": True, "change_order": co})
+
+
+@app.route("/api/owner/gc/change_orders/<co_id>", methods=["PATCH"])
+def gc_co_update(co_id):
+    _require_contractor_module()
+    body = request.get_json(force=True) or {}
+    updated = mod_change_orders.update(DATA_DIR, co_id, **{
+        k: v for k, v in body.items()
+        if k in ("description", "amount", "reason", "status", "notes")
+    })
+    if not updated:
+        return jsonify({"error": "not found"}), 404
+    return jsonify({"ok": True, "change_order": updated})
+
+
+# ── Invoices ─────────────────────────────────────────────────────────────────
+
+@app.route("/api/owner/gc/invoices", methods=["GET"])
+def gc_invoices_list():
+    _require_contractor_module()
+    pid = request.args.get("project_id")
+    unpaid_only = request.args.get("unpaid") == "1"
+    if pid:
+        invs = mod_invoices.list_for_project(DATA_DIR, pid)
+    elif unpaid_only:
+        invs = mod_invoices.list_unpaid(DATA_DIR)
+    else:
+        invs = mod_invoices._load(DATA_DIR)
+        invs.sort(key=lambda i: i.get("created_at", 0), reverse=True)
+        invs = invs[:200]
+    return jsonify({"ok": True, "invoices": invs})
+
+
+@app.route("/api/owner/gc/invoices", methods=["POST"])
+def gc_invoices_create():
+    _require_contractor_module()
+    body = request.get_json(force=True) or {}
+    due_days = int(body.get("due_days", 30))
+    due_at = int(time.time()) + due_days * 86400
+    try:
+        inv = mod_invoices.add(
+            DATA_DIR,
+            project_id=body.get("project_id", ""),
+            line_items=body.get("line_items") or body.get("items", []),
+            subtotal=body.get("subtotal"),
+            retainage_pct=float(body.get("retainage_pct", 0)),
+            memo=body.get("memo") or body.get("notes", ""),
+            due_at=due_at,
+            status=body.get("status", "draft"),
+        )
+    except (ValueError, KeyError) as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify({"ok": True, "invoice": inv}), 201
+
+
+@app.route("/api/owner/gc/invoices/<inv_id>/mark_paid", methods=["POST"])
+def gc_invoice_mark_paid(inv_id):
+    _require_contractor_module()
+    body = request.get_json(force=True) or {}
+    amount = body.get("amount")
+    if amount is None:
+        inv = mod_invoices.get(DATA_DIR, inv_id)
+        if not inv:
+            return jsonify({"error": "not found"}), 404
+        amount = float(inv.get("amount_due") or inv.get("subtotal") or 0)
+    updated = mod_invoices.record_payment(DATA_DIR, inv_id, float(amount))
+    if not updated:
+        return jsonify({"error": "not found"}), 404
+    return jsonify({"ok": True, "invoice": updated})
+
+
+# ── Daily Logs ───────────────────────────────────────────────────────────────
+
+@app.route("/api/owner/gc/daily_logs", methods=["GET"])
+def gc_daily_logs_list():
+    _require_contractor_module()
+    pid = request.args.get("project_id")
+    if pid:
+        logs = mod_daily_logs.list_for_project(DATA_DIR, pid, limit=60)
+    else:
+        logs = mod_daily_logs.list_for_week(DATA_DIR)
+    return jsonify({"ok": True, "logs": logs})
+
+
+@app.route("/api/owner/gc/daily_logs", methods=["POST"])
+def gc_daily_logs_create():
+    _require_contractor_module()
+    body = request.get_json(force=True) or {}
+    try:
+        log = mod_daily_logs.add(
+            DATA_DIR,
+            project_id=body.get("project_id", ""),
+            date_iso=body.get("date") or body.get("date_iso", ""),
+            crew=body.get("crew", []),
+            work_done=body.get("work_done") or body.get("work_performed", ""),
+            hours=float(body.get("hours", 0)),
+            weather=body.get("weather", ""),
+            materials_used=body.get("materials_used") or body.get("materials", []),
+            delays=body.get("delays", ""),
+            notes=body.get("notes", ""),
+            logged_by=body.get("logged_by", "owner"),
+        )
+    except (ValueError, KeyError) as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify({"ok": True, "log": log}), 201
+
+
+# ── Subcontractors ────────────────────────────────────────────────────────────
+
+@app.route("/api/owner/gc/subcontractors", methods=["GET"])
+def gc_subs_list():
+    _require_contractor_module()
+    trade = request.args.get("trade", "")
+    subs = mod_subs.list_subs(DATA_DIR, trade=trade)
+    return jsonify({"ok": True, "subcontractors": subs})
+
+
+@app.route("/api/owner/gc/subcontractors", methods=["POST"])
+def gc_subs_create():
+    _require_contractor_module()
+    body = request.get_json(force=True) or {}
+    try:
+        sub = mod_subs.add_sub(DATA_DIR, **{
+            k: v for k, v in body.items()
+            if k in ("name", "trade", "contact_name", "phone", "email",
+                     "license", "insurance_expires", "rate", "notes", "rating")
+        })
+    except (ValueError, KeyError) as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify({"ok": True, "subcontractor": sub}), 201
+
+
+# ── Summary / Dashboard Card ─────────────────────────────────────────────────
+
+@app.route("/api/owner/gc/summary", methods=["GET"])
+def gc_summary():
+    _require_contractor_module()
+    active    = mod_projects.list_active(DATA_DIR)
+    unpaid    = mod_invoices.list_unpaid(DATA_DIR)
+    pending   = mod_change_orders.list_pending_approval(DATA_DIR)
+    awaiting  = mod_change_orders.list_awaiting_signature(DATA_DIR)
+    unpaid_amt = sum(float(i.get("amount") or 0) for i in unpaid)
+    active_rev = sum(
+        float(p.get("contract_amount") or 0) +
+        mod_change_orders.signed_total_for_project(DATA_DIR, p["id"])
+        for p in active
+    )
+    return jsonify({
+        "ok": True,
+        "active_jobs":        len(active),
+        "active_revenue":     round(active_rev, 2),
+        "unpaid_invoices":    len(unpaid),
+        "unpaid_amount":      round(unpaid_amt, 2),
+        "pending_co_approval": len(pending),
+        "cos_awaiting_sig":   len(awaiting),
+    })
+
+
+
 @app.route("/api/owner/legal/contract_review", methods=["POST"])
 def legal_contract_review():
     """Two-phase contract exit strategy analysis.

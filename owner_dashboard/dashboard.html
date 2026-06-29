@@ -82,6 +82,7 @@
     <button class="tab" data-tab="business">Business</button>
     <button class="tab module-marketing" data-tab="marketing" hidden>Marketing</button>
     <button class="tab module-legal" data-tab="legal" hidden>Legal</button>
+    <button class="tab module-contractor" data-tab="contractor" hidden>Construction</button>
     <button class="tab owner-only" data-tab="people" hidden>Staff</button>
     <button class="tab" data-tab="team">Team Chat <span class="badge" id="team-unread-badge" hidden>0</span></button>
     <button class="tab" data-tab="web_tasks" title="Tasks Orbi runs in a browser for you (dispatch, supplier portals, etc.)">Web Tasks</button>
@@ -1262,6 +1263,131 @@
             </div>
           </div>
           <div id="doc-viewer-actions" style="padding:14px 20px;border-top:1px solid #2a3554;display:flex;gap:10px;flex-shrink:0"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- CONTRACTOR / CONSTRUCTION TAB — gated by enabled_modules: contractor -->
+    <section class="tab-panel" id="tab-contractor">
+      <div style="display:flex;gap:20px;height:100%;min-height:0">
+        <!-- Sub-nav sidebar -->
+        <nav style="width:148px;flex-shrink:0;display:flex;flex-direction:column;gap:4px;padding-top:2px">
+          <button class="gc-snav active" data-gc-tab="projects">Jobs</button>
+          <button class="gc-snav" data-gc-tab="invoices">Invoices</button>
+          <button class="gc-snav" data-gc-tab="change_orders">Change Orders</button>
+          <button class="gc-snav" data-gc-tab="daily_logs">Daily Logs</button>
+          <button class="gc-snav" data-gc-tab="subcontractors">Subs</button>
+        </nav>
+
+        <!-- Main content area -->
+        <div style="flex:1;overflow-y:auto;padding:0 4px">
+          <!-- Summary card always visible at top -->
+          <div id="gc-summary" style="margin-bottom:16px"></div>
+
+          <!-- Project detail overlay (hidden by default) -->
+          <div id="gc-project-detail" hidden style="background:#131929;border:1px solid #2a3554;border-radius:10px;padding:16px;margin-bottom:16px"></div>
+
+          <!-- Jobs panel -->
+          <div data-gc-panel="projects">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+              <h3 style="margin:0">Active Jobs</h3>
+              <div style="display:flex;gap:8px">
+                <select id="gc-status-filter" style="background:#1a2236;border:1px solid #2a3554;color:#fff;border-radius:6px;padding:4px 8px;font-size:13px">
+                  <option value="">All</option>
+                  <option value="estimate">Estimate</option>
+                  <option value="active" selected>Active</option>
+                  <option value="on_hold">On Hold</option>
+                  <option value="completed">Completed</option>
+                </select>
+              </div>
+            </div>
+            <div id="gc-projects-list"><p class="dim">Loading…</p></div>
+            <details style="margin-top:20px">
+              <summary style="cursor:pointer;color:#0fb9b1;font-size:14px;user-select:none">+ New Job</summary>
+              <form id="gc-new-project-form" style="margin-top:12px;display:flex;flex-direction:column;gap:10px;max-width:420px">
+                <input name="label" placeholder="Job name / description" class="dash-input" required>
+                <input name="address" placeholder="Job site address" class="dash-input">
+                <input name="contract_amount" type="number" min="0" step="0.01" placeholder="Contract amount ($)" class="dash-input">
+                <select name="status" class="dash-input">
+                  <option value="estimate">Estimate</option>
+                  <option value="active" selected>Active</option>
+                </select>
+                <textarea name="notes" placeholder="Notes" class="dash-input" rows="2"></textarea>
+                <button type="submit" class="primary-btn" style="width:fit-content">Create Job</button>
+              </form>
+            </details>
+          </div>
+
+          <!-- Invoices panel (hidden by default) -->
+          <div data-gc-panel="invoices" hidden>
+            <h3>Invoices — Outstanding</h3>
+            <div id="gc-invoices-list"><p class="dim">Loading…</p></div>
+            <details style="margin-top:20px">
+              <summary style="cursor:pointer;color:#0fb9b1;font-size:14px;user-select:none">+ New Invoice</summary>
+              <form id="gc-new-invoice-form" style="margin-top:12px;display:flex;flex-direction:column;gap:10px;max-width:420px">
+                <input name="project_id" placeholder="Job ID (from job card)" class="dash-input" required>
+                <input name="description" placeholder="Description (e.g. Draw 2 — framing)" class="dash-input">
+                <input name="subtotal" type="number" min="0" step="0.01" placeholder="Invoice amount ($)" class="dash-input" required>
+                <input name="due_days" type="number" value="30" placeholder="Due in (days)" class="dash-input">
+                <input name="memo" placeholder="Memo / note" class="dash-input">
+                <button type="submit" class="primary-btn" style="width:fit-content">Create Invoice</button>
+              </form>
+            </details>
+          </div>
+
+          <!-- Change Orders panel (hidden by default) -->
+          <div data-gc-panel="change_orders" hidden>
+            <h3>Change Orders — Pending</h3>
+            <div id="gc-cos-list"><p class="dim">Loading…</p></div>
+            <details style="margin-top:20px">
+              <summary style="cursor:pointer;color:#0fb9b1;font-size:14px;user-select:none">+ New Change Order</summary>
+              <form id="gc-new-co-form" style="margin-top:12px;display:flex;flex-direction:column;gap:10px;max-width:420px">
+                <input name="project_id" placeholder="Job ID" class="dash-input" required>
+                <input name="description" placeholder="What changed?" class="dash-input" required>
+                <input name="amount" type="number" step="0.01" placeholder="Amount ($)" class="dash-input" required>
+                <input name="reason" placeholder="Reason for change" class="dash-input">
+                <button type="submit" class="primary-btn" style="width:fit-content">Submit CO</button>
+              </form>
+            </details>
+          </div>
+
+          <!-- Daily Logs panel (hidden by default) -->
+          <div data-gc-panel="daily_logs" hidden>
+            <h3>Daily Logs — This Week</h3>
+            <div id="gc-logs-list"><p class="dim">Loading…</p></div>
+            <details style="margin-top:20px">
+              <summary style="cursor:pointer;color:#0fb9b1;font-size:14px;user-select:none">+ Log Today</summary>
+              <form id="gc-new-log-form" style="margin-top:12px;display:flex;flex-direction:column;gap:10px;max-width:420px">
+                <input name="project_id" placeholder="Job ID" class="dash-input" required>
+                <input name="date" type="date" class="dash-input">
+                <textarea name="work_done" placeholder="What was accomplished today?" class="dash-input" rows="3" required></textarea>
+                <input name="crew" placeholder="Crew names (comma separated)" class="dash-input">
+                <input name="hours" type="number" step="0.5" placeholder="Hours on site" class="dash-input">
+                <input name="weather" placeholder="Weather conditions" class="dash-input">
+                <textarea name="notes" placeholder="Other notes, delays, deliveries…" class="dash-input" rows="2"></textarea>
+                <button type="submit" class="primary-btn" style="width:fit-content">Save Log</button>
+              </form>
+            </details>
+          </div>
+
+          <!-- Subcontractors panel (hidden by default) -->
+          <div data-gc-panel="subcontractors" hidden>
+            <h3>Subcontractors</h3>
+            <div id="gc-subs-list"><p class="dim">Loading…</p></div>
+            <details style="margin-top:20px">
+              <summary style="cursor:pointer;color:#0fb9b1;font-size:14px;user-select:none">+ Add Subcontractor</summary>
+              <form id="gc-new-sub-form" style="margin-top:12px;display:flex;flex-direction:column;gap:10px;max-width:420px">
+                <input name="name" placeholder="Company or person name" class="dash-input" required>
+                <input name="trade" placeholder="Trade (framing, electric, plumbing…)" class="dash-input">
+                <input name="phone" placeholder="Phone" class="dash-input">
+                <input name="email" placeholder="Email" class="dash-input">
+                <input name="license" placeholder="License #" class="dash-input">
+                <input name="insurance_expires" type="date" placeholder="Insurance expiry" class="dash-input">
+                <textarea name="notes" placeholder="Notes" class="dash-input" rows="2"></textarea>
+                <button type="submit" class="primary-btn" style="width:fit-content">Add Sub</button>
+              </form>
+            </details>
+          </div>
         </div>
       </div>
     </section>

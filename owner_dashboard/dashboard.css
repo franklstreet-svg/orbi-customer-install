@@ -2276,3 +2276,80 @@ dialog .form-actions {
   border-bottom: 1px solid #1e2d4d;
   font-size: 13px;
 }
+
+/* ============================================================
+   CONTRACTOR / CONSTRUCTION MODULE
+   ============================================================ */
+.gc-snav {
+  background: none;
+  border: none;
+  color: #8898c0;
+  font-size: 13px;
+  font-weight: 500;
+  padding: 8px 10px;
+  border-radius: 7px;
+  cursor: pointer;
+  text-align: left;
+  transition: background .15s, color .15s;
+}
+.gc-snav:hover { background: rgba(15,185,177,0.08); color: #c0d0f0; }
+.gc-snav.active { background: rgba(15,185,177,0.15); color: #0fb9b1; font-weight: 600; }
+
+.gc-stat-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
+  gap: 10px;
+  margin-bottom: 4px;
+}
+.gc-stat {
+  background: #131929;
+  border: 1px solid #2a3554;
+  border-radius: 10px;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.gc-stat-num { font-size: 20px; font-weight: 700; color: #0fb9b1; }
+.gc-stat-label { font-size: 11px; color: #8898c0; }
+
+.gc-project-card {
+  background: #131929;
+  border: 1px solid #2a3554;
+  border-radius: 10px;
+  padding: 14px 16px;
+  margin-bottom: 10px;
+}
+.gc-proj-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; }
+.gc-proj-name { font-weight: 600; color: #e0e8ff; }
+.gc-proj-addr { font-size: 12px; margin-bottom: 8px; }
+.gc-proj-money { display: flex; gap: 16px; font-size: 13px; color: #8898c0; margin-bottom: 8px; flex-wrap: wrap; }
+.gc-proj-money strong { color: #e0e8ff; }
+.gc-prog-bar-wrap { height: 5px; background: #1e2d4d; border-radius: 3px; margin-bottom: 8px; }
+.gc-prog-bar { height: 100%; background: #0fb9b1; border-radius: 3px; transition: width .5s; }
+.gc-proj-actions { display: flex; gap: 8px; }
+
+.gc-log-card {
+  background: rgba(255,255,255,0.02);
+  border: 1px solid #2a3554;
+  border-radius: 8px;
+  padding: 12px 14px;
+  margin-bottom: 8px;
+  font-size: 13px;
+}
+.gc-log-header { font-size: 13px; margin-bottom: 4px; }
+
+.gc-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.gc-table th { text-align: left; padding: 8px 10px; color: #8898c0; border-bottom: 1px solid #2a3554; font-weight: 600; }
+.gc-table td { padding: 9px 10px; border-bottom: 1px solid #1e2d4d; color: #c0d0f0; vertical-align: middle; }
+.gc-table tr:last-child td { border-bottom: none; }
+
+.gc-row-item { display: flex; gap: 12px; align-items: center; padding: 8px 0; border-bottom: 1px solid #1e2d4d; font-size: 13px; flex-wrap: wrap; }
+.gc-row-item:last-child { border-bottom: none; }
+
+/* Colour-coded status badges — shared with legal and other modules */
+.badge-green  { background: rgba(40,167,69,0.2);  color: #4cbb70; font-size:11px; padding:2px 8px; border-radius:12px; font-weight:600; }
+.badge-red    { background: rgba(220,53,69,0.2);   color: #e06070; font-size:11px; padding:2px 8px; border-radius:12px; font-weight:600; }
+.badge-blue   { background: rgba(58,122,240,0.2);  color: #6ea2ff; font-size:11px; padding:2px 8px; border-radius:12px; font-weight:600; }
+.badge-yellow { background: rgba(255,193,7,0.2);   color: #ffc107; font-size:11px; padding:2px 8px; border-radius:12px; font-weight:600; }
+.badge-gray   { background: rgba(136,152,192,0.2); color: #8898c0; font-size:11px; padding:2px 8px; border-radius:12px; font-weight:600; }
