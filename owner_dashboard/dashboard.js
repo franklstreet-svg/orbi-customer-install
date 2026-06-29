@@ -1131,6 +1131,32 @@
       openMergeDialog();
     });
 
+    // Map view — toggle Leaflet contact map in the panel above the list
+    document.getElementById('contacts-map-btn')?.addEventListener('click', async () => {
+      const panel = document.getElementById('contacts-map-panel');
+      if (!panel) return;
+      const visible = panel.style.display !== 'none';
+      if (visible) {
+        panel.style.display = 'none';
+        document.getElementById('contacts-map-btn').textContent = '🗺 Map';
+        return;
+      }
+      panel.style.display = 'block';
+      document.getElementById('contacts-map-btn').textContent = '✕ Hide Map';
+      if (panel.innerHTML.trim()) return; // already loaded
+      panel.innerHTML = '<div style="padding:20px;color:#888">Loading map…</div>';
+      try {
+        const resp = await fetch('/api/owner/map', { credentials: 'include' });
+        if (!resp.ok) throw new Error(await resp.text());
+        const html = await resp.text();
+        // Extract just the body content from the full page
+        const bodyMatch = html.match(/<body[^>]*>([\s\S]*)<\/body>/i);
+        panel.innerHTML = bodyMatch ? bodyMatch[1] : html;
+      } catch (e) {
+        panel.innerHTML = `<div style="padding:20px;color:#e74c3c">Could not load map: ${e.message}</div>`;
+      }
+    });
+
     wireMailMerge();
   }
 

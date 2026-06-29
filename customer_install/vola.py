@@ -124,6 +124,7 @@ from modules import line_items as mod_line_items
 from tools import url_fetch as tool_url_fetch
 from tools import web_search as tool_web_search
 from modules import legal as mod_legal
+from modules import maps as mod_maps
 
 # ---------------------------------------------------------------------------
 # Paths and config
@@ -3328,7 +3329,17 @@ def public_chat():
 
     # Multi-tenant routing: business profile already resolved above (the
     # privacy guard needed it to detect sales-bot mode).
-    scope    = (CONFIG.get("scope") or {})
+    scope    = dict(CONFIG.get("scope") or {})
+
+    # Auto-enable ordering for any business profile that has both a menu
+    # and an order_submission config — regardless of what the global
+    # config.json says. This is the right default for restaurant profiles:
+    # if the business can accept orders (kitchen email/printer wired up)
+    # and has a menu, Orby should be instructed to collect name + phone.
+    if (business.get("menu_items") and business.get("order_submission")
+            and not scope.get("public_can_take_orders")):
+        scope = dict(scope)
+        scope["public_can_take_orders"] = True
 
     # SALES BOT prospect attachment — when the visitor on twickell.com told
     # Orby their business URL and the client already triggered a scrape,
@@ -15043,6 +15054,17 @@ _KNOW_SERVICES_RE = _re.compile(
     r")\s*[?.!]?\s*$",
     _re.IGNORECASE,
 )
+_KNOW_DISTANCE_RE = _re.compile(
+    r"^\s*(?:"
+    r"how\s+far\s+(?:is\s+it\s+)?(?:from\s+(?P<from>[^?!]{5,80})\s+to\s+(?P<to>[^?!]{5,80})"
+    r"|to\s+(?P<to2>[^?!]{5,80})(?:\s+from\s+(?P<from2>[^?!]{5,80}))?)"
+    r"|(?:how\s+long|what(?:'s|\s+is)\s+the\s+(?:drive|trip|commute))\s+(?:does\s+it\s+take\s+)?(?:from\s+(?P<from3>[^?!]{5,80})\s+to\s+(?P<to3>[^?!]{5,80})|to\s+(?P<to4>[^?!]{5,80}))"
+    r"|(?:drive|driving|travel)\s+(?:time|distance)\s+(?:from\s+(?P<from4>[^?!]{5,80})\s+to\s+(?P<to5>[^?!]{5,80})|to\s+(?P<to6>[^?!]{5,80}))"
+    r"|distance\s+(?:from\s+(?P<from5>[^?!]{5,80})\s+to\s+(?P<to7>[^?!]{5,80})|between\s+(?P<a>[^?!]{5,80})\s+and\s+(?P<b>[^?!]{5,80}))"
+    r"|get\s+directions?\s+(?:to|from)\s+(?P<dir_addr>[^?!]{5,120})"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
 _KNOW_SERVICE_AREA_RE = _re.compile(
     r"^\s*(?:"
     r"what(?:'s| is)?\s+(?:our|your|my|the)\s+service\s+area"
@@ -15209,6 +15231,29 @@ def _try_knowledge_chat(message: str, user_rec: dict) -> dict | None:
             f"Add it in Settings → Business → Policies → Service area."
         ), "tier": "local", "latency_ms": 0,
            "source": "know_service_area_empty"}
+
+    # DISTANCE / DIRECTIONS — "how far is 456 Main St from us"
+    m = _KNOW_DISTANCE_RE.match(msg)
+    if m:
+        g = m.groupdict()
+        # Pull origin + destination from whichever named groups matched
+        origin = (g.get("from") or g.get("from2") or g.get("from3") or
+                  g.get("from4") or g.get("from5") or g.get("a") or "").strip().rstrip("?.!")
+        dest   = (g.get("to") or g.get("to2") or g.get("to3") or g.get("to4") or
+                  g.get("to5") or g.get("to6") or g.get("to7") or
+                  g.get("b") or g.get("dir_addr") or "").strip().rstrip("?.!")
+        # Default origin to business address when not specified
+        if not origin:
+            addr_block = biz.get("address") or {}
+            origin = ", ".join(filter(None, [
+                addr_block.get("street", ""), addr_block.get("city", ""),
+                addr_block.get("state", ""), addr_block.get("zip", ""),
+            ]))
+        if dest:
+            cache_dir = DATA_DIR / "geocode_cache"
+            reply = mod_maps.distance_reply(origin, dest, cache_dir=cache_dir)
+            return {"reply": reply, "tier": "local", "latency_ms": 0,
+                    "source": "know_distance"}
 
     # HOURS — "what are our business hours"
     if _KNOW_HOURS_RE.match(msg):
@@ -21715,6 +21760,11 @@ _END_OF_ORDER_SIGNALS = (
     "submit", "place the order", "place my order", "send it",
     "how much", "what's the total", "what is the total", "what's it come to",
     "what does that come to", "ring me up", "im done", "i'm done",
+    # Natural confirmations after Orby reads back the order and asks "sound good?"
+    "yes please", "yes go ahead", "go ahead", "sounds good", "that sounds good",
+    "that works", "perfect", "yes that's right", "yes that works",
+    "please go ahead", "yes that's correct", "correct", "yep", "yup",
+    "that's correct", "thats correct", "yes please go ahead",
 )
 
 
@@ -22253,6 +22303,142 @@ def purblum_order():
         "message": (f"Got it — order {order_id[:6]} for ${totals['total']:.2f}. "
                     f"Frank's been notified."),
     }), origin)
+
+
+# ── Maps / Geo routes ─────────────────────────────────────────────────────────
+
+@app.route("/api/owner/map", methods=["GET"])
+def owner_map_page():
+    """Serve a full Leaflet.js HTML page showing all contacts with addresses.
+    GET params: ?demo_as=slug for demo mode."""
+    owner_session = auth.require_owner(ORBI_DIR)
+    if isinstance(owner_session, tuple):
+        return owner_session   # auth error redirect/response
+
+    owner_user = owner_session.get("username", "")
+    user_dir   = users_mod.get_user_dir(DATA_DIR, owner_user)
+    contacts   = mod_contacts.list_all(user_dir) or []
+    business   = _resolve_business_profile_for_request(request)
+
+    cache_dir = DATA_DIR / "geocode_cache"
+    map_html  = mod_maps.contacts_map_html(contacts, business, cache_dir=cache_dir)
+
+    biz_name = business.get("name", "Your Business")
+    page = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{biz_name} — Contact Map</title>
+<style>
+  body {{ margin: 0; padding: 20px; font-family: system-ui, sans-serif;
+          background: #0f0f1a; color: #e0e0e0; }}
+  h2   {{ margin: 0 0 12px; font-size: 18px; color: #a78bfa; }}
+  .map-wrap {{ background: #1a1a2e; border-radius: 10px; padding: 16px; }}
+  a    {{ color: #a78bfa; }}
+</style>
+</head>
+<body>
+<div class="map-wrap">
+  <h2>📍 {biz_name} — Contact Map</h2>
+  {map_html}
+</div>
+</body>
+</html>"""
+    from flask import Response
+    return Response(page, mimetype="text/html")
+
+
+@app.route("/api/owner/map/geocode", methods=["POST"])
+def owner_map_geocode():
+    """Geocode a single address. Body: {address: str}.
+    Returns: {lat, lon, display_name} or {error}."""
+    owner_session = auth.require_owner(ORBI_DIR)
+    if isinstance(owner_session, tuple):
+        return owner_session
+
+    body = request.get_json(silent=True) or {}
+    address = (body.get("address") or "").strip()
+    if not address:
+        return jsonify({"error": "address required"}), 400
+
+    cache_dir = DATA_DIR / "geocode_cache"
+    result = mod_maps.geocode(address, cache_dir=cache_dir)
+    if not result:
+        return jsonify({"error": f"Could not locate \"{address}\""}), 404
+    return jsonify(result)
+
+
+@app.route("/api/owner/map/distance", methods=["POST"])
+def owner_map_distance():
+    """Get driving distance + ETA between two addresses.
+    Body: {origin: str, destination: str}.
+    Returns: {distance_miles, duration_min, reply, directions_url}."""
+    owner_session = auth.require_owner(ORBI_DIR)
+    if isinstance(owner_session, tuple):
+        return owner_session
+
+    body = request.get_json(silent=True) or {}
+    origin = (body.get("origin") or "").strip()
+    dest   = (body.get("destination") or "").strip()
+    if not origin or not dest:
+        return jsonify({"error": "origin and destination required"}), 400
+
+    cache_dir = DATA_DIR / "geocode_cache"
+    o_geo = mod_maps.geocode(origin, cache_dir=cache_dir)
+    d_geo = mod_maps.geocode(dest,   cache_dir=cache_dir)
+    if not o_geo:
+        return jsonify({"error": f"Could not locate \"{origin}\""}), 404
+    if not d_geo:
+        return jsonify({"error": f"Could not locate \"{dest}\""}), 404
+
+    route  = mod_maps.driving_route(o_geo, d_geo)
+    reply  = mod_maps.distance_reply(origin, dest, cache_dir=cache_dir)
+    dirurl = mod_maps.directions_url(o_geo, d_geo)
+    return jsonify({
+        "distance_miles": route["distance_miles"],
+        "duration_min":   route["duration_min"],
+        "driving":        route["ok"],
+        "reply":          reply,
+        "directions_url": dirurl,
+    })
+
+
+@app.route("/api/owner/map/service_area", methods=["POST"])
+def owner_map_service_area():
+    """Check if an address is within the business's service area.
+    Body: {address: str}. Reads service_area_miles from business profile.
+    Returns: {within, distance_miles, duration_min, radius_miles}."""
+    owner_session = auth.require_owner(ORBI_DIR)
+    if isinstance(owner_session, tuple):
+        return owner_session
+
+    body = request.get_json(silent=True) or {}
+    address = (body.get("address") or "").strip()
+    if not address:
+        return jsonify({"error": "address required"}), 400
+
+    business  = _resolve_business_profile_for_request(request)
+    cache_dir = DATA_DIR / "geocode_cache"
+    result    = mod_maps.in_service_area(address, business, cache_dir=cache_dir)
+    radius    = float((business or {}).get("service_area_miles") or 25.0)
+
+    if result.get("error") == "business_address_not_configured":
+        return jsonify({"error": "Business address not set in your profile."}), 400
+    if result.get("error"):
+        return jsonify({"error": f"Could not check service area: {result['error']}"}), 400
+
+    within = result["within"]
+    dist   = result["distance_miles"]
+    mins   = result["duration_min"]
+    reply  = (
+        f"Yes, {address} is within your {radius:.0f}-mile service area "
+        f"— {dist} miles away, about {mins} minutes."
+        if within else
+        f"No, {address} is outside your {radius:.0f}-mile service area. "
+        f"It's {dist} miles away ({mins} min drive)."
+    )
+    return jsonify({**result, "radius_miles": radius, "reply": reply})
 
 
 if __name__ == "__main__":
