@@ -6282,7 +6282,183 @@
         } catch { alert('Could not close matter.'); }
       });
     });
+
+    // Matter card click → open detail overlay
+    el.addEventListener('click', e => {
+      const card = e.target.closest('.legal-matter-card');
+      if (!card || e.target.closest('.legal-close-matter-btn')) return;
+      _openMatterDetail(card.dataset.id);
+    });
   }
+
+  let _mdMatterId = null;
+
+  async function _openMatterDetail(matterId) {
+    _mdMatterId = matterId;
+    const overlay = document.getElementById('legal-matter-detail');
+    if (!overlay) return;
+    overlay.hidden = false;
+    document.getElementById('md-title').textContent = 'Loading…';
+    document.getElementById('md-info').innerHTML = '';
+    ['deadlines','time','docs'].forEach(s => {
+      const el = document.getElementById('md-sec-' + s);
+      if (el) el.innerHTML = '<p class="muted" style="font-size:13px">Loading…</p>';
+    });
+    _mdSwitchTab('deadlines');
+
+    const [matterData, dlData, timeData, draftData] = await Promise.allSettled([
+      api(`/api/owner/legal/matters/${matterId}`),
+      api(`/api/owner/legal/deadlines?matter_id=${matterId}&days=365`),
+      api(`/api/owner/legal/time?matter_id=${matterId}`),
+      api(`/api/owner/legal/drafts?matter_id=${matterId}`),
+    ]);
+
+    const m = matterData.status === 'fulfilled' ? matterData.value : {};
+    document.getElementById('md-title').textContent = m.title || 'Matter Detail';
+    document.getElementById('md-meta').textContent =
+      [m.matter_number, (m.status||'').toUpperCase(), m.practice_area ? m.practice_area.replace(/_/g,' ') : ''].filter(Boolean).join(' · ');
+
+    const infoEl = document.getElementById('md-info');
+    const infoRows = [
+      ['Client', m.client_name], ['Phone', m.client_phone], ['Email', m.client_email],
+      ['Opposing Party', m.opposing_party], ['Opposing Counsel', m.opposing_counsel],
+      ['Court', m.court], ['Case #', m.case_number], ['Judge', m.judge],
+      ['Jurisdiction', m.jurisdiction], ['Rate', m.rate ? `$${Number(m.rate).toFixed(2)}/hr` : null],
+      ['Retainer', m.retainer ? `$${Number(m.retainer).toFixed(2)}` : null],
+    ].filter(([,v]) => v);
+    infoEl.innerHTML = infoRows.map(([k,v]) =>
+      `<div><span style="color:#6a7a9a;font-size:11px;text-transform:uppercase;letter-spacing:.5px">${_lesc(k)}</span><br><span>${_lesc(v)}</span></div>`
+    ).join('');
+
+    // Deadlines tab
+    const dls = dlData.status === 'fulfilled' ? (dlData.value.deadlines || []) : [];
+    const today = new Date(); today.setHours(0,0,0,0);
+    document.getElementById('md-sec-deadlines').innerHTML = dls.length ? dls.map(d => {
+      const due = new Date(d.due_date + 'T00:00:00');
+      const diff = Math.ceil((due - today) / 86400000);
+      const urgency = diff < 0 ? 'color:#dc3545' : diff <= 7 ? 'color:#ffc107' : 'color:#4cbb70';
+      const label = diff < 0 ? `${Math.abs(diff)}d overdue` : diff === 0 ? 'Today' : `${diff}d`;
+      return `<div style="display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid #1a2040">
+        <div>
+          <div style="font-size:13px;font-weight:600">${_lesc(d.title)}</div>
+          <div style="font-size:11px;color:#6a7a9a">${_lesc(d.due_date)} · ${_lesc((d.type||'').replace(/_/g,' '))}</div>
+        </div>
+        <span style="font-size:12px;font-weight:600;${urgency}">${label}</span>
+      </div>`;
+    }).join('') : '<p class="muted" style="font-size:13px">No deadlines yet — click "+ Deadline" to add one.</p>';
+
+    // Time tab
+    const entries = timeData.status === 'fulfilled' ? (timeData.value.entries || []) : [];
+    const total = entries.reduce((s,e) => s + (e.hours||0), 0);
+    const unbilled = entries.filter(e => !e.billed).reduce((s,e) => s + (e.amount||0), 0);
+    document.getElementById('md-sec-time').innerHTML = entries.length ?
+      `<div style="display:flex;gap:24px;margin-bottom:14px;font-size:13px">
+        <span>Total: <strong>${total.toFixed(2)}h</strong></span>
+        <span>Unbilled: <strong>$${unbilled.toFixed(2)}</strong></span>
+      </div>` +
+      entries.map(e => `<div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #1a2040;font-size:12px">
+        <div>
+          <div style="color:#d0d8f0">${_lesc(e.description||'')}</div>
+          <div style="color:#6a7a9a">${_lesc(e.date||'')} · ${e.hours}h · $${Number(e.rate||0).toFixed(2)}/hr</div>
+        </div>
+        <span style="color:${e.billed ? '#4cbb70' : '#ffc107'};font-size:11px;font-weight:600">${e.billed ? 'Billed' : 'Unbilled'}</span>
+      </div>`).join('')
+      : '<p class="muted" style="font-size:13px">No time logged yet — say "log X hours to [matter]" in chat.</p>';
+
+    // Docs tab
+    const drafts = draftData.status === 'fulfilled' ? (draftData.value.drafts || []) : [];
+    document.getElementById('md-sec-docs').innerHTML = drafts.length ? drafts.map(d =>
+      `<div style="display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid #1a2040">
+        <div>
+          <div style="font-size:13px;font-weight:600">${_lesc(d.template_name||'Document')}</div>
+          <div style="font-size:11px;color:#6a7a9a">${new Date(d.updated_at*1000).toLocaleDateString()}</div>
+        </div>
+        <span class="legal-status-${_lesc(d.status||'draft')}" style="font-size:11px">${_lesc(d.status||'draft')}</span>
+      </div>`
+    ).join('') : '<p class="muted" style="font-size:13px">No documents yet — click "+ Document" to draft one.</p>';
+
+    // Close matter button state
+    document.getElementById('md-close-matter-btn').dataset.matterId = matterId;
+  }
+
+  function _mdSwitchTab(name) {
+    document.querySelectorAll('.md-tab').forEach(b => {
+      const active = b.dataset.sec === name;
+      b.style.borderBottomColor = active ? '#7b5cf0' : 'transparent';
+      b.style.color = active ? '#c0c8e8' : '#6a7a9a';
+      b.style.fontWeight = active ? '600' : '400';
+    });
+    ['deadlines','time','docs'].forEach(s => {
+      const el = document.getElementById('md-sec-' + s);
+      if (el) el.hidden = s !== name;
+    });
+  }
+
+  // Wire matter detail overlay controls (run once)
+  (function() {
+    document.getElementById('md-close')?.addEventListener('click', () => {
+      document.getElementById('legal-matter-detail').hidden = true;
+      _mdMatterId = null;
+    });
+    document.querySelectorAll('.md-tab').forEach(btn => {
+      btn.addEventListener('click', () => _mdSwitchTab(btn.dataset.sec));
+    });
+    document.getElementById('md-add-dl-btn')?.addEventListener('click', () => {
+      document.getElementById('md-add-dl-form').hidden = false;
+      document.getElementById('md-dl-due').valueAsDate = new Date();
+    });
+    document.getElementById('md-dl-cancel')?.addEventListener('click', () => {
+      document.getElementById('md-add-dl-form').hidden = true;
+    });
+    document.getElementById('md-dl-save')?.addEventListener('click', async () => {
+      if (!_mdMatterId) return;
+      const title = document.getElementById('md-dl-title').value.trim();
+      const due   = document.getElementById('md-dl-due').value;
+      if (!title || !due) { document.getElementById('md-dl-status').textContent = 'Title and date required.'; return; }
+      const matter = (_legalMattersCache || []).find(m => m.id === _mdMatterId) || {};
+      try {
+        await api('/api/owner/legal/deadlines', { method:'POST', body: JSON.stringify({
+          matter_id: _mdMatterId, matter_title: matter.title || '', title,
+          due_date: due, type: document.getElementById('md-dl-type').value || 'other',
+        })});
+        document.getElementById('md-add-dl-form').hidden = true;
+        document.getElementById('md-dl-title').value = '';
+        _openMatterDetail(_mdMatterId);
+      } catch { document.getElementById('md-dl-status').textContent = 'Could not save.'; }
+    });
+    document.getElementById('md-log-time-btn')?.addEventListener('click', () => {
+      document.getElementById('legal-matter-detail').hidden = true;
+      _legalSwitchSec('time');
+      const matter = (_legalMattersCache || []).find(m => m.id === _mdMatterId);
+      const matterInput = document.getElementById('time-matter');
+      if (matterInput && matter) matterInput.value = matter.title || '';
+    });
+    document.getElementById('md-draft-btn')?.addEventListener('click', () => {
+      document.getElementById('legal-matter-detail').hidden = true;
+      _legalSwitchSec('drafts');
+      document.getElementById('legal-draft-form').hidden = false;
+      document.getElementById('legal-new-draft-btn').hidden = true;
+      const matter = (_legalMattersCache || []).find(m => m.id === _mdMatterId);
+      const matterInput = document.getElementById('draft-matter');
+      if (matterInput && matter) matterInput.value = matter.title || '';
+    });
+    document.getElementById('md-close-matter-btn')?.addEventListener('click', async () => {
+      const id = document.getElementById('md-close-matter-btn').dataset.matterId;
+      if (!id || !confirm('Close this matter?')) return;
+      try {
+        await api(`/api/owner/legal/matters/${id}/close`, { method:'POST' });
+        document.getElementById('legal-matter-detail').hidden = true;
+        loadLegal();
+      } catch { alert('Could not close matter.'); }
+    });
+    // Click outside overlay to close
+    document.getElementById('legal-matter-detail')?.addEventListener('click', e => {
+      if (e.target === document.getElementById('legal-matter-detail')) {
+        document.getElementById('legal-matter-detail').hidden = true;
+        _mdMatterId = null;
+      }
+    });
+  })();
 
   function _legalRenderDeadlines(deadlines) {
     const el = document.getElementById('legal-deadlines-list');

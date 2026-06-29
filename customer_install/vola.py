@@ -590,6 +590,118 @@ threading.Thread(target=fleet_heartbeat_loop, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
+# Legal deadline reminder loop — checks every 24 h and fires in-app
+# notifications at the 30/14/7/3/1-day marks before each pending deadline.
+# Tracks sent reminders in legal/deadline_reminders.json so the same
+# milestone is never fired twice.
+# ---------------------------------------------------------------------------
+
+_DEADLINE_REMINDER_MILESTONES = [30, 14, 7, 3, 1]  # days out
+
+
+def _deadline_reminders_sent_path() -> Path:
+    return DATA_DIR / "legal" / "deadline_reminders.json"
+
+
+def _load_deadline_reminders_sent() -> dict:
+    p = _deadline_reminders_sent_path()
+    if p.exists():
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def _save_deadline_reminders_sent(sent: dict) -> None:
+    p = _deadline_reminders_sent_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(sent, ensure_ascii=False), encoding="utf-8")
+
+
+def _run_deadline_reminders() -> int:
+    """Check all pending deadlines and fire notifications for upcoming milestones.
+    Returns the number of notifications sent."""
+    if "legal" not in (CONFIG.get("enabled_modules") or []):
+        return 0
+    try:
+        from datetime import date as _date
+        deadlines = mod_legal.list_deadlines(DATA_DIR, status="pending")
+    except Exception as e:
+        log.debug(f"deadline reminder: could not load deadlines: {e}")
+        return 0
+    if not deadlines:
+        return 0
+
+    from datetime import date as _date
+    today = _date.today()
+    sent = _load_deadline_reminders_sent()
+    fired = 0
+
+    for dl in deadlines:
+        try:
+            due = _date.fromisoformat(dl["due_date"])
+        except (KeyError, ValueError):
+            continue
+        days_out = (due - today).days
+        if days_out < 0:
+            continue  # already past
+
+        for milestone in _DEADLINE_REMINDER_MILESTONES:
+            if days_out > milestone:
+                continue
+            key = f"{dl['id']}:{milestone}"
+            if key in sent:
+                continue
+            # Only fire if we're within 1 day of the milestone threshold
+            # (prevents double-firing if the loop ran slightly early)
+            if days_out < milestone - 1:
+                continue
+
+            matter_label = dl.get("matter_title") or dl.get("matter_id", "")
+            if days_out == 0:
+                when_str = "TODAY"
+            elif days_out == 1:
+                when_str = "tomorrow"
+            else:
+                when_str = f"in {days_out} days ({dl['due_date']})"
+
+            title = f"Deadline {when_str}: {dl.get('title', 'Unknown')}"
+            body  = f"Matter: {matter_label}\nDue: {dl['due_date']}"
+            if dl.get("type") and dl["type"] != "other":
+                body += f"\nType: {dl['type'].replace('_', ' ').title()}"
+
+            try:
+                notify.send(CONFIG, DATA_DIR, event="legal_deadline_reminder",
+                            title=title, body=body,
+                            url="/owner-dashboard#legal")
+                sent[key] = str(today)
+                fired += 1
+                log.info(f"deadline reminder fired: {key}")
+            except Exception as e:
+                log.warning(f"deadline reminder send failed for {key}: {e}")
+
+    if fired:
+        _save_deadline_reminders_sent(sent)
+    return fired
+
+
+def _deadline_reminder_loop():
+    time.sleep(120)  # let Orby finish starting up first
+    while True:
+        try:
+            n = _run_deadline_reminders()
+            if n:
+                log.info(f"deadline reminders: {n} sent this cycle")
+        except Exception as e:
+            log.warning(f"deadline reminder loop error: {e}")
+        time.sleep(86400)  # check once per day
+
+
+threading.Thread(target=_deadline_reminder_loop, daemon=True).start()
+
+
+# ---------------------------------------------------------------------------
 # Cloudflare tunnel — give the customer a stable-ish public URL so Twilio
 # voice webhooks (from Frank's brain server) and visitor-chat traffic can
 # reach this machine. Uses cloudflared's quick mode (trycloudflare.com)
@@ -16337,6 +16449,13 @@ _LEGAL_MATTERS_RE = _re.compile(
     r"^(?:list|show|what(?:'s|\s+are)?)\s+(?:me\s+)?(?:all\s+)?(?:my\s+)?(?:active\s+|open\s+|current\s+)?(?:matters?|cases?|files?)(?:\s+|$)",
     _re.IGNORECASE,
 )
+_LEGAL_MATTER_STATUS_RE = _re.compile(
+    r"^(?:what(?:'s|\s+is)\s+(?:the\s+)?(?:status|update|progress|standing)\s+(?:of|on|for)|"
+    r"(?:status|update|progress)\s+(?:of|on|for)|"
+    r"(?:how(?:'s|\s+is)\s+))"
+    r"\s*(?:the\s+)?(?P<matter>.{3,100})$",
+    _re.IGNORECASE,
+)
 _LEGAL_RESEARCH_RE = _re.compile(
     r"^(?:research|look\s+up|find\s+case\s+law\s+on|what(?:'s|\s+is)\s+the\s+law\s+on)\s+(?P<question>.+)$",
     _re.IGNORECASE,
@@ -16539,6 +16658,66 @@ def _try_legal_chat(message: str, user_rec: dict,
         if len(matters) > 10:
             lines.append(f"  … and {len(matters) - 10} more.")
         return {"reply": "\n".join(lines), "source": "legal.matters"}
+
+    # Matter status query — "what's the status of Smith v. Jones?"
+    m = _LEGAL_MATTER_STATUS_RE.match(msg)
+    if m:
+        matter_q = (m.group("matter") or "").strip()
+        # Strip trailing question marks, "matter", "case"
+        matter_q = _re.sub(r'[\?\s]+$', '', matter_q)
+        matter_q = _re.sub(r'\b(?:matter|case|file)\b', '', matter_q, flags=_re.I).strip()
+        hits = mod_legal.list_matters(DATA_DIR, search=matter_q) if matter_q else []
+        if not hits:
+            # Broader fallback — try each word
+            for word in matter_q.split():
+                if len(word) > 3:
+                    hits = mod_legal.list_matters(DATA_DIR, search=word)
+                    if hits:
+                        break
+        if not hits:
+            return {
+                "reply": (
+                    f"I couldn't find a matter matching \"{matter_q}\". "
+                    "Try the client name or matter number."
+                ),
+                "source": "legal.matter.status",
+            }
+        mat = hits[0]
+        from datetime import date as _status_date
+        today = _status_date.today()
+        # Upcoming deadlines for this matter
+        upcoming = mod_legal.list_deadlines(DATA_DIR, matter_id=mat["id"],
+                                             status="pending", upcoming_days=30)
+        # Unbilled time
+        time_entries = mod_legal.list_time(DATA_DIR, matter_id=mat["id"])
+        unbilled = [e for e in time_entries if not e.get("billed")]
+        unbilled_hrs  = sum(e.get("hours", 0) for e in unbilled)
+        unbilled_amt  = sum(e.get("amount", 0) for e in unbilled)
+        total_hrs     = sum(e.get("hours", 0) for e in time_entries)
+
+        lines = [
+            f"**{mat['title']}** ({mat['matter_number']})",
+            f"Status: {mat.get('status','?').upper()}  |  "
+            f"Practice area: {(mat.get('practice_area') or 'unspecified').replace('_', ' ')}",
+        ]
+        if mat.get("client_name"):
+            lines.append(f"Client: {mat['client_name']}")
+        if mat.get("opposing_party"):
+            lines.append(f"Opposing: {mat['opposing_party']}")
+        if mat.get("court"):
+            lines.append(f"Court: {mat['court']}"
+                         + (f"  |  Case #: {mat['case_number']}" if mat.get("case_number") else ""))
+        lines.append(f"Time logged: {total_hrs:.1f}h total  |  Unbilled: {unbilled_hrs:.1f}h (${unbilled_amt:.2f})")
+        if upcoming:
+            lines.append(f"\nUpcoming deadlines (next 30 days):")
+            for dl in upcoming[:5]:
+                due = _status_date.fromisoformat(dl["due_date"])
+                days_out = (due - today).days
+                label = "Today" if days_out == 0 else f"in {days_out}d ({dl['due_date']})"
+                lines.append(f"  • {dl['title']} — {label}")
+        else:
+            lines.append("No deadlines in the next 30 days.")
+        return {"reply": "\n".join(lines), "source": "legal.matter.status"}
 
     # Upcoming deadlines
     if _LEGAL_DEADLINES_RE.match(msg):

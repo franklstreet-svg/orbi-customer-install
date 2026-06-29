@@ -2495,6 +2495,41 @@ def build_phone_brief(business: dict, scope: dict | None = None) -> str:
     location = f" in {city}, {state_abbr}" if city else ""
     tagline_line = f" — {tagline}" if tagline else ""
 
+    # Attorney-specific block — injected when the legal module is active
+    legal_block = ""
+    legal = business.get("legal") or {}
+    if legal:
+        attorney_name  = legal.get("attorney_name") or owner_name or "the attorney"
+        practice_areas = legal.get("practice_areas") or []
+        if isinstance(practice_areas, str):
+            practice_areas = [a.strip() for a in practice_areas.replace(",", "\n").splitlines() if a.strip()]
+        areas_str = ", ".join(practice_areas) if practice_areas else "general practice"
+        consult_fee   = legal.get("consultation_fee")
+        consult_line  = f"  - Initial consultation: ${float(consult_fee):.0f} (tell callers this when they ask)" if consult_fee else ""
+        jurisdiction  = legal.get("default_jurisdiction") or ""
+        jx_line       = f"  - Jurisdiction: {jurisdiction}" if jurisdiction else ""
+        legal_block = f"""
+ATTORNEY RECEPTION RULES (this is a law firm — follow these strictly)
+ABOUT THIS FIRM: {attorney_name} handles {areas_str}.{' Based in ' + jurisdiction + '.' if jurisdiction else ''}
+{consult_line}
+{jx_line}
+
+INTAKE — when a caller wants to discuss a legal matter, capture all of these:
+  1. Full name
+  2. Phone number or best way to reach them
+  3. Brief description of their situation (2-3 sentences is enough)
+  4. Best time to call back
+Then say: "I'll pass this to {attorney_name} and someone will be in touch soon."
+
+UPL GUARDRAIL — CRITICAL:
+- NEVER give specific legal advice, case predictions, or interpret statutes for the caller.
+- You MAY answer general questions like hours, practice areas, consultation fees, and what types of cases the firm handles.
+- For anything requiring legal judgment say: "That's something {attorney_name} will discuss with you directly — let me get your contact info."
+- If asked about an active court case or specific law: "I'm not able to give legal advice, but {attorney_name} can — want me to set up a call?"
+
+CONFIDENTIALITY: Treat everything the caller shares as confidential. Do not repeat it back unnecessarily.
+"""
+
     return f"""You are Orby, the AI receptionist for {name}{owner_intro}{location}{tagline_line}.
 {desc[:400]}
 
@@ -2506,7 +2541,7 @@ MENU / SERVICES (authoritative — quote these names + prices VERBATIM)
 
 WHAT YOU CAN DO ON THIS CALL
 {cap_block}{avoid_line}
-
+{legal_block}
 PHONE DELIVERY RULES
 - PERSONALITY: warm, friendly, easygoing — a real person who works at this place. Use contractions ("I'll", "we've got", "lemme", "gotcha"). Drop in natural conversational beats ("yeah", "for sure", "honestly", "good question") where they fit. React to what the caller says. NEVER cold, NEVER lecture-tone, NEVER robotic.
 - BANNED OPENERS: "Absolutely!", "Certainly!", "Great question!", "Wonderful!", "Excellent!", "Perfect!" — skip those, just answer warmly.

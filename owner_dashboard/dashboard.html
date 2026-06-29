@@ -1184,6 +1184,60 @@
         </div><!-- end main content -->
       </div><!-- end flex row -->
 
+      <!-- Matter detail overlay — click any matter card to open -->
+      <div id="legal-matter-detail" hidden style="position:fixed;inset:0;background:rgba(0,0,0,0.80);z-index:1001;display:flex;align-items:flex-start;justify-content:center;padding:24px 16px;box-sizing:border-box;overflow-y:auto">
+        <div style="background:#131a2e;border-radius:14px;max-width:860px;width:100%;box-shadow:0 8px 48px rgba(0,0,0,0.7)">
+          <!-- Header -->
+          <div style="display:flex;align-items:center;justify-content:space-between;padding:18px 22px;border-bottom:1px solid #2a3554">
+            <div>
+              <h3 id="md-title" style="margin:0 0 2px;font-size:16px"></h3>
+              <span id="md-meta" class="muted" style="font-size:12px"></span>
+            </div>
+            <button id="md-close" class="text-btn" style="font-size:20px;line-height:1">✕</button>
+          </div>
+          <!-- Parties & info grid -->
+          <div id="md-info" style="padding:16px 22px;display:grid;grid-template-columns:1fr 1fr;gap:8px 24px;font-size:13px;border-bottom:1px solid #1a2040"></div>
+          <!-- Sub-tabs -->
+          <div style="display:flex;gap:0;border-bottom:1px solid #2a3554">
+            <button class="md-tab active" data-sec="deadlines" style="padding:10px 18px;font-size:13px;background:none;border:none;border-bottom:2px solid #7b5cf0;color:#c0c8e8;cursor:pointer;font-weight:600">Deadlines</button>
+            <button class="md-tab" data-sec="time" style="padding:10px 18px;font-size:13px;background:none;border:none;border-bottom:2px solid transparent;color:#6a7a9a;cursor:pointer">Time</button>
+            <button class="md-tab" data-sec="docs" style="padding:10px 18px;font-size:13px;background:none;border:none;border-bottom:2px solid transparent;color:#6a7a9a;cursor:pointer">Documents</button>
+          </div>
+          <div style="padding:18px 22px;min-height:200px">
+            <div id="md-sec-deadlines"></div>
+            <div id="md-sec-time" hidden></div>
+            <div id="md-sec-docs" hidden></div>
+          </div>
+          <!-- Add deadline quick form -->
+          <div id="md-add-dl-form" hidden style="padding:14px 22px;border-top:1px solid #1a2040;background:#0d1626">
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+              <input id="md-dl-title" class="legal-input" placeholder="Deadline title" style="grid-column:1/-1">
+              <input id="md-dl-due" class="legal-input" type="date">
+              <select id="md-dl-type" class="legal-input">
+                <option value="filing">Court Filing</option>
+                <option value="statute">Statute of Limitations</option>
+                <option value="discovery">Discovery</option>
+                <option value="hearing">Hearing</option>
+                <option value="trial">Trial</option>
+                <option value="other">Other</option>
+              </select>
+            </div>
+            <div style="display:flex;gap:10px;margin-top:8px">
+              <button id="md-dl-save" class="primary-btn" style="font-size:12px">Add Deadline</button>
+              <button id="md-dl-cancel" class="text-btn" style="font-size:12px">Cancel</button>
+              <span id="md-dl-status" class="muted" style="font-size:12px"></span>
+            </div>
+          </div>
+          <!-- Footer actions -->
+          <div style="padding:14px 22px;border-top:1px solid #2a3554;display:flex;gap:10px;flex-wrap:wrap">
+            <button id="md-add-dl-btn" class="secondary-btn" style="font-size:12px">+ Deadline</button>
+            <button id="md-log-time-btn" class="secondary-btn" style="font-size:12px">+ Log Time</button>
+            <button id="md-draft-btn" class="secondary-btn" style="font-size:12px">+ Document</button>
+            <button id="md-close-matter-btn" class="text-btn" style="font-size:12px;color:#8fa3c7;margin-left:auto">Close Matter</button>
+          </div>
+        </div>
+      </div>
+
       <!-- Document viewer overlay (shared across documents section) -->
       <div id="legal-doc-viewer" hidden style="position:fixed;inset:0;background:rgba(0,0,0,0.75);z-index:1000;display:flex;align-items:center;justify-content:center;padding:20px;box-sizing:border-box">
         <div style="background:#131a2e;border-radius:12px;max-width:820px;width:100%;max-height:90vh;display:flex;flex-direction:column;box-shadow:0 8px 40px rgba(0,0,0,0.6)">
