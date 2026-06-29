@@ -18664,6 +18664,12 @@ _AD_TRIGGER_RE = _re.compile(
     r"(?:story|stories|post|feed|cover|reels?|carousel|video|photo)?\s*"
     r"(?:ad|advert|advertisement|ad\s+creative|finished\s+ad|"
     r"complete\s+ad|whole\s+ad|full\s+ad|actual\s+ad)\b"
+    # "I want a picture/image for my ad / to promote / to drive traffic / for marketing"
+    r"|(?:i\s+(?:want|need|would\s+like)\s+(?:a\s+|an\s+)?)"
+    r"(?:stunning\s+|great\s+|good\s+|nice\s+|cool\s+|eye.catching\s+|bold\s+)?"
+    r"(?:picture|image|photo|graphic|visual|banner)\s+"
+    r"(?:of\s+|for\s+|that\s+|to\s+|which\s+).{0,120}"
+    r"(?:ad|promot|market|advertis|website|drive|push|stop|grab|attract|get\s+people)"
     r")",
     _re.IGNORECASE,
 )
