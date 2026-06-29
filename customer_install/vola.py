@@ -2797,7 +2797,7 @@ def owner_marketing_image_fetch(filename):
 # Attorney supervises all output — Idunn works FOR the attorney, not the client.
 
 def _require_legal_module():
-    owner_session = _require_owner()
+    owner_session = auth.require_owner(ORBI_DIR)
     if not is_module_enabled("legal"):
         abort(402, "Legal module not enabled — subscribe at billing.twickell.com")
     return owner_session
@@ -2836,8 +2836,8 @@ def legal_matters_create():
         notes=body.get("notes", ""),
         tags=body.get("tags", []),
     )
-    audit.log(s["username"], action="legal.matter.open",
-              detail=matter.get("matter_number"))
+    audit.log_event(DATA_DIR, actor=s["username"], action="legal.matter.open",
+                   resource=matter.get("matter_number"))
     return jsonify({"ok": True, "matter": matter}), 201
 
 @app.route("/api/owner/legal/matters/<matter_id>", methods=["GET"])
@@ -2855,8 +2855,8 @@ def legal_matter_update(matter_id):
     m = mod_legal.update_matter(DATA_DIR, matter_id, **body)
     if not m:
         return jsonify({"ok": False, "error": "not_found"}), 404
-    audit.log(s["username"], action="legal.matter.update",
-              detail=matter_id)
+    audit.log_event(DATA_DIR, actor=s["username"], action="legal.matter.update",
+                   resource=matter_id)
     return jsonify({"ok": True, "matter": m})
 
 @app.route("/api/owner/legal/matters/<matter_id>/close", methods=["POST"])
@@ -2867,7 +2867,7 @@ def legal_matter_close(matter_id):
                                 status=body.get("status", "closed"))
     if not m:
         return jsonify({"ok": False, "error": "not_found"}), 404
-    audit.log(s["username"], action="legal.matter.close", detail=matter_id)
+    audit.log_event(DATA_DIR, actor=s["username"], action="legal.matter.close", resource=matter_id)
     return jsonify({"ok": True, "matter": m})
 
 # Conflict check
@@ -2914,7 +2914,7 @@ def legal_deadlines_create():
         notes=body.get("notes", ""),
         reminder_days=body.get("reminder_days"),
     )
-    audit.log(s["username"], action="legal.deadline.add", detail=d.get("id"))
+    audit.log_event(DATA_DIR, actor=s["username"], action="legal.deadline.add", resource=d.get("id"))
     return jsonify({"ok": True, "deadline": d}), 201
 
 @app.route("/api/owner/legal/deadlines/<deadline_id>/complete", methods=["POST"])
@@ -2923,8 +2923,8 @@ def legal_deadline_complete(deadline_id):
     d = mod_legal.complete_deadline(DATA_DIR, deadline_id)
     if not d:
         return jsonify({"ok": False, "error": "not_found"}), 404
-    audit.log(s["username"], action="legal.deadline.complete",
-              detail=deadline_id)
+    audit.log_event(DATA_DIR, actor=s["username"], action="legal.deadline.complete",
+                   resource=deadline_id)
     return jsonify({"ok": True, "deadline": d})
 
 # Time tracking
@@ -2960,8 +2960,8 @@ def legal_time_log():
         entry_date=body.get("date"),
         rate=rate,
     )
-    audit.log(s["username"], action="legal.time.log",
-              detail=f"{entry['hours']}h on {matter_title}")
+    audit.log_event(DATA_DIR, actor=s["username"], action="legal.time.log",
+                   resource=f"{entry['hours']}h on {matter_title}")
     return jsonify({"ok": True, "entry": entry}), 201
 
 @app.route("/api/owner/legal/time/summary/<matter_id>", methods=["GET"])
@@ -2974,8 +2974,8 @@ def legal_time_summary(matter_id):
 def legal_time_mark_billed(matter_id):
     s = _require_legal_module()
     count = mod_legal.mark_time_billed(DATA_DIR, matter_id)
-    audit.log(s["username"], action="legal.time.bill",
-              detail=f"{count} entries on {matter_id}")
+    audit.log_event(DATA_DIR, actor=s["username"], action="legal.time.bill",
+                   resource=f"{count} entries on {matter_id}")
     return jsonify({"ok": True, "marked_billed": count})
 
 # SOL calculator
@@ -3073,8 +3073,8 @@ def legal_research():
     except Exception as e:
         log.exception("legal research failed")
         return jsonify({"ok": False, "error": str(e)}), 500
-    audit.log(s["username"], action="legal.research",
-              detail=question[:80])
+    audit.log_event(DATA_DIR, actor=s["username"], action="legal.research",
+                   resource=question[:80])
     return jsonify({
         "ok": True,
         "question": question,
@@ -3099,7 +3099,7 @@ def legal_intake():
     except Exception as e:
         log.exception("legal intake failed")
         return jsonify({"ok": False, "error": str(e)}), 500
-    audit.log(s["username"], action="legal.intake", detail="intake memo")
+    audit.log_event(DATA_DIR, actor=s["username"], action="legal.intake", resource="intake memo")
     return jsonify({"ok": True, "memo": memo})
 
 # Document drafts — approval workflow
@@ -3126,7 +3126,7 @@ def legal_draft_approve(draft_id):
     d = mod_legal.approve_draft(DATA_DIR, draft_id)
     if not d:
         return jsonify({"ok": False, "error": "not_found"}), 404
-    audit.log(s["username"], action="legal.draft.approve", detail=draft_id)
+    audit.log_event(DATA_DIR, actor=s["username"], action="legal.draft.approve", resource=draft_id)
     return jsonify({"ok": True, "draft": d})
 
 @app.route("/api/owner/legal/drafts/<draft_id>/revise", methods=["POST"])
@@ -3141,7 +3141,7 @@ def legal_draft_revise(draft_id):
                                 new_content=new_content, notes=notes)
     if not d:
         return jsonify({"ok": False, "error": "not_found"}), 404
-    audit.log(s["username"], action="legal.draft.revise", detail=draft_id)
+    audit.log_event(DATA_DIR, actor=s["username"], action="legal.draft.revise", resource=draft_id)
     return jsonify({"ok": True, "draft": d})
 
 # Regenerate draft with LLM + save to drafts
@@ -3187,8 +3187,8 @@ def legal_draft_document():
         content=content,
         fields=fields,
     )
-    audit.log(s["username"], action="legal.draft.create",
-              detail=f"{template_key} for {matter_title}")
+    audit.log_event(DATA_DIR, actor=s["username"], action="legal.draft.create",
+                   resource=f"{template_key} for {matter_title}")
     return jsonify({"ok": True, "template": template_key,
                     "draft": saved})
 
@@ -3396,8 +3396,8 @@ def legal_contract_review():
         log.exception("contract analysis phase 2 failed")
         return jsonify({"error": str(e)}), 500
 
-    audit.log(s["username"], action="legal.contract_review",
-              detail=f"contract ({len(contract_text)} chars), {jurisdiction}")
+    audit.log_event(DATA_DIR, actor=s["username"], action="legal.contract_review",
+                   resource=f"contract ({len(contract_text)} chars), {jurisdiction}")
     return jsonify({
         "ok": True,
         "memo": memo,
@@ -16434,7 +16434,7 @@ _LEGAL_LOG_TIME_RE = _re.compile(
     _re.IGNORECASE,
 )
 _LEGAL_CONFLICT_RE = _re.compile(
-    r"^(?:run\s+a?\s*)?conflict\s*(?:check|search)\s+(?:for\s+)?(?P<name>.+)$",
+    r"^(?:run\s+a?\s*)?conflict\s*(?:check|search)\s+(?:(?:for|on|against)\s+)?(?P<name>.+)$",
     _re.IGNORECASE,
 )
 _LEGAL_OPEN_MATTER_RE = _re.compile(
@@ -16442,7 +16442,11 @@ _LEGAL_OPEN_MATTER_RE = _re.compile(
     _re.IGNORECASE,
 )
 _LEGAL_DEADLINES_RE = _re.compile(
-    r"^(?:what(?:'s|\s+are)?\s+my\s+)?(?:upcoming\s+)?(?:legal\s+)?deadlines?(?:\s+(?:this\s+week|this\s+month|next\s+\d+\s+days?|\s*in\s+the\s+next.+))?",
+    r"^(?:"
+    r"(?:what(?:'s|\s+are)?\s+)?(?:my\s+)?(?:upcoming\s+)?(?:legal\s+)?deadlines?(?:\s+(?:this\s+week|this\s+month|next\s+\d+\s+days?|in\s+the\s+next.+|coming\s+up))?"
+    r"|(?:what\s+)?(?:deadlines?|due\s+dates?)\s+do\s+I\s+have\s*(?:coming\s+up|this\s+week|this\s+month|soon|next\s+\d+\s+days?)?"
+    r"|show\s+(?:me\s+)?(?:my\s+)?(?:upcoming\s+)?deadlines?"
+    r")\s*\??$",
     _re.IGNORECASE,
 )
 _LEGAL_MATTERS_RE = _re.compile(
