@@ -1,6 +1,7 @@
 # Idunn AI — Source of Truth
 
-**Last updated:** 2026-06-27 (brand rename session. myOrbi → Idunn AI company/product brand. AI spoken character name → Jade (STT-safe default; customers rename at onboarding). Website twickell.com fully rebranded: forest green + gold color scheme, golden apple SVG logo, all "myOrbi" references replaced with "Idunn AI". embed.js updated: forest green button, "Talk to Idunn" label, golden apple icon. prompts.py updated: AI introduces herself as "Idunn" in all modes — will update to "Jade" as spoken name. Twilio/HF billing reviewed this session. 24-48 hour delivery notice + modal added to website checkout flow.)
+**Last updated:** 2026-06-28 (core module testing + PurBlum restaurant order email + US sales tax table. See "Current verified state" section below.)
+**Previous update:** 2026-06-27 (brand rename session. Idunn AI + Jade + forest green/gold all scrapped same session after creation. Website reverted to original black/dark + purple-blue. AI spoken character name reverted to Orby. "Brindy" was a brief intermediate name — now listed in prompts.py STT-mishear list as "old name." Company brand status: in flux; myOrbi/FST LLC in code. idunn.ai domain NOT purchased.)
 **Previous update:** 2026-06-25 15:34 PDT (end-of-chat handoff refresh. Active source-of-truth location confirmed as `/home/frank/orbi_web/SOURCE_OF_TRUTH.md`; stale top-level `/home/frank/ORBI_MASTER_SOURCE_OF_TRUTH.md` now points here. Active trees verified: `~/orbi_web`, `~/orbi-brain`, `~/orbi-tenants`, `~/twickell_live`, and `~/Orbi`; legacy/reference/backup trees exist but are not the current product path. Live runtime right now: brain/billing on `127.0.0.1:5060`, sales/dev Orbi on `127.0.0.1:6000`, test tenant `orbi_xVvgR3ucXNS` on `127.0.0.1:6100`, and multiple Cloudflared processes are listening locally. Tenant ports `6101` and `6102` are not listening right now.)
 **Previous full refresh:** 2026-06-23 (full catch-up pass from disk. Read this SoT and inventoried the referenced active trees: `~/orbi_web`, `~/orbi-brain`, `~/orbi-tenants`, `~/twickell_live`, plus the referenced docs/modules/service files. Verified `https://twickell.com/` matches `~/twickell_live/website/index.html` byte-for-byte. Cloud-v1 is no longer just a future pivot note: it is the active direction and local runtime on this machine. Local-install remains preserved for v2, but the current revenue path is cloud-hosted signup + tenant dashboards.)
 **Previous refresh:** 2026-06-20 (CLOUD-V1 PIVOT day — Frank pivoted from local-install to cloud-hosted. Reasons: SmartScreen/AV trust problem, no time + money for code-signing cert, install pain was the bottleneck to revenue. New plan: cloud now → revenue → fund certs → ship v2 local install later. ALL build work today lives on `cloud-v1` branches in both `orbi_web` and `twickell_live`. Earlier today: file-audit refresh — no policy changes since 6-18, but file counts, route lists, line counts, and the customer_install/owner_dashboard symlink claim were stale.)
@@ -14,7 +15,58 @@
 
 ---
 
-## Current verified state (2026-06-25 15:34 PDT)
+## Current verified state (2026-06-28)
+
+### Session work
+
+**Core module test suite — 54/54 passing.** A full hard-test pass was run against all general core modules (Memory, Contacts, Reminders, Calendar, Quick Capture/Notes, Tasks, Leads, Knowledge, Search, Concern Capture, Gift Suggestion, Email, Safety Guards, Business Info, Morning/Tomorrow Brief). Eight routing failures were found and fixed in `vola.py`:
+
+- `_QC_TRIGGER_RE`: Added `add\s+a\s+(?:new\s+)?task\b` and `set\s+a\s+reminder\b` so "Add a task:" and "Set a reminder for X:" patterns reach quick_capture instead of LLM
+- `_LEADS_RECENT_RE`: Fixed to allow "recent" as a pre-modifier ("show me my recent leads")
+- `_CONTACT_PERSONAL_NOTE_RE`: Added `(?-i:[A-Z])` inline flag — `re.IGNORECASE` was making `[A-Z]` match lowercase, causing gift questions to be filed as contact notes
+- `_MODULES_INTRO_RE`: Added optional "enabled/active/installed" suffix
+- `_CONTACTS_FIND_RE`: Added `name5` group for "What's X's phone number?" pattern; added negative lookaheads `(?!my\b|the\b|all\b)` to prevent "find my attorney contacts" from matching "my" as a name
+- `_CONTACTS_ALL_RE`: Added "who are my contacts?" alternative
+- Fixed `m.group("name3")` KeyError (was causing HTTP 500)
+- Contact add `_try_contact_add`: Strip honorific prefix (Dr., Mr., Mrs., etc.) before name regex, restore after — periods in "Dr." were breaking the name parser
+- Added role-search ("find my attorney contacts") and location-search ("contacts in Sparks?") handlers in `_try_contacts_chat`
+- `quick_capture.py`: `_TASK_RE`, `_SET_REMINDER_RE`, `_SET_REMINDER_SIMPLE_RE`, `_REMINDERS_LIST_RE` — handles "Add a task: X" and "Set a reminder for X:" patterns
+
+**PurBlum kitchen order email — end-to-end confirmed.** When a customer places a chat order at purblum.com, Orby sends a formatted kitchen ticket email to franklstreet@yahoo.com.
+- `data/customer_profiles/purblum_com.json`: added `order_submission: {method: email, kitchen_email: franklstreet@yahoo.com}` and `tax_rate: 0.0825`
+- `vola.py chat_submit_order()` auto-finds Frank's Yahoo SMTP via owner user_dir → `imap_accounts.json` — no env var setup needed
+- Live test confirmed: order ID `ord_ddc000e212a6` placed via API, kitchen ticket received in Yahoo inbox
+- Cloud→printer gap confirmed: Orby on Linux cannot print to Windows/Mac LAN printers. For real restaurant customers, recommend Star CloudPRNT thermal printers (~$200-250). Email-to-kitchen is the default for cloud deployments.
+
+**US sales tax table added to `onboarding.py`.** New owners are now asked for their tax rate during setup, with a suggested rate based on the city/state already scraped from their website.
+- `_STATE_TAX` dict: all 50 states + DC with 2024 combined average rates
+- `_CITY_TAX` dict: ~40 city-level overrides (Reno 8.265%, Las Vegas 8.375%, LA 10.25%, NYC 8.875%, Chicago 10.25%, Seattle 10.25%, etc.)
+- `suggest_tax_rate(city, state)` function: returns city override if available, else state average, else None
+- `gap_questions()`: fires a tax rate question when `tax_rate` not set, pre-fills suggested rate with city/state context ("In Reno, NV the typical combined rate is 8.27% — enter that or your exact local rate")
+- `_parse_tax_rate()`: accepts "8.25%", "8.25", "0.0825", "none", "zero" — normalizes to 0-1 float
+
+**Two open bugs in chat order flow (not yet fixed):**
+- Orby says "I'll text you the confirmation" without first collecting the customer's phone number
+- "— backup mode —" label appearing on responses (brain server timing out, fallback to HF Qwen; not a code bug — latency/availability issue with Render free tier cold start)
+
+### Brand status (as of 2026-06-28)
+
+Brand is in flux. Current code state:
+- AI spoken name: **Orby** (prompts.py, voice, embed button). "Brindy" is in the STT-mishear list as "old name."
+- Company/product: **myOrby / FST LLC** in prompts and code. "Idunn AI" branding was created and scrapped in the same 2026-06-27 session.
+- Website: back to original black/dark + purple-blue (Idunn forest green/gold scrapped)
+- idunn.ai domain: NOT purchased
+
+### Source state now
+
+`~/orbi_web` branch `cloud-v1`:
+- Modified vs HEAD: `customer_install/backup.py`, `customer_install/imap_smtp.py`, `customer_install/modules/contacts.py`, `customer_install/modules/workspace.py`, `customer_install/onboarding.py`, `customer_install/tools/web_search.py`
+- Untracked: `brain/`, `cross_platform/bin/`, `cross_platform/mac/`, `cross_platform/shared/`, `cross_platform/windows/`
+- `vola.py` routing fixes from this session are already committed and clean vs HEAD
+
+---
+
+## Previous verified state (2026-06-25 15:34 PDT)
 
 ### Runtime now
 
@@ -196,28 +248,18 @@ Three jobs in one product:
 
 ---
 
-## Brand structure (updated 2026-06-27 — Idunn AI rebrand)
+## Brand structure (updated 2026-06-28 — back to Orby)
 
 | Label | What it is | Where it shows up |
 |---|---|---|
-| **Jade** | AI spoken character name (default) | Her greetings, `personality.name`, prompts.py persona, TTS voice, embed button label. Customers rename at onboarding. |
-| **Idunn AI** | Company/product brand | Marketing copy, logo wordmark, twickell.com website, Stripe product name, footer brand block |
-| **idunn.ai** | Target domain | Domain references, polished marketing copy — NOT yet owned, deferred until first revenue |
-| **FST LLC** | Legal entity | Terms, refund, privacy, Stripe, Twilio, contracts, "by FST LLC" subtext under logo |
+| **Orby** | AI spoken character name | Greetings, prompts.py persona, TTS voice, embed button label. Customers rename at onboarding. |
+| **myOrby / FST LLC** | Company/product brand (in flux) | Marketing copy, twickell.com, Stripe, prompts. Brand name not finalized. |
+| **twickell.com** | Current domain | Live website. idunn.ai NOT purchased. |
+| **FST LLC** | Legal entity | Terms, refund, privacy, Stripe, Twilio, contracts |
 
-**Domain:** twickell.com (current). Target: idunn.ai — NOT yet owned, deferred until first paid customer per the no-new-spend rule.
+**Brand history note:** "Idunn AI" + "Jade" + forest green/gold color scheme were created AND scrapped in the same 2026-06-27 session. "Brindy" was a brief intermediate spoken name, now preserved in the STT-mishear list as "old name — still means YOU." Current code name is Orby. Website is back to original dark/purple-blue.
 
-**Greeting rule:** AI always says "Hi, I'm Jade" (default) — never "Idunn AI" in self-introduction. The brand name only appears in marketing/legal contexts.
-
-**Brand history:** Previously myOrbi/Orbi. Renamed 2026-06-27 due to trademark conflicts. "Orbi" was in use by multiple companies (Netgear Orbi, OrbiShaper, others). "Idunn AI" chosen for: Norse goddess of eternal youth + memory (on-brand for forever-memory product), golden apple symbol, Class 42 trademark-clear. "Jade" chosen as spoken name because "Idunn" is not recognized correctly by STT systems.
-
-**Color scheme (locked 2026-06-27):**
-- `--bg: #1B4332` (forest green)
-- `--gold: #D4A017` (antique gold)
-- `--text: #F5F0E8` (warm cream)
-- `--surface: #162E22`, `--surface2: #0D1F17`
-- `--gold-light: #F5C518`, `--gold-dark: #A07000`
-- `--accent: #52796F` (sage)
+**Domain:** twickell.com (live). No new domain purchased per no-new-spend rule.
 
 ---
 

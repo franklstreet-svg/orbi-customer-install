@@ -44,6 +44,91 @@ from pathlib import Path
 log = logging.getLogger("orbi.onboarding")
 
 
+# ── Sales tax reference table ────────────────────────────────────────────
+# State base rates (combined state+avg-local). Keyed by 2-letter state code.
+# Source: Tax Foundation 2024 combined averages — good enough for a suggested
+# default; owner always confirms or overrides during onboarding.
+
+_STATE_TAX = {
+    "AL": 0.0922, "AK": 0.0176, "AZ": 0.0840, "AR": 0.0947, "CA": 0.0873,
+    "CO": 0.0777, "CT": 0.0635, "DE": 0.0000, "FL": 0.0701, "GA": 0.0732,
+    "HI": 0.0444, "ID": 0.0602, "IL": 0.0882, "IN": 0.0700, "IA": 0.0694,
+    "KS": 0.0868, "KY": 0.0600, "LA": 0.0945, "ME": 0.0550, "MD": 0.0600,
+    "MA": 0.0625, "MI": 0.0600, "MN": 0.0749, "MS": 0.0707, "MO": 0.0822,
+    "MT": 0.0000, "NE": 0.0694, "NV": 0.0823, "NH": 0.0000, "NJ": 0.0660,
+    "NM": 0.0783, "NY": 0.0852, "NC": 0.0698, "ND": 0.0696, "OH": 0.0722,
+    "OK": 0.0896, "OR": 0.0000, "PA": 0.0634, "RI": 0.0700, "SC": 0.0746,
+    "SD": 0.0640, "TN": 0.0955, "TX": 0.0819, "UT": 0.0719, "VT": 0.0618,
+    "VA": 0.0573, "WA": 0.0924, "WV": 0.0650, "WI": 0.0543, "WY": 0.0536,
+    "DC": 0.0600,
+}
+
+# City/county overrides where the combined rate differs meaningfully from the
+# state average. Keyed by (city_lower, state_upper).
+_CITY_TAX: dict[tuple[str, str], float] = {
+    # Nevada
+    ("reno", "NV"):           0.08265,
+    ("sparks", "NV"):         0.08265,
+    ("las vegas", "NV"):      0.08375,
+    ("henderson", "NV"):      0.08375,
+    ("north las vegas", "NV"): 0.08375,
+    # California
+    ("los angeles", "CA"):    0.10250,
+    ("san francisco", "CA"):  0.08625,
+    ("san jose", "CA"):       0.09375,
+    ("san diego", "CA"):      0.07750,
+    ("sacramento", "CA"):     0.08750,
+    ("fresno", "CA"):         0.08350,
+    ("long beach", "CA"):     0.10250,
+    # Texas
+    ("houston", "TX"):        0.08250,
+    ("dallas", "TX"):         0.08250,
+    ("san antonio", "TX"):    0.08250,
+    ("austin", "TX"):         0.08250,
+    # Washington
+    ("seattle", "WA"):        0.10250,
+    ("spokane", "WA"):        0.08900,
+    # New York
+    ("new york", "NY"):       0.08875,
+    ("new york city", "NY"):  0.08875,
+    ("buffalo", "NY"):        0.08000,
+    # Illinois
+    ("chicago", "IL"):        0.10250,
+    # Tennessee
+    ("nashville", "TN"):      0.09250,
+    ("memphis", "TN"):        0.09750,
+    # Georgia
+    ("atlanta", "GA"):        0.08900,
+    # Colorado
+    ("denver", "CO"):         0.08810,
+    # Arizona
+    ("phoenix", "AZ"):        0.08600,
+    ("tucson", "AZ"):         0.08700,
+    ("scottsdale", "AZ"):     0.07950,
+    # Oregon/Montana/Delaware/New Hampshire — no sales tax
+    ("portland", "OR"):       0.0000,
+    ("eugene", "OR"):         0.0000,
+    ("billings", "MT"):       0.0000,
+    ("missoula", "MT"):       0.0000,
+    ("dover", "DE"):          0.0000,
+    ("manchester", "NH"):     0.0000,
+}
+
+
+def suggest_tax_rate(city: str, state: str) -> float | None:
+    """Return a suggested combined sales tax rate (0-1) for a given
+    city/state, or None if the state is unknown. City match is case-
+    insensitive; state must be a 2-letter code."""
+    state = (state or "").strip().upper()
+    city  = (city  or "").strip().lower()
+    if not state:
+        return None
+    key = (city, state)
+    if key in _CITY_TAX:
+        return _CITY_TAX[key]
+    return _STATE_TAX.get(state)
+
+
 # ── Page-discovery patterns ─────────────────────────────────────────────
 
 
@@ -173,6 +258,32 @@ def gap_questions(draft: dict) -> list[dict]:
                                 "Format: 'Q: ...' on one line, 'A: ...' on the next."),
                    "type": "textarea"})
 
+    if not draft.get("tax_rate"):
+        addr = draft.get("address", {}) or {}
+        city  = addr.get("city", "")
+        state = addr.get("state", "")
+        suggested = suggest_tax_rate(city, state)
+        if suggested is not None and suggested > 0:
+            pct = round(suggested * 100, 3)
+            hint = (f" In {city}, {state} the typical combined rate is "
+                    f"{pct:.3g}% — enter that or your exact local rate."
+                    if city and state else
+                    f" In {state} the typical combined rate is {pct:.3g}% "
+                    f"— enter that or your exact local rate."
+                    if state else "")
+            q = f"What is your local sales tax rate?{hint}"
+        elif suggested == 0.0:
+            state_name = state or "your state"
+            q = (f"{state_name} has no sales tax — I'll skip the tax line on "
+                 f"orders. If your city or county charges one anyway, enter "
+                 f"the rate here (e.g. 2.5%). Otherwise just say 'none'.")
+        else:
+            q = ("What is your local sales tax rate? Enter a percentage "
+                 "(e.g. 8.25%) or decimal (e.g. 0.0825). Say 'none' if you "
+                 "don't charge sales tax.")
+        qs.append({"field": "tax_rate", "question": q, "type": "text",
+                   "suggested": suggested})
+
     return qs
 
 
@@ -222,6 +333,8 @@ def parse_answer(field: str, raw: str) -> dict:
         return {"services": _parse_services(raw)}
     if field == "faq":
         return {"faq": _parse_faq(raw)}
+    if field == "tax_rate":
+        return {"tax_rate": _parse_tax_rate(raw)}
     return {field: raw}
 
 
@@ -473,6 +586,24 @@ def _parse_faq(raw: str) -> list:
             out.append({"q": q, "a": a})
         i += 1
     return out
+
+
+def _parse_tax_rate(raw: str) -> float:
+    """Parse an owner's tax rate answer into a 0-1 float.
+    Handles: '8.25%', '8.25', '0.0825', 'none', 'zero', '0'.
+    Returns 0.0 for 'none'/'no'/'zero'.
+    """
+    raw = raw.strip().lower()
+    if not raw or raw in ("none", "no", "zero", "n/a", "na", "0", "no tax",
+                          "no sales tax", "exempt"):
+        return 0.0
+    raw = raw.replace("%", "").strip()
+    try:
+        val = float(raw)
+    except ValueError:
+        return 0.0
+    # If > 1 assume it's a percentage (e.g. 8.25 → 0.0825)
+    return round(val / 100.0, 6) if val > 1 else round(val, 6)
 
 
 def _score_confidence(draft: dict) -> dict:
