@@ -410,9 +410,16 @@ _INTENT_PATTERNS = [
 
 
 _NOT_A_STAFF_NAME = {
+    # Pronouns
     "me", "myself", "us", "you", "yourself", "him", "her", "them", "it",
     "everyone", "everybody", "anyone", "anybody", "someone", "somebody",
-    "myself", "ourselves", "themselves",
+    "ourselves", "themselves",
+    # Articles / determiners — "tell the buyer", "tell a customer", etc.
+    "the", "a", "an", "my", "your", "our", "their", "this", "that",
+    "these", "those", "its", "his",
+    # Common non-name nouns that follow "tell"
+    "buyer", "customer", "client", "user", "owner", "visitor", "caller",
+    "team", "staff", "everyone", "vendor", "partner", "prospect",
 }
 
 

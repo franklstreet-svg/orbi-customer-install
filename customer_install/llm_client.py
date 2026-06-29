@@ -148,8 +148,8 @@ def call_huggingface(config: dict, system: str, messages: list[dict]) -> LLMResp
     }
     timeout = _GEN_OVERRIDES.get("timeout_seconds") or cfg.get("timeout_seconds", 15)
 
-    # Attempt 1: featherless-ai (Qwen 2.5 72B dropped off all HF providers 2026-06-29;
-    # featherless-ai serves Llama 3.3 70B, ~3-4s, cost unlisted but HF-billed).
+    # Attempt 1: featherless-ai (Qwen 2.5 72B, back on 2026-06-29 after brief outage).
+    # Falls back to auto-router if featherless-ai is unavailable.
     payload = {
         "model": model,
         "messages": [{"role": "system", "content": system}] + messages,
