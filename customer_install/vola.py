@@ -3068,8 +3068,8 @@ def legal_research():
         "Never give legal advice directly to clients."
     )
     try:
-        memo = llm_client.generate(CONFIG, system,
-                                   [{"role": "user", "content": research_prompt}]).text
+        memo = llm_client.generate_legal(CONFIG, system,
+                                        [{"role": "user", "content": research_prompt}]).text
     except Exception as e:
         log.exception("legal research failed")
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -3095,7 +3095,7 @@ def legal_intake():
         "Be thorough, flag every risk, mark every SOL estimate for attorney verification."
     )
     try:
-        memo = llm_client.generate(CONFIG, system, [{"role":"user","content":intake_prompt}]).text
+        memo = llm_client.generate_legal(CONFIG, system, [{"role":"user","content":intake_prompt}]).text
     except Exception as e:
         log.exception("legal intake failed")
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -3173,7 +3173,7 @@ def legal_draft_document():
         "review and approval only. Not for distribution without attorney authorization.'"
     )
     try:
-        content = llm_client.generate(CONFIG, system, [{"role":"user","content":draft_prompt}]).text
+        content = llm_client.generate_legal(CONFIG, system, [{"role":"user","content":draft_prompt}]).text
     except Exception as e:
         log.exception("legal draft failed")
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -3352,8 +3352,8 @@ def legal_contract_review():
     # Phase 1: extract issues and search terms
     extract_prompt = mod_legal.build_contract_extraction_prompt(contract_text, client_side)
     try:
-        extraction = llm_client.generate(CONFIG, system_extract,
-                                         [{"role": "user", "content": extract_prompt}]).text
+        extraction = llm_client.generate_legal(CONFIG, system_extract,
+                                              [{"role": "user", "content": extract_prompt}]).text
     except Exception as e:
         log.exception("contract extraction phase 1 failed")
         return jsonify({"error": str(e)}), 500
@@ -3390,8 +3390,8 @@ def legal_contract_review():
         client_side=client_side,
     )
     try:
-        memo = llm_client.generate(CONFIG, system_memo,
-                                   [{"role": "user", "content": memo_prompt}]).text
+        memo = llm_client.generate_legal(CONFIG, system_memo,
+                                        [{"role": "user", "content": memo_prompt}]).text
     except Exception as e:
         log.exception("contract analysis phase 2 failed")
         return jsonify({"error": str(e)}), 500
@@ -16805,7 +16805,7 @@ def _try_legal_chat(message: str, user_rec: dict,
             "from this contract precisely. Only extract what is actually in the text."
         )
         try:
-            extraction = llm_client.generate(
+            extraction = llm_client.generate_legal(
                 CONFIG, extraction_system,
                 [{"role": "user", "content": extraction_prompt}],
             ).text
@@ -16870,7 +16870,7 @@ def _try_legal_chat(message: str, user_rec: dict,
         memo = ""
         for _attempt in range(2):
             try:
-                memo = llm_client.generate(
+                memo = llm_client.generate_legal(
                     CONFIG, analysis_system,
                     [{"role": "user", "content": analysis_prompt}],
                 ).text or ""
@@ -16936,8 +16936,8 @@ def _try_legal_chat(message: str, user_rec: dict,
             "Always end with: 'Attorney should verify all citations before relying on this memo.'"
         )
         try:
-            memo = llm_client.generate(CONFIG, system,
-                                       [{"role": "user", "content": research_prompt}]).text
+            memo = llm_client.generate_legal(CONFIG, system,
+                                           [{"role": "user", "content": research_prompt}]).text
         except Exception:
             log.exception("legal research via chat failed")
             return None
@@ -16971,7 +16971,7 @@ def _try_legal_chat(message: str, user_rec: dict,
         content = ""
         for _attempt in range(2):
             try:
-                content = (llm_client.generate(
+                content = (llm_client.generate_legal(
                     CONFIG, mod_legal._DRAFT_SYSTEM,
                     [{"role": "user", "content": draft_prompt}],
                 ).text or "").strip()
@@ -17041,7 +17041,7 @@ def _try_legal_chat(message: str, user_rec: dict,
         content = ""
         for _attempt in range(2):
             try:
-                content = (llm_client.generate(
+                content = (llm_client.generate_legal(
                     CONFIG, mod_legal._DRAFT_SYSTEM,
                     [{"role": "user", "content": draft_prompt}],
                 ).text or "").strip()

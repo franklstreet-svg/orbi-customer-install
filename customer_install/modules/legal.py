@@ -704,10 +704,10 @@ DOCUMENT_TEMPLATES = {
             "Case: {case_title}, No. {case_number}. Court: {court}. "
             "Propounding party: {client_name}. Responding party: {opposing_party}. "
             "Matter type: {matter_type}. Attorney: {attorney_name}. "
-            "Include 15-20 interrogatories and 15-20 document requests appropriate "
-            "for this matter type. Include definitions section, instructions, "
-            "and time frame for response. Mark any interrogatories that may need "
-            "jurisdiction-specific modification."
+            "Include 8 interrogatories and 8 document requests targeted at this "
+            "matter type. Include a definitions section and instructions. "
+            "Mark any items that may need jurisdiction-specific modification. "
+            "Keep each item concise — attorney will expand as needed."
         ),
     },
     "settlement_letter": {

@@ -146,7 +146,7 @@ def call_huggingface(config: dict, system: str, messages: list[dict]) -> LLMResp
         "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     }
-    timeout = cfg.get("timeout_seconds", 15)
+    timeout = _GEN_OVERRIDES.get("timeout_seconds") or cfg.get("timeout_seconds", 15)
 
     # Attempt 1: router (Inference Providers — requires paid HF Pro)
     payload = {
@@ -165,6 +165,80 @@ def call_huggingface(config: dict, system: str, messages: list[dict]) -> LLMResp
     url = f"https://api-inference.huggingface.co/models/{model}/v1/chat/completions"
     resp = _http_chat(url, payload, headers, timeout, tier="huggingface")
     return resp
+
+
+# ---------------------------------------------------------------------------
+# Anthropic Claude — used exclusively for the legal module
+# ---------------------------------------------------------------------------
+
+def call_anthropic(config: dict, system: str, messages: list[dict]) -> LLMResponse:
+    """Direct call to Anthropic Messages API. Used for legal document drafting,
+    research memos, and contract analysis where quality > cost."""
+    cfg = (config or {}).get("anthropic") or {}
+    if not cfg.get("enabled") or not cfg.get("api_key"):
+        return LLMResponse("", "anthropic", 0, "disabled")
+    api_key = cfg["api_key"]
+    model   = cfg.get("model", "claude-sonnet-4-6")
+    timeout = _GEN_OVERRIDES.get("timeout_seconds") or cfg.get("timeout_seconds", 90)
+    max_tok = _GEN_OVERRIDES.get("max_tokens") or cfg.get("max_tokens", 4096)
+
+    payload = {
+        "model":      model,
+        "max_tokens": max_tok,
+        "system":     system,
+        "messages":   messages,
+    }
+    headers = {
+        "Content-Type":    "application/json",
+        "x-api-key":       api_key,
+        "anthropic-version": "2023-06-01",
+    }
+    start = time.time()
+    try:
+        data = json.dumps(payload).encode("utf-8")
+        req  = urllib.request.Request(
+            "https://api.anthropic.com/v1/messages",
+            data=data, headers=headers, method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8", errors="ignore")
+        latency = int((time.time() - start) * 1000)
+        obj  = json.loads(body)
+        text = ""
+        for block in obj.get("content") or []:
+            if block.get("type") == "text":
+                text += block.get("text", "")
+        text = text.strip()
+        if not text:
+            return LLMResponse("", "anthropic", latency, "empty_content")
+        log.info(f"tier=anthropic ok latency={latency}ms model={model}")
+        return LLMResponse(text, "anthropic", latency)
+    except (urllib.error.HTTPError, urllib.error.URLError,
+            socket.timeout, ConnectionError, OSError) as e:
+        latency = int((time.time() - start) * 1000)
+        log.warning(f"tier=anthropic failed latency={latency}ms err={type(e).__name__}: {e}")
+        return LLMResponse("", "anthropic", latency, f"{type(e).__name__}: {e}")
+    except Exception as e:
+        latency = int((time.time() - start) * 1000)
+        log.exception("tier=anthropic unexpected error")
+        return LLMResponse("", "anthropic", latency, f"unexpected: {e}")
+
+
+def generate_legal(config: dict, system: str, messages: list[dict],
+                   max_tokens: int | None = None,
+                   timeout_seconds: int | None = None) -> LLMResponse:
+    """LLM call for legal module work — goes straight to Anthropic Claude.
+    Falls back to HuggingFace if Anthropic is not configured."""
+    _GEN_OVERRIDES["max_tokens"] = max_tokens
+    _GEN_OVERRIDES["timeout_seconds"] = timeout_seconds or 90
+    resp = call_anthropic(config, system, messages)
+    if resp:
+        return resp
+    log.warning("legal: Anthropic unavailable — falling back to HuggingFace")
+    resp = call_huggingface(config, system, messages)
+    if resp:
+        return resp
+    return LLMResponse("", "none", 0, "all_legal_tiers_failed")
 
 
 # ---------------------------------------------------------------------------
@@ -248,7 +322,8 @@ _SKIP_COOLDOWN_SECONDS = 300   # then skip the tier for 5 min before retry
 
 def generate(config: dict, system: str, messages: list[dict],
               max_tokens: int | None = None,
-              channel: str = "chat") -> LLMResponse:
+              channel: str = "chat",
+              timeout_seconds: int | None = None) -> LLMResponse:
     """
     Try each tier in order, return the first successful response.
     Returns an empty LLMResponse with tier='none' if all tiers fail.
@@ -276,6 +351,7 @@ def generate(config: dict, system: str, messages: list[dict],
     # Stash on a thread-local so the tier callers can read it without
     # threading the param through every signature.
     _GEN_OVERRIDES["max_tokens"] = max_tokens
+    _GEN_OVERRIDES["timeout_seconds"] = timeout_seconds
     tiers = []
     skip_brain = False
     phone_cfg = (config or {}).get("phone_llm") or {}
