@@ -6058,7 +6058,7 @@
       showToast('Give me a little more detail about the campaign first.');
       return;
     }
-    if (statusBar) { statusBar.hidden = false; statusBar.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }
+    if (statusBar) { statusBar.style.display = 'flex'; statusBar.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }
     if (statusMsg) statusMsg.textContent = 'Writing 7 platform assets — usually 5–15 seconds';
     if (btn) btn.disabled = true;
     try {
@@ -6076,12 +6076,12 @@
       _renderCampaignResults(_currentCampaign.title,
                               _currentCampaign.assets,
                               _currentCampaign.images);
-      if (statusBar) statusBar.hidden = true;
+      if (statusBar) statusBar.style.display = 'none';
       const results = document.getElementById('marketing-results');
       if (results) results.scrollIntoView({ behavior: 'smooth', block: 'start' });
     } catch (e) {
       console.error('marketing generate failed', e);
-      if (statusBar) statusBar.hidden = true;
+      if (statusBar) statusBar.style.display = 'none';
       showToast('Generation failed — try again or rephrase your brief.');
     } finally {
       if (btn) btn.disabled = false;
