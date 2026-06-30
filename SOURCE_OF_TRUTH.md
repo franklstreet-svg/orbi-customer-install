@@ -20,8 +20,8 @@
 
 ### Session work — Retail module live, marketing disabled, website & LLM updates
 
-#### LLM emergency swap (2026-06-29)
-Qwen 2.5 72B disappeared from all HuggingFace Inference Providers without notice. **Current LLM: Llama 3.3 70B via featherless-ai (~3-4s response time).** Revert to Qwen 2.5 72B when HF restores it. Legal calls still route to Anthropic Claude when `config.json anthropic.enabled = true`. General/sales/retail/contractor calls go to Llama 3.3 70B.
+#### LLM status (verified 2026-06-30)
+Qwen 2.5 72B had a brief outage on 2026-06-29 but came back the same day. **Current LLM: Qwen/Qwen2.5-72B-Instruct via featherless-ai** (confirmed in `config.json` and `llm_client.py` comment line 151: "Qwen 2.5 72B, back on 2026-06-29 after brief outage"). Llama 3.3 70B is the phone/voice tier only. Legal calls still route to Anthropic Claude when `config.json anthropic.enabled = true`.
 
 #### Retail module — fully wired end-to-end
 
