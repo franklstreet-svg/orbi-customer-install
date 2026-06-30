@@ -645,7 +645,7 @@ Each bullet is a real Windows install bug a customer or test PC surfaced. All fi
         quick_capture.py workspace.py forms.py form_filler.py        (general personal-assistant modules — 15 files)
       workflow_learner.py preferences.py glossary.py
         schedule_patterns.py thread_tone.py                          (5 learning modules — wired, unobtrusive until they have data)
-      maps.py                       (⚠ EXISTS but completely undocumented — purpose unknown, not referenced in session notes)
+      maps.py                       (FUTURE — taxicab dispatch system. Fully built: geocoding via Nominatim, driving routes + ETAs via OSRM, service area checks, conversational distance replies, contact/lead map via Leaflet.js. Zero API cost. NOT wired into vola.py yet — activate when taxi dispatch module is built post-revenue.)
       bids.py change_orders.py closeout_pdf.py daily_logs.py
         invoice_pdf.py invoices.py line_items.py pricing.py
         projects.py proposal_pdf.py subcontractors.py wins.py
