@@ -196,7 +196,8 @@ def context_block(data_dir: Path) -> str:
             for s in items:
                 dur = f", {s['duration_min']} min" if s.get("duration_min") else ""
                 desc = f" — {s['description']}" if s.get("description") else ""
-                lines.append(f"      • {s['name']}: ${s['price']:.2f}{dur}{desc}")
+                price_str = f"${s['price']:.2f}" if s.get("price") else "pricing on request"
+                lines.append(f"      • {s['name']}: {price_str}{dur}{desc}")
     if products:
         lines.append("  Products:")
         cats = {}
@@ -207,8 +208,118 @@ def context_block(data_dir: Path) -> str:
             for p in items:
                 sku = f" (SKU: {p['sku']})" if p.get("sku") else ""
                 desc = f" — {p['description']}" if p.get("description") else ""
-                lines.append(f"      • {p['name']}{sku}: ${p['price']:.2f}{desc}")
+                price_str = f"${p['price']:.2f}" if p.get("price") else "pricing on request"
+                lines.append(f"      • {p['name']}{sku}: {price_str}{desc}")
     return "\n".join(lines)
+
+
+# ── Import from website scrape ───────────────────────────────────────────────
+
+def _parse_price(raw: str) -> float | None:
+    """Extract the first dollar amount from a scraped price string.
+
+    Handles: "$12.95", "350+", "$120-190+", "95+ /month", "From $4.95",
+    "Not specified", "".  Returns None if no number is found.
+    """
+    import re
+    if not raw or not isinstance(raw, str):
+        return None
+    s = raw.strip().lower()
+    if s in ("", "not specified", "varies", "call", "tbd", "tbh", "contact us"):
+        return None
+    # Pull every decimal number out of the string, take the first
+    nums = re.findall(r"\d+(?:\.\d+)?", raw)
+    if not nums:
+        return None
+    try:
+        return round(float(nums[0]), 2)
+    except ValueError:
+        return None
+
+
+def _duration_from_text(text: str) -> int:
+    """Pull a duration in minutes from a description string if present.
+    Handles: '30 min', '1 hr', '90 min', '1.5 hr'.
+    Caps at 480 min (8 hours) so marketing phrases like '72-hour moisture'
+    don't produce nonsense durations.
+    """
+    import re
+    if not text:
+        return 0
+    # "hr" / "hour" — only count if the number ≤ 8
+    m = re.search(r"(\d+(?:\.\d+)?)\s*(?:hr|hour)s?", text, re.I)
+    if m:
+        hours = float(m.group(1))
+        if hours <= 8:
+            return int(hours * 60)
+    m = re.search(r"(\d+)\s*min", text, re.I)
+    if m:
+        mins = int(m.group(1))
+        return min(mins, 480)
+    return 0
+
+
+def import_from_scrape_profile(data_dir: Path, profile: dict) -> dict:
+    """Read a site_scraper profile dict and import any services / menu_items
+    into the retail module.  Items already present (same lowered name) are
+    skipped.  Returns {services_added, products_added, skipped}.
+    """
+    services_added = 0
+    products_added = 0
+    skipped = 0
+
+    existing_svcs = {s["name"].strip().lower() for s in list_services(data_dir)}
+    existing_prods = {p["name"].strip().lower() for p in list_products(data_dir)}
+    # Track names imported this run so services don't also land as products
+    imported_names: set[str] = set()
+
+    # services → retail services
+    for item in (profile.get("services") or []):
+        name = (item.get("name") or "").strip()
+        if not name or name.lower() in existing_svcs:
+            skipped += 1
+            continue
+        price = _parse_price(item.get("price") or "")
+        desc = (item.get("description") or "").strip()
+        cat  = (item.get("category") or "").strip()
+        # Skip bare category-label rows: no parseable price AND no description
+        # (these are navigation headers the LLM mistakenly extracted as services)
+        if price is None and not desc:
+            skipped += 1
+            continue
+        price = price if price is not None else 0.0
+        dur  = _duration_from_text(desc) or _duration_from_text(item.get("price") or "")
+        add_service(data_dir, name=name, price=price,
+                    category=cat, duration_min=dur, description=desc)
+        existing_svcs.add(name.lower())
+        imported_names.add(name.lower())
+        services_added += 1
+
+    # menu_items → retail products
+    for item in (profile.get("menu_items") or []):
+        name = (item.get("name") or "").strip()
+        if not name or name.lower() in existing_prods or name.lower() in imported_names:
+            skipped += 1
+            continue
+        price = _parse_price(item.get("price") or "")
+        if price is None:
+            price = 0.0
+        desc = (item.get("description") or "").strip()
+        cat  = (item.get("category") or "").strip()
+        add_product(data_dir, name=name, price=price,
+                    category=cat, description=desc)
+        existing_prods.add(name.lower())
+        products_added += 1
+
+    log.info(
+        "retail import: +%d services, +%d products, %d skipped",
+        services_added, products_added, skipped,
+    )
+    return {
+        "services_added": services_added,
+        "products_added": products_added,
+        "skipped": skipped,
+    }
 
 
 # ── Summary ──────────────────────────────────────────────────────────────────

@@ -936,13 +936,31 @@ def _run_scrape_job(job_id: str, url: str, payload: dict) -> None:
             except Exception as _me:
                 log.warning(f"sales-scrape rename failed: {_me}")
 
-        biz_name, menu_items = "", 0
+        biz_name, menu_count = "", 0
+        retail_import: dict = {}
         if profile_path.exists():
             try:
                 with profile_path.open("r", encoding="utf-8") as f:
                     prof = json.load(f)
                 biz_name = prof.get("name", "")
-                menu_items = len(prof.get("menu_items") or [])
+                menu_count = len(prof.get("menu_items") or [])
+
+                # Auto-import into retail module when retail is enabled and
+                # this is the customer's own site (not a public-sales scrape).
+                if (not is_public_sales and
+                        "retail" in (CONFIG.get("enabled_modules") or [])):
+                    try:
+                        retail_import = mod_retail.import_from_scrape_profile(
+                            DATA_DIR, prof)
+                        log.info(
+                            "scrape auto-import: slug=%s services_added=%s "
+                            "products_added=%s",
+                            slug,
+                            retail_import.get("services_added", 0),
+                            retail_import.get("products_added", 0),
+                        )
+                    except Exception as _ri:
+                        log.warning("retail auto-import failed: %s", _ri)
             except Exception:
                 pass
         with _SCRAPE_JOBS_LOCK:
@@ -954,8 +972,9 @@ def _run_scrape_job(job_id: str, url: str, payload: dict) -> None:
                 "slug": slug,
                 "name": biz_name,
                 "pages_visited": result.get("pages_visited", 0),
-                "menu_items": menu_items,
+                "menu_items": menu_count,
                 "elapsed_seconds": result.get("elapsed_seconds", 0),
+                "retail_import": retail_import,
             })
     except ValueError as e:
         with _SCRAPE_JOBS_LOCK:
@@ -2328,7 +2347,7 @@ def health():
     enabled_mods = CONFIG.get("enabled_modules") or []
     if not isinstance(enabled_mods, list):
         enabled_mods = []
-    return jsonify({
+    resp = jsonify({
         "status": "ok",
         "version": CONFIG.get("version", "0.1.0"),
         "uptime": int(time.time() - START_TIME),
@@ -2336,6 +2355,8 @@ def health():
         "business_name": business.get("name") or CONFIG.get("business", {}).get("name", ""),
         "enabled_modules": [str(m).strip().lower() for m in enabled_mods if m],
     })
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 @app.route("/api/owner/notifications/inbox")
@@ -3720,6 +3741,42 @@ def retail_summary():
     _require_retail_module()
     return jsonify({"ok": True, **mod_retail.summary(DATA_DIR)})
 
+
+@app.route("/api/owner/retail/import_from_scrape", methods=["POST"])
+def retail_import_from_scrape():
+    """Read the saved site-scraper profile for this business's website
+    and import any services / menu_items into the retail module.
+    Body (optional): {"slug": "tangerinesalonspa_com"} — if omitted,
+    uses the business.website from config to derive the slug."""
+    _require_retail_module()
+    from site_scraper.storage import domain_from_url
+
+    body = request.get_json(silent=True) or {}
+    slug = (body.get("slug") or "").strip()
+
+    if not slug:
+        website = (CONFIG.get("business") or {}).get("website", "").strip()
+        if not website:
+            return jsonify({"ok": False, "error": "no_website_configured"}), 400
+        try:
+            slug = domain_from_url(website)
+        except Exception:
+            return jsonify({"ok": False, "error": "cannot_derive_slug"}), 400
+
+    profile_path = DATA_DIR / "customer_profiles" / f"{slug}.json"
+    if not profile_path.exists():
+        return jsonify({"ok": False, "error": "profile_not_found",
+                        "slug": slug}), 404
+
+    try:
+        import json as _json
+        with profile_path.open("r", encoding="utf-8") as f:
+            profile = _json.load(f)
+        result = mod_retail.import_from_scrape_profile(DATA_DIR, profile)
+        return jsonify({"ok": True, "slug": slug, **result})
+    except Exception as e:
+        log.exception("retail import_from_scrape failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.route("/api/owner/legal/contract_review", methods=["POST"])
@@ -6767,6 +6824,10 @@ def owner_chat():
     if onb_resp is not None:
         return jsonify(onb_resp)
 
+    followup_resp = _try_scrape_followup(user_msg)
+    if followup_resp is not None:
+        return jsonify(followup_resp)
+
     # Safety refusals first — "sign for the customer", "modify a signed
     # CO", "delete all X files", "create a CO and send without approval".
     # Must run BEFORE contractor_chat so "create a CO" doesn't get caught
@@ -6774,6 +6835,12 @@ def owner_chat():
     safety_resp = _try_safety_refusal(user_msg, user_rec)
     if safety_resp is not None:
         return jsonify(safety_resp)
+
+    # Retail & Service module — "add service: Oil Change $39.99", "what services
+    # do I offer?", "add product: Wiper Blades $12.99", "what products do I carry?"
+    retail_resp = _try_retail_chat(user_msg, user_rec)
+    if retail_resp is not None:
+        return jsonify(retail_resp)
 
     # Contractor module — "add project at X", "what jobs are open",
     # "status of the Maple project". Gated by enabled_modules so it's
@@ -7935,17 +8002,16 @@ _NAME_AFTER_FILLER = (
 # → personal; "restaurant" / "cafe" / "deli" → restaurant). Each track
 # has its own follow-up questions appropriate to the use case.
 ONBOARDING_STEPS_PERSONAL = [
-    ("assistant_name",
-     "Hi — I'm Orby, your new assistant.\n\n"
-     "If you'd like to call me something else, just type the name "
-     "you'd prefer (Sarah, Maya, anything that fits). Otherwise, "
-     "type **keep** and I'll stay Orby."),
-    ("website",
-     "Do you have a website I can read to learn your business? "
-     "Paste the URL — something like 'yourbusiness.com' — and I'll "
-     "pick up your name, address, hours, services, and what you offer.\n\n"
-     "If you don't have a website yet, type **no** and we'll fill "
-     "things in together over time."),
+    # Step 0: learn the owner's name — this IS the first thing Orby says.
+    # The welcome message is replaced by this step so the flow starts
+    # immediately with "hi, what's your name?" rather than a cold generic
+    # greeting followed by a separate first question.
+    ("owner_name",
+     "Hi there! I'm Orby — and I am SO glad to be here with you! "
+     "Before we do anything else, what's your name? "
+     "I'd love to know who I'm talking to!"),
+    # Step 1: website — personalized with owner name (see _try_onboarding)
+    ("website", None),   # question built dynamically below
 ]
 ONBOARDING_STEPS_RESTAURANT = [
     # Added on top of the personal track when track='restaurant' or 'both'.
@@ -8001,6 +8067,194 @@ def _needs_onboarding() -> bool:
     return False
 
 
+# ── Post-scrape follow-up conversation ───────────────────────────────────────
+# After the background scrape finishes during onboarding, Orby saves a
+# follow-up state file. The next time the owner opens chat, Orby delivers
+# a warm debrief: here's what I found, here's what I'm missing — then asks
+# 1-2 gap-fill questions before switching to normal conversation.
+
+def _followup_path() -> "Path":
+    return DATA_DIR / ".scrape_followup.json"
+
+
+def _load_followup() -> dict:
+    p = _followup_path()
+    try:
+        return json.loads(p.read_text("utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_followup(state: dict) -> None:
+    p = _followup_path()
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state, indent=2), "utf-8")
+    tmp.replace(p)
+
+
+_SCRAPE_EMPTY = {
+    "", "not specified", "n/a", "none", "unknown", "tbd", "tbh",
+    "not available", "not found", "contact us", "varies", "call for pricing",
+}
+
+
+def _real(v) -> str:
+    """Return the value if it's a real non-placeholder string, else ''."""
+    if not v or not isinstance(v, str):
+        return ""
+    s = v.strip()
+    return "" if s.lower() in _SCRAPE_EMPTY else s
+
+
+def _build_scrape_followup(owner_name: str, profile: dict,
+                            retail_added: dict) -> dict:
+    """Build the follow-up state dict from a completed scrape profile.
+    Called at the end of _bg_scrape once we know what was found."""
+    biz_name  = _real(profile.get("name"))
+    contact   = profile.get("contact") or {}
+    address   = profile.get("address") or {}
+    hours     = profile.get("hours") or {}
+    svc_added = retail_added.get("services_added", 0)
+    prod_added = retail_added.get("products_added", 0)
+
+    hey = f"Hey{', ' + owner_name if owner_name else ''}!"
+
+    phone       = _real(contact.get("phone"))
+    email       = _real(contact.get("email"))
+    street      = _real(address.get("street"))
+    city        = _real(address.get("city"))
+    state_abbr  = _real(address.get("state"))
+    description = _real(profile.get("description"))
+
+    # ── What she found ────────────────────────────────────────────────
+    bullets: list[str] = []
+    if biz_name:
+        bullets.append(f"**{biz_name}**")
+    if street:
+        addr_line = street
+        if city:  addr_line += f", {city}"
+        if state_abbr: addr_line += f", {state_abbr}"
+        bullets.append(f"Address: {addr_line}")
+    if phone:
+        bullets.append(f"Phone: {phone}")
+    if email:
+        bullets.append(f"Email: {email}")
+    if hours:
+        bullets.append(f"Hours: {len(hours)}-day schedule")
+    if svc_added:
+        bullets.append(f"{svc_added} service{'s' if svc_added != 1 else ''} added to your Shop")
+    if prod_added:
+        bullets.append(f"{prod_added} product{'s' if prod_added != 1 else ''} added to your Shop")
+    if not bullets:
+        bullets.append("I read through your site but the content was a bit sparse — "
+                       "let's fill things in together")
+
+    found_block = "\n".join(f"✓ {b}" for b in bullets)
+
+    # ── Gap questions (max 3, most important first) ───────────────────
+    gap_questions: list[dict] = []
+    if not email:
+        gap_questions.append({
+            "key": "email",
+            "question": "What's the best email address for customers to reach you?"
+        })
+    if not description:
+        name_part = f"**{biz_name}**" if biz_name else "your business"
+        gap_questions.append({
+            "key": "description",
+            "question": (f"How would you describe {name_part} in a sentence or two? "
+                         f"This is what I'll tell customers who ask what you do.")
+        })
+    if not street:
+        gap_questions.append({
+            "key": "address_raw",
+            "question": "What's your street address? I'll use it when customers ask how to find you."
+        })
+
+    # ── Compose the opening message ───────────────────────────────────
+    if gap_questions:
+        transition = (f"\nI'm almost fully up to speed — just a couple of quick "
+                      f"questions to fill in the last few gaps.")
+        opener = (f"{hey} I just finished reading your website and I'm ready to go! "
+                  f"Here's what I picked up:\n\n{found_block}"
+                  f"{transition}\n\n{gap_questions[0]['question']}")
+    else:
+        opener = (f"{hey} I just finished reading your website — I'm all set! "
+                  f"Here's what I picked up:\n\n{found_block}\n\n"
+                  f"I'm ready to answer questions from your customers and "
+                  f"help you run your business. What would you like to do first?")
+
+    return {
+        "pending":        True,
+        "shown":          False,
+        "opener":         opener,
+        "gap_questions":  gap_questions,
+        "current_idx":    0,
+        "complete":       len(gap_questions) == 0,
+    }
+
+
+def _try_scrape_followup(message: str) -> dict | None:
+    """If a post-scrape follow-up is pending, handle it.
+    Returns a reply dict or None to fall through to normal chat."""
+    state = _load_followup()
+    if not state or state.get("complete"):
+        return None
+
+    # First delivery: show the opener (summary + first gap question)
+    if not state.get("shown"):
+        state["shown"] = True
+        _save_followup(state)
+        return {"reply": state["opener"], "tier": "local", "latency_ms": 0,
+                "source": "scrape_followup_opener"}
+
+    # Subsequent messages: capture gap answers and ask next question
+    gaps = state.get("gap_questions") or []
+    idx  = int(state.get("current_idx", 0))
+    if idx < len(gaps):
+        # Save the answer to the current gap key
+        key = gaps[idx]["key"]
+        answer = (message or "").strip()
+        if answer and answer.lower() not in ("skip", "n/a", "not sure", "idk"):
+            try:
+                biz = mod_business.load(DATA_DIR) or {}
+                if key == "email":
+                    contact = biz.get("contact") or {}
+                    contact["email"] = answer
+                    biz["contact"] = contact
+                elif key == "description":
+                    if not biz.get("description"):
+                        biz["description"] = answer
+                elif key == "address_raw":
+                    if not (biz.get("address") or {}).get("street"):
+                        biz.setdefault("address", {})["street"] = answer
+                mod_business.save(DATA_DIR, biz)
+            except Exception as _e:
+                log.warning("scrape followup save failed: %s", _e)
+
+        idx += 1
+        state["current_idx"] = idx
+
+        if idx < len(gaps):
+            next_q = gaps[idx]["question"]
+            _save_followup(state)
+            return {"reply": next_q, "tier": "local", "latency_ms": 0,
+                    "source": "scrape_followup_gap"}
+
+        # All gaps answered
+        state["complete"] = True
+        _save_followup(state)
+        return {"reply": ("Got it — I think I have everything I need now! "
+                          "Feel free to ask me anything about your business, "
+                          "or just start using me. I'm here!"),
+                "tier": "local", "latency_ms": 0,
+                "source": "scrape_followup_done"}
+
+    state["complete"] = True
+    _save_followup(state)
+    return None
+
+
 def _try_onboarding(message: str, user_rec: dict) -> dict | None:
     """If business_info needs onboarding, walk the user through it via
     chat. Returns a reply dict or None to fall through.
@@ -8019,84 +8273,54 @@ def _try_onboarding(message: str, user_rec: dict) -> dict | None:
     # used to short-circuit _try_onboarding here because business.name
     # was non-empty, which left her silent. Now we always greet first,
     # mark the welcome shown, and only then defer to the regular flow.
-    if not state.get("welcome_shown"):
+    # ── Special welcome path: business already fully set up ─────────────
+    # If business_info is already populated (e.g. scrape finished before
+    # owner hit the dashboard for the first time), skip the wizard and
+    # show a warm "I'm ready" greeting instead.
+    if not state.get("welcome_shown") and not _needs_onboarding():
         state["welcome_shown"] = True
+        state["complete"] = True
         _save_onboarding_state(state)
         try:
             biz = mod_business.load(DATA_DIR) or {}
         except Exception:
             biz = {}
-        biz_name = (biz.get("name") or "").strip()
+        raw_name = (biz.get("name") or "").strip()
+        biz_name = "" if (not raw_name or raw_name.startswith("REPLACE_")) else raw_name
         owner_first = ((biz.get("personality") or {}).get("owner_name")
                         or biz.get("owner_name") or "").strip().split()
         owner_first = owner_first[0] if owner_first else ""
-        hello = f"Hi{', ' + owner_first if owner_first else ''}! I'm Orby — your new assistant."
-        # Did the install actually scrape a website? Only claim "I read your
-        # website" if there's real scrape evidence. Otherwise the customer
-        # gets a misleading "I just read your website" greeting when no scrape
-        # ever happened (common when business_info was pre-populated by some
-        # other path, like a magic-link login on a fresh tenant).
+        hello = f"Hi{', ' + owner_first if owner_first else ''}! I'm Orby — so glad to be here!"
         scraped_text = (biz.get("_scraped_pages_text") or "").strip()
         if biz_name and scraped_text:
             greeting = (
                 f"{hello}\n\n"
-                f"I just read your website, so I've already got a sense "
-                f"of {biz_name} — your services, hours, address, the basics. "
-                f"You can ask me to walk you through what I found, or "
-                f"jump straight into anything you need. A few good ways "
-                f"to start:\n\n"
-                f"  • \"Tell me about my business\" — I'll summarize what I "
-                f"picked up so you can confirm it.\n"
-                f"  • \"Show me my hours\" or \"What services did you find?\" — "
-                f"spot-check specific pieces.\n"
-                f"  • \"Add a contact named …\" or \"Remind me to … tomorrow\" — "
-                f"start using me as your assistant.\n\n"
+                f"I already read your website and got a good feel for "
+                f"{biz_name} — your services, hours, address, the works. "
+                f"Ask me anything about your business, or just start using me. "
                 f"What would you like to do first?"
-            )
-        elif biz_name:
-            # Have a business name but no website scrape evidence — common
-            # right after a fresh magic-link login. Be honest about what I
-            # know and offer to fill in the rest.
-            greeting = (
-                f"{hello}\n\n"
-                f"I see your business is called {biz_name}. I don't have "
-                f"everything else yet — your services, hours, location, that "
-                f"kind of detail. Easiest way to get me up to speed is to "
-                f"point me at your website — type the URL (something like "
-                f"'yourbusiness.com') and I'll read it and pick up your "
-                f"address, hours, and services automatically.\n\n"
-                f"If you don't have a website, type **no** and we'll fill "
-                f"things in together as we go."
             )
         else:
             greeting = (
                 f"{hello}\n\n"
-                f"I don't have anything about your business yet. The "
-                f"easiest way to get me up to speed is to point me at "
-                f"your website — type the URL (something like "
-                f"'yourbusiness.com') and I'll read it and pick up your "
-                f"name, address, hours, and services.\n\n"
-                f"If you don't have a website, type **no** and we'll "
-                f"fill things in together as we go."
+                f"I'm all set up and ready to help. What's on your mind?"
             )
         return {"reply": greeting, "tier": "local", "latency_ms": 0,
                 "source": "onboarding_welcome"}
 
-    # Welcome's been shown. If business_info is already populated, the
-    # wizard has nothing left to do — mark complete and let the regular
-    # chat path take over.
+    # ── Fresh install wizard ──────────────────────────────────────────────
+    # The FIRST message from the owner triggers step 0, which is Orby
+    # asking for their name. The welcome IS step 0 — no separate greeting
+    # hop — so the flow is: hi → name → website → done (3 messages).
     if not _needs_onboarding():
         state["complete"] = True
         _save_onboarding_state(state)
         return None
+
     step_idx = int(state.get("step", -1))
     collected = state.get("collected") or {}
 
-    # Compose the steps list lazily based on the chosen track so the
-    # length is right for the routing math below. Q0 = track. After Q0,
-    # the personal-only steps run, then if track in {'restaurant','both'}
-    # the restaurant-only steps run.
-    def _steps_for_track(track: str) -> list[tuple[str, str]]:
+    def _steps_for_track(track: str) -> list[tuple]:
         steps = list(ONBOARDING_STEPS_PERSONAL)
         if track in ("restaurant", "both"):
             steps.extend(ONBOARDING_STEPS_RESTAURANT)
@@ -8105,8 +8329,11 @@ def _try_onboarding(message: str, user_rec: dict) -> dict | None:
     track = (collected.get("track") or "").lower().strip()
     steps = _steps_for_track(track)
 
-    # First-ever message: greet + ask question #0, bump state.
+    # First-ever message: jump straight to step 0 (name question).
+    # welcome_shown doubles as "have we said hello yet" — mark it so
+    # the check above doesn't fire on the second message.
     if step_idx < 0:
+        state["welcome_shown"] = True
         state["step"] = 0
         state["collected"] = {}
         _save_onboarding_state(state)
@@ -8118,7 +8345,11 @@ def _try_onboarding(message: str, user_rec: dict) -> dict | None:
     answer = (message or "").strip()
     if step_idx < len(steps):
         key, _q = steps[step_idx]
-        if key == "assistant_name":
+        if key == "owner_name":
+            # Just grab the first word — "Sarah Smith" → "Sarah"
+            name_clean = answer.strip().split()[0] if answer.strip() else ""
+            collected["owner_name"] = name_clean[:32] if name_clean else ""
+        elif key == "assistant_name":
             # "keep" / "no" / empty / "Orbi" — keep the default name.
             # Anything else becomes the assistant's new name.
             low = answer.lower().strip(".!? ").strip()
@@ -8184,19 +8415,27 @@ def _try_onboarding(message: str, user_rec: dict) -> dict | None:
                             # populate them. The previous truthy check
                             # treated those as "already has data" and
                             # never let the scraped values in.
+                            def _is_empty(val):
+                                if val is None: return True
+                                if isinstance(val, str):
+                                    return (not val.strip()
+                                            or val.startswith("REPLACE_"))
+                                if isinstance(val, list): return len(val) == 0
+                                if isinstance(val, dict):
+                                    return not any(val.values())
+                                return False
+
                             for k, v in profile.items():
                                 if not v:
                                     continue
-                                existing = biz.get(k)
-                                existing_is_empty = (
-                                    existing is None
-                                    or existing == ""
-                                    or existing == []
-                                    or existing == {}
-                                    or (isinstance(existing, dict)
-                                        and not any(existing.values()))
-                                )
-                                if existing_is_empty:
+                                # Nested dicts (contact, address, social):
+                                # merge field-by-field so we only fill gaps
+                                # rather than replacing the whole sub-dict.
+                                if isinstance(v, dict) and isinstance(biz.get(k), dict):
+                                    for sub_k, sub_v in v.items():
+                                        if sub_v and _is_empty(biz[k].get(sub_k)):
+                                            biz[k][sub_k] = sub_v
+                                elif _is_empty(biz.get(k)):
                                     biz[k] = v
                             biz["website"] = url
                             mod_business.save(DATA_DIR, biz)
@@ -8214,6 +8453,42 @@ def _try_onboarding(message: str, user_rec: dict) -> dict | None:
                             except Exception as _e:
                                 log.warning("workspace label rebrand "
                                             "failed: %s", _e)
+                            # Auto-import services / products into the
+                            # retail module if it's enabled and the
+                            # scrape found any catalog items.
+                            ri: dict = {}
+                            if "retail" in (CONFIG.get("enabled_modules") or []):
+                                try:
+                                    ri = mod_retail.import_from_scrape_profile(
+                                        DATA_DIR, profile)
+                                    log.info(
+                                        "onboarding retail import: "
+                                        "+%d services +%d products",
+                                        ri.get("services_added", 0),
+                                        ri.get("products_added", 0),
+                                    )
+                                except Exception as _ri:
+                                    log.warning(
+                                        "onboarding retail import failed: %s",
+                                        _ri)
+
+                            # Build and save the post-scrape follow-up so
+                            # Orby debriefs the owner on the next chat open.
+                            try:
+                                ob_state = _load_onboarding_state()
+                                owner_nm = (
+                                    (ob_state.get("collected") or {})
+                                    .get("owner_name", "")
+                                )
+                                followup = _build_scrape_followup(
+                                    owner_nm, profile, ri)
+                                _save_followup(followup)
+                                log.info("scrape followup saved: "
+                                         "%d gap questions",
+                                         len(followup.get("gap_questions", [])))
+                            except Exception as _fup:
+                                log.warning("scrape followup build failed: %s",
+                                            _fup)
                         except Exception as e:
                             log.warning("onboarding bg scrape failed: %s", e)
                     threading.Thread(target=_bg_scrape, daemon=True).start()
@@ -8229,9 +8504,36 @@ def _try_onboarding(message: str, user_rec: dict) -> dict | None:
     state["collected"] = collected
     _save_onboarding_state(state)
 
-    # If more steps remain, ask the next
+    # If more steps remain, ask the next question.
+    # The website question (step key "website") is built dynamically so
+    # it can use the owner's name captured in the previous step.
     if step_idx < len(steps):
         _next_key, next_q = steps[step_idx]
+        if _next_key == "website":
+            owner = (collected.get("owner_name") or "").strip().split()
+            owner = owner[0] if owner else ""
+            if owner:
+                next_q = (
+                    f"So nice to meet you, {owner}! "
+                    f"Now, let me find out about your business. "
+                    f"Do you have a website? Just drop the URL here — "
+                    f"something like **yourbusiness.com** — and I'll read "
+                    f"through it myself and learn your services, hours, "
+                    f"address, all of it. I'll have it figured out in just "
+                    f"a minute or two!\n\n"
+                    f"If you don't have a website yet, just say **no** "
+                    f"and we'll build things up together as we go."
+                )
+            else:
+                next_q = (
+                    f"Now let me find out about your business! "
+                    f"Do you have a website? Drop the URL here — "
+                    f"something like **yourbusiness.com** — and I'll read "
+                    f"through it and learn your services, hours, and "
+                    f"everything else on my own.\n\n"
+                    f"If you don't have a website yet, just say **no** "
+                    f"and we'll build things up together as we go."
+                )
         return {"reply": next_q, "tier": "local", "latency_ms": 0,
                 "source": "onboarding_step"}
 
@@ -8248,6 +8550,9 @@ def _try_onboarding(message: str, user_rec: dict) -> dict | None:
         # Reasonable defaults — customer can change these in Settings.
         personality.setdefault("tone", "friend")
         personality.setdefault("companion_mode", "personal")
+        owner_name_val = (collected.get("owner_name") or "").strip()
+        if owner_name_val:
+            personality["owner_name"] = owner_name_val
         biz["personality"] = personality
         biz.setdefault("track", "personal")
         if collected.get("website"):
@@ -8266,21 +8571,27 @@ def _try_onboarding(message: str, user_rec: dict) -> dict | None:
             f"details under Settings instead, no harm done."
         ), "tier": "local", "latency_ms": 0,
                 "source": "onboarding_save_error"}
+    owner = (collected.get("owner_name") or "").strip()
     assistant_name = (collected.get("assistant_name") or "Orby").strip() or "Orby"
+    owner_tag = f", {owner}" if owner else ""
     if collected.get("website"):
-        ready_line = (f"I'm reading {collected['website']} right now and "
-                      f"learning your business — it'll keep filling in "
-                      f"for the next minute or two. Meanwhile, try "
-                      f"\"what's on my calendar\" or \"remind me tomorrow "
-                      f"at 9.\" You can change anything in Settings.")
+        ready_line = (
+            f"I'm reading {collected['website']} right now, {owner + '!' if owner else 'and'} "
+            f"Give me a minute or two and I'll know your business inside and out — "
+            f"services, hours, address, all of it. "
+            f"While I'm at it, feel free to poke around the dashboard or just chat with me. "
+            f"I'm here!"
+        )
     else:
-        ready_line = (f"I'm ready. Try \"what's on my calendar,\" "
-                      f"\"remind me tomorrow at 9,\" or just tell me "
-                      f"about your business. You can change anything "
-                      f"in Settings.")
-    intro = (f"🎉 All set — call me **{assistant_name}** from now on. "
-             if assistant_name.lower() != "orbi"
-             else "🎉 All set. ")
+        ready_line = (
+            f"I'm all set{owner_tag} — let's get to work! "
+            f"You can tell me about your business anytime, add it to your Settings, "
+            f"or just start using me. I'm here whenever you need me."
+        )
+    if assistant_name.lower() not in ("orby", "orbi"):
+        intro = f"I love it — you can call me **{assistant_name}** from now on! "
+    else:
+        intro = ""
     return {"reply": f"{intro}{ready_line}",
             "tier": "local", "latency_ms": 0,
             "source": "onboarding_complete"}
@@ -8860,6 +9171,41 @@ _GC_PROFITABILITY_RE = _re.compile(
     _re.IGNORECASE,
 )
 
+# ── Retail / Auto / Salon NL chat regexes ────────────────────────────────────
+_RETAIL_LIST_SERVICES_RE = _re.compile(
+    r"^\s*(?:"
+    r"what\s+services?\s+do\s+(?:i|we)\s+(?:offer|provide|have|carry|list)"
+    r"|(?:list|show(?:\s+me)?)\s+(?:all\s+(?:my\s+|our\s+)?|my\s+|our\s+)?services?"
+    r"|what\s+(?:are\s+)?(?:my|our)\s+services?"
+    r"|do\s+(?:i|we)\s+(?:have|offer|list)\s+(?:any\s+)?services?"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+_RETAIL_LIST_PRODUCTS_RE = _re.compile(
+    r"^\s*(?:"
+    r"what\s+products?\s+do\s+(?:i|we)\s+(?:carry|sell|have|stock|offer)"
+    r"|(?:list|show(?:\s+me)?)\s+(?:all\s+(?:my\s+|our\s+)?|my\s+|our\s+)?(?:products?|inventory)"
+    r"|what\s+(?:are\s+)?(?:my|our)\s+products?"
+    r"|(?:show(?:\s+me)?\s+)?(?:my|our)\s+inventory"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+_RETAIL_ADD_SERVICE_RE = _re.compile(
+    r"^\s*(?:add|create|new)\s+(?:a\s+)?service[:\s]+(?P<name>[^,$\n]+?)"
+    r"(?:[,\s]+(?:price\s*[:\s]*|for\s+|at\s+)?\$(?P<price>[\d.,]+))?"
+    r"(?:[,\s]+(?:takes?\s+|duration[:\s]*)?(?P<dur>\d+)\s*(?:min(?:ute)?s?|m)\b)?"
+    r"(?:[,\s]+(?:category[:\s]*)?(?P<cat>[a-zA-Z ]+?))?"
+    r"\s*[.!]?\s*$",
+    _re.IGNORECASE,
+)
+_RETAIL_ADD_PRODUCT_RE = _re.compile(
+    r"^\s*(?:add|create|new)\s+(?:a\s+)?product[:\s]+(?P<name>[^,$\n]+?)"
+    r"(?:[,\s]+(?:price\s*[:\s]*|for\s+|at\s+)?\$(?P<price>[\d.,]+))?"
+    r"(?:[,\s]+(?:sku[:\s]*)?(?P<sku>[A-Z0-9\-]+))?"
+    r"\s*[.!]?\s*$",
+    _re.IGNORECASE,
+)
+
 
 def _draft_nudge_text(invoice: dict, project: dict, escalation: int = 1) -> str:
     """Generate the polite-escalating reminder body. Tone tiers:
@@ -8956,6 +9302,85 @@ Customer Signature: {customer}
 ________________________________________
 Date Signed:
 """
+
+
+def _try_retail_chat(message: str, user_rec: dict) -> dict | None:
+    """Detect Retail & Service module intents and act deterministically.
+    Gated by is_module_enabled('retail'). Returns chat reply or None.
+    """
+    if not is_module_enabled("retail"):
+        return None
+    msg = _strip_polite_prefix(message or "")
+
+    # LIST SERVICES
+    if _RETAIL_LIST_SERVICES_RE.match(msg):
+        services = mod_retail.list_services(DATA_DIR, active_only=True)
+        if not services:
+            return {"reply": "No services on file yet. Add one with: \"add service: Oil Change, $39.99, 30 min\"",
+                    "tier": "local", "latency_ms": 0, "source": "retail.services.empty"}
+        lines = [f"Your services ({len(services)}):"]
+        for s in services[:20]:
+            dur = f", {s['duration_min']} min" if s.get("duration_min") else ""
+            lines.append(f"  • {s['name']} — ${s['price']:.2f}{dur}")
+        return {"reply": "\n".join(lines), "tier": "local", "latency_ms": 0, "source": "retail.services.list"}
+
+    # LIST PRODUCTS
+    if _RETAIL_LIST_PRODUCTS_RE.match(msg):
+        products = mod_retail.list_products(DATA_DIR, active_only=True)
+        if not products:
+            return {"reply": "No products on file yet. Add one with: \"add product: Wiper Blades, $12.99\"",
+                    "tier": "local", "latency_ms": 0, "source": "retail.products.empty"}
+        lines = [f"Your products ({len(products)}):"]
+        for p in products[:20]:
+            sku_bit = f" (SKU: {p['sku']})" if p.get("sku") else ""
+            lines.append(f"  • {p['name']} — ${p['price']:.2f}{sku_bit}")
+        return {"reply": "\n".join(lines), "tier": "local", "latency_ms": 0, "source": "retail.products.list"}
+
+    # ADD SERVICE
+    m = _RETAIL_ADD_SERVICE_RE.match(msg)
+    if m:
+        name = (m.group("name") or "").strip().rstrip(",")
+        price_raw = (m.group("price") or "").replace(",", "")
+        dur_raw = m.group("dur") or ""
+        cat = (m.group("cat") or "").strip()
+        if not name:
+            return {"reply": "What's the service name and price? E.g.: \"add service: Oil Change, $39.99, 30 min\"",
+                    "tier": "local", "latency_ms": 0, "source": "retail.service.needs_name"}
+        try:
+            price = float(price_raw) if price_raw else 0.0
+            dur = int(dur_raw) if dur_raw else 0
+            svc = mod_retail.add_service(DATA_DIR, name=name, price=price,
+                                          category=cat, duration_min=dur)
+            dur_bit = f", takes {dur} min" if dur else ""
+            price_bit = f" at ${price:.2f}" if price else " (no price set yet)"
+            return {"reply": f"Added: {svc['name']}{price_bit}{dur_bit}. Say \"what services do I offer?\" to see the full list.",
+                    "tier": "local", "latency_ms": 0, "source": "retail.service.added"}
+        except Exception as exc:
+            log.exception("retail add_service failed")
+            return {"reply": f"Couldn't add that service: {exc}", "tier": "local",
+                    "latency_ms": 0, "source": "retail.service.error"}
+
+    # ADD PRODUCT
+    m = _RETAIL_ADD_PRODUCT_RE.match(msg)
+    if m:
+        name = (m.group("name") or "").strip().rstrip(",")
+        price_raw = (m.group("price") or "").replace(",", "")
+        sku = (m.group("sku") or "").strip()
+        if not name:
+            return {"reply": "What's the product name and price? E.g.: \"add product: Wiper Blades, $12.99\"",
+                    "tier": "local", "latency_ms": 0, "source": "retail.product.needs_name"}
+        try:
+            price = float(price_raw) if price_raw else 0.0
+            prod = mod_retail.add_product(DATA_DIR, name=name, price=price, sku=sku)
+            price_bit = f" at ${price:.2f}" if price else " (no price set yet)"
+            return {"reply": f"Added: {prod['name']}{price_bit}. Say \"what products do I carry?\" to see the full list.",
+                    "tier": "local", "latency_ms": 0, "source": "retail.product.added"}
+        except Exception as exc:
+            log.exception("retail add_product failed")
+            return {"reply": f"Couldn't add that product: {exc}", "tier": "local",
+                    "latency_ms": 0, "source": "retail.product.error"}
+
+    return None
 
 
 def _try_contractor_chat(message: str, user_rec: dict) -> dict | None:
@@ -16844,7 +17269,7 @@ _LEGAL_CONFLICT_RE = _re.compile(
     _re.IGNORECASE,
 )
 _LEGAL_OPEN_MATTER_RE = _re.compile(
-    r"^(?:open|create|new)\s+(?:a\s+)?(?:new\s+)?(?:matter|case|file)\s+(?:for\s+)?(?P<client>.+)$",
+    r"^(?:open|create|new|add)\s+(?:a\s+)?(?:new\s+)?(?:matter|case|file)\s+(?:for\s+)?(?P<client>.+)$",
     _re.IGNORECASE,
 )
 _LEGAL_DEADLINES_RE = _re.compile(
@@ -17128,6 +17553,35 @@ def _try_legal_chat(message: str, user_rec: dict,
         else:
             lines.append("No deadlines in the next 30 days.")
         return {"reply": "\n".join(lines), "source": "legal.matter.status"}
+
+    # Add deadline to a matter — "add deadline to Jones matter: discovery due July 15"
+    _add_dl_m = _re.match(
+        r"^\s*(?:add|set|create|log)\s+(?:a\s+)?deadline\s+(?:to|for|on)\s+"
+        r"(?:the\s+)?(?P<matter>.+?)\s+(?:matter|case|file)?\s*:\s*"
+        r"(?P<title>.+?)\s+(?:due\s+)?(?P<date>(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+\d{1,2}|\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}(?:/\d{2,4})?)"
+        r"\s*[.!]?\s*$",
+        msg, _re.IGNORECASE,
+    )
+    if _add_dl_m:
+        matter_q = _add_dl_m.group("matter").strip()
+        title = _add_dl_m.group("title").strip()
+        date_raw = _add_dl_m.group("date").strip()
+        hits = mod_legal.list_matters(DATA_DIR, search=matter_q)
+        if not hits:
+            return {"reply": f"I don't see a matter matching \"{matter_q}\". Check the name and try again.",
+                    "source": "legal.deadline.matter_not_found"}
+        mat = hits[0]
+        try:
+            import dateutil.parser as _dp
+            due_date = _dp.parse(date_raw, default=_datetime.now()).date().isoformat()
+        except Exception:
+            due_date = date_raw
+        dl = mod_legal.add_deadline(DATA_DIR, matter_id=mat["id"],
+                                    matter_title=mat["title"], title=title, due_date=due_date)
+        audit.log_event(DATA_DIR, actor=user_rec.get("username", "owner"),
+                        action="legal.deadline.add", resource=dl.get("id"))
+        return {"reply": f"Deadline added to {mat['title']}: {title} due {due_date}.",
+                "source": "legal.deadline.added"}
 
     # Upcoming deadlines
     if _LEGAL_DEADLINES_RE.match(msg):
