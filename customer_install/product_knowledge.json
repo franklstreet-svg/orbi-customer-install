@@ -32,16 +32,21 @@
       "price_monthly": "+$49.99/mo on top of Base (founding members: $33.49/mo year 1 — 33% off, first 50 customers, auto-applied)",
       "what_it_does": "Industry-specific knowledge for food businesses. Menu knowledge from website, phone order-taking, SMS receipts to every caller, delivery questions, hours questions. Currently the only fully-built industry module."
     },
+    "retail_module": {
+      "price_monthly": "+$49.99/mo on top of Base",
+      "what_it_does": "Industry module for auto shops, salons, and retail stores. Manages a services catalog (oil change, haircut, brakes — with price and duration) and a products catalog. Orby knows what you offer, quotes the right price to every caller and website visitor, and lets you add or update services just by telling her.",
+      "who_it_is_for": "Any business that sells services or products: auto repair, detailing, salons, barbershops, retail stores, mixed shops. If you charge for something by the item or by the service, this module is for you."
+    },
     "marketing_module": {
-      "price_monthly": "+$29.99/mo on top of Base",
+      "status": "coming soon — not yet available",
+      "price_monthly": "+$29.99/mo on top of Base (when released)",
       "what_it_does": "Multi-platform ad and campaign copy generation — Facebook, Instagram, TikTok, LinkedIn, Google Search ads, email newsletter, print flyer — all from one brief, using the business's context.",
-      "image_generation_submodule": "+$19.99/mo on top of Marketing module. AI image generation (FLUX-powered). Generate ad-ready visuals from a short brief in the business's voice."
+      "image_generation_submodule": "+$19.99/mo on top of Marketing module. AI image generation (FLUX-powered). Generate ad-ready visuals from a short brief in the business's voice.",
+      "how_to_answer": "If a customer asks about the Marketing module, tell them it's in development and not yet available. They can ask Orby on the demo line to be added to the early-access list."
     },
     "industry_modules_coming_soon": {
-      "construction": "+$49.99/mo (coming after v1)",
-      "auto": "+$49.99/mo (coming after v1)",
-      "salon": "+$49.99/mo (coming after v1)",
-      "legal": "+$49.99/mo (coming v1.1 with UPL safeguards)",
+      "marketing": "+$29.99/mo (in development — not yet available)",
+      "legal": "+$199.99/mo (v1.1 with UPL safeguards — now available via Orbi Law)",
       "medical": "deferred indefinitely until HIPAA compliance work is funded"
     },
     "founding_member_program": {
@@ -149,12 +154,20 @@
       "9 voices to choose from (Kokoro)",
       "STT (phone calls via Twilio, voice memos via Whisper)"
     ],
-    "marketing_module": [
-      "Facebook / Instagram / TikTok ad copy",
-      "LinkedIn + Google Search ads",
-      "Email newsletter generation",
-      "Print flyer generation",
-      "AI image generation sub-module (FLUX-schnell)"
+    "retail_module": [
+      "Services catalog — name, price, duration (auto shop, salon, retail)",
+      "Products catalog with pricing and SKU",
+      "Orby answers calls and chats about services, prices, and hours",
+      "Add or update services and products via owner chat",
+      "Works for auto shops, salons, barbershops, retail stores, mixed shops"
+    ],
+    "marketing_module_coming_soon": [
+      "NOT YET AVAILABLE — do not tell customers this is active",
+      "Facebook / Instagram / TikTok ad copy (coming soon)",
+      "LinkedIn + Google Search ads (coming soon)",
+      "Email newsletter generation (coming soon)",
+      "Print flyer generation (coming soon)",
+      "AI image generation sub-module — FLUX-schnell (coming soon)"
     ],
     "web_agent": [
       "Playwright-based browser automation",
@@ -275,9 +288,9 @@
   "honest_limits": [
     "Local-install version is v2, no specific ship date promised",
     "Multi-tenant cloud is still maturing — v1 may have brief downtimes during early customer onboarding",
-    "Industry modules: only Restaurant available fully in v1. Construction, Auto, Salon coming after v1. Legal coming v1.1. Medical deferred until HIPAA work is funded.",
+    "Industry modules: Restaurant, Retail/Auto/Salon, and Construction are available in v1. Legal is available as Orbi Law ($199.99/mo). Marketing is in development. Medical deferred until HIPAA work is funded.",
     "Web agent can repair simple website issues with CMS credentials but cannot fix complex code, server outages, or hosting/DNS issues",
-    "Image generation requires the Marketing module + Image Generation sub-module ($29.99 + $19.99/mo)",
+    "Image generation (Marketing module + Image Generation sub-module) is not yet available — coming soon",
     "Forever memory means forever — if a customer wants Orbi to forget something specific, they tell her to forget it and she does, but otherwise she remembers across sessions"
   ]
 }
