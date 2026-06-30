@@ -1,6 +1,7 @@
 # Idunn AI — Source of Truth
 
-**Last updated:** 2026-06-29 (attorney/legal module completed end-to-end; Anthropic Claude routing for legal LLM calls added; full codebase audit run. See "Current verified state" section below.)
+**Last updated:** 2026-06-30 (retail module wired end-to-end; marketing disabled/hidden; website trial box rewritten; LLM emergency swap to Llama 3.3 70B; legal research confirmed fully built with live database queries.)
+**Previous update:** 2026-06-29 (attorney/legal module completed end-to-end; Anthropic Claude routing for legal LLM calls added; full codebase audit run.)
 **Previous update:** 2026-06-28 (core module testing + PurBlum restaurant order email + US sales tax table.)
 **Previous update:** 2026-06-25 15:34 PDT (end-of-chat handoff refresh. Active source-of-truth location confirmed as `/home/frank/orbi_web/SOURCE_OF_TRUTH.md`; stale top-level `/home/frank/ORBI_MASTER_SOURCE_OF_TRUTH.md` now points here. Active trees verified: `~/orbi_web`, `~/orbi-brain`, `~/orbi-tenants`, `~/twickell_live`, and `~/Orbi`; legacy/reference/backup trees exist but are not the current product path. Live runtime right now: brain/billing on `127.0.0.1:5060`, sales/dev Orbi on `127.0.0.1:6000`, test tenant `orbi_xVvgR3ucXNS` on `127.0.0.1:6100`, and multiple Cloudflared processes are listening locally. Tenant ports `6101` and `6102` are not listening right now.)
 **Previous full refresh:** 2026-06-23 (full catch-up pass from disk. Read this SoT and inventoried the referenced active trees: `~/orbi_web`, `~/orbi-brain`, `~/orbi-tenants`, `~/twickell_live`, plus the referenced docs/modules/service files. Verified `https://twickell.com/` matches `~/twickell_live/website/index.html` byte-for-byte. Cloud-v1 is no longer just a future pivot note: it is the active direction and local runtime on this machine. Local-install remains preserved for v2, but the current revenue path is cloud-hosted signup + tenant dashboards.)
@@ -15,7 +16,104 @@
 
 ---
 
-## Current verified state (2026-06-29)
+## Current verified state (2026-06-30)
+
+### Session work — Retail module live, marketing disabled, website & LLM updates
+
+#### LLM emergency swap (2026-06-29)
+Qwen 2.5 72B disappeared from all HuggingFace Inference Providers without notice. **Current LLM: Llama 3.3 70B via featherless-ai (~3-4s response time).** Revert to Qwen 2.5 72B when HF restores it. Legal calls still route to Anthropic Claude when `config.json anthropic.enabled = true`. General/sales/retail/contractor calls go to Llama 3.3 70B.
+
+#### Retail module — fully wired end-to-end
+
+The retail module (`customer_install/modules/retail.py`, 334+ lines) was already written. This session wired everything it was missing:
+
+1. **NL chat handlers added to `vola.py`** — `_try_retail_chat()` handles:
+   - `what services do I offer/have?` → `mod_retail.list_services()` → formatted bullet list
+   - `what products do we carry?` → `mod_retail.list_products()` → formatted bullet list
+   - `add service: Oil Change, $39.99, 30 min` → `mod_retail.add_service()`
+   - `add product: Wiper Blades, $12.99` → `mod_retail.add_product()`
+   - Regex patterns: `_RETAIL_LIST_SERVICES_RE`, `_RETAIL_LIST_PRODUCTS_RE`, `_RETAIL_ADD_SERVICE_RE`, `_RETAIL_ADD_PRODUCT_RE`
+
+2. **Stripe checkout wired** (`orbi-brain/stripe_webhook.py`):
+   - Added `STRIPE_PRICE_RETAIL_MO` / `STRIPE_PRICE_RETAIL_YR` env vars (currently placeholders)
+   - Added to `_CLOUD_V1_BUNDLES`: `retail_mo`, `retail_yr`, `retail` keys
+   - Added to `_TIER_ENV_MAP` and `_TIER_PRETTY`
+   - Founding-member promo check updated: `marketing_` removed, `retail_` added
+
+3. **`product_knowledge.json` updated**:
+   - Added `retail_service_module` entry with pricing, description, target customers
+   - `marketing_module` marked "coming soon — not yet available"
+   - `industry_modules_coming_soon` updated: auto/salon → marketing
+   - `honest_limits` updated to reflect retail/auto/salon available, marketing in development
+
+4. **⚠️ Stripe prices still need to be created.** `STRIPE_PRICE_RETAIL_MO` and `STRIPE_PRICE_RETAIL_YR` are set to placeholder values. Frank must create real Stripe prices and add them to `~/orbi-brain/stripe.env` before retail checkout charges real customers.
+
+#### Marketing module — disabled and hidden
+
+- Removed from `twickell_live/website/index.html` entirely (no card, no button)
+- `product_knowledge.json` tells Orby to say marketing is "in development, not yet available"
+- Marketing code/routes still exist in `vola.py` and `modules/marketing.py` — just not in enabled_modules for the dev Orby and not sold on the website
+
+#### Website — trial button and copy updated
+
+- Button: `Try Orby for 2 Weeks — $20` (removed misleading word "free")
+- Moved trial offer into its own dedicated card below the hero buttons
+- Card explains in plain English: pay $20, try 2 weeks; don't like it → walk away for $20; like it → pay another $29.99, two weeks become your first full month, then $49.99/mo
+- Card uses site color palette (teal gradient + gold border — matches pricing cards)
+- Commits pushed to `twickell_live/main` → live on twickell.com via Vercel
+
+#### Legal deadline via chat — bug fixed
+
+- `_add_dl_m` handler in `vola.py` used `_import_datetime` which doesn't exist (NameError silently caught), causing dates to be stored as raw strings like `"July 25"` instead of ISO `"2026-07-25"`. Fixed to use `_datetime.now()` (correct alias from line 44).
+- Torres v. Sunrise Hotel deposition deadline in dev data patched from `"July 25"` → `"2026-07-25"`.
+- `_LEGAL_OPEN_MATTER_RE` updated to accept `add` as a verb alongside `open|create|new`.
+
+#### Legal research — confirmed fully built (was incorrectly believed missing)
+
+**`customer_install/tools/legal_research.py` is fully built and wired.** Sources hit in order:
+1. CourtListener API — free, no key required, federal + most state courts, precedential opinions
+2. Harvard Caselaw Access Project — digitized US case law
+3. Cornell LII (via DuckDuckGo targeted) — statutes, CFR, constitution
+4. Justia (via DuckDuckGo targeted) — state + federal case law and codes
+
+Flow: question → `tool_legal.search(question, jurisdiction)` → real case results → injected as `db_results_block` into `build_research_prompt()` → LLM writes memo citing ONLY retrieved cases. If database returns nothing, memo states that and attorney must verify manually.
+
+Also wired for contract analysis: `build_contract_extraction_prompt()` (Phase 1 — extracts issues + generates search terms) → database hit → `build_contract_analysis_prompt()` (Phase 2 — full exit strategy memo citing real cases).
+
+All legal LLM calls use `generate_legal()` which tries Anthropic Claude first, falls back to HF Llama 3.3 70B.
+
+#### Dev Orbi enabled_modules (port 6000)
+
+Current: `["legal", "contractor", "retail"]`
+(Marketing/marketing_image removed; retail added)
+
+#### Git state (2026-06-30)
+
+- `~/orbi_web` branch `cloud-v1` — committed and pushed: `vola.py` (retail NL handlers, legal fixes), `modules/retail.py` (price guard, scrape helpers), `pwa/service-worker.js` (cache v6), `owner_dashboard/dashboard.html` (JS version bump)
+- `~/orbi-brain/stripe_webhook.py` — retail wired into checkout bundles (local edits, not in git — brain is not in the orbi_web git repo)
+- `~/twickell_live` — trial box + retail card + marketing removal pushed to `main` → live on Vercel
+
+#### Onboarding test results (2026-06-30)
+
+Full end-to-end NL chat test against dev Orby at port 6000:
+
+**Retail** ✅ ALL PASSING:
+- `add service: Oil Change, $39.99, 30 min` → `[retail.service.added]`
+- `add service: Brake Inspection, $25.00` → `[retail.service.added]`
+- `add product: Windshield Wiper Blades, $12.99` → `[retail.product.added]`
+- `what services do I offer?` → bullet list with price + duration
+- `what products do we carry?` → bullet list with price
+
+**Contractor** ✅ PASSING (address-based format required: `new job at [address] — [desc] $[amount]`)
+
+**Legal** ✅ PASSING:
+- Matter intake multi-step flow (open → collect client info → confirm)
+- `add a deadline to Torres matter: deposition due July 25` → `[legal.deadline.added]` stored as `2026-07-25`
+- `what are my upcoming deadlines?` → lists pending deadlines within 30 days
+
+---
+
+## Previous verified state (2026-06-29)
 
 ### Session work — Attorney/Legal module completed
 
@@ -52,7 +150,7 @@
 **Full codebase audit results (audit agent):**
 
 - `vola.py`: **22,824 lines** (was ~18,657 at last audit)
-- `enabled_modules` in dev config: `["marketing", "marketing_image", "legal"]`
+- `enabled_modules` in dev config: `["marketing", "marketing_image", "legal"]` *(updated 2026-06-30 to `["legal", "contractor", "retail"]` — marketing removed, retail added)*
 - Modules directory: 40 files total
 
 **FULLY WORKING (module + routes + dashboard + chat all wired):**
@@ -332,8 +430,9 @@ Three jobs in one product:
 | **Receptionist module** | +$79.99/mo | Phone receptionist, 1,000 call-minutes included, Twilio number/routing. Visible website math currently shows Base + Receptionist = $129.98/mo. |
 | **Website Controller module** | +$49.99/mo | Website chat widget, 20,000 chat sessions/mo, lead capture, voice toggle. |
 | **Full stack bundle** | $179.97/mo | Base + Receptionist + Website Controller. This is the non-restaurant "everything" bundle (`full_mo`). |
-| **Restaurant module** | +$49.99/mo | Current built industry module. Restaurant full stack = Base + Receptionist + Website + Restaurant = $229.96/mo. |
-| **Marketing module** | +$29.99/mo | Marketing/ad/campaign copy generation. |
+| **Restaurant module** | +$49.99/mo | Built industry module. Restaurant full stack = Base + Receptionist + Website + Restaurant = $229.96/mo. |
+| **Retail & Service module** | +$49.99/mo | Built industry module. Auto repair, salons, barbershops, retail stores, mixed shops. NL chat for adding/listing services and products. Stripe checkout wired — needs real price IDs in stripe.env before live. |
+| **Marketing module** | +$29.99/mo | IN DEVELOPMENT — not yet sold. Hidden from website. Do not tell customers it is available. |
 | **Image generation sub-module** | +$19.99/mo | FLUX-powered image generation, should sit on top of Marketing. |
 | **Founding member discount** | 15% off entire first-year bill | First 50 customers. Applies to Base + all modules + all seats. |
 | **Annual prepay** | ~17% effective | Pay 10 months, get 12. Stacks with founding-member discount for ~29% effective first-year discount. |
@@ -456,7 +555,7 @@ The old Windows installer flow is preserved for v2 and still matters historicall
 - **Code-signing certificate** — installer is unsigned. Every customer hits SmartScreen + AV popups. Disclosure page bridges the gap until cert is in place. OV cert ~$80-100/yr, EV ~$400/yr. Deferred until first paid customer revenue covers it.
 - **Cloud-v1 production cleanup** — cloud hosting is now the active v1 path, not a future tier. Remaining work is cleanup and alignment: fix pricing drift across `product_knowledge.json`, website meta copy, and `_TIER_PRETTY`; resolve the duplicate tenant port; finish/verify early-customer onboarding/admin flow.
 - **Native nssm bundling** — would let us register Orbi as a proper Windows service. Currently using Startup-folder shortcut as a workaround.
-- **Real industry modules** — Restaurant module built. Construction, Law, Medical, Auto, Salon all "coming soon" — not started.
+- **Real industry modules** — Restaurant ✅ built. Legal (Orby Law) ✅ built. Retail & Service ✅ built. Construction ✅ built (shelved in config — reactivate when needed). Marketing IN DEVELOPMENT. Medical deferred (HIPAA). Stripe prices for Retail still need to be created before checkout works.
 - **Onboarding mid-question scrape feedback** — the website scrape runs in background but Orbi doesn't tell the customer "I found 12 services from your site" mid-conversation.
 - **Learning loop — partial.** The "Orbi doesn't know → captures caller contact → asks owner → stores answer → delivers back to original caller" pipeline. Real implementation in `customer_install/modules/learning_loop.py` (not a stub) and imported in `orbi.py:94`, but the full owner-notification + answer-routing pipeline is not yet end-to-end. ~26 hrs estimated remaining.
 
