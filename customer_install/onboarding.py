@@ -194,6 +194,15 @@ def discover_from_url(url: str) -> dict:
 
     draft["_inputs"] = {k: v.get("url", "") for k, v in fetched.items()}
     draft["_confidence"] = _score_confidence(draft)
+
+    # Detect CMS platform from homepage HTML so widget install can pick the right recipe
+    home_html = fetched.get("home", {}).get("text", "")
+    try:
+        from widget_installer import detect_platform
+        draft["_platform"] = detect_platform(url, home_html)
+    except Exception:
+        draft["_platform"] = "unknown"
+
     return draft
 
 
@@ -286,6 +295,28 @@ def gap_questions(draft: dict, enabled_modules: list | None = None) -> list[dict
                  "don't charge sales tax.")
         qs.append({"field": "tax_rate", "question": q, "type": "text",
                    "suggested": suggested})
+
+    # ── WIDGET INSTALL ─────────────────────────────────────────────────────────
+    # Ask this only when the business has a website but the widget isn't installed yet.
+    website = (draft.get("contact") or {}).get("website", "")
+    widget_installed = draft.get("widget_installed", False)
+    if website and not widget_installed:
+        platform = draft.get("_platform", "unknown")
+        try:
+            from widget_installer import install_prompt, generate_embed_code
+            prompt_text = install_prompt(platform, website)
+        except Exception:
+            prompt_text = (
+                "I can install my chat widget on your website automatically. "
+                "Would you like me to do that now?"
+            )
+        qs.append({
+            "field": "widget_install",
+            "question": prompt_text,
+            "type": "widget_install",
+            "platform": platform,
+            "site_url": website,
+        })
 
     # ── ATTORNEY / LEGAL MODULE ONBOARDING ────────────────────────────────────
     if "legal" in enabled_modules:

@@ -75,6 +75,7 @@ import chart_gen
 import email_inbox
 import mail_merge
 import onboarding
+import widget_installer
 import pptx_gen
 import style_learner
 import translation
@@ -6836,6 +6837,11 @@ def owner_chat():
     if safety_resp is not None:
         return jsonify(safety_resp)
 
+    # Widget install — "install me on my website", "add the chat widget", credential replies
+    widget_resp = _try_widget_install_chat(user_msg, user_rec)
+    if widget_resp is not None:
+        return jsonify(widget_resp)
+
     # Retail & Service module — "add service: Oil Change $39.99", "what services
     # do I offer?", "add product: Wiper Blades $12.99", "what products do I carry?"
     retail_resp = _try_retail_chat(user_msg, user_rec)
@@ -9171,6 +9177,24 @@ _GC_PROFITABILITY_RE = _re.compile(
     _re.IGNORECASE,
 )
 
+# ── Widget install NL chat regexes ───────────────────────────────────────────
+_WIDGET_INSTALL_RE = _re.compile(
+    r"^\s*(?:"
+    r"(?:install|add|put|place|embed|set\s+up|setup)\s+(?:the\s+)?(?:orb[iy]|chat|widget|button|code)\s+(?:on|to|onto|into)?\s+(?:my\s+)?(?:website|site|page)"
+    r"|(?:install|set\s+up|setup)\s+(?:me|orb[iy])\s+on\s+(?:my\s+)?(?:website|site)"
+    r"|(?:put|place|add)\s+(?:me|orb[iy])\s+on\s+(?:my\s+)?(?:website|site)"
+    r"|(?:my\s+)?website\s+(?:install|setup|set\s+up|integration)"
+    r"|(?:add|install)\s+(?:the\s+)?(?:chat\s+)?widget"
+    r"|(?:install|set\s+up)\s+(?:the\s+)?chat\s+(?:button|bubble|widget)"
+    r")\s*[?.!]?\s*$",
+    _re.IGNORECASE,
+)
+
+# Regex for credential reply: "email / password" or just credential text during widget install
+_WIDGET_CREDS_RE = _re.compile(
+    r"^\s*(?P<user>[\w.+\-]+@[\w\-]+\.[\w\-.]+)\s*[/|,]\s*(?P<pass>\S+)\s*$"
+)
+
 # ── Retail / Auto / Salon NL chat regexes ────────────────────────────────────
 _RETAIL_LIST_SERVICES_RE = _re.compile(
     r"^\s*(?:"
@@ -9302,6 +9326,117 @@ Customer Signature: {customer}
 ________________________________________
 Date Signed:
 """
+
+
+def _try_widget_install_chat(message: str, user_rec: dict) -> dict | None:
+    """Handle the widget auto-install flow.
+
+    Triggers on "install me on my website", "add the chat widget", etc.
+    Then handles the credential-reply turn and runs the web_agent recipe.
+    Falls back to manual instructions if automation is blocked.
+    """
+    from modules import business_info as mod_biz
+    data_dir = Path(user_rec["data_dir"])
+
+    # ── Pending credential reply ────────────────────────────────────────────
+    pending = _session_get(user_rec, "widget_install_pending")
+    if pending:
+        m = _WIDGET_CREDS_RE.match(message.strip())
+        if m:
+            username = m.group("user")
+            password = m.group("pass")
+        else:
+            # Owner typed something else — treat two-line as user/pass
+            lines = [l.strip() for l in message.strip().splitlines() if l.strip()]
+            if len(lines) >= 2:
+                username, password = lines[0], lines[1]
+            elif len(lines) == 1 and " " in lines[0]:
+                parts = lines[0].split(None, 1)
+                username, password = parts[0], parts[1]
+            else:
+                _session_set(user_rec, "widget_install_pending", None)
+                return _orbi_reply("I didn't catch those credentials. "
+                                   "Please send your login email and password "
+                                   "like this: email / password")
+
+        platform   = pending.get("platform", "unknown")
+        site_url   = pending.get("site_url", "")
+        embed_code = pending.get("embed_code", "")
+        _session_set(user_rec, "widget_install_pending", None)
+
+        workspace_dir = Path(user_rec.get("workspace_dir") or str(data_dir / "workspace"))
+        workspace_dir.mkdir(parents=True, exist_ok=True)
+
+        result = widget_installer.run_install(
+            platform=platform,
+            site_url=site_url,
+            username=username,
+            password=password,
+            embed_code=embed_code,
+            data_dir=data_dir,
+            workspace_dir=workspace_dir,
+            brain_call=llm_client.generate,
+        )
+
+        if result["ok"]:
+            # Verify it's live
+            config = _load_config()
+            api_key = config.get("api_key", "")
+            live = widget_installer.verify_installed(site_url, api_key)
+            if live:
+                biz = mod_biz.load(data_dir)
+                mod_biz.save(data_dir, {**biz, "widget_installed": True})
+                return _orbi_reply(
+                    f"Done! I'm live on your website now. "
+                    f"Visit {site_url} and you should see my chat button in the corner."
+                )
+            return _orbi_reply(
+                "I installed the code, but I couldn't confirm it's live yet — "
+                "your site may take a minute to update. "
+                "Refresh your website in a few minutes and I should be there."
+            )
+
+        # Auto-install failed — show manual instructions
+        return _orbi_reply(
+            result.get("message", "")
+            + "\n\n"
+            + widget_installer.get_manual_instructions(platform, embed_code)
+        )
+
+    # ── Initial trigger ─────────────────────────────────────────────────────
+    if not _WIDGET_INSTALL_RE.match(message):
+        return None
+
+    biz = mod_biz.load(data_dir)
+    site_url = (biz.get("contact") or {}).get("website", "")
+    if not site_url:
+        return _orbi_reply(
+            "I'd need your website URL to install on it. "
+            "What's your website address?"
+        )
+
+    if biz.get("widget_installed"):
+        return _orbi_reply(
+            f"I'm already installed on {site_url}. "
+            "If something looks wrong, let me know and I can reinstall."
+        )
+
+    config = _load_config()
+    embed_code = widget_installer.generate_embed_code(config)
+    platform = biz.get("_platform") or widget_installer.detect_platform(site_url, "")
+
+    can_auto = platform in ("wordpress", "squarespace", "shopify", "wix")
+
+    if can_auto:
+        _session_set(user_rec, "widget_install_pending", {
+            "platform":   platform,
+            "site_url":   site_url,
+            "embed_code": embed_code,
+        })
+        return _orbi_reply(widget_installer.install_prompt(platform, site_url))
+
+    # Platform not supported for auto-install — give manual instructions
+    return _orbi_reply(widget_installer.get_manual_instructions(platform, embed_code))
 
 
 def _try_retail_chat(message: str, user_rec: dict) -> dict | None:
