@@ -3889,10 +3889,17 @@ def public_business_summary():
 # Public chat
 # ---------------------------------------------------------------------------
 
-def _try_public_lead_capture(message: str, visitor: dict | None = None) -> dict | None:
+def _try_public_lead_capture(message: str, visitor: dict | None = None,
+                             history: list | None = None) -> dict | None:
     """Capture visitor contact info from public chat without invoking owner
     SMS/email workflows. Handles natural lead replies like:
-    'My name is Test Lead and my phone is 775-555-1212'."""
+    'My name is Test Lead and my phone is 775-555-1212'.
+
+    Mid-conversation (visitor already got at least one Orby reply): saves
+    the lead silently and returns None so the LLM can acknowledge naturally
+    and keep the conversation going.
+    Fresh start (opening message contains contact info): saves and returns
+    a short friendly ACK so the LLM call is skipped."""
     text = " ".join(str(message or "").split()).strip()
     visitor = visitor or {}
     phone_m = _re.search(r"(\+?\d[\d\-\(\)\s]{7,}\d)", text)
@@ -3932,14 +3939,19 @@ def _try_public_lead_capture(message: str, visitor: dict | None = None) -> dict 
             )
         except Exception:
             pass
-        label = name or phone or email_addr
-        return {"reply": f"Thanks, {label}. I have your contact info and will pass it to the owner.",
+        # Mid-conversation: lead saved, fall through to LLM so Orby
+        # acknowledges naturally and keeps the conversation going.
+        prior_replies = [m for m in (history or []) if m.get("role") == "assistant"]
+        if prior_replies:
+            return None
+        # Opening message contained contact info: short friendly ACK.
+        greeting = f"Got it, {name}! " if name else "Thanks! "
+        return {"reply": f"{greeting}What can I help you with?",
                 "tier": "local", "source": "public_lead_captured",
                 "message_id": captured.get("id")}
     except Exception as e:
         log.warning(f"public lead capture failed: {e}")
-        return {"reply": "I had trouble saving that contact info. Please call or try again.",
-                "tier": "local", "source": "public_lead_capture_error"}
+        return None  # fall through to LLM rather than showing an error
 
 @app.route("/chat", methods=["POST"])
 def public_chat():
@@ -4050,7 +4062,7 @@ def public_chat():
             "source": "personal_intent_blocked",
         }), 200
 
-    lead_capture = _try_public_lead_capture(user_msg, visitor)
+    lead_capture = _try_public_lead_capture(user_msg, visitor, history=history)
     if lead_capture is not None:
         return jsonify(lead_capture), 200
 
@@ -4382,6 +4394,12 @@ def public_chat():
         ph = _re_local.search(r"\b(\d{3}[-.\s]?\d{3}[-.\s]?\d{4})\b", full_text)
         if ph:
             params["phone"] = ph.group(1)
+        # Standalone seats fallback — scan the ENTIRE conversation for any
+        # mention of N seats/seat. Use the LAST match so later corrections
+        # (customer says "actually 3") win over earlier guesses.
+        seats_all = _re_local.findall(r"\b(\d{1,2})\s*seats?\b", full_text, _re_local.IGNORECASE)
+        if seats_all:
+            params["seats"] = seats_all[-1]
         return params
 
     resp = llm_client.generate(CONFIG, system, messages)
@@ -23683,6 +23701,30 @@ def chat_submit_order():
         log.info(f"chat order submitted via web_driver: "
                   f"ok={result.get('ok')} order_id={result.get('order_id','?')} "
                   f"customer={customer_name} phone={customer_phone}")
+        # SMS receipt to the CUSTOMER (not the owner) when order succeeds
+        if result.get("ok") and customer_phone:
+            try:
+                from twilio.rest import Client as TwilioClient
+                ph_cfg = CONFIG.get("phone") or {}
+                tw = TwilioClient(ph_cfg.get("twilio_account_sid"),
+                                  ph_cfg.get("twilio_auth_token"))
+                item_lines = "; ".join(
+                    f"{li['qty']}x {li['name']}" for li in (totals.get("lines") or [])
+                ) or "your order"
+                sms_body = (
+                    f"Hi {customer_name}! Your order at {biz_name} is confirmed.\n"
+                    f"{item_lines}\n"
+                    f"Total: ${totals['total']:.2f} (paid at pickup)\n"
+                    f"Pickup: {pickup_time or 'see you soon!'}"
+                )
+                tw.messages.create(
+                    body=sms_body,
+                    from_=ph_cfg.get("twilio_number"),
+                    to=customer_phone,
+                )
+                log.info(f"customer SMS receipt sent to {customer_phone}")
+            except Exception as _sms_err:
+                log.warning(f"customer SMS receipt failed: {_sms_err}")
         return _purblum_cors(jsonify({
             "ok": result.get("ok", False),
             "order_id": result.get("order_id", ""),
