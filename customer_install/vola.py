@@ -9195,6 +9195,20 @@ _WIDGET_CREDS_RE = _re.compile(
     r"^\s*(?P<user>[\w.+\-]+@[\w\-]+\.[\w\-.]+)\s*[/|,]\s*(?P<pass>\S+)\s*$"
 )
 
+# Regex: owner says they don't manage their own website
+_WIDGET_WEBDEV_RE = _re.compile(
+    r"(?:"
+    r"(?:i\s+)?(?:have\s+a|use\s+a|got\s+a)\s+web\s*(?:site\s+)?(?:guy|developer|designer|person|company|admin|team)"
+    r"|(?:my|a)\s+web\s*(?:site\s+)?(?:guy|developer|designer|person|company|admin|team)"
+    r"|(?:someone\s+else|he|she|they)\s+(?:handles?|manages?|does?|runs?)\s+(?:my\s+)?(?:website|site)"
+    r"|i\s+don'?t\s+(?:handle|manage|do|run|touch|deal\s+with)\s+(?:my\s+)?(?:website|site)"
+    r"|i\s+(?:can'?t|cannot|don'?t\s+have)\s+(?:access|log\s*in|get\s+into)\s+(?:the\s+|my\s+)?(?:website|site|backend|admin)"
+    r"|(?:my\s+)?web\s*(?:site\s+)?(?:guy|developer|designer)\s+(?:does?|handles?|manages?)"
+    r"|(?:forward|send|email)\s+(?:it\s+)?to\s+(?:my\s+)?(?:web\s*(?:site\s+)?(?:guy|developer|designer)|developer)"
+    r")",
+    _re.IGNORECASE,
+)
+
 # ── Retail / Auto / Salon NL chat regexes ────────────────────────────────────
 _RETAIL_LIST_SERVICES_RE = _re.compile(
     r"^\s*(?:"
@@ -9338,9 +9352,74 @@ def _try_widget_install_chat(message: str, user_rec: dict) -> dict | None:
     from modules import business_info as mod_biz
     data_dir = Path(user_rec["data_dir"])
 
+    # ── Pending: waiting for web developer's email address ─────────────────
+    dev_pending = _session_get(user_rec, "widget_install_dev_pending")
+    if dev_pending:
+        import re as _stdlib_re
+        email_match = _stdlib_re.search(r"[\w.+\-]+@[\w\-]+\.[\w\-.]+", message)
+        if not email_match:
+            return _orbi_reply(
+                "I need an email address to reach them. "
+                "What's your web developer's email?"
+            )
+        dev_email_addr = email_match.group(0)
+        _session_set(user_rec, "widget_install_dev_pending", None)
+
+        platform   = dev_pending.get("platform", "unknown")
+        site_url   = dev_pending.get("site_url", "")
+        embed_code = dev_pending.get("embed_code", "")
+
+        from modules import business_info as mod_biz
+        data_dir = Path(user_rec["data_dir"])
+        biz = mod_biz.load(data_dir)
+        biz_name   = biz.get("name", "")
+        owner_name = user_rec.get("display_name") or biz.get("personality", {}).get("owner_name", "the owner")
+
+        subject, body = widget_installer.developer_email(
+            platform, site_url, biz_name, owner_name, embed_code
+        )
+
+        # Send via owner's connected email account
+        sent = False
+        try:
+            import imap_smtp
+            owner_dir = Path(user_rec["user_dir"])
+            accounts = imap_smtp.list_accounts(owner_dir)
+            if accounts:
+                result = imap_smtp.send_email(
+                    owner_dir, accounts[0]["id"],
+                    to=dev_email_addr,
+                    subject=subject,
+                    body=body,
+                )
+                sent = result.get("ok", False)
+        except Exception as _e:
+            log.warning("widget_install dev email failed: %s", _e)
+
+        if sent:
+            return _orbi_reply(
+                f"Done — I sent everything to {dev_email_addr}. "
+                f"They have the code, which platform it's for, and exactly where to put it. "
+                f"Once they're done, just tell me and I'll check your site to confirm I'm live."
+            )
+        # Email send failed — give owner a copy to forward manually
+        return _orbi_reply(
+            f"I couldn't send the email directly (no connected mailbox). "
+            f"Here's a message you can copy and forward to {dev_email_addr}:\n\n"
+            f"---\nSubject: {subject}\n\n{body}"
+        )
+
     # ── Pending credential reply ────────────────────────────────────────────
     pending = _session_get(user_rec, "widget_install_pending")
     if pending:
+        # Owner says they have a web developer instead of providing credentials
+        if _WIDGET_WEBDEV_RE.search(message):
+            _session_set(user_rec, "widget_install_pending", None)
+            _session_set(user_rec, "widget_install_dev_pending", pending)
+            from modules import business_info as mod_biz
+            biz = mod_biz.load(Path(user_rec["data_dir"]))
+            return _orbi_reply(widget_installer.webdev_ask_prompt(biz.get("name", "")))
+
         m = _WIDGET_CREDS_RE.match(message.strip())
         if m:
             username = m.group("user")
@@ -9404,7 +9483,8 @@ def _try_widget_install_chat(message: str, user_rec: dict) -> dict | None:
         )
 
     # ── Initial trigger ─────────────────────────────────────────────────────
-    if not _WIDGET_INSTALL_RE.match(message):
+    _install_kw = _re.search(r"install|add|embed|set\s+up|widget|chat\s+button", message, _re.IGNORECASE)
+    if not _WIDGET_INSTALL_RE.match(message) and not (_install_kw and _WIDGET_WEBDEV_RE.search(message)):
         return None
 
     biz = mod_biz.load(data_dir)
@@ -9426,6 +9506,15 @@ def _try_widget_install_chat(message: str, user_rec: dict) -> dict | None:
     platform = biz.get("_platform") or widget_installer.detect_platform(site_url, "")
 
     can_auto = platform in ("wordpress", "squarespace", "shopify", "wix")
+
+    # If owner mentions web developer in the same message, skip straight to dev email path
+    if _WIDGET_WEBDEV_RE.search(message):
+        _session_set(user_rec, "widget_install_dev_pending", {
+            "platform":   platform,
+            "site_url":   site_url,
+            "embed_code": embed_code,
+        })
+        return _orbi_reply(widget_installer.webdev_ask_prompt(biz.get("name", "")))
 
     if can_auto:
         _session_set(user_rec, "widget_install_pending", {

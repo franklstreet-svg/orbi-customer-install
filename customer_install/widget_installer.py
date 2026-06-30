@@ -317,6 +317,73 @@ def install_prompt(platform: str, site_url: str) -> str:
     )
 
 
+def developer_email(
+    platform: str,
+    site_url: str,
+    biz_name: str,
+    owner_name: str,
+    embed_code: str,
+) -> tuple[str, str]:
+    """Return (subject, body) for a professional email to the web developer."""
+    platform_labels = {
+        "wordpress":   "WordPress",
+        "squarespace": "Squarespace",
+        "shopify":     "Shopify",
+        "wix":         "Wix",
+        "webflow":     "Webflow",
+        "weebly":      "Weebly",
+        "godaddy":     "GoDaddy Website Builder",
+        "unknown":     "the website",
+    }
+    label = platform_labels.get(platform, "the website")
+
+    where_map = {
+        "wordpress":   "Paste it in **Appearance → Theme File Editor → header.php**, just above the closing `</head>` tag.",
+        "squarespace": "Go to **Settings → Advanced → Code Injection** and paste it in the **Header** field.",
+        "shopify":     "Go to **Online Store → Themes → Actions → Edit Code**, open **Layout/theme.liquid**, and paste it just above the closing `</head>` tag.",
+        "wix":         "Go to **Settings → Custom Code → Add Code**, paste it in the **Head** section, then publish the site.",
+        "webflow":     "Go to **Project Settings → Custom Code** and paste it in the **Head Code** section, then publish.",
+        "weebly":      "Go to **Settings → SEO → Header Code** and paste it there, then save and publish.",
+        "godaddy":     "Go to **Settings → Website Settings → Header** or **Custom Code** and paste it there.",
+        "unknown":     "Paste it just above the closing `</head>` tag in your site's main template or header file.",
+    }
+    where = where_map.get(platform, where_map["unknown"])
+
+    subject = f"Please add one line of code to {site_url} — from {owner_name}"
+
+    body = f"""\
+Hi,
+
+{owner_name} at {biz_name or site_url} has set up an AI chat assistant called Orby \
+for their website ({site_url}). They asked me to send you everything you need to get it live.
+
+It's one line of code. Here it is:
+
+{embed_code}
+
+Where to put it ({label}):
+{where}
+
+That's the whole job. Once it's added and published, Orby's chat button will appear \
+on every page of the site automatically — no further configuration needed.
+
+If you run into any questions, {owner_name} can reach out to support@orbi.ai.
+
+Thanks for your help,
+Orby (on behalf of {owner_name})
+"""
+    return subject, body
+
+
+def webdev_ask_prompt(biz_name: str) -> str:
+    """What Orby says when pivoting to the web-developer email path."""
+    return (
+        "No problem at all. What's your web developer's email address? "
+        "I'll send them everything they need — the code, where to put it, "
+        "and a clear explanation. They'll be done in about 2 minutes."
+    )
+
+
 def blocked_prompt(platform: str, embed_code: str) -> str:
     """What Orby says when auto-install fails."""
     return (
