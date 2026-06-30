@@ -32,10 +32,11 @@
       "price_monthly": "+$49.99/mo on top of Base (founding members: $33.49/mo year 1 — 33% off, first 50 customers, auto-applied)",
       "what_it_does": "Industry-specific knowledge for food businesses. Menu knowledge from website, phone order-taking, SMS receipts to every caller, delivery questions, hours questions. Currently the only fully-built industry module."
     },
-    "retail_module": {
+    "retail_service_module": {
+      "display_name": "Orby Retail & Service Module",
       "price_monthly": "+$49.99/mo on top of Base",
-      "what_it_does": "Industry module for auto shops, salons, and retail stores. Manages a services catalog (oil change, haircut, brakes — with price and duration) and a products catalog. Orby knows what you offer, quotes the right price to every caller and website visitor, and lets you add or update services just by telling her.",
-      "who_it_is_for": "Any business that sells services or products: auto repair, detailing, salons, barbershops, retail stores, mixed shops. If you charge for something by the item or by the service, this module is for you."
+      "what_it_does": "Industry module for any business that sells services or products. Manages a services catalog (oil change, haircut, brakes — with price and duration) and a products catalog. Orby knows what you offer, quotes the right price to every caller and website visitor, and lets you add or update services just by telling her.",
+      "who_it_is_for": "Auto repair, detailing, salons, barbershops, retail stores, mixed shops. If you charge for something by the item or by the service, this module is for you."
     },
     "marketing_module": {
       "status": "coming soon — not yet available",
@@ -154,8 +155,8 @@
       "9 voices to choose from (Kokoro)",
       "STT (phone calls via Twilio, voice memos via Whisper)"
     ],
-    "retail_module": [
-      "Services catalog — name, price, duration (auto shop, salon, retail)",
+    "retail_service_module": [
+      "Services catalog — name, price, duration (auto shop, salon, retail, any service business)",
       "Products catalog with pricing and SKU",
       "Orby answers calls and chats about services, prices, and hours",
       "Add or update services and products via owner chat",
