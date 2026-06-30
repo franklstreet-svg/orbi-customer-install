@@ -1,6 +1,7 @@
 # Idunn AI — Source of Truth
 
-**Last updated:** 2026-06-30 (retail module wired end-to-end; marketing disabled/hidden; website trial box rewritten; LLM emergency swap to Llama 3.3 70B; legal research confirmed fully built with live database queries.)
+**Last updated:** 2026-06-30 (SoT audit pass: orbi.py → vola.py rename corrected throughout; module count updated to 40; maps.py, legal.py, retail.py added to module layout; stale line counts corrected; brain stripe_webhook.py count updated.)
+**Previous update:** 2026-06-30 (retail module wired end-to-end; marketing disabled/hidden; website trial box rewritten; LLM emergency swap to Llama 3.3 70B; legal research confirmed fully built with live database queries.)
 **Previous update:** 2026-06-29 (attorney/legal module completed end-to-end; Anthropic Claude routing for legal LLM calls added; full codebase audit run.)
 **Previous update:** 2026-06-28 (core module testing + PurBlum restaurant order email + US sales tax table.)
 **Previous update:** 2026-06-25 15:34 PDT (end-of-chat handoff refresh. Active source-of-truth location confirmed as `/home/frank/orbi_web/SOURCE_OF_TRUTH.md`; stale top-level `/home/frank/ORBI_MASTER_SOURCE_OF_TRUTH.md` now points here. Active trees verified: `~/orbi_web`, `~/orbi-brain`, `~/orbi-tenants`, `~/twickell_live`, and `~/Orbi`; legacy/reference/backup trees exist but are not the current product path. Live runtime right now: brain/billing on `127.0.0.1:5060`, sales/dev Orbi on `127.0.0.1:6000`, test tenant `orbi_xVvgR3ucXNS` on `127.0.0.1:6100`, and multiple Cloudflared processes are listening locally. Tenant ports `6101` and `6102` are not listening right now.)
@@ -258,7 +259,7 @@ Frank hit a Cloudflare 502 at `2026-06-25 13:48 PDT` after reboot. Brain logs sh
 **Canonical product source: `~/orbi_web`**
 
 - `SOURCE_OF_TRUTH.md` — this file; read first.
-- `customer_install/orbi.py` — tenant app/server, owner chat routes, public chat routes, SMS/email/calendar/reminder/task routing, voice/TTS routes, module wiring.
+- `customer_install/vola.py` — tenant app/server, owner chat routes, public chat routes, SMS/email/calendar/reminder/task routing, voice/TTS routes, module wiring.
 - `customer_install/prompts.py` — public/owner/voice prompt builders; loads `product_knowledge.json`.
 - `customer_install/product_knowledge.json` — shared myOrbi product/business knowledge.
 - `customer_install/modules/` — per-user/business modules: calendar, reminders, tasks, contacts, notes, memory, messages, business_info, catalog, workspace, marketing, learning_loop, restaurant/contractor-adjacent modules, PDFs, bids, invoices, projects, change orders, reviews, etc.
@@ -375,15 +376,15 @@ Important: there is a **port/config collision** on disk: two tenant configs list
 - `main` and `origin/main` point to the current live website.
 - Local `cloud-v1` is ahead of `origin/cloud-v1` by 6 commits; do not assume `origin/cloud-v1` is the latest website branch.
 
-### File counts / module inventory verified 2026-06-23
+### File counts / module inventory verified 2026-06-23 (⚠ stale — see 2026-06-30 audit for current counts)
 
-- `customer_install/orbi.py`: 18,657 lines
-- `customer_install/prompts.py`: 2,590 lines
+- `customer_install/vola.py` (was `orbi.py`): 18,657 lines at 6-23 → **23,690 lines as of 2026-06-30**
+- `customer_install/prompts.py`: 2,590 lines at 6-23 → **2,795 lines as of 2026-06-30**
 - `customer_install/kokoro_tts.py`: 250 lines
-- `customer_install/product_knowledge.json`: 283 lines
-- `orbi-brain/stripe_webhook.py`: 4,231 lines
+- `customer_install/product_knowledge.json`: 283 lines at 6-23 → **297 lines as of 2026-06-30**
+- `orbi-brain/stripe_webhook.py`: 4,231 lines at 6-23 → **4,552 lines as of 2026-06-30**
 - `twickell_live/website/index.html`: 1,226 lines
-- `customer_install/modules/`: 37 Python module files including `marketing.py`, `learning_loop.py`, the five learning modules, and the contractor-leftover modules.
+- `customer_install/modules/`: 37 Python module files at 6-23 → **40 files as of 2026-06-30** (added legal.py, retail.py, maps.py)
 
 ### Known drift / cleanup needed
 
@@ -481,7 +482,7 @@ This is preserved for v2/local-install and for the old installer build path. It 
 - Service registration via Startup-folder shortcut (not sc.exe — Python scripts can't be proper Windows services without nssm). `launcher.cmd` checks port 5050, spawns `pythonw.exe orbi.py` in background if not listening, waits up to 30s for port to come up, opens Chrome in `--app` mode at `http://localhost:5050/owner/login`.
 - Data dir: `C:\Program Files\Orbi\data\` (encrypted nightly backup tarballs).
 - Self-contained tunnel: bundled `cloudflared.exe` opens a public quick-tunnel so Twilio can webhook into the customer's home computer through their NAT.
-- **Module gating via `config.json` → `enabled_modules`** (list of lowercase strings). All 37 module files in `customer_install/modules/` are present in every install, but only the modules listed here have their routes/aliases activated at runtime. Dev install currently runs `["marketing", "marketing_image"]`. Per-customer this list comes from the brain at activation time based on subscription tier + add-ons (see `orbi.py:180, :2146, :12500+`).
+- **Module gating via `config.json` → `enabled_modules`** (list of lowercase strings). All 40 module files in `customer_install/modules/` are present in every install, but only the modules listed here have their routes/aliases activated at runtime. Dev install currently runs `["legal","contractor","retail"]`. "contractor" maps to the 15-file contractor group in vola.py's routing code, not a single contractor.py. Per-customer this list comes from the brain at activation time based on subscription tier + add-ons.
 
 ---
 
@@ -557,7 +558,7 @@ The old Windows installer flow is preserved for v2 and still matters historicall
 - **Native nssm bundling** — would let us register Orbi as a proper Windows service. Currently using Startup-folder shortcut as a workaround.
 - **Real industry modules** — Restaurant ✅ built. Legal (Orby Law) ✅ built. Retail & Service ✅ built. Construction ✅ built (shelved in config — reactivate when needed). Marketing IN DEVELOPMENT. Medical deferred (HIPAA). Stripe prices for Retail still need to be created before checkout works.
 - **Onboarding mid-question scrape feedback** — the website scrape runs in background but Orbi doesn't tell the customer "I found 12 services from your site" mid-conversation.
-- **Learning loop — partial.** The "Orbi doesn't know → captures caller contact → asks owner → stores answer → delivers back to original caller" pipeline. Real implementation in `customer_install/modules/learning_loop.py` (not a stub) and imported in `orbi.py:94`, but the full owner-notification + answer-routing pipeline is not yet end-to-end. ~26 hrs estimated remaining.
+- **Learning loop — partial.** The "Orbi doesn't know → captures caller contact → asks owner → stores answer → delivers back to original caller" pipeline. Real implementation in `customer_install/modules/learning_loop.py` (not a stub) and imported in `vola.py`, but the full owner-notification + answer-routing pipeline is not yet end-to-end. ~26 hrs estimated remaining.
 
 ---
 
@@ -600,12 +601,12 @@ Each bullet is a real Windows install bug a customer or test PC surfaced. All fi
 ```
 ~/orbi_web/                         (main dev workspace — git repo, pushed to GitHub. ⚠ Working tree currently dirty — see "Uncommitted source state" below.)
   customer_install/                 (what gets bundled into the .exe — runs on dev port 6000; ships as port 5050 on the customer .exe)
-    orbi.py                         (the customer-side Flask app — 18,314 lines as of 6-19, all routes)
-    prompts.py                      (LLM prompt templates — sales mode, owner mode, public mode)
+    vola.py                         (the customer-side Flask app — 23,690 lines as of 2026-06-30, all routes. ⚠ Previously called orbi.py — that name no longer exists.)
+    prompts.py                      (LLM prompt templates — sales mode, owner mode, public mode; 2,795 lines as of 2026-06-30)
     voice.py                        (Twilio phone TwiML + edge-tts)
-    llm_client.py                   (LLM router with circuit breaker, Mozilla UA for Cloudflare)
-    image_gen.py                    (image sub-module — FLUX.1-schnell via HF, wired in orbi.py:63)
-    ad_gen.py                       (ad composition — orchestrates LLM + image_gen + PIL, orbi.py:64)
+    llm_client.py                   (LLM router with circuit breaker, Mozilla UA for Cloudflare; 580 lines as of 2026-06-30)
+    image_gen.py                    (image sub-module — FLUX.1-schnell via HF, wired in vola.py)
+    ad_gen.py                       (ad composition — orchestrates LLM + image_gen + PIL, wired in vola.py)
     auth.py                         (three-mode session tokens: visitor / staff / owner)
     users.py                        (multi-user registry, per-user data folders, archive-not-delete)
     onboarding.py                   (first-run wizard; restaurant variant lives here, not in modules/)
@@ -632,20 +633,23 @@ Each bullet is a real Windows install bug a customer or test PC surfaced. All fi
     backups/                        (nightly encrypted `.tar.gz.enc` archives — local-only)
     data/                           (live runtime data — per-user folders, sessions, learned answers)
     data.preroll-*/                 (frozen pre-rollout data snapshots from 2026-06-06 — historical, can be archived/pruned)
-    config.json                     (per-install config; `enabled_modules` gates which modules activate at runtime. Currently ["marketing","marketing_image"].)
+    config.json                     (per-install config; `enabled_modules` gates which modules activate at runtime. As of 2026-06-30: ["legal","contractor","retail"].)
     config.json.template            (defaults shipped in the installer)
-    modules/                        (37 module files; ONLY the ones in config.enabled_modules light up)
-      marketing.py                  (active — enabled in dev config)
-      learning_loop.py              (PARTIAL — real impl, imported in orbi.py:94, full pipeline incomplete)
+    modules/                        (40 module files; ONLY the ones in config.enabled_modules light up)
+      legal.py                      (FULL — NL chat + dashboard + phone brief + all API routes + Anthropic LLM; enabled in dev config)
+      retail.py                     (FULL — services + products NL chat + Stripe checkout wired; enabled in dev config)
+      marketing.py                  (dashboard only — NL chat handler missing; NOT in dev enabled_modules; hidden from website)
+      learning_loop.py              (PARTIAL — real impl, imported in vola.py, full pipeline incomplete)
       memory.py business_info.py calendar.py contacts.py reminders.py
         notes.py tasks.py messages.py reviews.py mood.py gifts.py
         quick_capture.py workspace.py forms.py form_filler.py        (general personal-assistant modules — 15 files)
       workflow_learner.py preferences.py glossary.py
         schedule_patterns.py thread_tone.py                          (5 learning modules — wired, unobtrusive until they have data)
+      maps.py                       (⚠ EXISTS but completely undocumented — purpose unknown, not referenced in session notes)
       bids.py change_orders.py closeout_pdf.py daily_logs.py
         invoice_pdf.py invoices.py line_items.py pricing.py
         projects.py proposal_pdf.py subcontractors.py wins.py
-        clients.py catalog.py internal_messages.py                   (CONTRACTOR LEFTOVERS — 15 files; shelved 2026-05-31, code preserved but disabled at config level)
+        clients.py catalog.py internal_messages.py                   (CONTRACTOR group — 15 files; enabled via "contractor" string in enabled_modules, which vola.py maps to this file group. Code was shelved 2026-05-31, reactivated in dev config 2026-06-30.)
     static/                         (chat widget JS + CSS; dashboard.* are SYMLINKS → ~/orbi_web/owner_dashboard/)
     owner_dashboard                 (SYMLINK → ../owner_dashboard. ONE canonical source. No drift risk — previous "SECONDARY physical copy" note was wrong.)
     installer/
@@ -671,7 +675,7 @@ Each bullet is a real Windows install bug a customer or test PC surfaced. All fi
   README.md
 
 ~/orbi-brain/                       (THE LIVE BRAIN — Render-hosted at billing.twickell.com. Also running locally as orbi-stripe.service for dev.)
-  stripe_webhook.py                 (Flask app — 2,535 lines as of 6-11. ACTIVE. Routes grouped by surface:
+  stripe_webhook.py                 (Flask app — 4,552 lines as of 2026-06-30. ACTIVE. Routes grouped by surface:
                                      Customer/install:   POST /webhook, GET /api/verify/<token>,
                                                          GET /download/<install_token>, GET /download/by-platform/<platform>
                                      LLM proxy + TTS:    POST /v1/chat/completions, POST /api/brain/tts,
