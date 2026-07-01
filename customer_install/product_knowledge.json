@@ -29,6 +29,7 @@
       "what_it_does": "Embed the Orbi chat widget on the customer's existing website with one line of code. Works on WordPress, Squarespace, Wix, custom sites — anything. Visitors can chat or use voice toggle. Captures every visitor's contact info. Knows the business's menu/services/hours/FAQs."
     },
     "restaurant_module": {
+      "display_name": "Orby Restaurant",
       "price_monthly": "+$49.99/mo on top of Base (founding members: $33.49/mo year 1 — 33% off, first 50 customers, auto-applied)",
       "what_it_does": "Industry-specific knowledge for food businesses. Menu knowledge from website, phone order-taking, SMS receipts to every caller, delivery questions, hours questions."
     },
@@ -55,7 +56,7 @@
     },
     "industry_modules_coming_soon": {
       "marketing": "+$29.99/mo (in development — not yet available)",
-      "legal": "+$199.99/mo (v1.1 with UPL safeguards — now available via Orbi Law)",
+      "legal": "+$199.99/mo (v1.1 with UPL safeguards — now available via Orby Law)",
       "medical": "deferred indefinitely until HIPAA compliance work is funded"
     },
     "founding_member_program": {
@@ -310,7 +311,7 @@
   "honest_limits": [
     "Local-install version is v2, no specific ship date promised",
     "Multi-tenant cloud is still maturing — v1 may have brief downtimes during early customer onboarding",
-    "Industry modules: Restaurant, Retail/Auto/Salon, and Construction are available in v1. Legal is available as Orbi Law ($199.99/mo). Marketing is in development. Medical deferred until HIPAA work is funded.",
+    "Industry modules: Restaurant, Retail/Auto/Salon, and Construction are available in v1. Legal is available as Orby Law ($199.99/mo). Marketing is in development. Medical deferred until HIPAA work is funded.",
     "Web agent can repair simple website issues with CMS credentials but cannot fix complex code, server outages, or hosting/DNS issues",
     "Image generation (Marketing module + Image Generation sub-module) is not yet available — coming soon",
     "Forever memory means forever — if a customer wants Orbi to forget something specific, they tell her to forget it and she does, but otherwise she remembers across sessions"
