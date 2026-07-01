@@ -853,7 +853,7 @@ _audioEl.src = '/tts?text=%20&silent=1';
       if (wantsListening && !isSpeaking) {
         clearTimeout(restartTimer);
         restartTimer = setTimeout(() => {
-          if (wantsListening && !isSpeaking) safeStart();
+          if (wantsListening && !isSpeaking && !isListening) safeStart();
         }, 250);
       }
     };
@@ -900,8 +900,29 @@ _audioEl.src = '/tts?text=%20&silent=1';
   }
 
   function safeStart() {
+    if (isListening) return;
+    // Chrome's SpeechRecognition in iframes silently stops capturing audio
+    // after the first session — same symptom as revoking+re-granting the
+    // browser mic permission. Creating a fresh object each call forces a new
+    // mic stream connection, which is what manual permission cycling does.
+    const prev = recognition;
+    const _onstart  = prev.onstart;
+    const _onend    = prev.onend;
+    const _onerror  = prev.onerror;
+    const _onresult = prev.onresult;
+    prev.onstart = null; prev.onend = null;
+    prev.onerror = null; prev.onresult = null;
+    recognition = new Recognition();
+    recognition.lang = 'en-US';
+    recognition.continuous = false;
+    recognition.interimResults = true;
+    recognition.maxAlternatives = 3;
+    recognition.onstart  = _onstart;
+    recognition.onend    = _onend;
+    recognition.onerror  = _onerror;
+    recognition.onresult = _onresult;
     try { recognition.start(); }
-    catch (e) { /* already running — ignore */ }
+    catch (e) { /* ignore */ }
   }
 
   function stopListening() {
