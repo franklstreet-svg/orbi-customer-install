@@ -175,7 +175,22 @@
       badge.style.display = 'none';
     }
   }
-  launcher.addEventListener('click', () => opened ? closeWidget() : openWidget());
+  launcher.addEventListener('click', () => {
+    if (opened) { closeWidget(); return; }
+    // Request mic permission on the PARENT page (twickell.com) before opening.
+    // Chrome's allow="microphone" delegation only works when the top-level
+    // origin has permission — this is why manually cycling the Chrome mic
+    // icon fixed it. Acquiring getUserMedia here triggers the browser prompt
+    // for this origin so the iframe's SpeechRecognition can use the delegated
+    // permission without the user having to visit Chrome settings.
+    if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+      navigator.mediaDevices.getUserMedia({ audio: true })
+        .then(s => { s.getTracks().forEach(t => t.stop()); openWidget(); })
+        .catch(() => openWidget());
+    } else {
+      openWidget();
+    }
+  });
 
   // Allow the chat shell inside the iframe to talk back to us
   // (for unread badge updates, "close me" requests, full-page

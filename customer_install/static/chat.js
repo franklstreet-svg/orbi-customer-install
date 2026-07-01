@@ -899,20 +899,8 @@ _audioEl.src = '/tts?text=%20&silent=1';
     safeStart();
   }
 
-  async function safeStart() {
+  function safeStart() {
     if (isListening) return;
-    // Briefly acquire and immediately release a real mic stream before
-    // starting SpeechRecognition. This forces Chrome to reconnect the
-    // microphone at the OS level — the programmatic equivalent of
-    // clicking the browser mic icon off then on. Without this, Chrome's
-    // SpeechRecognition in an iframe shows green/active but captures
-    // nothing after a page refresh or permission change.
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      stream.getTracks().forEach(t => t.stop());
-    } catch {}
-    // Re-check guards — state may have changed during the getUserMedia await
-    if (!wantsListening || isSpeaking || isListening) return;
     const prev = recognition;
     const _onstart  = prev.onstart;
     const _onend    = prev.onend;
