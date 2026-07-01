@@ -161,6 +161,16 @@
     launcher.classList.add('open');
     opened = true;
     setBadge(0);
+    // Unlock an audio element RIGHT NOW inside the click gesture so we can
+    // play the greeting TTS from it when the iframe sends orbi:greeting-ready.
+    // This is the standard mobile audio-unlock pattern: call play() in the
+    // gesture, then swap the src and replay when the content is ready.
+    if (!_greetAudio) {
+      _greetAudio = new Audio('data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=');
+      _greetAudio.volume = 0;
+      _greetAudio.play().catch(() => {});
+      _greetAudio.volume = 1;
+    }
   }
   function closeWidget() {
     if (_greetAudio) { try { _greetAudio.pause(); } catch {} _greetAudio = null; }
@@ -197,8 +207,13 @@
     if (msg.type === 'orbi:greeting-ready' && msg.text) {
       const ttsUrl = origin + '/tts?voice=en-US-AvaNeural'
         + '&text=' + encodeURIComponent((msg.text || '').slice(0, 2000));
-      if (_greetAudio) { try { _greetAudio.pause(); } catch {} }
-      _greetAudio = new Audio(ttsUrl);
+      // Re-use the element unlocked in the click gesture (swap its src to the
+      // real TTS URL). If openWidget() somehow didn't prime one, fall back to
+      // a fresh Audio element (still likely to work since the parent page has
+      // user activation from the launcher click).
+      if (!_greetAudio) _greetAudio = new Audio();
+      _greetAudio.src = ttsUrl;
+      _greetAudio.volume = 1;
       _greetAudio.play().then(() => {
         // Audio started — suppress iframe's _drainOnFirstTap double-play
         try { frame.contentWindow.postMessage({ type: 'orbi:clear-greeting' }, origin); } catch {}
