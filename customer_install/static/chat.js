@@ -993,10 +993,9 @@ _audioEl.src = '/tts?text=%20&silent=1';
 
     // ANTI-ECHO: cut the mic BEFORE audio starts
     const wasMicOn = prefs.micOn;
-    if (wasMicOn) {
-      stopListening();
-      micToggle.classList.add('muted-while-speaking');
-    }
+    if (wasMicOn) stopListening();
+    micToggle.classList.remove('listening');
+    micToggle.classList.add('muted-while-speaking');
 
     isSpeaking = true;
     avatar.classList.add('speaking');
