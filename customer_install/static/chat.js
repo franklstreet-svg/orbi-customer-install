@@ -1002,11 +1002,19 @@ _audioEl.src = '/tts?text=%20&silent=1';
     // Wait for speech to finish, then re-enable STT
     try { await speechPromise; } catch {}
     _suppressSTT = false;
-    // Recognition fires onend during TTS (continuous=false, no-speech timeout)
-    // and the onend handler skips restart while isSpeaking=true. Kick it back
-    // on now that speaking is done and we want to hear the user.
-    if (prefs.micOn && wantsListening && !isListening && !isSpeaking) {
-      safeStart();
+    clearInterim();
+    // Flush TTS echo: abort the current STT session so any audio the mic
+    // captured during the greeting is discarded before results flow again.
+    // If recognition already ended (continuous=false no-speech timeout during
+    // TTS), start fresh directly. Either way the mic is live when done.
+    if (prefs.micOn && wantsListening) {
+      if (isListening) {
+        try { recognition.abort(); } catch {}
+        isListening = false;
+        // onend fires from the abort and its 250ms timer restarts the session
+      } else {
+        safeStart();
+      }
     }
   }
 
