@@ -441,6 +441,11 @@ _audioEl.src = '/tts?text=%20&silent=1';
         _pendingFirstSpeech = null;
         if (!prefs.speakerOn) setSpeakerOn(true);
         setMicOn(true);
+        // Force recognition.start() RIGHT NOW inside this gesture window.
+        // startListening() bails when isSpeaking=true (proactive greeting),
+        // so call safeStart() directly. speak() anti-echo will stop it,
+        // armMic re-arms it after TTS. No skipAntiEcho needed — normal flow.
+        if (!isListening) safeStart();
         deliverSpokenWelcome();
       } else {
         if (turningOn && !prefs.speakerOn) setSpeakerOn(true);
@@ -984,11 +989,10 @@ _audioEl.src = '/tts?text=%20&silent=1';
     div.appendChild(body);
     chatArea.appendChild(div);
     chatArea.scrollTop = chatArea.scrollHeight;
-    // Speak in parallel with typing. skipAntiEcho keeps the mic running so
-    // Chrome's gesture-established recognition session stays alive. We
-    // suppress STT results via _suppressSTT so Orby doesn't "hear" herself.
-    _suppressSTT = true;
-    const speechPromise = (prefs.speakerOn ? speak(welcomeText, { skipAntiEcho: true }) : Promise.resolve());
+    // Normal speak() — anti-echo stops recognition before audio plays, armMic
+    // re-arms it when TTS finishes. gesture-window safeStart() above already
+    // established Chrome's mic connection, so the armMic restart works.
+    const speechPromise = (prefs.speakerOn ? speak(welcomeText) : Promise.resolve());
     // Type ~30 chars/sec — slow enough to read along with her voice
     for (let i = 0; i < welcomeText.length; i++) {
       body.textContent = welcomeText.slice(0, i + 1);
@@ -999,23 +1003,7 @@ _audioEl.src = '/tts?text=%20&silent=1';
     // continues the conversation from there.
     history.push({ role: 'assistant', content: welcomeText });
     _saveHistory(history);
-    // Wait for speech to finish, then re-enable STT
     try { await speechPromise; } catch {}
-    _suppressSTT = false;
-    clearInterim();
-    // Flush TTS echo: abort the current STT session so any audio the mic
-    // captured during the greeting is discarded before results flow again.
-    // If recognition already ended (continuous=false no-speech timeout during
-    // TTS), start fresh directly. Either way the mic is live when done.
-    if (prefs.micOn && wantsListening) {
-      if (isListening) {
-        try { recognition.abort(); } catch {}
-        isListening = false;
-        // onend fires from the abort and its 250ms timer restarts the session
-      } else {
-        safeStart();
-      }
-    }
   }
 
   // ------------------------------------------------------------------
