@@ -1002,6 +1002,12 @@ _audioEl.src = '/tts?text=%20&silent=1';
     // Wait for speech to finish, then re-enable STT
     try { await speechPromise; } catch {}
     _suppressSTT = false;
+    // Recognition fires onend during TTS (continuous=false, no-speech timeout)
+    // and the onend handler skips restart while isSpeaking=true. Kick it back
+    // on now that speaking is done and we want to hear the user.
+    if (prefs.micOn && wantsListening && !isListening && !isSpeaking) {
+      safeStart();
+    }
   }
 
   // ------------------------------------------------------------------
