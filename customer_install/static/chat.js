@@ -851,7 +851,7 @@ _audioEl.src = '/tts?text=%20&silent=1';
       if (wantsListening && !isSpeaking) {
         clearTimeout(restartTimer);
         restartTimer = setTimeout(() => {
-          if (wantsListening && !isSpeaking && !isListening) safeStart();
+          if (wantsListening && !isSpeaking) safeStart();
         }, 250);
       }
     };
@@ -862,7 +862,7 @@ _audioEl.src = '/tts?text=%20&silent=1';
       console.warn('mic error:', e.error);
       if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
         setMicOn(false);
-        setStateBar('Microphone blocked — tap the mic icon to retry.', 'error');
+        alert('Microphone permission was denied. To use voice, please allow microphone access in your browser settings.');
       }
     };
 
@@ -898,27 +898,8 @@ _audioEl.src = '/tts?text=%20&silent=1';
   }
 
   function safeStart() {
-    if (isListening) return;
-    // Chrome's SpeechRecognition in iframes silently stops capturing audio
-    // after the first abort()+start() cycle on the same object. Creating a
-    // fresh object each time forces the browser to reconnect the mic stream.
-    const prev = recognition;
-    recognition = new Recognition();
-    recognition.lang = 'en-US';
-    recognition.continuous = false;
-    recognition.interimResults = true;
-    recognition.maxAlternatives = 3;
-    recognition.onstart  = prev.onstart;
-    recognition.onend    = prev.onend;
-    recognition.onerror  = prev.onerror;
-    recognition.onresult = prev.onresult;
-    if (prev && prev !== recognition) {
-      prev.onstart = null; prev.onend = null;
-      prev.onerror = null; prev.onresult = null;
-      try { prev.abort(); } catch {}
-    }
     try { recognition.start(); }
-    catch (e) { /* ignore */ }
+    catch (e) { /* already running — ignore */ }
   }
 
   function stopListening() {
@@ -1012,9 +993,10 @@ _audioEl.src = '/tts?text=%20&silent=1';
 
     // ANTI-ECHO: cut the mic BEFORE audio starts
     const wasMicOn = prefs.micOn;
-    if (wasMicOn) stopListening();
-    micToggle.classList.remove('listening');
-    micToggle.classList.add('muted-while-speaking');
+    if (wasMicOn) {
+      stopListening();
+      micToggle.classList.add('muted-while-speaking');
+    }
 
     isSpeaking = true;
     avatar.classList.add('speaking');
@@ -1037,42 +1019,31 @@ _audioEl.src = '/tts?text=%20&silent=1';
       const ttsUrl = '/tts?voice=' + encodeURIComponent(ORBI_TTS_VOICE)
         + '&text=' + encodeURIComponent(cleanText.slice(0, 2000));
 
-      // Timeout guard: if TTS server stalls (edge_tts hangs waiting for
-      // Microsoft's API), the audio element never fires onended and speak()
-      // hangs forever, freezing the whole widget. 45s covers any realistic
-      // reply length; longer than that and the user has moved on anyway.
-      const _ttsTimeout = new Promise(r => setTimeout(r, 45000));
       if (_audioUnlocked) {
-        await Promise.race([
-          new Promise((resolve) => {
-            const done = () => {
-              _audioEl.onended = null;
-              _audioEl.onerror = null;
-              resolve();
-            };
-            _audioEl.onended = done;
-            _audioEl.onerror = done;
-            _audioEl.src = ttsUrl;
-            _audioEl.volume = 1;
-            _audioEl.muted = false;
-            _audioEl.play().catch(done);
-          }),
-          _ttsTimeout,
-        ]);
+        await new Promise((resolve) => {
+          const done = () => {
+            _audioEl.onended = null;
+            _audioEl.onerror = null;
+            resolve();
+          };
+          _audioEl.onended = done;
+          _audioEl.onerror = done;
+          _audioEl.src = ttsUrl;
+          _audioEl.volume = 1;
+          _audioEl.muted = false;
+          _audioEl.play().catch(done);
+        });
       } else {
         // Pre-gesture (rare — first reply before any tap inside chat).
         // Fresh Audio() may fail to play on iOS; the persistent element
         // path above handles every subsequent reply once the user taps.
         currentAudio = new Audio(ttsUrl);
         currentAudio.preload = 'auto';
-        await Promise.race([
-          new Promise((resolve) => {
-            currentAudio.onended = resolve;
-            currentAudio.onerror = resolve;
-            currentAudio.play().catch(resolve);
-          }),
-          _ttsTimeout,
-        ]);
+        await new Promise((resolve) => {
+          currentAudio.onended = resolve;
+          currentAudio.onerror = resolve;
+          currentAudio.play().catch(resolve);
+        });
       }
     } catch (err) {
       console.warn('[Orbi] server TTS failed, falling back to browser voice:', err);
