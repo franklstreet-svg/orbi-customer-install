@@ -160,6 +160,9 @@
     launcher.classList.add('open');
     opened = true;
     setBadge(0);
+    // Give the iframe browser focus so Chrome's SpeechRecognition inside it
+    // actually captures audio. Without focus the mic shows "on" but hears nothing.
+    setTimeout(() => { try { frame.focus(); } catch {} }, 200);
   }
   function closeWidget() {
     frame.classList.remove('open');

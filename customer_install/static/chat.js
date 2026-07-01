@@ -862,7 +862,7 @@ _audioEl.src = '/tts?text=%20&silent=1';
       console.warn('mic error:', e.error);
       if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
         setMicOn(false);
-        alert('Microphone permission was denied. To use voice, please allow microphone access in your browser settings.');
+        setStateBar('Microphone blocked — tap the mic icon to retry.', 'error');
       }
     };
 
