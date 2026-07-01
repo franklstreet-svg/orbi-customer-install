@@ -148,8 +148,10 @@ def call_huggingface(config: dict, system: str, messages: list[dict]) -> LLMResp
     }
     timeout = _GEN_OVERRIDES.get("timeout_seconds") or cfg.get("timeout_seconds", 15)
 
-    # Attempt 1: featherless-ai (Qwen 2.5 72B, back on 2026-06-29 after brief outage).
-    # Falls back to auto-router if featherless-ai is unavailable.
+    # Auto-router first — picks the fastest available provider for Qwen 72B.
+    # featherless-ai was pinned here on 2026-06-29 when it was fastest (735ms)
+    # but degraded to 2.6s on 2026-06-30 while the auto-router landed on a
+    # faster backend (0.88s). Revert to pinning only if auto-router degrades.
     payload = {
         "model": model,
         "messages": [{"role": "system", "content": system}] + messages,
@@ -157,13 +159,17 @@ def call_huggingface(config: dict, system: str, messages: list[dict]) -> LLMResp
         "max_tokens": _GEN_OVERRIDES.get("max_tokens") or 4096,
         "stream": False,
     }
-    resp = _http_chat("https://router.huggingface.co/featherless-ai/v1/chat/completions",
-                      payload, headers, timeout, tier="huggingface")
+    # Respect provider override in config if explicitly set
+    _hf_provider = cfg.get("provider", "")
+    _router_url = (f"https://router.huggingface.co/{_hf_provider}/v1/chat/completions"
+                   if _hf_provider
+                   else "https://router.huggingface.co/v1/chat/completions")
+    resp = _http_chat(_router_url, payload, headers, timeout, tier="huggingface")
     if resp:
         return resp
 
-    # Attempt 2: auto-router fallback (provider selection varies by availability)
-    resp = _http_chat("https://router.huggingface.co/v1/chat/completions",
+    # Fallback: featherless-ai (in case auto-router fails)
+    resp = _http_chat("https://router.huggingface.co/featherless-ai/v1/chat/completions",
                       payload, headers, timeout, tier="huggingface")
     return resp
 

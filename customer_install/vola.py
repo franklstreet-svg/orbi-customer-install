@@ -4583,7 +4583,8 @@ def public_chat():
                 r'\s*\([^)]{0,200}(?:'
                 r'standing by|reviewing|just a|hold on|one moment|'
                 r'give me a|be right|scanning|checking|I\'ll|I will|'
-                r'working on|pulling up|looking at|on my way|sit tight'
+                r'working on|pulling up|looking at|on my way|sit tight|'
+                r'note[:\s]|note —|scrape|didn\'t return|did not return'
                 r')[^)]{0,200}\)',
                 _re.IGNORECASE,
             )

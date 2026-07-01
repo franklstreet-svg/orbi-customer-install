@@ -109,11 +109,11 @@ def pre_execute(message: str, data_dir: Path,
     if biz_website and _WEBSITE_RE.search(msg_l):
         return (f"Our website is {biz_website}.", "direct")
 
-    # ── HOURS → data lookup (LLM composes natural reply) ──────────────
+    # ── HOURS → direct reply (no LLM needed for factual lookup) ──────
     if _HOURS_RE.search(msg_l):
         hours = business.get("hours")
         if hours:
-            return (_format_hours(hours), "data:hours")
+            return (_format_hours(hours), "direct")
 
     # ── SERVICES → data lookup ────────────────────────────────────────
     if _SERVICES_RE.search(msg_l):
@@ -122,6 +122,22 @@ def pre_execute(message: str, data_dir: Path,
             if isinstance(services, list):
                 return ("Services we offer: " + ", ".join(str(s) for s in services), "data:services")
             return (f"Services: {services}", "data:services")
+
+    # ── MENU LISTING → direct reply using item names only ────────────
+    # When a visitor asks to see the menu or what's available, return
+    # the top items by NAME ONLY — no descriptions, no LLM. Keeps it
+    # to 1-2 sentences and avoids the LLM dumping full descriptions.
+    if _MENU_LIST_RE.search(msg_l):
+        items = (business.get("menu_items") or
+                 business.get("services") or
+                 business.get("menu") or [])
+        names = [s["name"] for s in items[:6] if isinstance(s, dict) and s.get("name")]
+        if names:
+            if len(names) <= 4:
+                name_str = ", ".join(names)
+            else:
+                name_str = ", ".join(names[:4]) + f", and {len(items) - 4} more"
+            return (f"We've got {name_str} — what sounds good?", "direct")
 
     # ── CATALOG ITEM COUNT → data lookup from catalog index ───────────
     if _CATALOG_COUNT_RE.search(msg_l):
@@ -149,8 +165,20 @@ def _format_hours(hours) -> str:
     if isinstance(hours, list):
         return "Hours:\n" + "\n".join(f"  {h}" for h in hours)
     if isinstance(hours, dict):
-        return "Hours:\n" + "\n".join(f"  {day.title()}: {val}"
-                                       for day, val in hours.items())
+        lines = []
+        for day, val in hours.items():
+            if isinstance(val, dict):
+                o = val.get("open") or val.get("opens") or ""
+                c = val.get("close") or val.get("closes") or ""
+                if val.get("closed"):
+                    lines.append(f"  {day.title()}: Closed")
+                elif o and c:
+                    lines.append(f"  {day.title()}: {o} – {c}")
+                elif o:
+                    lines.append(f"  {day.title()}: Opens at {o}")
+            else:
+                lines.append(f"  {day.title()}: {val}")
+        return "Hours:\n" + "\n".join(lines)
     return f"Hours: {hours}"
 
 
@@ -247,5 +275,17 @@ _CATALOG_COUNT_RE = re.compile(
     r"\bhow big is your (?:catalog|inventory|store)\b|"
     r"\bsize of your (?:catalog|inventory)\b|"
     r"\bcatalog count\b",
+    re.IGNORECASE,
+)
+
+_MENU_LIST_RE = re.compile(
+    r"\bwhat(?:'s|s| is| are)? (?:on (?:the |your )?menu|(?:the |your )?menu items?)\b|"
+    r"\bdo you have (?:a )?menu\b|"
+    r"\bshow (?:me )?(?:the |your )?menu\b|"
+    r"\bwhat (?:sandwiches?|food|items?|options?|dishes?|soups?|salads?|drinks?|sides?) "
+        r"(?:do you (?:have|offer|serve)|are (?:available|on the menu))\b|"
+    r"\bwhat can i (?:order|get|eat)\b|"
+    r"\bwhat(?:'s|s) available\b|"
+    r"\byour (?:sandwiches?|menu|food|items?|options?)\b",
     re.IGNORECASE,
 )
