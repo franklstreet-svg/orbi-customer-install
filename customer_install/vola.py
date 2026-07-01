@@ -4570,6 +4570,30 @@ def public_chat():
         except Exception as _e:
             log.warning(f"biz-name scrub failed: {_e}")
 
+    # PARENTHETICAL STAGE-DIRECTION SCRUB: LLM sometimes appends internal
+    # narration as parenthetical asides despite the prompt ban, e.g.
+    # "(Standing by while I review your site...)" or "(I'll get back to you
+    # with details)". Strip any parenthetical that reads like a stage direction
+    # — contains "standing by", "reviewing", "I'll", "just a", "hold on",
+    # "scanning", "checking", "give me a", "be right", "one moment".
+    if resp and resp.text:
+        try:
+            _stage_direction_re = _re.compile(
+                r'\s*\([^)]{0,200}(?:'
+                r'standing by|reviewing|just a|hold on|one moment|'
+                r'give me a|be right|scanning|checking|I\'ll|I will|'
+                r'working on|pulling up|looking at|on my way|sit tight'
+                r')[^)]{0,200}\)',
+                _re.IGNORECASE,
+            )
+            _orig = resp.text
+            resp.text = _stage_direction_re.sub('', resp.text).strip()
+            resp.text = _re.sub(r'\s{2,}', ' ', resp.text).strip()
+            if _orig != resp.text:
+                log.info("chat: scrubbed parenthetical stage-direction")
+        except Exception as _e:
+            log.warning(f"parenthetical scrub failed: {_e}")
+
     # NAV FALLBACK (added 2026-06-22): the sales-bot LLM (Qwen 72B via
     # Scaleway) reliably says "Perfect — sending you to the terms page now"
     # at close-out but routinely drops the <<NAV:...>> marker, leaving the

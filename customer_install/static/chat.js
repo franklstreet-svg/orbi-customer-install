@@ -586,12 +586,19 @@ _audioEl.src = '/tts?text=%20&silent=1';
     opts = opts || {};
     text = (text || '').trim();
     if (!text || isSending) return;
-    // If a scrape is running, absorb any user message so the LLM doesn't
+    // If a scrape is running, absorb casual user messages so the LLM doesn't
     // see the conversation and re-emit a duplicate <<SCRAPE:>> marker.
-    // The silent "(continue)" will fire automatically when the scrape finishes.
+    // Exception: if the user sends something that looks like a URL correction
+    // (contains a domain extension), cancel the current scrape and let the
+    // message through so the LLM can start a fresh scrape with the right URL.
     if (_scrapeInProgress && !opts.silent) {
-      addBubble('assistant', "Still scanning your site — just another moment...", { tier: 'local' });
-      return;
+      const looksLikeUrl = /\b\w[\w-]*\.(?:com|net|org|io|co|biz|info|us|gov|edu)\b/i.test(text);
+      if (!looksLikeUrl) {
+        addBubble('assistant', "Still scanning your site — just another moment...", { tier: 'local' });
+        return;
+      }
+      // URL correction — abort current scrape, fall through to LLM
+      _scrapeInProgress = false;
     }
     // We're inside a user-gesture handler here (sendBtn click or Enter
     // keydown). Unlock mobile audio BEFORE the async fetch below so the
@@ -677,24 +684,22 @@ _audioEl.src = '/tts?text=%20&silent=1';
       // the iframe to take the navigation instead. The reliable path
       // is to postMessage to embed.js (which runs in the parent page
       // and can navigate its own window with no cross-origin friction).
-      if (data.navigate_request && data.navigate_request.url) {
-        const navUrl = data.navigate_request.url;
-        // Give the bot's last sentence ~2.5s to speak before nav.
-        setTimeout(() => {
-          // Primary path: ask the parent embed.js to do the navigation.
-          // The parent listens for orbi:navigate and runs
-          // window.location.href = url in its own origin.
-          try {
-            notifyParent('orbi:navigate', { url: navUrl });
-          } catch {}
-          // Fallback for standalone (non-embed) chat — when there is
-          // no parent embed.js listener, the iframe IS the top window,
-          // so this just navigates the page normally.
-          if (window.top === window.self) {
-            try { window.top.location.assign(navUrl); } catch {}
-          }
-        }, 2500);
-      }
+      const navUrl = (data.navigate_request && data.navigate_request.url) ? data.navigate_request.url : null;
+      const navigateAfterReply = () => {
+        if (!navUrl) return;
+        // Primary path: ask the parent embed.js to do the navigation.
+        // The parent listens for orbi:navigate and runs
+        // window.location.href = url in its own origin.
+        try {
+          notifyParent('orbi:navigate', { url: navUrl });
+        } catch {}
+        // Fallback for standalone (non-embed) chat — when there is
+        // no parent embed.js listener, the iframe IS the top window,
+        // so this just navigates the page normally.
+        if (window.top === window.self) {
+          try { window.top.location.assign(navUrl); } catch {}
+        }
+      };
 
       // Live cart panel — server returns order_summary when the chat
       // looks like an order. Show items + subtotal + tax + total so the
@@ -721,10 +726,12 @@ _audioEl.src = '/tts?text=%20&silent=1';
       // Speak the reply if speaker is on
       if (prefs.speakerOn) {
         await speak(reply);
+        if (navUrl) setTimeout(navigateAfterReply, 600);
       } else {
         setStateBar(null);
         // Re-arm listening if mic was on
         if (prefs.micOn) startListening();
+        if (navUrl) setTimeout(navigateAfterReply, 2500);
       }
     } catch (err) {
       thinkingEl.remove();
