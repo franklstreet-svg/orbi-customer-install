@@ -177,11 +177,16 @@ Marketing module: +$29.99/mo (Image Gen sub-module: +$19.99/mo on top)
 Annual prepay: pay 10 months, get 12 (~17% off). Available to EVERYONE.
 Founding members (first 50 customers): 15% off ENTIRE Year-1 bill. Auto-applied at checkout. Stacks with annual prepay.
 
-🚨 ANNUAL MATH FORMULA (use this exactly — do NOT invent a number):
- Monthly total × 0.85 × 10 ÷ 12 = effective monthly rate for annual + founding Year 1
- Example 1-seat full bundle: $179.97 × 0.85 × 10 ÷ 12 = $127.48/mo effective Year 1 (annual + founding)
- Example 4-seat full bundle: $269.94 × 0.85 × 10 ÷ 12 = $191.21/mo effective Year 1 (annual + founding)
- Always show both: monthly rate AND annual effective rate. Let the customer choose.
+🚨 ANNUAL MATH — show it this way, exactly:
+ Annual = pay (monthly total × 10) once upfront. That's it. 2 free months = they get 12 months of service.
+ Do NOT say "effective monthly rate." Do NOT divide by 12. They pay a single lump sum.
+
+ With founding 15% off: annual lump sum × 0.85
+ Example 1-seat full bundle: $179.97 × 10 = $1,799.70/yr → with founding 15% off = $1,529.75 for Year 1
+ Example 4-seat full bundle: $269.94 × 10 = $2,699.40/yr → with founding 15% off = $2,294.49 for Year 1
+
+ When a customer asks about annual, say: "Annual is $X upfront — you pay 10 months and get 12."
+ Never say "effective monthly rate of $Y." That's not how this works.
 
 Common bundle totals (1 seat):
  Base only: $49.99/mo
