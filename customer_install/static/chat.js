@@ -1671,17 +1671,16 @@ _audioEl.src = '/tts?text=%20&silent=1';
   // of sitting silent waiting for the visitor to type. Personalized for
   // returning visitors via the persisted visitor profile (name).
   function _fireProactiveGreeting(businessName) {
-    if (history.some(m => m.role === 'assistant')) {
+    // Embed widget always starts fresh — clear any history left over from a
+    // prior session so the old silent bubbles don't render on reopen.
+    if (IS_EMBED && history.some(m => m.role === 'assistant')) {
+      history = [];
+      _saveHistory(history);
+      chatArea.querySelectorAll('.message').forEach(el => el.remove());
+    }
+    if (!IS_EMBED && history.some(m => m.role === 'assistant')) {
       const greeting = "Hi, this is Orby. I'm listening.";
       _pendingFirstSpeech = greeting;
-      if (IS_EMBED) {
-        _unlockMobileAudio();
-        Promise.resolve(speak(greeting)).finally(() => {
-          _pendingFirstSpeech = null;
-          _markGreetingDone();
-          notifyParent('orbi:ready-for-mic');
-        });
-      }
       return;
     }
     const hr = new Date().getHours();
