@@ -11,6 +11,79 @@
 **Previous full refresh:** 2026-06-23 (full catch-up pass from disk. Read this SoT and inventoried the referenced active trees: `~/orbi_web`, `~/orbi-brain`, `~/orbi-tenants`, `~/twickell_live`, plus the referenced docs/modules/service files. Verified `https://twickell.com/` matches `~/twickell_live/website/index.html` byte-for-byte. Cloud-v1 is no longer just a future pivot note: it is the active direction and local runtime on this machine. Local-install remains preserved for v2, but the current revenue path is cloud-hosted signup + tenant dashboards.)
 **Previous refresh:** 2026-06-20 (CLOUD-V1 PIVOT day — Frank pivoted from local-install to cloud-hosted. Reasons: SmartScreen/AV trust problem, no time + money for code-signing cert, install pain was the bottleneck to revenue. New plan: cloud now → revenue → fund certs → ship v2 local install later. ALL build work today lives on `cloud-v1` branches in both `orbi_web` and `twickell_live`. Earlier today: file-audit refresh — no policy changes since 6-18, but file counts, route lists, line counts, and the customer_install/owner_dashboard symlink claim were stale.)
 **Previous local-install refresh:** 2026-06-18 (after Frank's external-customer install round — SCS / scsplanroom.com test surfaced new bugs around the welcome wizard, owner-name handling, and staff session writes. All fixed in source 6-18 and shipped in a fresh `.exe` (16:19) that's on Frank's thumb drive.)
+## Current verified state (2026-07-01 — session 2)
+
+### Session work — Sales bot overhaul + 5 bug fixes
+
+All changes committed and pushed to `cloud-v1`. Dev Orby restarted after each `prompts.py` change.
+
+#### Sales bot — restructured conversation flow (`prompts.py`)
+
+The sales bot phase order was redesigned to feel more personal and to auto-recommend the right bundle without asking the customer to choose:
+
+**New phase order:**
+1. Opening (chitchat/trust)
+2. Industry — what kind of business
+3. **Name (Phase 2.5 — NEW)** — ask for first name early ("Nice — and what's your name?"). Use it throughout.
+4. Website yes/no — "Got a website I can look at?" If yes → scrape. If no → skip scrape.
+5. Scrape + reveal + bundle recommendation (same message) — name the business verbatim, call out 2–4 specific services, then recommend full bundle (Receptionist + Website) if they have a site, or phone-only bundle if they don't.
+6. Seats — how many people
+7. Price — real math for the recommended bundle + founding discount
+8. Email → Phone → Billing cycle → Recap → Checkout
+
+**Key rules added to `prompts.py`:**
+- `ORBY NAME SPELLING` — LLM always writes O-R-B-Y, never Orbi/Orbee/Orbie
+- `WHEN YOU MAY QUOTE A PRICE` — Prices ONLY when customer explicitly asks, or in Phase 5 pitch and Phase 9 recap. Banned everywhere else.
+- `NEVER OUTPUT INTERNAL NOTES` — No phase labels, note blocks, reminder lists, or parenthetical "what I'm doing next" narration visible to customer
+- `STT URL RECONSTRUCTION` — When customer gives a URL with spaces ("SCS plan room.com"), strip spaces and reconstruct ("scsplanroom.com")
+- Phase 3 now mandatory for ALL business customers (previously "only if Receptionist or Website bundle" — LLM was skipping it)
+- Phase 4.1 (scrape reveal) + Phase 4.5 (seats) can share one message — only exception to the one-phase-per-message rule
+- Phase 4.2 (no-website path) — recommends Base + Receptionist, skips website controller
+- Good/bad examples updated throughout to show the new name-first, auto-recommend flow
+
+#### Checkout success page (`twickell_live/website/checkout-success.html`)
+
+New page created at `twickell.com/checkout-success.html`. Stripe `success_url` changed from `/?from=success` (which went to the homepage and did nothing) to `/checkout-success.html`.
+
+Page shows: "You're in!", payment confirmation, "setup email within 24 hours", and 3 numbered next steps. Matches site dark/purple-blue design. Pushed to `twickell_live main` → live on Vercel.
+
+**Files changed:**
+- `~/orbi-brain/stripe_webhook.py` — both `success_url` entries updated (lines ~4097 and ~4174)
+- `~/twickell_live/website/checkout-success.html` — NEW FILE
+
+#### STT Orby-name normalization (`customer_install/static/chat.js`)
+
+Chrome STT mishears "Orby" as "Orbi", "Orbee", "Orbie", or "Orbey". Final transcript now normalized before `send()`:
+```javascript
+finalText = finalText
+  .replace(/\bOrb(?:i|ee|ie|ey)\b/g, 'Orby')
+  .replace(/\bORB(?:I|EE|IE|EY)\b/g, 'ORBY')
+  .replace(/\borb(?:i|ee|ie|ey)\b/g, 'orby');
+```
+
+#### Scrape lockout (`customer_install/static/chat.js`)
+
+Added `_scrapeInProgress` flag. While `_orchestrateSalesScrape()` is running, any user message gets a local "Still scanning your site — just another moment..." response and never reaches the LLM. Prevents the LLM from seeing a partial conversation and re-emitting a duplicate `<<SCRAPE:>>` marker that would hit the 10-minute per-IP rate limit. Also changed the rate-limit error message from "I've already looked at one site recently..." to "Still pulling up your site — hang tight" since rate-limited usually means the first scrape is still running.
+
+#### TTS dollar amount fix (`customer_install/vola.py`)
+
+Commas inside dollar amounts stripped before sending to TTS engine. "$2,294.49" → "$2294.49" so TTS reads it as a single number ("two thousand two hundred ninety-four dollars and forty-nine cents") instead of three fragments.
+
+#### Service worker cache
+
+Bumped from v15 → v16 → v17 across this session. v17 is current.
+
+#### Git state (2026-07-01 session 2)
+
+`~/orbi_web` branch `cloud-v1` — all changes committed and pushed:
+- `customer_install/prompts.py` — multiple commits: Orby name rule, price ban, flow restructure, URL reconstruction, internal-notes ban (×2)
+- `customer_install/static/chat.js` — STT name normalization, scrape lockout
+- `customer_install/pwa/service-worker.js` — cache v16, v17
+- `customer_install/vola.py` — TTS dollar amount preprocessing
+- `BUGS.md` — BUG-006 through BUG-010 added
+
+---
+
 ## Bug Log — BUGS.md
 
 **`~/orbi_web/BUGS.md` is the confirmed-fixes-only bug log.** Every entry is a bug that was verified fixed: symptom, root cause, and the exact code change that resolved it. Failed attempts are omitted (they're in git history).

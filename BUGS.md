@@ -97,6 +97,95 @@ recognition.onresult = (event) => {
 
 ---
 
+---
+
+## Sales Bot — prompts / chat.js / vola.py
+
+### BUG-006 — STT misreads "Orby" as "Orbi", "Orbee", "Orbie"
+**Date fixed:** 2026-07-01
+**File:** `customer_install/static/chat.js` — `recognition.onresult`
+
+**Symptom:** When a visitor said "Orby" out loud, Chrome STT transcribed it as "Orbi", "Orbee", or "Orbie". The LLM received the misspelling and sometimes echoed it back in its reply.
+
+**Root cause:** Chrome SpeechRecognition phonetically interprets "Orby" as a long-E ending. The transcript was sent to the LLM verbatim with the wrong spelling.
+
+**Fix:** Normalize the final transcript before `send()` using a regex replace. Also added an explicit spelling rule to `prompts.py` so the LLM knows to write ORBY in its own output.
+```javascript
+finalText = finalText
+  .replace(/\bOrb(?:i|ee|ie|ey)\b/g, 'Orby')
+  .replace(/\bORB(?:I|EE|IE|EY)\b/g, 'ORBY')
+  .replace(/\borb(?:i|ee|ie|ey)\b/g, 'orby');
+```
+
+---
+
+### BUG-007 — LLM outputs internal phase notes and parenthetical plans to the customer
+**Date fixed:** 2026-07-01
+**File:** `customer_install/prompts.py` — sales brief template
+
+**Symptom:** Orby would send messages like "(After getting their name, I'll ask about their website...)" or "(Standing by while I review your site — we'll get Orby perfectly matched to your needs.)" or "🚨 Key reminders for this phase:" directly in the customer-facing chat window.
+
+**Root cause:** The sales prompt uses phase labels, note blocks, and good/bad examples as instructional scaffolding. Llama/Qwen sometimes mirrors the prompt's structural formatting back as output, treating internal annotations as text to emit.
+
+**Fix:** Added an explicit ban at the top of the prompt listing every form of internal leakage: phase names, note blocks, reminder lists, and parenthetical "here's what I'm doing next" narration. Second fix applied when parenthetical plan-narration persisted despite the first rule.
+```
+🚨 NEVER OUTPUT INTERNAL NOTES — Never write phase names, note blocks,
+reminder lists, or parenthetical plans for what you'll do next.
+If it sounds like a stage direction or a memo to yourself, cut it.
+```
+
+---
+
+### BUG-008 — STT breaks domain URLs with spaces; Orby scrapes only the last word
+**Date fixed:** 2026-07-01
+**File:** `customer_install/prompts.py` — STT mishear rule
+
+**Symptom:** Visitor said "SCS plan room dot com" (voice). STT returned "SCS plan room.com". Orby extracted only "room.com" as the URL to scrape — picked up just the last space-separated fragment containing a dot extension.
+
+**Root cause:** LLM saw "SCS plan room.com" and treated it as three separate words, taking the `.com`-suffixed word ("room.com") as the domain.
+
+**Fix:** Added a rule to the STT MISHEAR section: when a URL comes in with spaces, reconstruct it by stripping spaces between the parts and keeping the extension. "SCS plan room.com" → "scsplanroom.com".
+
+---
+
+### BUG-009 — User message during scrape triggers duplicate SCRAPE marker, hits rate limit
+**Date fixed:** 2026-07-01
+**File:** `customer_install/static/chat.js` — `_orchestrateSalesScrape()`
+
+**Symptom:** Orby said "Cool, looking at scsplanroom.com now..." and started the scrape. Visitor typed "hello" a minute later while waiting. Orby replied with "I've already looked at one site recently — give me a few minutes before I scan another." Conversation was broken. Visitor had to start over.
+
+**Root cause:** When the visitor sent "hello" mid-scrape, `send()` hit the LLM with the conversation history. The LLM saw the prior "Cool, looking at X now..." turn with no scrape result yet and re-emitted `<<SCRAPE:X>>`. The second `/api/public/sales_scrape` call hit the 10-minute per-IP rate limit and returned the hardcoded error message. Meanwhile the first scrape eventually finished and sent its silent `(continue)`, producing the correct reveal — but the conversation was already broken.
+
+**Fix:** Added `_scrapeInProgress` flag. While scraping, any user message gets a local "Still scanning your site — just another moment..." response and never reaches the LLM. The original poll loop continues and fires the silent `(continue)` when done.
+```javascript
+if (_scrapeInProgress && !opts.silent) {
+  addBubble('assistant', "Still scanning your site — just another moment...", { tier: 'local' });
+  return;
+}
+```
+
+---
+
+### BUG-010 — TTS mispronounces comma-separated dollar amounts
+**Date fixed:** 2026-07-01
+**File:** `customer_install/vola.py` — `tts()` route
+
+**Symptom:** Orby said "$2,294.49" as "two dollars" [pause] "two hundred ninety-four" [pause] "zero dollars and forty-nine cents" instead of "two thousand two hundred ninety-four dollars and forty-nine cents."
+
+**Root cause:** TTS engines treat a comma as a natural pause boundary. "$2,294.49" was parsed as three tokens: "$2", "294", "$0.49".
+
+**Fix:** Strip commas from inside dollar amounts before sending text to the TTS engine. Regex runs on the text inside `tts()` before it reaches either Kokoro or edge_tts.
+```python
+import re as _re_tts
+text = _re_tts.sub(
+    r'\$(\d{1,3}(?:,\d{3})+(?:\.\d+)?)',
+    lambda m: '$' + m.group(1).replace(',', ''),
+    text,
+)
+```
+
+---
+
 ## How to use this file
 
 - **One entry per confirmed fix.** If you try three things and only the third works, write only the third.
