@@ -1019,31 +1019,42 @@ _audioEl.src = '/tts?text=%20&silent=1';
       const ttsUrl = '/tts?voice=' + encodeURIComponent(ORBI_TTS_VOICE)
         + '&text=' + encodeURIComponent(cleanText.slice(0, 2000));
 
+      // Timeout guard: if TTS server stalls (edge_tts hangs waiting for
+      // Microsoft's API), the audio element never fires onended and speak()
+      // hangs forever, freezing the whole widget. 45s covers any realistic
+      // reply length; longer than that and the user has moved on anyway.
+      const _ttsTimeout = new Promise(r => setTimeout(r, 45000));
       if (_audioUnlocked) {
-        await new Promise((resolve) => {
-          const done = () => {
-            _audioEl.onended = null;
-            _audioEl.onerror = null;
-            resolve();
-          };
-          _audioEl.onended = done;
-          _audioEl.onerror = done;
-          _audioEl.src = ttsUrl;
-          _audioEl.volume = 1;
-          _audioEl.muted = false;
-          _audioEl.play().catch(done);
-        });
+        await Promise.race([
+          new Promise((resolve) => {
+            const done = () => {
+              _audioEl.onended = null;
+              _audioEl.onerror = null;
+              resolve();
+            };
+            _audioEl.onended = done;
+            _audioEl.onerror = done;
+            _audioEl.src = ttsUrl;
+            _audioEl.volume = 1;
+            _audioEl.muted = false;
+            _audioEl.play().catch(done);
+          }),
+          _ttsTimeout,
+        ]);
       } else {
         // Pre-gesture (rare — first reply before any tap inside chat).
         // Fresh Audio() may fail to play on iOS; the persistent element
         // path above handles every subsequent reply once the user taps.
         currentAudio = new Audio(ttsUrl);
         currentAudio.preload = 'auto';
-        await new Promise((resolve) => {
-          currentAudio.onended = resolve;
-          currentAudio.onerror = resolve;
-          currentAudio.play().catch(resolve);
-        });
+        await Promise.race([
+          new Promise((resolve) => {
+            currentAudio.onended = resolve;
+            currentAudio.onerror = resolve;
+            currentAudio.play().catch(resolve);
+          }),
+          _ttsTimeout,
+        ]);
       }
     } catch (err) {
       console.warn('[Orbi] server TTS failed, falling back to browser voice:', err);
