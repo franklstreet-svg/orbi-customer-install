@@ -905,6 +905,11 @@ _audioEl.src = '/tts?text=%20&silent=1';
       if (interim) showInterim(interim);
       if (finalText.trim()) {
         clearInterim();
+        // STT mishears "Orby" as "Orbi", "Orbee", "Orbie", etc. — fix before sending.
+        finalText = finalText
+          .replace(/\bOrb(?:i|ee|ie|ey)\b/g, 'Orby')
+          .replace(/\bORB(?:I|EE|IE|EY)\b/g, 'ORBY')
+          .replace(/\borb(?:i|ee|ie|ey)\b/g, 'orby');
         send(finalText);
       }
     };
