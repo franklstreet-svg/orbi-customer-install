@@ -30,7 +30,15 @@
     },
     "restaurant_module": {
       "price_monthly": "+$49.99/mo on top of Base (founding members: $33.49/mo year 1 — 33% off, first 50 customers, auto-applied)",
-      "what_it_does": "Industry-specific knowledge for food businesses. Menu knowledge from website, phone order-taking, SMS receipts to every caller, delivery questions, hours questions. Currently the only fully-built industry module."
+      "what_it_does": "Industry-specific knowledge for food businesses. Menu knowledge from website, phone order-taking, SMS receipts to every caller, delivery questions, hours questions."
+    },
+    "construction_module": {
+      "display_name": "Orby Construction Module",
+      "price_monthly": "+$79.99/mo on top of Base",
+      "status": "available now",
+      "what_it_does": "Full job-site management for GCs, remodelers, and specialty contractors. Track projects and contract values. Create, approve, and send change orders (digital signatures with one-click signing link). Generate and send PDF invoices by job. Record payments and track what's outstanding. Create and manage bids (Orby follows up automatically if a bid goes quiet). Write daily site logs (hours, crew, weather, work performed). Manage a subcontractor roster with license and insurance expiration tracking. Generate closeout packages. Review links for completed jobs. Weekly money report — contracted vs billed vs collected.",
+      "who_it_is_for": "General contractors, remodelers, custom home builders, commercial GCs, specialty contractors (electrical, plumbing, HVAC, roofing). Any contractor managing multiple active jobs, change orders, and billing.",
+      "real_example": "A 3-person contractor crew (owner + 2 field leads) with phone + website: $319.94/mo (Base $49.99 + 2 extra seats $59.98 + Receptionist $79.99 + Website $49.99 + Construction $79.99). Founding members pay $312.44/mo year 1 (15% off Base only)."
     },
     "retail_service_module": {
       "display_name": "Orby Retail & Service Module",
@@ -66,7 +74,7 @@
       "small_business_phone_only": "$119.98/mo (Base + Receptionist)",
       "small_business_phone_plus_website": "$169.97/mo (Base + Receptionist + Website Controller)",
       "restaurant_full_stack": "$219.96/mo standard; ~$196.46/mo year 1 for founding members",
-      "3_person_contractor_crew_full_stack": "$279.94/mo (Base + 2 additional seats + Receptionist + Website + Construction-when-shipped)"
+      "3_person_contractor_crew_full_stack": "$319.94/mo (Base $49.99 + 2 extra seats $59.98 + Receptionist $79.99 + Website Controller $49.99 + Construction Module $79.99). Founding member year 1: $312.44/mo (15% off Base only)."
     }
   },
 
@@ -161,6 +169,19 @@
       "Orby answers calls and chats about services, prices, and hours",
       "Add or update services and products via owner chat",
       "Works for auto shops, salons, barbershops, retail stores, mixed shops"
+    ],
+    "construction_module": [
+      "Project tracking — add, list, update status for all active jobs",
+      "Change orders — draft, approve, send for digital signature (one-click signing link)",
+      "Invoice generation — numbered PDF invoices per job, track sent vs paid",
+      "Payment recording — log partial and full payments, auto-calculates balance",
+      "Bid management — track proposals, auto-follow-up nudges if bid goes quiet",
+      "Daily site logs — crew, hours, weather, materials, work performed",
+      "Subcontractor roster — license numbers, insurance certs, expiration alerts",
+      "Closeout packages — generate project closeout PDF",
+      "Review links — request customer reviews at job completion",
+      "Financial overview — contracted vs billed vs collected (money report)",
+      "Unsigned-work leak alarm — catches pending COs before jobs close"
     ],
     "marketing_module_coming_soon": [
       "NOT YET AVAILABLE — do not tell customers this is active",

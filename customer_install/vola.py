@@ -548,6 +548,7 @@ def _send_fleet_heartbeat() -> None:
     # Reads from the live cloudflared tunnel runner; falls back to
     # config-pinned URLs for dev / advanced setups.
     public_url = (current_tunnel_url() or
+                  (CONFIG.get("server") or {}).get("tunnel_url") or
                   CONFIG.get("tunnel_url") or
                   (CONFIG.get("brain") or {}).get("local_public_url") or "")
     payload = {
@@ -6813,6 +6814,9 @@ def owner_chat():
     username = user_rec["username"]
     user_dir = users_mod.get_user_dir(DATA_DIR, username)
     user_dir.mkdir(parents=True, exist_ok=True)
+    # Inject computed paths so module handlers can access them without re-deriving
+    user_rec.setdefault("data_dir", str(DATA_DIR))
+    user_rec.setdefault("user_dir", str(user_dir))
 
     data = request.get_json(silent=True) or {}
     user_msg = (data.get("message") or "").strip()
@@ -9405,6 +9409,23 @@ Date Signed:
 """
 
 
+# In-memory session store for multi-turn widget install flow.
+# Keys are usernames; values are dicts of pending install state.
+_widget_sessions: dict[str, dict] = {}
+
+def _session_get(user_rec: dict, key: str):
+    return _widget_sessions.get(user_rec.get("username", ""), {}).get(key)
+
+def _session_set(user_rec: dict, key: str, value) -> None:
+    uname = user_rec.get("username", "")
+    if uname not in _widget_sessions:
+        _widget_sessions[uname] = {}
+    if value is None:
+        _widget_sessions[uname].pop(key, None)
+    else:
+        _widget_sessions[uname][key] = value
+
+
 def _try_widget_install_chat(message: str, user_rec: dict) -> dict | None:
     """Handle the widget auto-install flow.
 
@@ -10914,11 +10935,11 @@ def _handle_add_log(msg: str, user_rec: dict) -> dict:
         work_text = _re.sub(r"\s+", " ", work_text).strip(" ,")
     # Parse crew: "crew Mike + Jose" / "crew: Mike, Jose, Tony"
     crew = []
-    crew_match = _re.search(r"crew[:\s]+((?:[A-Z][a-z]+(?:\s*[+,&]\s*[A-Z][a-z]+)*))",
+    crew_match = _re.search(r"crew[:\s]+((?:[A-Z][a-z]+(?:\s*(?:[+,&]|\band\b)\s*[A-Z][a-z]+)*))",
                               work_text)
     if crew_match:
         raw = crew_match.group(1)
-        crew = [n.strip() for n in _re.split(r"[+,&]", raw) if n.strip()]
+        crew = [n.strip() for n in _re.split(r"[+,&]|\band\b", raw) if n.strip()]
         work_text = work_text[:crew_match.start()] + work_text[crew_match.end():]
         work_text = _re.sub(r"\s+", " ", work_text).strip(" :—–-,.")
     work_done = work_text or "Day's work logged"
@@ -11466,9 +11487,10 @@ def _handle_review_link(msg: str, user_rec: dict) -> dict | None:
                 "source": "gc_review_ambiguous"}
     project = matches[0]
     review = mod_reviews.issue(DATA_DIR, project["id"])
-    base = (CONFIG.get("tunnel_url")
+    base = ((CONFIG.get("server") or {}).get("tunnel_url")
+             or CONFIG.get("tunnel_url")
              or (CONFIG.get("brain") or {}).get("local_public_url")
-             or "http://127.0.0.1:5050").rstrip("/")
+             or f"http://127.0.0.1:{(CONFIG.get('server') or {}).get('port', 5050)}").rstrip("/")
     url = f"{base}/r/{review['token']}"
     customer = project.get("customer_name") or "the customer"
     audit.log_event(DATA_DIR, actor=user_rec.get("username", "?"),
@@ -11774,9 +11796,10 @@ def _handle_closeout_pdf(msg: str, user_rec: dict) -> dict | None:
     # closeout→review loop without the GC having to remember a second step.
     try:
         review = mod_reviews.issue(DATA_DIR, project["id"])
-        base = (CONFIG.get("tunnel_url")
+        base = ((CONFIG.get("server") or {}).get("tunnel_url")
+                 or CONFIG.get("tunnel_url")
                  or (CONFIG.get("brain") or {}).get("local_public_url")
-                 or "http://127.0.0.1:5050").rstrip("/")
+                 or f"http://127.0.0.1:{(CONFIG.get('server') or {}).get('port', 5050)}").rstrip("/")
         review_url = f"{base}/r/{review['token']}"
     except Exception as e:
         log.warning(f"closeout review mint failed: {e}")
@@ -11842,9 +11865,10 @@ def _handle_share_portal(msg: str, user_rec: dict) -> dict | None:
         return {"reply": "Couldn't mint a portal link — try again.",
                 "tier": "local", "latency_ms": 0,
                 "source": "gc_portal_mint_failed"}
-    base = (CONFIG.get("tunnel_url")
+    base = ((CONFIG.get("server") or {}).get("tunnel_url")
+             or CONFIG.get("tunnel_url")
              or (CONFIG.get("brain") or {}).get("local_public_url")
-             or "http://127.0.0.1:5050").rstrip("/")
+             or f"http://127.0.0.1:{(CONFIG.get('server') or {}).get('port', 5050)}").rstrip("/")
     url = f"{base}/p/{token}"
     customer = project.get("customer_name") or "the client"
     customer_email = project.get("customer_email") or ""
@@ -12128,9 +12152,10 @@ def _mint_co_sign_token(co_id: str) -> str:
 def _co_sign_url(token: str) -> str:
     """Public URL the client clicks. Uses the tunnel URL so it's reachable
     from outside the LAN. Falls back to localhost for dev."""
-    base = (CONFIG.get("tunnel_url") or
+    base = ((CONFIG.get("server") or {}).get("tunnel_url") or
+            CONFIG.get("tunnel_url") or
             (CONFIG.get("brain") or {}).get("local_public_url") or
-            "http://127.0.0.1:5050").rstrip("/")
+            f"http://127.0.0.1:{(CONFIG.get('server') or {}).get('port', 5050)}").rstrip("/")
     return f"{base}/co/sign/{token}"
 
 
