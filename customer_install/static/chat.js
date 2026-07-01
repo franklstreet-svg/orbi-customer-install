@@ -1248,6 +1248,9 @@ _audioEl.src = '/tts?text=%20&silent=1';
       // Em/en dashes used as connectors — replace with comma-pause
       .replace(/\s*[–—]\s*/g, ', ')
       // Currency — Edge TTS reads "$129" as "dollar one twenty nine".
+      // First, strip commas from comma-formatted amounts so $2,754.54 → $2754.54
+      // before the converter below handles it (the converter's \d+ stops at commas).
+      .replace(/\$(\d{1,3}(?:,\d{3})+(?:\.\d+)?)/g, (_m, n) => '$' + n.replace(/,/g, ''))
       // Rewrite as natural English: "$129" → "129 dollars",
       // "$29.99" → "29 dollars and 99 cents", "$0.99" → "99 cents".
       .replace(/\$(\d+)\.(\d{2})\b/g, (_m, d, c) => {
