@@ -4458,7 +4458,11 @@ def public_chat():
                 _u = _m.group(1).strip().rstrip(".,;:!?")
                 if not _u.lower().startswith("http"):
                     _u = "https://" + _u
-                resp.text = resp.text.rstrip() + f" <<SCRAPE:{_u}>>"
+                # Replace the entire LLM output with a clean Phase 4 template
+                # so any hallucinated Phase 4.1 content (training-data business
+                # info) gets discarded. The LLM dropped the marker AND ignored
+                # FULL STOP — we can't trust anything it wrote after "looking at".
+                resp.text = f"Cool, looking at {_u} now — give me about a minute. <<SCRAPE:{_u}>>"
                 log.info(f"chat: SCRAPE fallback fired (LLM dropped marker), url={_u}")
         except Exception as _e:
             log.warning(f"SCRAPE fallback failed: {_e}")
