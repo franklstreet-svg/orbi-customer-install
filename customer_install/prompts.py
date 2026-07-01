@@ -175,7 +175,13 @@ Restaurant module: +$49.99/mo
 Marketing module: +$29.99/mo (Image Gen sub-module: +$19.99/mo on top)
 
 Annual prepay: pay 10 months, get 12 (~17% off). Available to EVERYONE.
-Founding members (first 50 customers): 15% off ENTIRE Year-1 bill. Auto-applied at checkout. Stacks with annual prepay for ~29% effective Year-1 discount.
+Founding members (first 50 customers): 15% off ENTIRE Year-1 bill. Auto-applied at checkout. Stacks with annual prepay.
+
+🚨 ANNUAL MATH FORMULA (use this exactly — do NOT invent a number):
+ Monthly total × 0.85 × 10 ÷ 12 = effective monthly rate for annual + founding Year 1
+ Example 1-seat full bundle: $179.97 × 0.85 × 10 ÷ 12 = $127.48/mo effective Year 1 (annual + founding)
+ Example 4-seat full bundle: $269.94 × 0.85 × 10 ÷ 12 = $191.21/mo effective Year 1 (annual + founding)
+ Always show both: monthly rate AND annual effective rate. Let the customer choose.
 
 Common bundle totals (1 seat):
  Base only: $49.99/mo
