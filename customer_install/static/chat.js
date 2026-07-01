@@ -900,8 +900,8 @@ _audioEl.src = '/tts?text=%20&silent=1';
   }
 
   function startListening() {
+    wantsListening = true;  // always set intent first — onend restart checks this
     if (!recognition || isListening || isSpeaking) return;
-    wantsListening = true;
     safeStart();
   }
 
@@ -1114,6 +1114,16 @@ _audioEl.src = '/tts?text=%20&silent=1';
     avatar.classList.remove('speaking');
     micToggle.classList.remove('muted-while-speaking');
     setStateBar(null);
+
+    // General re-arm: covers the case where the user turned the mic on WHILE
+    // we were speaking (wantsListening=true but wasMicOn=false at speak() start,
+    // so the armMic block below is skipped). skipAntiEcho path uses its own
+    // restart in deliverSpokenWelcome, so exclude it here to avoid double-start.
+    if (!opts?.skipAntiEcho && prefs.micOn && wantsListening && !isListening) {
+      setTimeout(() => {
+        if (prefs.micOn && wantsListening && !isListening && !isSpeaking) safeStart();
+      }, 400);
+    }
 
     if (wasMicOn && !opts?.skipAntiEcho && prefs.micOn) {
       const armMic = () => {
