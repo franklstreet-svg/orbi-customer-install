@@ -186,6 +186,52 @@ text = _re_tts.sub(
 
 ---
 
+## Owner Chat — /api/owner/chat
+
+### BUG-011 — /api/owner/chat returns 500 on every request (KeyError: data_dir)
+**Date fixed:** 2026-07-01
+**File:** `customer_install/vola.py` — `owner_chat()` route + `_try_widget_install_chat()`
+
+**Symptom:** Every POST to `/api/owner/chat` returned HTTP 500 "Something broke". Construction module testing, owner dashboard chat — all broken.
+
+**Root cause (1):** `_try_widget_install_chat()` called `data_dir = Path(user_rec["data_dir"])` unconditionally at the top of the function, before any message-trigger check. `user_rec` from `auth.require_user()` only has username/role/status — no `data_dir`. Crash happened on every request.
+
+**Root cause (2):** `_try_widget_install_chat()` also called `_session_get()` and `_session_set()` which were never defined anywhere in vola.py (written but stub was missing).
+
+**Fix:**
+1. In `owner_chat()`, inject `user_rec.setdefault("data_dir", str(DATA_DIR))` and `user_rec.setdefault("user_dir", str(user_dir))` after computing them.
+2. Added `_session_get()` / `_session_set()` as module-level helpers backed by `_widget_sessions: dict[str, dict]` — simple in-memory store keyed by username.
+
+---
+
+### BUG-012 — CO/review/portal signing URLs default to port 5050 (Frank's personal Orby)
+**Date fixed:** 2026-07-01
+**File:** `customer_install/vola.py` — `_co_sign_url()` and related URL builders
+
+**Symptom:** Change order signing links, review links, and client portal links all pointed to `http://127.0.0.1:5050/...` instead of the configured tunnel URL or port 6000 (dev).
+
+**Root cause:** URL builder functions called `CONFIG.get("tunnel_url")` but the tunnel URL is nested at `CONFIG["server"]["tunnel_url"]`. The key lookup returned `None` and fell back to the hardcoded `"http://127.0.0.1:5050"` literal.
+
+**Fix:** Updated all 5 occurrences to check `(CONFIG.get("server") or {}).get("tunnel_url")` first, then fall back to the flat key, then dynamic port from config, then 5050. Signing links now correctly use `https://orbi.twickell.com/...`.
+
+---
+
+### BUG-013 — Daily log crew parsing ignores "and" as separator
+**Date fixed:** 2026-07-01
+**File:** `customer_install/vola.py` — `_parse_daily_log_message()`
+
+**Symptom:** "crew: Mike and Jose" only captured "Mike". "Jose" was left in the work description text.
+
+**Root cause:** Crew regex split on `[+,&]` but not the word "and". "Mike and Jose" matched "Mike" (first name before the unsupported separator) and stopped.
+
+**Fix:** Added `|\band\b` to both the crew capture regex and the split pattern.
+```python
+_re.search(r"crew[:\s]+((?:[A-Z][a-z]+(?:\s*(?:[+,&]|\band\b)\s*[A-Z][a-z]+)*))", ...)
+crew = [n.strip() for n in _re.split(r"[+,&]|\band\b", raw) if n.strip()]
+```
+
+---
+
 ## How to use this file
 
 - **One entry per confirmed fix.** If you try three things and only the third works, write only the third.
