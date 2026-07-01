@@ -84,6 +84,52 @@ Bumped from v15 → v16 → v17 across this session. v17 is current.
 
 ---
 
+## Construction Module — v2/v3 Roadmap
+
+**Current state (v1, live as of 2026-07-01):** Project tracking, invoicing, payment recording, change orders (draft/approve/sign/send), daily site logs, subcontractor roster, insurance/license expiry tracking, bid management, closeout PDFs, review links, financial overview. Priced at **$79.99/mo**.
+
+**Competitive context:** Buildertrend (the market leader) runs $499–$699/mo and targets residential GCs. Orby's contractor full bundle (Base + Receptionist + Website + Construction) is **$319.94/mo** — cheaper, and includes AI phone + website chat that Buildertrend doesn't have. Target customer: 2–3 person GC/remodeler doing $500K–$3M/yr who's too small for Buildertrend but too busy for spreadsheets.
+
+### Phase 2 — Price to $99/mo (estimated 3–4 weeks of build)
+
+| Feature | Notes |
+|---|---|
+| **Photo uploads on daily logs** | File upload endpoint + storage per log entry. Most-missed daily-use feature for GCs — they document everything visually. |
+| **Lien waivers** | PDF generation reusing existing invoice_pdf/closeout_pdf infrastructure. |
+| **Purchase orders to suppliers** | Same pattern as invoices but directed at vendors, not clients. |
+| **Lead CRM pipeline** | Extend existing leads (phone + website) into a pipeline view: new → proposal sent → signed. |
+| **Gantt timeline view (dashboard)** | Visual timeline of active projects. Backend data exists; need a UI view. |
+
+### Phase 3 — Price to $149/mo (add 6–8 weeks)
+
+| Feature | Notes |
+|---|---|
+| **Job costing** | Track estimated vs actual per job (labor + materials). New data structures + chat commands. |
+| **Client portal** | Homeowner logs in, sees project progress, daily logs, photos, CO status. CO signing page already exists — extend it into a full project view. Orby differentiator: put the chat widget IN the portal so homeowners can ask Orby questions live. No competitor does that. |
+| **Subcontractor scheduling + dispatch** | Sub availability calendar, job assignments, SMS dispatch notifications. |
+
+### Phase 4 — Full Buildertrend parity at $199/mo (add 8–10 weeks)
+
+| Feature | Notes |
+|---|---|
+| **QuickBooks sync** | OAuth to QBO API, sync invoices/payments both directions. |
+| **Selection/allowance tracking** | Homeowner picks finishes (flooring, cabinets, tile); each has an allowance budget; Orby tracks over/under. Ties into client portal. |
+| **Field time clock (GPS punch-in/out)** | Mobile web page for crew to punch in/out with GPS verification. |
+| **Estimate/proposal templates by job type** | Pre-built line-item templates (kitchen remodel, bathroom, deck, roof) that the contractor customizes per bid. |
+
+### Pricing trajectory
+
+| Phase | Monthly (module alone) | Full contractor bundle | Vs Buildertrend |
+|---|---|---|---|
+| v1 (now) | $79.99 | $319.94 | $180–380 cheaper + AI phone/web |
+| v2 (photos + Gantt + lien) | $99 | $339.94 | still cheaper + AI |
+| v3 (job costing + client portal) | $149 | $389.94 | still cheaper + AI |
+| v4 (full parity) | $199 | $439.94 | still cheaper + AI phone/web |
+
+**Key differentiator at every tier:** Orby's construction module includes the AI receptionist and website chat. No construction software competitor has that. Even at $199 for the module, the full bundle is cheaper than Buildertrend alone and does more.
+
+---
+
 ## Bug Log — BUGS.md
 
 **`~/orbi_web/BUGS.md` is the confirmed-fixes-only bug log.** Every entry is a bug that was verified fixed: symptom, root cause, and the exact code change that resolved it. Failed attempts are omitted (they're in git history).
