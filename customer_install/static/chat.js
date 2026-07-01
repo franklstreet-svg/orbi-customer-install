@@ -851,7 +851,7 @@ _audioEl.src = '/tts?text=%20&silent=1';
       if (wantsListening && !isSpeaking) {
         clearTimeout(restartTimer);
         restartTimer = setTimeout(() => {
-          if (wantsListening && !isSpeaking) safeStart();
+          if (wantsListening && !isSpeaking && !isListening) safeStart();
         }, 250);
       }
     };
@@ -898,8 +898,27 @@ _audioEl.src = '/tts?text=%20&silent=1';
   }
 
   function safeStart() {
+    if (isListening) return;
+    // Chrome's SpeechRecognition in iframes silently stops capturing audio
+    // after the first abort()+start() cycle on the same object. Creating a
+    // fresh object each time forces the browser to reconnect the mic stream.
+    const prev = recognition;
+    recognition = new Recognition();
+    recognition.lang = 'en-US';
+    recognition.continuous = false;
+    recognition.interimResults = true;
+    recognition.maxAlternatives = 3;
+    recognition.onstart  = prev.onstart;
+    recognition.onend    = prev.onend;
+    recognition.onerror  = prev.onerror;
+    recognition.onresult = prev.onresult;
+    if (prev && prev !== recognition) {
+      prev.onstart = null; prev.onend = null;
+      prev.onerror = null; prev.onresult = null;
+      try { prev.abort(); } catch {}
+    }
     try { recognition.start(); }
-    catch (e) { /* already running — ignore */ }
+    catch (e) { /* ignore */ }
   }
 
   function stopListening() {
