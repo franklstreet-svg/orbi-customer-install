@@ -98,13 +98,15 @@
     // Mobile audio gate — any direct tap inside the iframe is a user-
     // gesture context, which is what mobile browsers need to start audio.
     // If we have a queued first speech (the proactive greeting from before
-    // the user interacted), drain it here.
+    // the user interacted), drain it here. Do not auto-start the mic from
+    // this generic tap; Chrome requires the mic request to come from the
+    // actual mic button gesture.
     const _drainOnFirstTap = () => {
       _unlockMobileAudio();
       if (_pendingFirstSpeech && prefs.speakerOn) {
         const txt = _pendingFirstSpeech;
         _pendingFirstSpeech = null;
-        const afterGreeting = () => { _markGreetingDone(); if (!prefs.micOn) setMicOn(true); };
+        const afterGreeting = () => { _markGreetingDone(); };
         try { Promise.resolve(speak(txt)).finally(afterGreeting); } catch { afterGreeting(); }
       }
     };
@@ -155,7 +157,8 @@
     // orbi:clear-greeting — parent page started playing the greeting audio;
     //   clear pending so _drainOnFirstTap doesn't double-play.
     // orbi:greeting-done — greeting audio finished on parent page;
-    //   mark the greeting gate resolved and turn the mic on.
+    //   mark the greeting gate resolved. The mic must still be started
+    //   by the visitor tapping the mic button inside the iframe.
     window.addEventListener('message', (e) => {
       const msg = e.data || {};
       if (msg.type === 'orbi:clear-greeting') {
@@ -163,17 +166,45 @@
       }
       if (msg.type === 'orbi:greeting-done') {
         _markGreetingDone();
-        if (!prefs.micOn) setMicOn(true);
+      }
+      if (msg.type === 'orbi:start-mic') {
+        if (!prefs.speakerOn) setSpeakerOn(true);
+        prefs.micOn = true;
+        updateMicButton(true);
+        const openingLine = takeOpeningLineForMicTap(true);
+        requestMicPermission().then((ok) => {
+          if (!ok || !prefs.micOn) {
+            setMicOn(false);
+            return;
+          }
+          const arm = () => { if (prefs.micOn) setMicOn(true); };
+          if (openingLine) Promise.resolve(speak(openingLine)).finally(arm);
+          else arm();
+        });
+      }
+      if (msg.type === 'orbi:mic-blocked') {
+        setMicOn(false);
+        setStateBar('Microphone blocked. Allow microphone access, then tap the mic.', 'error');
+      }
+      if (msg.type === 'orbi:parent-voice-on') {
+        prefs.micOn = true;
+        updateMicButton(true);
+        micToggle.classList.add('listening');
+        setStateBar('Listening — speak any time...', 'listening');
+      }
+      if (msg.type === 'orbi:parent-voice-off') {
+        micToggle.classList.remove('listening');
+        if (stateBar.classList.contains('listening')) setStateBar(null);
+      }
+      if (msg.type === 'orbi:parent-transcript' && msg.text) {
+        send(String(msg.text || ''));
       }
     });
 
     if (IS_EMBED) {
       setTimeout(() => {
         if (!prefs.speakerOn) setSpeakerOn(true);
-        if (!prefs.micOn) setMicOn(true);
       }, 100);
-      // After greeting finishes (parent-page audio or 8s failsafe), keep mic on.
-      _greetingDone.then(() => { if (!prefs.micOn) setMicOn(true); });
     }
   });
 
@@ -248,7 +279,13 @@
     // here; the user clicks "Talk to Orbi" to start every session.
     if (prefs.panelOpen && IS_EMBED) openPanel(false);
     setSpeakerOn(prefs.speakerOn, /*persist*/ false);
-    if (prefs.micOn && IS_EMBED) setMicOn(true, /*persist*/ false);
+    // Never restore the mic automatically in embed mode. A persisted mic-on
+    // preference from a prior visit is not a valid browser gesture, and Chrome
+    // rejects it with not-allowed, which shows the crossed-out mic.
+    if (IS_EMBED && prefs.micOn) {
+      prefs.micOn = false;
+      savePrefs();
+    }
   }
 
   // ------------------------------------------------------------------
@@ -284,20 +321,24 @@
     // the proactive greeting.
     _unlockMobileAudio();
     if (!prefs.speakerOn) setSpeakerOn(true);
+    const micReady = requestMicPermission();
     // Drain proactive greeting — this click is a user gesture so audio is unlocked.
-    // Mic turns on after the greeting finishes (avoids echo during playback).
+    // In standalone mode this launcher click is also the mic permission
+    // gesture, so start listening after the greeting finishes.
     if (prefs.speakerOn && _pendingFirstSpeech) {
       const _greetTxt = _pendingFirstSpeech;
       _pendingFirstSpeech = null;
       try {
         Promise.resolve(speak(_greetTxt)).finally(() => {
           _markGreetingDone();
-          if (!prefs.micOn) setMicOn(true);
+          micReady.then((ok) => { if (ok && !prefs.micOn) setMicOn(true); });
         });
       } catch {
         _markGreetingDone();
-        if (!prefs.micOn) setMicOn(true);
+        micReady.then((ok) => { if (ok && !prefs.micOn) setMicOn(true); });
       }
+    } else {
+      micReady.then((ok) => { if (ok && !prefs.micOn) setMicOn(true); });
     }
   }
 
@@ -398,6 +439,24 @@ _audioEl.src = '/tts?text=%20&silent=1';
     }, 3000);
   }
 
+  async function requestMicPermission() {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      return true;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      stream.getTracks().forEach((track) => {
+        try { track.stop(); } catch {}
+      });
+      return true;
+    } catch (err) {
+      console.warn('[Orbi] microphone permission request failed:', err && (err.name || err.message || err));
+      setMicOn(false);
+      setStateBar('Microphone blocked. Allow microphone access, then tap the mic.', 'error');
+      return false;
+    }
+  }
+
   // Mobile audio gate — Orby's first message (the proactive greeting) is
   // generated BEFORE the user has clicked anything inside the iframe, so
   // mobile browsers block the playback. We queue the text here; the next
@@ -455,17 +514,30 @@ _audioEl.src = '/tts?text=%20&silent=1';
       // toggle mic. Speaker stays sticky after mic is later turned off.
       _unlockMobileAudio();
       const turningOn = !prefs.micOn;
-      if (turningOn && !prefs.speakerOn) setSpeakerOn(true);
-      // If this is the FIRST mic-on tap in this conversation, deliver
-      // the spoken+typed welcome before turning the mic on. That way
-      // Orby actually GREETS the visitor in her voice (per Frank's
-      // request) instead of sitting there with a canned silent welcome
-      // bubble. Subsequent mic taps don't re-greet.
-      if (turningOn && history.length === 0 && !_welcomeDelivered) {
-        deliverSpokenWelcome().finally(() => setMicOn(true));
-      } else {
-        setMicOn(turningOn);
+      if (turningOn && !prefs.speakerOn) setSpeakerOn(true, true, false);
+      if (!turningOn) {
+        setMicOn(false);
+        return;
       }
+      // Show the mic as on immediately, request browser permission while this
+      // click is still the user gesture, then start recognition after the
+      // permission promise resolves. Starting SpeechRecognition before
+      // getUserMedia settles can fire not-allowed and flip the icon back off.
+      prefs.micOn = true;
+      updateMicButton(true);
+      savePrefs();
+      const micReady = requestMicPermission();
+      const openingLine = takeOpeningLineForMicTap(true);
+      const armMic = () => {
+        micReady.then((ok) => {
+          if (ok && prefs.micOn) setMicOn(true);
+          else setMicOn(false);
+        });
+      };
+      // Manual mic-on always speaks first. This proves the voice path is alive
+      // before recognition starts, even if old session history or a prior
+      // failed attempt marked the greeting as delivered.
+      Promise.resolve(speak(openingLine)).finally(armMic);
     });
     speakerToggle.addEventListener('click', () => {
       _unlockMobileAudio();   // gesture-time unlock
@@ -491,8 +563,7 @@ _audioEl.src = '/tts?text=%20&silent=1';
 
   function setMicOn(on, persist = true) {
     prefs.micOn = on;
-    micToggle.setAttribute('aria-pressed', on ? 'true' : 'false');
-    micToggle.title = 'Microphone (' + (on ? 'on' : 'off') + ')';
+    updateMicButton(on);
     if (on) {
       // Don't start listening if Orbi is currently speaking (anti-echo)
       if (!isSpeaking) startListening();
@@ -502,7 +573,55 @@ _audioEl.src = '/tts?text=%20&silent=1';
     if (persist) savePrefs();
   }
 
-  function setSpeakerOn(on, persist = true) {
+  function updateMicButton(on) {
+    micToggle.setAttribute('aria-pressed', on ? 'true' : 'false');
+    micToggle.title = 'Microphone (' + (on ? 'on' : 'off') + ')';
+  }
+
+  function takeOpeningLineForMicTap(force = false) {
+    if (force) {
+      _pendingFirstSpeech = null;
+      _welcomeDelivered = true;
+      _markGreetingDone();
+      const text = "Hi, this is Orby. I'm listening.";
+      if (!history.some(m => m.role === 'assistant' && m.content === text)) {
+        document.getElementById('welcome')?.remove();
+        addBubble('assistant', text);
+        history.push({ role: 'assistant', content: text });
+        _saveHistory(history);
+      }
+      return text;
+    }
+    if (_welcomeDelivered) return null;
+    let text = null;
+    if (_pendingFirstSpeech) {
+      text = _pendingFirstSpeech;
+      _pendingFirstSpeech = null;
+    } else {
+      const firstAssistant = history.find(m => m.role === 'assistant' && m.content);
+      if (firstAssistant) text = firstAssistant.content;
+    }
+    if (!text) {
+      // No proactive greeting is available, or this tab has old conversation
+      // history from earlier tests. Still speak first on the first mic click
+      // so the visitor knows voice mode is working.
+      const fallback = "Hi, this is Orby. I'm listening.";
+      document.getElementById('welcome')?.remove();
+      if (!history.some(m => m.role === 'assistant' && m.content === fallback)) {
+        addBubble('assistant', fallback);
+        history.push({ role: 'assistant', content: fallback });
+        _saveHistory(history);
+      }
+      text = fallback;
+    }
+    if (text) {
+      _welcomeDelivered = true;
+      _markGreetingDone();
+    }
+    return text;
+  }
+
+  function setSpeakerOn(on, persist = true, drainPending = true) {
     prefs.speakerOn = on;
     speakerToggle.setAttribute('aria-pressed', on ? 'true' : 'false');
     speakerToggle.title = 'Speaker (' + (on ? 'on' : 'off') + ')';
@@ -513,7 +632,7 @@ _audioEl.src = '/tts?text=%20&silent=1';
     // or because the browser blocked autoplay), drain it now. This is the
     // path that gets the proactive greeting actually heard the moment the
     // speaker becomes available.
-    if (on && _pendingFirstSpeech) {
+    if (drainPending && on && _pendingFirstSpeech) {
       const txt = _pendingFirstSpeech;
       _pendingFirstSpeech = null;
       try { Promise.resolve(speak(txt)).finally(_markGreetingDone); } catch { _markGreetingDone(); }
@@ -889,7 +1008,7 @@ _audioEl.src = '/tts?text=%20&silent=1';
       console.warn('mic error:', e.error);
       if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
         setMicOn(false);
-        alert('Microphone permission was denied. To use voice, please allow microphone access in your browser settings.');
+        setStateBar('Microphone blocked. Tap the mic and allow access in the browser prompt.', 'error');
       }
     };
 
@@ -1026,6 +1145,7 @@ _audioEl.src = '/tts?text=%20&silent=1';
     }
 
     isSpeaking = true;
+    notifyParent('orbi:speaking-start');
     avatar.classList.add('speaking');
     setStateBar('Speaking...', 'speaking');
 
@@ -1087,6 +1207,7 @@ _audioEl.src = '/tts?text=%20&silent=1';
     }
 
     isSpeaking = false;
+    notifyParent('orbi:speaking-end');
     currentAudio = null;
     avatar.classList.remove('speaking');
     micToggle.classList.remove('muted-while-speaking');
@@ -1364,16 +1485,11 @@ _audioEl.src = '/tts?text=%20&silent=1';
             `Hi! I'm Orby at ${data.name}.`;
         }
         renderQuickActions(data.quick_actions || []);
-        // Proactive greeting — Orbi speaks first when the chat opens
-        // so the visitor knows she's awake and ready. _fireProactiveGreeting
-        // guards against double-greeting on widget reopen by checking
-        // history. Skip if conversation history already exists (visitor
-        // navigated to a new page on the same site).
-        if (history.length === 0) {
-          _fireProactiveGreeting(data.name || 'us');
-        } else {
-          _markGreetingDone();
-        }
+        // Proactive greeting — Orbi speaks first when the chat opens so the
+        // visitor knows she's awake and ready. Even with old session history,
+        // still send a short spoken greeting; otherwise the widget appears
+        // silent until the visitor talks first.
+        _fireProactiveGreeting(data.name || 'us');
       } else {
         _markGreetingDone();
       }
@@ -1555,9 +1671,19 @@ _audioEl.src = '/tts?text=%20&silent=1';
   // of sitting silent waiting for the visitor to type. Personalized for
   // returning visitors via the persisted visitor profile (name).
   function _fireProactiveGreeting(businessName) {
-    // Guard: if a greeting already exists in history (e.g. user reopened
-    // the widget mid-session), don't double-greet.
-    if (history.some(m => m.role === 'assistant')) { _markGreetingDone(); return; }
+    if (history.some(m => m.role === 'assistant')) {
+      const greeting = "Hi, this is Orby. I'm listening.";
+      _pendingFirstSpeech = greeting;
+      if (IS_EMBED) {
+        _unlockMobileAudio();
+        Promise.resolve(speak(greeting)).finally(() => {
+          _pendingFirstSpeech = null;
+          _markGreetingDone();
+          notifyParent('orbi:ready-for-mic');
+        });
+      }
+      return;
+    }
     const hr = new Date().getHours();
     const tod = hr < 12 ? "Good morning" : hr < 17 ? "Good afternoon" : "Good evening";
     const v = (typeof visitor === 'object' && visitor) ? visitor : {};
@@ -1586,12 +1712,17 @@ _audioEl.src = '/tts?text=%20&silent=1';
     // and the greeting never queues at all. The drains below (first tap,
     // speaker toggle) consult prefs.speakerOn at drain time instead.
     _pendingFirstSpeech = greeting;
-    // In embed mode: send greeting text to embed.js. It plays audio from the
-    // PARENT PAGE where the user's "Talk to Orby" click lives, bypassing the
-    // iframe audio-gesture boundary. On success it sends orbi:clear-greeting back
-    // so _drainOnFirstTap won't double-play. On failure, _pendingFirstSpeech
-    // stays set and _drainOnFirstTap speaks it on the first tap inside the iframe.
-    if (IS_EMBED) notifyParent('orbi:greeting-ready', { text: greeting });
+    if (IS_EMBED) {
+      // allow="autoplay" on the iframe grants audio playback without a user
+      // gesture inside the frame. Speak directly, then tell the parent page
+      // to start its voice recognition session.
+      _unlockMobileAudio();
+      Promise.resolve(speak(greeting)).finally(() => {
+        _pendingFirstSpeech = null;
+        _markGreetingDone();
+        notifyParent('orbi:ready-for-mic');
+      });
+    }
     // In standalone: openPanel() drains on launcher click. _drainOnFirstTap is fallback.
   }
 

@@ -153,7 +153,36 @@
   let opened = false;
   let unread = 0;
   let _greetAudio = null;
+  let _micPermissionPromise = null;
+  let _micReady = Promise.resolve(false);
+  let _openVoiceToken = 0;
+  let _openIntroOwnedByParent = false;
+  let _parentRecognition = null;
+  let _parentVoiceWanted = false;
+  let _parentVoiceListening = false;
+  let _orbySpeaking = false;
+  let _waitingForReply = false;
   const badge = launcher.querySelector('#orbi-embed-badge');
+
+  function requestMicPermissionFromLauncherClick() {
+    if (_micPermissionPromise) return _micPermissionPromise;
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      _micPermissionPromise = Promise.resolve(true);
+      return _micPermissionPromise;
+    }
+    _micPermissionPromise = navigator.mediaDevices.getUserMedia({ audio: true })
+      .then((stream) => {
+        stream.getTracks().forEach((track) => {
+          try { track.stop(); } catch {}
+        });
+        return true;
+      })
+      .catch((err) => {
+        console.warn('[Orbi] microphone permission request failed:', err && (err.name || err.message || err));
+        return false;
+      });
+    return _micPermissionPromise;
+  }
 
   function openWidget() {
     if (!frame.src) frame.src = frame.dataset.src;
@@ -161,18 +190,19 @@
     launcher.classList.add('open');
     opened = true;
     setBadge(0);
-    // Unlock an audio element RIGHT NOW inside the click gesture so we can
-    // play the greeting TTS from it when the iframe sends orbi:greeting-ready.
-    // This is the standard mobile audio-unlock pattern: call play() in the
-    // gesture, then swap the src and replay when the content is ready.
-    if (!_greetAudio) {
-      _greetAudio = new Audio('data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=');
-      _greetAudio.volume = 0;
-      _greetAudio.play().catch(() => {});
-      _greetAudio.volume = 1;
-    }
+    // Request mic permission NOW, in the user-gesture context of this click.
+    // The iframe's allow="autoplay" lets it speak the greeting without any
+    // gesture inside the frame. When the greeting ends, the iframe sends
+    // orbi:ready-for-mic and we start parent-page voice recognition using
+    // this pre-granted permission.
+    _micReady = requestMicPermissionFromLauncherClick();
   }
   function closeWidget() {
+    _openVoiceToken++;
+    _openIntroOwnedByParent = false;
+    _waitingForReply = false;
+    _orbySpeaking = false;
+    stopParentVoiceRecognition(false);
     if (_greetAudio) { try { _greetAudio.pause(); } catch {} _greetAudio = null; }
     frame.classList.remove('open');
     launcher.classList.remove('open');
@@ -189,6 +219,120 @@
   }
   launcher.addEventListener('click', () => opened ? closeWidget() : openWidget());
 
+  function postToFrame(message) {
+    try { frame.contentWindow && frame.contentWindow.postMessage(message, origin); } catch {}
+  }
+
+  function startMicAfterIntro() {
+    startParentVoiceSession();
+  }
+
+  function getParentRecognition() {
+    const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!Recognition) return null;
+    if (_parentRecognition) return _parentRecognition;
+    const rec = new Recognition();
+    rec.lang = 'en-US';
+    rec.continuous = false;
+    rec.interimResults = false;
+    rec.maxAlternatives = 3;
+    rec.onstart = () => {
+      _parentVoiceListening = true;
+      postToFrame({ type: 'orbi:parent-voice-on' });
+    };
+    rec.onend = () => {
+      _parentVoiceListening = false;
+      if (!_parentVoiceWanted) {
+        postToFrame({ type: 'orbi:parent-voice-off' });
+        return;
+      }
+      if (!_orbySpeaking && !_waitingForReply) {
+        setTimeout(startParentVoiceRecognition, 250);
+      }
+    };
+    rec.onerror = (e) => {
+      console.warn('[Orbi] parent mic error:', e && e.error);
+      _parentVoiceListening = false;
+      if (e && (e.error === 'not-allowed' || e.error === 'service-not-allowed')) {
+        _parentVoiceWanted = false;
+        postToFrame({ type: 'orbi:mic-blocked' });
+      }
+    };
+    rec.onresult = (event) => {
+      let bestText = '';
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        let best = event.results[i][0];
+        for (let k = 1; k < event.results[i].length; k++) {
+          if ((event.results[i][k].confidence || 0) > (best.confidence || 0)) {
+            best = event.results[i][k];
+          }
+        }
+        if (event.results[i].isFinal) bestText += best.transcript;
+      }
+      const text = bestText.trim();
+      if (text) {
+        _waitingForReply = true;
+        postToFrame({ type: 'orbi:parent-transcript', text });
+        try { rec.stop(); } catch {}
+      }
+    };
+    _parentRecognition = rec;
+    return rec;
+  }
+
+  function startParentVoiceSession() {
+    _micReady.then((ok) => {
+      if (!ok) {
+        postToFrame({ type: 'orbi:mic-blocked' });
+        return;
+      }
+      _parentVoiceWanted = true;
+      startParentVoiceRecognition();
+    });
+  }
+
+  function startParentVoiceRecognition() {
+    if (!_parentVoiceWanted || _orbySpeaking || _waitingForReply || _parentVoiceListening) return;
+    const rec = getParentRecognition();
+    if (!rec) {
+      postToFrame({ type: 'orbi:start-mic' });
+      return;
+    }
+    try { rec.start(); }
+    catch {}
+  }
+
+  function stopParentVoiceRecognition(keepWanted = true) {
+    _parentVoiceWanted = !!keepWanted;
+    if (_parentRecognition) {
+      try { _parentRecognition.stop(); } catch {}
+    }
+    if (!keepWanted) postToFrame({ type: 'orbi:parent-voice-off' });
+  }
+
+  function playParentIntroThenStartMic(token) {
+    if (!opened || token !== _openVoiceToken) return;
+    const text = "Hi, this is Orby. I'm listening.";
+    const ttsUrl = origin + '/tts?voice=en-US-AvaNeural'
+      + '&text=' + encodeURIComponent(text);
+    if (!_greetAudio) _greetAudio = new Audio();
+    _greetAudio.src = ttsUrl;
+    _greetAudio.volume = 1;
+    _greetAudio.play().then(() => {
+      postToFrame({ type: 'orbi:clear-greeting' });
+      const done = () => {
+        if (token !== _openVoiceToken) return;
+        postToFrame({ type: 'orbi:greeting-done' });
+        startMicAfterIntro();
+        _greetAudio = null;
+      };
+      _greetAudio.addEventListener('ended', done, { once: true });
+      _greetAudio.addEventListener('error', done, { once: true });
+    }).catch(() => {
+      startMicAfterIntro();
+    });
+  }
+
   // Allow the chat shell inside the iframe to talk back to us
   // (for unread badge updates, "close me" requests, full-page
   // navigations at the end of the buy flow, etc.)
@@ -198,6 +342,18 @@
     if (msg.type === 'orbi:unread')  setBadge(Number(msg.count) || 0);
     if (msg.type === 'orbi:close')   closeWidget();
     if (msg.type === 'orbi:open')    openWidget();
+    if (msg.type === 'orbi:speaking-start') {
+      _orbySpeaking = true;
+      stopParentVoiceRecognition(true);
+    }
+    if (msg.type === 'orbi:speaking-end') {
+      _orbySpeaking = false;
+      _waitingForReply = false;
+      startParentVoiceRecognition();
+    }
+    if (msg.type === 'orbi:ready-for-mic') {
+      startMicAfterIntro();
+    }
     // Play greeting audio FROM THE PARENT PAGE using the user's launcher-click
     // gesture. Audio elements load cross-origin URLs freely (no CORS restriction),
     // so new Audio(origin + '/tts?...') works from twickell.com without issues.
@@ -205,6 +361,10 @@
     // won't double-play. On failure: leave _pendingFirstSpeech so the iframe's
     // fallback drain can try when the user first taps inside.
     if (msg.type === 'orbi:greeting-ready' && msg.text) {
+      if (_openIntroOwnedByParent) {
+        postToFrame({ type: 'orbi:clear-greeting' });
+        return;
+      }
       const ttsUrl = origin + '/tts?voice=en-US-AvaNeural'
         + '&text=' + encodeURIComponent((msg.text || '').slice(0, 2000));
       // Re-use the element unlocked in the click gesture (swap its src to the
@@ -216,17 +376,22 @@
       _greetAudio.volume = 1;
       _greetAudio.play().then(() => {
         // Audio started — suppress iframe's _drainOnFirstTap double-play
-        try { frame.contentWindow.postMessage({ type: 'orbi:clear-greeting' }, origin); } catch {}
-        // When audio finishes, tell iframe to mark greeting done + turn on mic
+        postToFrame({ type: 'orbi:clear-greeting' });
+        // When audio finishes, tell iframe to mark greeting done. The iframe
+        // must not auto-start the mic here; microphone permission has to be
+        // requested from the visitor's mic-button click inside the iframe.
         const notifyDone = () => {
-          try { frame.contentWindow.postMessage({ type: 'orbi:greeting-done' }, origin); } catch {}
+          postToFrame({ type: 'orbi:greeting-done' });
+          startMicAfterIntro();
           _greetAudio = null;
         };
         _greetAudio.addEventListener('ended', notifyDone, { once: true });
         _greetAudio.addEventListener('error', notifyDone, { once: true });
       }).catch(() => {
         _greetAudio = null;
-        // Blocked — iframe keeps _pendingFirstSpeech for _drainOnFirstTap fallback
+        // Blocked — iframe keeps _pendingFirstSpeech for _drainOnFirstTap fallback.
+        // Still start the mic if the launcher-click mic permission succeeded.
+        startMicAfterIntro();
       });
     }
     if (msg.type === 'orbi:navigate' && msg.url) {
