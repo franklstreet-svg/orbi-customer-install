@@ -186,6 +186,11 @@
     if (msg.type === 'orbi:unread')  setBadge(Number(msg.count) || 0);
     if (msg.type === 'orbi:close')   closeWidget();
     if (msg.type === 'orbi:open')    openWidget();
+    // Greeting queued in the iframe — bounce play signal back immediately.
+    // The iframe has allow="autoplay" so it can speak without a user tap inside.
+    if (msg.type === 'orbi:greeting-ready') {
+      try { frame.contentWindow.postMessage({ type: 'orbi:play-greeting' }, origin); } catch {}
+    }
     if (msg.type === 'orbi:navigate' && msg.url) {
       // Sales-bot end-of-flow navigation. The visitor needs a
       // full-page legal page → full-page Stripe checkout (Stripe

@@ -151,6 +151,19 @@
     // already on. Customer taps the mic icon when they want to talk;
     // that tap unlocks audio + turns speaker on + starts the mic in
     // one gesture (see micToggle handler in setupToggles).
+    // Receive play-greeting signal from embed.js parent. embed.js sends this
+    // immediately after receiving orbi:greeting-ready. The iframe has
+    // allow="autoplay" so audio plays without a tap inside the iframe.
+    window.addEventListener('message', (e) => {
+      const msg = e.data || {};
+      if (msg.type !== 'orbi:play-greeting') return;
+      if (!_pendingFirstSpeech || !prefs.speakerOn) return;
+      const txt = _pendingFirstSpeech;
+      _pendingFirstSpeech = null;
+      _unlockMobileAudio();
+      try { Promise.resolve(speak(txt)).finally(_markGreetingDone); } catch { _markGreetingDone(); }
+    });
+
     if (IS_EMBED) {
       setTimeout(() => {
         if (!prefs.speakerOn) setSpeakerOn(true);
@@ -1567,11 +1580,12 @@ _audioEl.src = '/tts?text=%20&silent=1';
     // and the greeting never queues at all. The drains below (first tap,
     // speaker toggle) consult prefs.speakerOn at drain time instead.
     _pendingFirstSpeech = greeting;
-    // Don't call speak() here — audio is not yet unlocked (no user gesture at page load).
-    // openPanel() drains _pendingFirstSpeech on the "Talk to Orby" click (standalone),
-    // or _drainOnFirstTap fires on the first interaction in embed mode.
-    // If speakerOn is false right now, leave _pendingFirstSpeech queued —
-    // the setSpeakerOn drain (auto-on at boot or user toggle) picks it up.
+    // In embed mode: notify the parent (embed.js) that the greeting is queued.
+    // embed.js bounces back orbi:play-greeting immediately, which lets the iframe
+    // speak using the allow="autoplay" permission without needing a tap inside.
+    if (IS_EMBED) notifyParent('orbi:greeting-ready');
+    // In standalone mode: openPanel() drains _pendingFirstSpeech on launcher click.
+    // _drainOnFirstTap fires on the first interaction in either mode as fallback.
   }
 
   // Visitor profile (name + phone + email) lives in sessionStorage — same
