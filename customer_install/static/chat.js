@@ -580,11 +580,19 @@ _audioEl.src = '/tts?text=%20&silent=1';
   // /chat in this session forwards prospect_url so the LLM keeps the
   // prospect's business in its context.
   let _pendingProspectUrl = null;
+  let _scrapeInProgress = false;  // true while _orchestrateSalesScrape is running
 
   async function send(text, opts) {
     opts = opts || {};
     text = (text || '').trim();
     if (!text || isSending) return;
+    // If a scrape is running, absorb any user message so the LLM doesn't
+    // see the conversation and re-emit a duplicate <<SCRAPE:>> marker.
+    // The silent "(continue)" will fire automatically when the scrape finishes.
+    if (_scrapeInProgress && !opts.silent) {
+      addBubble('assistant', "Still scanning your site — just another moment...", { tier: 'local' });
+      return;
+    }
     // We're inside a user-gesture handler here (sendBtn click or Enter
     // keydown). Unlock mobile audio BEFORE the async fetch below so the
     // TTS playback on the reply can sound. After the await, we'd be out
@@ -753,6 +761,7 @@ _audioEl.src = '/tts?text=%20&silent=1';
   // then triggers a silent "continue" turn so the bot can deliver its
   // tailored pitch using the freshly-scraped PROSPECT BUSINESS context.
   async function _orchestrateSalesScrape(url) {
+    _scrapeInProgress = true;
     try {
       setStateBar('Scanning your site...', 'thinking');
       const startRes = await fetch('/api/public/sales_scrape', {
@@ -762,12 +771,19 @@ _audioEl.src = '/tts?text=%20&silent=1';
       });
       const startData = await startRes.json();
       if (!startData.ok) {
+        _scrapeInProgress = false;
         setStateBar(null);
-        addBubble('assistant',
-          startData.error === 'rate_limited'
-            ? "I've already looked at one site recently — give me a few minutes before I scan another. Or tell me what kind of business you run and I'll recommend a fit."
-            : "I couldn't reach that site. Want to tell me what kind of business you run instead?",
-          { tier: 'local' });
+        // Rate-limited means the first scrape is still running or just finished.
+        // Don't alarm the user — the silent "(continue)" will fire when it's done.
+        if (startData.error === 'rate_limited') {
+          addBubble('assistant',
+            "Still pulling up your site — hang tight, almost there.",
+            { tier: 'local' });
+        } else {
+          addBubble('assistant',
+            "I couldn't reach that site. Want to tell me what kind of business you run instead?",
+            { tier: 'local' });
+        }
         return;
       }
       const jobId = startData.job_id;
@@ -782,12 +798,14 @@ _audioEl.src = '/tts?text=%20&silent=1';
         const status = sData && sData.status;
         if (status === 'done') {
           _pendingProspectUrl = url;
+          _scrapeInProgress = false;
           setStateBar(null);
           // Silent continuation — server sees this in history but the
           // visitor never sees "(continue)" in their chat panel.
           send('(continue — scrape complete)', { silent: true });
           return;
         } else if (status === 'error') {
+          _scrapeInProgress = false;
           setStateBar(null);
           addBubble('assistant',
             "Sorry, I had trouble loading that site. Want to tell me what kind of business you run instead?",
@@ -797,12 +815,14 @@ _audioEl.src = '/tts?text=%20&silent=1';
         // still running, keep waiting
       }
       // Timeout after ~3 min
+      _scrapeInProgress = false;
       setStateBar(null);
       addBubble('assistant',
         "That's taking longer than I expected. Want to tell me what kind of business you run instead?",
         { tier: 'local' });
     } catch (e) {
       console.error('[Orbi] sales scrape orchestration failed:', e);
+      _scrapeInProgress = false;
       setStateBar(null);
     }
   }
