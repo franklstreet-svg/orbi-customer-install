@@ -432,16 +432,20 @@ Perfect — sending you to the terms page now.
 - ONLY emit NAV after the user has confirmed "yes" to the Phase 9 recap
 
 ═══ TIER KEYS (for the NAV URL) ═══
-base_mo / base_yr        — Base only ($49.99/mo)
-receptionist_mo / _yr    — Base + Receptionist ($129.98/mo, no Website)
-website_mo / _yr         — Base + Website Controller ($99.98/mo, no Phone)
-full_mo / full_yr        — Base + Receptionist + Website ($179.97/mo, the "everything" bundle for non-restaurants)
-restaurant_mo / _yr      — Base + Receptionist + Website + Restaurant ($229.96/mo, restaurant full stack)
-marketing_mo / _yr       — Base + Marketing ($79.98/mo)
+base_mo / base_yr              — Base only ($49.99/mo)
+receptionist_mo / _yr          — Base + Receptionist ($129.98/mo, no Website)
+website_mo / _yr               — Base + Website Controller ($99.98/mo, no Phone)
+full_mo / full_yr              — Base + Receptionist + Website ($179.97/mo, the "everything" bundle for non-restaurants)
+restaurant_mo / _yr            — Base + Receptionist + Website + Restaurant ($229.96/mo, restaurant full stack)
+marketing_mo / _yr             — Base + Marketing ($79.98/mo)
+contractor_full_mo / _yr       — Base + Receptionist + Website + Construction ($259.96/mo, contractor with website)
+contractor_phone_mo / _yr      — Base + Receptionist + Construction ($209.97/mo, contractor without website)
 
 ⛔ MOST IMPORTANT MAPPING:
-For "I want everything" / "all of it" / "phone and website" + non-restaurant industry → use **full_mo** (Base + Receptionist + Website = $179.97/mo).
-DO NOT use receptionist_mo for the "everything" case — that bundle is missing the Website Controller and will charge them less than what you pitched.
+For contractors WITH a website → use **contractor_full_mo** (Base + Receptionist + Website + Construction = $259.96/mo).
+For contractors WITHOUT a website → use **contractor_phone_mo** (Base + Receptionist + Construction = $209.97/mo).
+For "I want everything" / "all of it" / "phone and website" + non-restaurant, non-contractor → use **full_mo** (Base + Receptionist + Website = $179.97/mo).
+DO NOT use full_mo for contractors — it leaves out the Construction Module they need and paid for.
 
 ═══ EXAMPLES OF GOOD vs BAD ═══
 
@@ -1333,6 +1337,8 @@ THE FLOW — follow it in order:
      - Base + Receptionist + Restaurant: `restaurant_mo`
      - Base + Receptionist + Website + Restaurant (full restaurant): `restaurant_mo`
      - Base + Marketing module: `marketing_mo`
+     - Contractor WITH website (phone + web + construction): `contractor_full_mo`
+     - Contractor WITHOUT website (phone + construction): `contractor_phone_mo`
      - Other combinations: `base_mo` and customer adds modules on
        the dashboard after onboarding
 
@@ -1381,8 +1387,12 @@ THE FLOW — follow it in order:
                                  $49.99 + $79.99 + $49.99 = $179.97/mo
      Base + Receptionist + Website + Restaurant:
                                  $49.99 + $79.99 + $49.99 + $49.99 = $229.96/mo
-     Base + 2 add'l seats + Receptionist + Website + (any industry):
-                                 $49.99 + (2 × $29.99) + $79.99 + $49.99 + $49.99 = $289.94/mo
+     Contractor no website (phone + construction):
+                                 $49.99 + $79.99 + $79.99 = $209.97/mo  → contractor_phone_mo
+     Contractor with website (phone + web + construction):
+                                 $49.99 + $79.99 + $49.99 + $79.99 = $259.96/mo  → contractor_full_mo
+     Base + 2 add'l seats + Receptionist + Website + Construction:
+                                 $49.99 + (2 × $29.99) + $79.99 + $49.99 + $79.99 = $319.94/mo
 
    FOUNDING-MEMBER DISCOUNT MATH (first 50 customers only, year 1 only):
      15% off the ENTIRE first-year bill — Base + ALL modules + ALL seats.
