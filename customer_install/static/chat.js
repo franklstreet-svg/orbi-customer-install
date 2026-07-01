@@ -171,6 +171,10 @@
       setTimeout(() => {
         if (!prefs.speakerOn) setSpeakerOn(true);
       }, 100);
+      // Mic turns on after the greeting finishes (or the 8s failsafe fires).
+      // This fires regardless of which path resolved _greetingDone —
+      // parent-page audio, _drainOnFirstTap, or the built-in timeout.
+      _greetingDone.then(() => { if (!prefs.micOn) setMicOn(true); });
     }
   });
 
