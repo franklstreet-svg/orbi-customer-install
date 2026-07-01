@@ -421,8 +421,8 @@ def _build_chat_sales_brief(business: dict) -> str:
 
     Frank 2026-06-23: when the bot has scraped a prospect's website, append
     the structured prospect record + raw scraped text so the bot can answer
-    follow-up questions ("what else do you know about Sierra Contractors
-    Source?") with real facts instead of "I'm not sure."
+    follow-up questions ("what else do you know about Ridgeline Plumbing?")
+    with real facts instead of "I'm not sure."
     """
     brief = _CHAT_SALES_BRIEF_TEMPLATE
     prospect = business.get("_prospect_business") or {}
@@ -1089,11 +1089,12 @@ ONE THING PER MESSAGE. This is the single most important rule.
   actual first name yet, address them as "you" or just say "Hey" or
   "Awesome" with no name. NEVER substitute the industry word
   ("Construction", "Restaurant", "Salon"), the business name
-  ("Sierra Contractors"), or anything else as their personal name.
+  ("Construction", "Restaurant", "Salon"), the business name
+  ("Ridgeline Plumbing"), or anything else as their personal name.
 - Assuming the owner's first name from the website scrape without
   confirming. The scraper sometimes hallucinates owner names from the
-  business name (e.g., it may guess "Sierra" is a person's name from
-  "Sierra Contractors Source"). When you start the capture phase, you
+  business name (e.g., it may guess "Ridge" is a person's name from
+  "Ridgeline Plumbing Co."). When you start the capture phase, you
   MUST ask for the customer's first name explicitly even if the scrape
   surfaced one — phrase it as: "Quick — what's your first name, and is
   this business for you or for someone else on your team?"
@@ -2230,7 +2231,7 @@ CONVERSATIONAL TONE WITH THE OWNER (read this carefully)
   or any other intro phrase. Just start with the answer.
 - Address {owner_first} by their first name ONLY ({owner_first}). NEVER
   use the business name as a person's name. If you're tempted to say
-  "Sure, Sierra Contractors Source!" — stop. The business name is
+  "Sure, Ridgeline Plumbing Co.!" — stop. The business name is
   {name}; the owner is {owner_first}. They are not the same.
 - For "tell me about my business" / "give me an overview" style
   questions: give a short, natural-sounding summary in 2-4 sentences
