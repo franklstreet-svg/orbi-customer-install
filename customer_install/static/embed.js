@@ -152,6 +152,7 @@
   // ----- Behavior -----
   let opened = false;
   let unread = 0;
+  let _greetAudio = null;
   const badge = launcher.querySelector('#orbi-embed-badge');
 
   function openWidget() {
@@ -162,6 +163,7 @@
     setBadge(0);
   }
   function closeWidget() {
+    if (_greetAudio) { try { _greetAudio.pause(); } catch {} _greetAudio = null; }
     frame.classList.remove('open');
     launcher.classList.remove('open');
     opened = false;
@@ -186,10 +188,23 @@
     if (msg.type === 'orbi:unread')  setBadge(Number(msg.count) || 0);
     if (msg.type === 'orbi:close')   closeWidget();
     if (msg.type === 'orbi:open')    openWidget();
-    // Greeting queued in the iframe — bounce play signal back immediately.
-    // The iframe has allow="autoplay" so it can speak without a user tap inside.
-    if (msg.type === 'orbi:greeting-ready') {
-      try { frame.contentWindow.postMessage({ type: 'orbi:play-greeting' }, origin); } catch {}
+    // Play greeting audio FROM THE PARENT PAGE using the user's launcher-click
+    // gesture. Audio elements load cross-origin URLs freely (no CORS restriction),
+    // so new Audio(origin + '/tts?...') works from twickell.com without issues.
+    // On success: tell the iframe to clear its pending so _drainOnFirstTap
+    // won't double-play. On failure: leave _pendingFirstSpeech so the iframe's
+    // fallback drain can try when the user first taps inside.
+    if (msg.type === 'orbi:greeting-ready' && msg.text) {
+      const ttsUrl = origin + '/tts?voice=en-US-AvaNeural'
+        + '&text=' + encodeURIComponent((msg.text || '').slice(0, 2000));
+      if (_greetAudio) { try { _greetAudio.pause(); } catch {} }
+      _greetAudio = new Audio(ttsUrl);
+      _greetAudio.play().then(() => {
+        try { frame.contentWindow.postMessage({ type: 'orbi:clear-greeting' }, origin); } catch {}
+      }).catch(() => {
+        _greetAudio = null;
+        // Blocked — iframe keeps _pendingFirstSpeech for _drainOnFirstTap fallback
+      });
     }
     if (msg.type === 'orbi:navigate' && msg.url) {
       // Sales-bot end-of-flow navigation. The visitor needs a
