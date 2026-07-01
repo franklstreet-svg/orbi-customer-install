@@ -104,7 +104,8 @@
       if (_pendingFirstSpeech && prefs.speakerOn) {
         const txt = _pendingFirstSpeech;
         _pendingFirstSpeech = null;
-        try { Promise.resolve(speak(txt)).finally(_markGreetingDone); } catch { _markGreetingDone(); }
+        const afterGreeting = () => { _markGreetingDone(); if (!prefs.micOn) setMicOn(true); };
+        try { Promise.resolve(speak(txt)).finally(afterGreeting); } catch { afterGreeting(); }
       }
     };
     document.addEventListener('click', _drainOnFirstTap, { once: true });
@@ -151,13 +152,18 @@
     // already on. Customer taps the mic icon when they want to talk;
     // that tap unlocks audio + turns speaker on + starts the mic in
     // one gesture (see micToggle handler in setupToggles).
-    // Parent page (embed.js) confirmed greeting audio started playing —
-    // clear _pendingFirstSpeech so _drainOnFirstTap won't double-play it.
+    // orbi:clear-greeting — parent page started playing the greeting audio;
+    //   clear pending so _drainOnFirstTap doesn't double-play.
+    // orbi:greeting-done — greeting audio finished on parent page;
+    //   mark the greeting gate resolved and turn the mic on.
     window.addEventListener('message', (e) => {
       const msg = e.data || {};
       if (msg.type === 'orbi:clear-greeting') {
         _pendingFirstSpeech = null;
+      }
+      if (msg.type === 'orbi:greeting-done') {
         _markGreetingDone();
+        if (!prefs.micOn) setMicOn(true);
       }
     });
 

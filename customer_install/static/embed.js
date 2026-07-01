@@ -200,7 +200,15 @@
       if (_greetAudio) { try { _greetAudio.pause(); } catch {} }
       _greetAudio = new Audio(ttsUrl);
       _greetAudio.play().then(() => {
+        // Audio started — suppress iframe's _drainOnFirstTap double-play
         try { frame.contentWindow.postMessage({ type: 'orbi:clear-greeting' }, origin); } catch {}
+        // When audio finishes, tell iframe to mark greeting done + turn on mic
+        const notifyDone = () => {
+          try { frame.contentWindow.postMessage({ type: 'orbi:greeting-done' }, origin); } catch {}
+          _greetAudio = null;
+        };
+        _greetAudio.addEventListener('ended', notifyDone, { once: true });
+        _greetAudio.addEventListener('error', notifyDone, { once: true });
       }).catch(() => {
         _greetAudio = null;
         // Blocked — iframe keeps _pendingFirstSpeech for _drainOnFirstTap fallback
