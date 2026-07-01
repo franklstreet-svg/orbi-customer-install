@@ -436,8 +436,8 @@ Three jobs in one product:
 | **Retail & Service module** | +$49.99/mo | Built industry module. Auto repair, salons, barbershops, retail stores, mixed shops. NL chat for adding/listing services and products. Stripe checkout wired — needs real price IDs in stripe.env before live. |
 | **Marketing module** | +$29.99/mo | IN DEVELOPMENT — not yet sold. Hidden from website. Do not tell customers it is available. |
 | **Image generation sub-module** | +$19.99/mo | FLUX-powered image generation, should sit on top of Marketing. |
-| **Founding member discount** | 15% off entire first-year bill | First 50 customers. Applies to Base + all modules + all seats. |
-| **Annual prepay** | ~17% effective | Pay 10 months, get 12. Stacks with founding-member discount for ~29% effective first-year discount. |
+| **Founding member discount** | 15% off entire first-year bill | First 50 customers. Applies to Base + all modules + all seats. Auto-applied at Stripe checkout via FOUNDING15 promo code. |
+| **Annual prepay** | Pay 10 months, get 12 | Customer pays a single lump sum = monthly total × 10. They get 12 months of service. No "effective monthly rate" — it's one payment upfront. Stacks with founding discount: lump sum × 0.85. Example: 4-seat full bundle = $269.94 × 10 = $2,699.40/yr → with founding 15% off = $2,294.49 for Year 1. |
 
 ### The seat/account model
 
