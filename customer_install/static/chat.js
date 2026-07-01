@@ -780,12 +780,13 @@ _audioEl.src = '/tts?text=%20&silent=1';
       if (!startData.ok) {
         _scrapeInProgress = false;
         setStateBar(null);
-        // Rate-limited means the first scrape is still running or just finished.
-        // Don't alarm the user — the silent "(continue)" will fire when it's done.
         if (startData.error === 'rate_limited') {
-          addBubble('assistant',
-            "Still pulling up your site — hang tight, almost there.",
-            { tier: 'local' });
+          // Rate-limited = a scrape already ran and completed for this URL
+          // (that's the only way we hit the cooldown). The result is already
+          // saved server-side. Skip the "hang tight" dead-end and fire the
+          // silent (continue) immediately so Orby can do her Phase 4.1 reveal.
+          _pendingProspectUrl = url;
+          send('(continue — scrape complete)', { silent: true });
         } else {
           addBubble('assistant',
             "I couldn't reach that site. Want to tell me what kind of business you run instead?",

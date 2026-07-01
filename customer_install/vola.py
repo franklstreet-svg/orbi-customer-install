@@ -1099,7 +1099,7 @@ def api_owner_demo_delete(slug):
 
 _SALES_SCRAPE_IP_LOG: dict = {}  # ip -> last_scrape_ts
 _SALES_SCRAPE_IP_LOCK = _scrape_threading.Lock()
-_SALES_SCRAPE_COOLDOWN_SEC = 600  # one scrape per IP per 10 minutes
+_SALES_SCRAPE_COOLDOWN_SEC = 90   # one scrape per IP per 90 seconds
 
 def _validate_public_url(raw: str) -> tuple[bool, str]:
     """Returns (ok, normalized_url_or_error). Rejects non-HTTP(S), localhost,
