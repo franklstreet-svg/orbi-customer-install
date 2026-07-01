@@ -431,21 +431,19 @@ _audioEl.src = '/tts?text=%20&silent=1';
       // toggle mic. Speaker stays sticky after mic is later turned off.
       _unlockMobileAudio();
       const turningOn = !prefs.micOn;
-      if (turningOn && !prefs.speakerOn) setSpeakerOn(true);
-      // If this is the FIRST mic-on tap in this conversation, deliver
-      // the spoken+typed welcome before turning the mic on. That way
-      // Orby actually GREETS the visitor in her voice (per Frank's
-      // request) instead of sitting there with a canned silent welcome
-      // bubble. Subsequent mic taps don't re-greet.
+      // If this is the FIRST mic-on tap, deliver the spoken welcome.
+      // IMPORTANT: null _pendingFirstSpeech BEFORE calling setSpeakerOn so
+      // its drain logic doesn't call speak() — deliverSpokenWelcome owns
+      // the first speak() call. Two simultaneous speak() calls compete over
+      // the same audio element's onended handler and one always silently
+      // wins, leaving _suppressSTT=true forever (mic deaf) or causing echo.
       if (turningOn && history.length === 0 && !_welcomeDelivered) {
-        // Turn mic on FIRST inside the user-gesture window so Chrome's
-        // SpeechRecognition actually captures audio. speak() inside
-        // deliverSpokenWelcome will apply anti-echo (stop mic during TTS,
-        // re-arm after). Delaying setMicOn until after TTS put it outside
-        // Chrome's gesture window, causing green-but-deaf recognition.
+        _pendingFirstSpeech = null;
+        if (!prefs.speakerOn) setSpeakerOn(true);
         setMicOn(true);
         deliverSpokenWelcome();
       } else {
+        if (turningOn && !prefs.speakerOn) setSpeakerOn(true);
         setMicOn(turningOn);
       }
     });
