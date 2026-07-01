@@ -899,12 +899,20 @@ _audioEl.src = '/tts?text=%20&silent=1';
     safeStart();
   }
 
-  function safeStart() {
+  async function safeStart() {
     if (isListening) return;
-    // Chrome's SpeechRecognition in iframes silently stops capturing audio
-    // after the first session — same symptom as revoking+re-granting the
-    // browser mic permission. Creating a fresh object each call forces a new
-    // mic stream connection, which is what manual permission cycling does.
+    // Briefly acquire and immediately release a real mic stream before
+    // starting SpeechRecognition. This forces Chrome to reconnect the
+    // microphone at the OS level — the programmatic equivalent of
+    // clicking the browser mic icon off then on. Without this, Chrome's
+    // SpeechRecognition in an iframe shows green/active but captures
+    // nothing after a page refresh or permission change.
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      stream.getTracks().forEach(t => t.stop());
+    } catch {}
+    // Re-check guards — state may have changed during the getUserMedia await
+    if (!wantsListening || isSpeaking || isListening) return;
     const prev = recognition;
     const _onstart  = prev.onstart;
     const _onend    = prev.onend;
