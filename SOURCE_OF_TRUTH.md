@@ -130,6 +130,35 @@ Bumped from v15 → v16 → v17 across this session. v17 is current.
 
 ---
 
+## Client Portal Module — Cross-Industry Add-On (Future)
+
+**Concept:** A standalone module that gives any customer's clients their own login — so they can see their own relevant data, track progress, sign documents, and talk directly to Orby. NOT construction-specific. Works across every industry Orby serves.
+
+**Why it's its own module (not baked into Construction):**
+Every industry Frank adds benefits from a client-facing view:
+- **Construction** — homeowner sees project progress, photos, CO status, daily logs
+- **Restaurant** — customer checks order status, loyalty history
+- **Legal** — client sees case timeline, outstanding tasks, can sign documents
+- **Retail/Auto/Salon** — customer views service history, upcoming appointments, invoices
+
+Building it once, selling it everywhere. The chat widget already works inside any page — the portal just gives clients a login shell around it.
+
+**What it includes:**
+- Unique login link per client (token-based, no password required — one-click access)
+- Client sees only THEIR records (not other customers' data)
+- Orby chat widget embedded — client can ask Orby questions live ("when will my kitchen be done?", "what's the status of my case?")
+- Document signing (change orders, contracts, waivers) — already built for COs, extend to all doc types
+- Notification emails when status changes ("Your project moved to rough electrical")
+- Owner controls what each client can see (progress only vs full financials vs documents)
+
+**Pricing:** **+$29.99–$49.99/mo** add-on on top of any industry module. Multiplies the value of every other module rather than replacing anything.
+
+**No competitor does this with AI in it.** Buildertrend has a client portal — it's a static status board. Orby's portal has a live AI that knows the whole project and can answer questions in plain English. That's a real gap.
+
+**Build estimate:** 2–3 weeks once the Construction client portal (Phase 3 above) is done — the construction version IS the first version; then it gets generalized.
+
+---
+
 ## Bug Log — BUGS.md
 
 **`~/orbi_web/BUGS.md` is the confirmed-fixes-only bug log.** Every entry is a bug that was verified fixed: symptom, root cause, and the exact code change that resolved it. Failed attempts are omitted (they're in git history).
