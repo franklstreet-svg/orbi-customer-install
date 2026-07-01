@@ -1592,7 +1592,7 @@ _audioEl.src = '/tts?text=%20&silent=1';
       // collects info its own way.
       const isOrbiSite = /^(vola|myorby|orbi|myorbi)$/i.test((businessName || '').trim());
       greeting = isOrbiSite
-        ? `Hi! I'm Orby — how can I help?`
+        ? `Welcome to myOrby, how can I help you?`
         : `Hi! Welcome to ${businessName} — what's your name?`;
     }
     // Remove the welcome bubble (replaced by Orby's actual first message)
