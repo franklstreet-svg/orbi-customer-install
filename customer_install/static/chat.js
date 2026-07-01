@@ -380,6 +380,7 @@ _audioEl.src = '/tts?text=%20&silent=1';
   // firing recognition.onstart, OR any direct tap inside the iframe), we
   // play the queued text from THAT context.
   let _pendingFirstSpeech = null;
+  let _suppressSTT = false;  // true while welcome speech plays — ignore mic results
 
   // Boot sequencer — mic auto-on waits until the proactive greeting has
   // finished speaking (or 8s failsafe). This keeps the status flow correct:
@@ -875,6 +876,7 @@ _audioEl.src = '/tts?text=%20&silent=1';
     };
 
     recognition.onresult = (event) => {
+      if (_suppressSTT) { clearInterim(); return; }
       let interim = '';
       let finalText = '';
       for (let i = event.resultIndex; i < event.results.length; i++) {
@@ -984,8 +986,11 @@ _audioEl.src = '/tts?text=%20&silent=1';
     div.appendChild(body);
     chatArea.appendChild(div);
     chatArea.scrollTop = chatArea.scrollHeight;
-    // Speak in parallel with typing — both kick off now
-    const speechPromise = (prefs.speakerOn ? speak(welcomeText) : Promise.resolve());
+    // Speak in parallel with typing. skipAntiEcho keeps the mic running so
+    // Chrome's gesture-established recognition session stays alive. We
+    // suppress STT results via _suppressSTT so Orby doesn't "hear" herself.
+    _suppressSTT = true;
+    const speechPromise = (prefs.speakerOn ? speak(welcomeText, { skipAntiEcho: true }) : Promise.resolve());
     // Type ~30 chars/sec — slow enough to read along with her voice
     for (let i = 0; i < welcomeText.length; i++) {
       body.textContent = welcomeText.slice(0, i + 1);
@@ -996,8 +1001,9 @@ _audioEl.src = '/tts?text=%20&silent=1';
     // continues the conversation from there.
     history.push({ role: 'assistant', content: welcomeText });
     _saveHistory(history);
-    // Wait for speech to finish (so anti-echo guard works correctly)
+    // Wait for speech to finish, then re-enable STT
     try { await speechPromise; } catch {}
+    _suppressSTT = false;
   }
 
   // ------------------------------------------------------------------
@@ -1013,16 +1019,19 @@ _audioEl.src = '/tts?text=%20&silent=1';
   // Browser fallback (only if server TTS fails)
   const browserSynth = window.speechSynthesis;
 
-  async function speak(text) {
+  async function speak(text, opts) {
     if (!text) {
       if (prefs.micOn && !isSpeaking) startListening();
       return;
     }
     stopSpeaking();
 
-    // ANTI-ECHO: cut the mic BEFORE audio starts
+    // ANTI-ECHO: cut the mic BEFORE audio starts.
+    // skipAntiEcho is set for the welcome greeting so the mic stays active
+    // (established inside the user-gesture window) — we suppress STT results
+    // via _suppressSTT instead of stopping the mic entirely.
     const wasMicOn = prefs.micOn;
-    if (wasMicOn) {
+    if (wasMicOn && !opts?.skipAntiEcho) {
       stopListening();
       micToggle.classList.add('muted-while-speaking');
     }
@@ -1094,16 +1103,7 @@ _audioEl.src = '/tts?text=%20&silent=1';
     micToggle.classList.remove('muted-while-speaking');
     setStateBar(null);
 
-    // Anti-echo release: give the speaker a moment to settle, then re-arm
-    // mic. 100ms was too tight — Chrome's SpeechRecognition can fail
-    // silently when the audio playback hasn't fully released the device.
-    // 400ms is the floor that reliably works across Chrome / Edge / Brave
-    // / Safari for both desktop and laptop mics.
-    //
-    // Plus: if the first attempt doesn't actually take (no onstart event
-    // within 600ms), retry once. Without the retry, a silently-failed
-    // start leaves the user staring at a dead mic with no signal.
-    if (wasMicOn && prefs.micOn) {
+    if (wasMicOn && !opts?.skipAntiEcho && prefs.micOn) {
       const armMic = () => {
         if (!prefs.micOn || isSpeaking) return;
         startListening();
