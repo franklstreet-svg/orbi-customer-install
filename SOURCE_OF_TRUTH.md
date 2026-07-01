@@ -1,6 +1,8 @@
-# Idunn AI — Source of Truth
+# myOrby / Orby — Source of Truth
 
-**Last updated:** 2026-06-30 (Widget auto-installer built: Orby installs herself on customer WordPress/Squarespace/Shopify/Wix sites via Playwright; web developer email path added; 36/36 mock chat tests passing. LLM re-verified: Qwen/Qwen2.5-72B-Instruct is live on featherless-ai at 735ms — Llama 3.3 70B swap was temporary and is no longer active.)
+**Last updated:** 2026-07-01 (Source-of-truth audit against disk/runtime: prompts.py line count corrected to 3,014; dev Orbi `/health` now reports `["legal","contractor","retail"]`; only tenant port `6100` is currently listening while `6101`/`6102` are down; `web_agent.py missing` claim corrected because `customer_install/web_agent/` package exists; Anthropic legal config corrected to `enabled: true`; `_TIER_PRETTY` stale `$119.98` note removed because checkout display now says `$129.98/mo`; `twickell_live` branch/commit state refreshed. Product knowledge pricing drift still exists.)
+**Previous update:** 2026-06-30 (Full disk audit pass: brand metadata corrected (Jade → Orby; Idunn AI → myOrby/FST LLC per 2026-06-27 scraps), line counts updated (vola.py 23,966 / prompts.py 2,992 / llm_client.py 586 / stripe_webhook.py 4,612), new files documented: widget_installer.py, test_capabilities.py, tools/ directory, login.html in owner_dashboard + twickell_live website, purblum-demo.html, static embed/booking/demo files, brand asset images. Restaurant module confirmed as inline in vola.py — no modules/restaurant.py file.)
+**Previous update:** 2026-06-30 (Widget auto-installer built: Orby installs herself on customer WordPress/Squarespace/Shopify/Wix sites via Playwright; web developer email path added; 36/36 mock chat tests passing. LLM re-verified: Qwen/Qwen2.5-72B-Instruct is live on featherless-ai at 735ms — Llama 3.3 70B swap was temporary and is no longer active.)
 **Previous update:** 2026-06-30 (SoT audit pass: orbi.py → vola.py rename corrected throughout; module count updated to 40; maps.py, legal.py, retail.py added to module layout; stale line counts corrected; brain stripe_webhook.py count updated.)
 **Previous update:** 2026-06-30 (retail module wired end-to-end; marketing disabled/hidden; website trial box rewritten; LLM emergency swap to Llama 3.3 70B — brief outage only, Qwen returned same day; legal research confirmed fully built with live database queries.)
 **Previous update:** 2026-06-29 (attorney/legal module completed end-to-end; Anthropic Claude routing for legal LLM calls added; full codebase audit run.)
@@ -9,11 +11,19 @@
 **Previous full refresh:** 2026-06-23 (full catch-up pass from disk. Read this SoT and inventoried the referenced active trees: `~/orbi_web`, `~/orbi-brain`, `~/orbi-tenants`, `~/twickell_live`, plus the referenced docs/modules/service files. Verified `https://twickell.com/` matches `~/twickell_live/website/index.html` byte-for-byte. Cloud-v1 is no longer just a future pivot note: it is the active direction and local runtime on this machine. Local-install remains preserved for v2, but the current revenue path is cloud-hosted signup + tenant dashboards.)
 **Previous refresh:** 2026-06-20 (CLOUD-V1 PIVOT day — Frank pivoted from local-install to cloud-hosted. Reasons: SmartScreen/AV trust problem, no time + money for code-signing cert, install pain was the bottleneck to revenue. New plan: cloud now → revenue → fund certs → ship v2 local install later. ALL build work today lives on `cloud-v1` branches in both `orbi_web` and `twickell_live`. Earlier today: file-audit refresh — no policy changes since 6-18, but file counts, route lists, line counts, and the customer_install/owner_dashboard symlink claim were stale.)
 **Previous local-install refresh:** 2026-06-18 (after Frank's external-customer install round — SCS / scsplanroom.com test surfaced new bugs around the welcome wizard, owner-name handling, and staff session writes. All fixed in source 6-18 and shipped in a fresh `.exe` (16:19) that's on Frank's thumb drive.)
+## Bug Log — BUGS.md
+
+**`~/orbi_web/BUGS.md` is the confirmed-fixes-only bug log.** Every entry is a bug that was verified fixed: symptom, root cause, and the exact code change that resolved it. Failed attempts are omitted (they're in git history).
+
+**Rule: after every confirmed bug fix, update BUGS.md before closing the session.** One entry per bug. Root cause first. No failed attempts.
+
+---
+
 **Owner:** Frank Street
 **Legal entity:** FST LLC
-**Product/company brand:** Idunn AI (Norse goddess of eternal youth/memory; golden apple symbol; forest green + gold color scheme)
-**AI spoken character name:** Jade (STT-safe default spoken name; company brand stays "Idunn AI"; customers rename at onboarding setup)
-**Domain target:** idunn.ai (available; deferred until first revenue per no-new-spend rule)
+**Product/company brand:** myOrby / FST LLC (brand in flux; "Idunn AI" + forest green/gold color scheme were created AND scrapped 2026-06-27; website back to dark/purple-blue; see Brand structure section below)
+**AI spoken character name:** Orby (default spoken name; "Brindy" and "Jade" were brief experiments in the 2026-06-27 session, both scrapped; customers rename at onboarding setup)
+**Domain target:** twickell.com (live). idunn.ai not purchased — deferred per no-new-spend rule.
 **Status:** Pre-revenue / founding-member cloud-v1 prep. Stripe/product plumbing exists locally, but there is still manual/white-glove onboarding in the first customer flow. Local-install bug rounds (Kathy + SCS) are preserved below because they matter for v2, but they are not the immediate revenue path anymore.
 
 ---
@@ -23,7 +33,7 @@
 ### Session work — Retail module live, marketing disabled, website & LLM updates
 
 #### LLM status (verified 2026-06-30)
-Qwen 2.5 72B had a brief outage on 2026-06-29 but came back the same day. **Current LLM: Qwen/Qwen2.5-72B-Instruct via featherless-ai** (confirmed in `config.json` and `llm_client.py` comment line 151: "Qwen 2.5 72B, back on 2026-06-29 after brief outage"). Llama 3.3 70B is the phone/voice tier only. Legal calls still route to Anthropic Claude when `config.json anthropic.enabled = true`.
+Qwen 2.5 72B had a brief outage on 2026-06-29 but came back the same day. **Current general LLM default: Qwen/Qwen2.5-72B-Instruct via featherless-ai** (confirmed in `llm_client.py` default model config). Llama 3.3 70B remains documented as a HuggingFace fallback/phone-voice tier path. **Legal calls route to Anthropic Claude now because `customer_install/config.json` has `anthropic.enabled = true`.**
 
 #### Retail module — fully wired end-to-end
 
@@ -145,7 +155,7 @@ Full end-to-end NL chat test against dev Orby at port 6000:
 - Added `generate_legal()` — tries Anthropic first, falls back to HuggingFace Qwen. Sets `timeout_seconds=90` by default.
 - All 10 legal LLM calls in `vola.py` switched from `generate()` to `generate_legal()` (conflict check, intake, draft, research, contract review, contract chat, research chat, document draft).
 - Added `_GEN_OVERRIDES` thread-local so per-call `max_tokens` and `timeout_seconds` pass cleanly through the function stack.
-- Config `anthropic` block added to `customer_install/config.json`: `{"enabled": false, "api_key": "", "model": "claude-sonnet-4-6", "timeout_seconds": 90, "max_tokens": 4096}`. Set `enabled: true` + paste API key when Frank is ready. Normal Orby chat stays on Qwen/HuggingFace — only legal routes hit Anthropic.
+- Config `anthropic` block exists in `customer_install/config.json` and is currently enabled: `{"enabled": true, "model": "claude-sonnet-4-6", "timeout_seconds": 90, "max_tokens": 4096}`. Normal Orby chat stays on Qwen/HuggingFace — only legal routes hit Anthropic.
 
 **Pricing note:** Frank confirmed $250/mo for the legal module is intentional and correct. Attorneys who don't know what Westlaw is don't know what they're getting. Attorneys who do know will pay more for Orby because she has persistent memory and learns. Confirmed: even heavy attorney use won't exceed $50-100/mo on Anthropic API costs.
 
@@ -159,7 +169,7 @@ Full end-to-end NL chat test against dev Orby at port 6000:
 Core chat, owner auth, business info, contacts, calendar/scheduling, tasks, notes, reminders, messages/team chat, workspace/files, forms, pricing, learning loop, marketing (dashboard only — no NL chat), legal (full — NL chat + dashboard + phone brief + all API routes), voicemails, email, SMS, morning/tomorrow brief, notifications, staff/people, clients, catalog/search, fleet heartbeat.
 
 **PARTIALLY BUILT:**
-- **Web Tasks tab** — dashboard tab + 3 API routes + full orchestration code in vola.py exist, but `web_agent.py` is missing. Tab will crash at runtime. Highest-risk gap.
+- **Web Tasks tab** — dashboard tab + API routes + orchestration code in `vola.py` exist, and the browser automation package now exists at `customer_install/web_agent/` (`controller.py`, `session.py`, `actions.py`, `learner.py`, recipes). Needs runtime/browser verification, but the old `web_agent.py missing` crash claim is stale.
 - **Marketing NL chat** — all dashboard UI + API routes work. Zero `_try_marketing_chat` handler. Owner cannot ask Orby to write promo copy via chat, only via dashboard.
 - **Contractor module** — all 8 modules written and imported but shelved by config. Reactivate with `enabled_modules` change only.
 
@@ -168,7 +178,7 @@ Core chat, owner auth, business info, contacts, calendar/scheduling, tasks, note
 **BACKGROUND JOBS running at startup:** billing check, archive sweep, reminder fire loop, receivables follow-up, fleet heartbeat, legal deadline reminder loop, tunnel runner, gcal sync, file temp sweep, briefing scheduler, birthdays sweep. (11 threads total.)
 
 **KEY GAPS identified:**
-1. `web_agent.py` missing — Web Tasks tab errors on run
+1. Web Tasks tab/browser automation still needs runtime verification, but `customer_install/web_agent/` now exists; the old missing-file claim is stale.
 2. Marketing has no NL chat handler
 3. 5 written modules sitting unused
 4. Fleet dashboard (heartbeat sends to brain, but "customer went dark" alerts + fleet UI not built)
@@ -233,7 +243,7 @@ Brand is in flux. Current code state:
 Verified with `ss -tlnp` and local `/health` probes:
 
 - Brain/billing app: `127.0.0.1:5060/health` -> `{"service":"stripe-webhook","status":"ok"}`
-- Sales/dev Orbi: `127.0.0.1:6000/health` -> business `myOrbi`, modules `["marketing","marketing_image"]`
+- Sales/dev Orbi: `127.0.0.1:6000/health` -> business `myOrby`, modules `["legal","contractor","retail"]`
 - Test tenant Orbi: `127.0.0.1:6100/health` -> business `FST LLC`, modules `["receptionist"]`
 - Cloudflared: multiple local listeners are up (`127.0.0.1:20241`, `20242`, `20243`, `20244`, `20245`, and one transient high port observed during handoff). Some are leftovers from repeated tenant/test imports; do not assume every listener is required.
 - Tenant ports: `6101` and `6102` are **not listening right now**.
@@ -250,7 +260,7 @@ Frank hit a Cloudflare 502 at `2026-06-25 13:48 PDT` after reboot. Brain logs sh
   - `orbi_qiBLye0t1ET` -> Phase 7/8 Test Co, configured for port `6102`, modules `["receptionist"]`.
   - `orbi_eX7ov3jfMHV` -> onboarding placeholder, also configured for port `6102`, modules `["receptionist","website"]`.
 - The duplicate `6102` tenant config collision still exists and must be resolved before production tenant launch.
-- `~/twickell_live` is the public website source; `main`, `origin/main`, and local `cloud-v1` all point at commit `8aa0427`, while local `cloud-v1` remains ahead of `origin/cloud-v1` by 6 commits.
+- `~/twickell_live` is the public website source; local `cloud-v1` tracks `origin/cloud-v1` at `2b805f0`, while `main` and `origin/main` point at `8729a87` (`Merge branch 'cloud-v1'`).
 - `~/Orbi` is the owner workspace folder Orbi indexes/searches; current observed file includes `orby_drives_purblum.mp4`.
 - `/home/frank/ORBI_MASTER_SOURCE_OF_TRUTH.md` is **not canonical anymore**. It is an old May document and should only be used as a pointer to this file.
 - Legacy/reference/backup folders observed but not current product path: `~/_old_orbi_workspace_backup`, `~/orbi_web_repo_backup_20260525_172748`, `~/orbi_test`, `~/orbi_FULL_BACKUP_20260618_234557.tar.gz`, `~/FULL_BRIDGE_BACKUP/orbi_full_system_20260522_041908.tar.gz`, and the many Orbi/Orby trees under `~/_quarantine_2026_05_26/`.
@@ -260,6 +270,7 @@ Frank hit a Cloudflare 502 at `2026-06-25 13:48 PDT` after reboot. Brain logs sh
 **Canonical product source: `~/orbi_web`**
 
 - `SOURCE_OF_TRUTH.md` — this file; read first.
+- `BUGS.md` — confirmed-fixes-only bug log; update after every verified fix.
 - `customer_install/vola.py` — tenant app/server, owner chat routes, public chat routes, SMS/email/calendar/reminder/task routing, voice/TTS routes, module wiring.
 - `customer_install/prompts.py` — public/owner/voice prompt builders; loads `product_knowledge.json`.
 - `customer_install/product_knowledge.json` — shared myOrbi product/business knowledge.
@@ -308,8 +319,8 @@ Frank hit a Cloudflare 502 at `2026-06-25 13:48 PDT` after reboot. Brain logs sh
 
 ### Source state now
 
-- `~/orbi_web` is dirty with modified `SOURCE_OF_TRUTH.md`, `customer_install/orbi.py`, `customer_install/prompts.py`, `customer_install/modules/quick_capture.py`, `customer_install/static/chat.js`, and `owner_dashboard/dashboard.js`.
-- `~/orbi_web` also has untracked `brain/`, `cross_platform/bin/`, `cross_platform/mac/`, `cross_platform/shared/`, `cross_platform/windows/`, and `customer_install/config.json.bak_corrupted_093615`.
+- `~/orbi_web` is dirty with modified `SOURCE_OF_TRUTH.md`, `customer_install/llm_client.py`, `customer_install/pre_execute.py`, `customer_install/static/chat.html`, and `customer_install/vola.py`.
+- `~/orbi_web` also has untracked `brain/`, `cross_platform/bin/`, `cross_platform/mac/`, `cross_platform/shared/`, `cross_platform/windows/`, `customer_install/.backup_local_key`, `customer_install/static/myorbi-favicon.png`, and `customer_install/workspace/`.
 - `customer_install/static/dashboard.js`, `dashboard.css`, and `dashboard-mobile.css` are symlinks to `~/orbi_web/owner_dashboard`; `customer_install/owner_dashboard` is also a symlink to the same canonical dashboard source.
 - Tenant config files contain live credentials and should not be pasted into chat or committed.
 
@@ -326,19 +337,18 @@ The old local-first promise still matters strategically, but it is no longer tru
 ### Verified public website
 
 - `https://twickell.com/` matches `~/twickell_live/website/index.html` exactly.
-- Verified 2026-06-23: same size (`71,252` bytes) and SHA-256 `a2c4ef73451bc556e2384bc38bd91f23af77d30e232724241e21d728cb944845`.
-- Local file mtime: 2026-06-23 00:22 PDT.
-- `twickell_live` git state: local branch `cloud-v1`; `main` and `origin/main` point at current website commit `8aa0427` ("twickell.com: add Login button to nav + /login page that calls brain auth API"). Local `cloud-v1` is ahead of `origin/cloud-v1` by 6 commits, but production `main` is already at the current site commit.
+- Verified 2026-07-01: same size (`80,524` bytes) and SHA-256 `5005e04914dc0ece9bb0534790716e036993f05a02bce5624c2fe2a20626fed8`.
+- Local file mtime: 2026-06-30 10:24 PDT.
+- `twickell_live` git state: local branch `cloud-v1` tracks `origin/cloud-v1` at `2b805f0` (`purblum-demo: allow microphone in iframe so voice works`); `main` and `origin/main` point at `8729a87` (`Merge branch 'cloud-v1'`).
 
 ### Verified local runtime
 
 `systemctl --user` could not be queried from this sandbox (`Failed to connect to bus: Operation not permitted`), so current runtime was verified via listening ports and `/health` endpoints.
 
 - Brain/billing app: `127.0.0.1:5060/health` → `{"service":"stripe-webhook","status":"ok"}`
-- Sales/dev Orbi: `127.0.0.1:6000/health` → business `myOrbi`, modules `["marketing","marketing_image"]`
+- Sales/dev Orbi: `127.0.0.1:6000/health` → business `myOrby`, modules `["legal","contractor","retail"]` as of the 2026-07-01 audit.
 - Tenant instance: `127.0.0.1:6100/health` → business `FST LLC`, modules `["receptionist"]`
-- Tenant instance: `127.0.0.1:6101/health` → business `Sue's Demo Deli`, modules `["receptionist","restaurant"]`
-- Tenant instance: `127.0.0.1:6102/health` → business `(set during onboarding)`, modules `["receptionist","website"]`
+- Tenant ports `6101` and `6102` are configured on disk but are not listening as of the 2026-07-01 audit.
 
 ### Active tenants on disk
 
@@ -349,7 +359,7 @@ The old local-first promise still matters strategically, but it is no longer tru
 - `orbi_qiBLye0t1ET` — `Phase 7/8 Test Co`, config says port `6102`
 - `orbi_eX7ov3jfMHV` — onboarding placeholder business, config also says port `6102`
 
-Important: there is a **port/config collision** on disk: two tenant configs list `6102`. Only one process can actually own that port; `/health` on `6102` currently reports the onboarding-placeholder tenant. Before treating tenant inventory as production-clean, resolve or intentionally archive the stale `6102` tenant config.
+Important: there is a **port/config collision** on disk: two tenant configs list `6102`. Only one process can actually own that port; as of the 2026-07-01 audit, nothing is listening on `6102`. Before treating tenant inventory as production-clean, resolve or intentionally archive the stale `6102` tenant config.
 
 ### Brain changes since the 2026-06-20 note
 
@@ -373,25 +383,28 @@ Important: there is a **port/config collision** on disk: two tenant configs list
 `~/twickell_live`:
 
 - Branch: `cloud-v1`
-- Current commit: `8aa0427`
-- `main` and `origin/main` point to the current live website.
-- Local `cloud-v1` is ahead of `origin/cloud-v1` by 6 commits; do not assume `origin/cloud-v1` is the latest website branch.
+- Current local `cloud-v1`: `2b805f0` (`origin/cloud-v1`, `purblum-demo: allow microphone in iframe so voice works`)
+- `main` and `origin/main`: `8729a87` (`Merge branch 'cloud-v1'`)
+- Do not assume the checked-out branch is the production deployment target; `twickell.com` deploys from `main`.
 
-### File counts / module inventory verified 2026-06-23 (⚠ stale — see 2026-06-30 audit for current counts)
+### File counts / module inventory (updated 2026-06-30 per disk audit)
 
-- `customer_install/vola.py` (was `orbi.py`): 18,657 lines at 6-23 → **23,690 lines as of 2026-06-30**
-- `customer_install/prompts.py`: 2,590 lines at 6-23 → **2,795 lines as of 2026-06-30**
+- `customer_install/vola.py` (was `orbi.py`): 18,657 lines at 6-23 → **23,966 lines as of 2026-06-30**
+- `customer_install/prompts.py`: 2,590 lines at 6-23 → **3,014 lines as of 2026-07-01**
+- `customer_install/llm_client.py`: **586 lines as of 2026-06-30**
 - `customer_install/kokoro_tts.py`: 250 lines
 - `customer_install/product_knowledge.json`: 283 lines at 6-23 → **297 lines as of 2026-06-30**
-- `orbi-brain/stripe_webhook.py`: 4,231 lines at 6-23 → **4,552 lines as of 2026-06-30**
+- `orbi-brain/stripe_webhook.py`: 4,231 lines at 6-23 → **4,612 lines as of 2026-06-30**
 - `twickell_live/website/index.html`: 1,226 lines
 - `customer_install/modules/`: 37 Python module files at 6-23 → **40 files as of 2026-06-30** (added legal.py, retail.py, maps.py)
 
 ### Known drift / cleanup needed
 
-- Pricing copy is not perfectly aligned across files. `prompts.py`, `twickell_live/website/index.html`, and the brain checkout bundles currently use Receptionist as `+$79.99/mo` and show full stack totals like `$179.97/mo` and restaurant `$229.96/mo`. `product_knowledge.json` still contains older example totals in places (`$169.97`, `$219.96`, and old founding-member restaurant wording). Update `product_knowledge.json` before relying on Orbi's own product-support answers.
-- `twickell_live/website/index.html` meta description still says Receptionist module `($69.99/mo)` while visible site/button math says Base + Receptionist is `$129.98/mo` (meaning Receptionist is `+$79.99/mo`). Fix the meta description for SEO/social consistency.
-- `orbi-brain/_TIER_PRETTY` lists `receptionist_mo` as `$119.98/mo`, which conflicts with the current site and prompt math (`$129.98/mo`). Checkout display may be stale even if dynamic line items charge correctly from env price IDs.
+- Pricing copy is not perfectly aligned across files. `prompts.py`, `twickell_live/website/index.html`, and the brain checkout bundles currently use Receptionist as `+$79.99/mo` and show full stack totals like `$179.97/mo` and restaurant `$229.96/mo`. `product_knowledge.json` still contains older example totals in places (`$119.98`, `$169.97`, `$219.96`, `$279.94`, and old founding-member restaurant wording). Update `product_knowledge.json` before relying on Orbi's own product-support answers.
+- Legal/Orbi Law pricing is inconsistent: this SoT says Frank confirmed the legal module target is `$250/mo`, while `product_knowledge.json` and `twickell_live/website/index.html` currently say Orbi Law is `+$199.99/mo` / Base + Law `$249.98/mo`. Decide final legal pricing and align website, product knowledge, prompts, Stripe, and brain checkout.
+- `orbi-brain/_TIER_PRETTY` still lists `restaurant_mo` as `$219.96/mo`, while current prompts/source pricing say restaurant full stack is `$229.96/mo`. Fix checkout display/env bundle math before selling restaurant self-serve.
+- `twickell_live/website/index.html` meta description has been updated for Receptionist `+$79.99/mo`, but still advertises Construction `+$79.99/mo` and Orbi Law `+$199.99/mo`; recheck against final module availability/pricing before relying on SEO/social snippets.
+- `orbi-brain/_TIER_PRETTY` now lists `receptionist_mo` as `$129.98/mo`; the older `$119.98/mo` checkout-display drift is fixed.
 - Two tenant configs list port `6102`; resolve before any production tenant launch.
 
 ---
@@ -469,9 +482,9 @@ The old local-install "one host computer + thin clients" model belongs to v2 pla
 ### Frank's infrastructure (`orbi-brain` + `twickell_live`)
 
 - **billing.twickell.com / local brain on 5060** — Flask app in `~/orbi-brain/stripe_webhook.py`. Handles Stripe webhooks, legal acceptance, dynamic checkout bundles, auth/session routes, tenant launch/proxy, LLM proxy, billing status, fleet inbox, Twilio routes, admin/customer routes.
-- **orbi.twickell.com / local dev Orbi on 6000** — Sales bot and embed runtime for the marketing site. Current `/health` shows business `myOrbi` and modules `["marketing","marketing_image"]`.
+- **orbi.twickell.com / local dev Orbi on 6000** — Sales bot/embed runtime for the marketing site. Current local `/health` shows business `myOrby` and modules `["legal","contractor","retail"]`.
 - **tenant ports 6100-6499** — Per-customer Orbi processes spawned from shared `customer_install` code with per-tenant config/data under `~/orbi-tenants`.
-- **twickell.com** — Vercel-deployed static site from `~/twickell_live/website`. Live site matches local `index.html` as of 2026-06-23.
+- **twickell.com** — Vercel-deployed static site from `~/twickell_live/website`. Live site matches local `index.html` as of 2026-07-01.
 
 ### Local-install architecture status (`customer_install/`)
 
@@ -515,7 +528,7 @@ The old Windows installer flow is preserved for v2 and still matters historicall
 
 ## What's working today
 
-- Cloud-v1 local runtime: brain on `5060`, sales Orbi on `6000`, tenant instances on `6100`, `6101`, and `6102` all return healthy `/health` responses.
+- Cloud-v1 local runtime: brain on `5060`, sales/dev Orbi on `6000`, and test tenant `6100` return healthy `/health` responses. Tenant ports `6101` and `6102` are configured on disk but are not listening as of the 2026-07-01 audit.
 - `twickell.com` live site matches the local `twickell_live/website/index.html` exactly.
 - Stripe webhook → customer record/token/api_key/module plumbing exists in `orbi-brain`.
 - Brain-side auth (`tenant_auth.py`), tenant spawning (`tenant_spawner.py`), and dashboard/proxy routes exist in `stripe_webhook.py`.
@@ -602,15 +615,15 @@ Each bullet is a real Windows install bug a customer or test PC surfaced. All fi
 ```
 ~/orbi_web/                         (main dev workspace — git repo, pushed to GitHub. ⚠ Working tree currently dirty — see "Uncommitted source state" below.)
   customer_install/                 (what gets bundled into the .exe — runs on dev port 6000; ships as port 5050 on the customer .exe)
-    vola.py                         (the customer-side Flask app — 23,690 lines as of 2026-06-30, all routes. ⚠ Previously called orbi.py — that name no longer exists.)
-    prompts.py                      (LLM prompt templates — sales mode, owner mode, public mode; 2,795 lines as of 2026-06-30)
+    vola.py                         (the customer-side Flask app — 23,966 lines as of 2026-06-30, all routes. ⚠ Previously called orbi.py — that name no longer exists.)
+    prompts.py                      (LLM prompt templates — sales mode, owner mode, public mode; 3,014 lines as of 2026-07-01)
     voice.py                        (Twilio phone TwiML + edge-tts)
-    llm_client.py                   (LLM router with circuit breaker, Mozilla UA for Cloudflare; 580 lines as of 2026-06-30)
+    llm_client.py                   (LLM router with circuit breaker, Mozilla UA for Cloudflare; 586 lines as of 2026-06-30)
     image_gen.py                    (image sub-module — FLUX.1-schnell via HF, wired in vola.py)
     ad_gen.py                       (ad composition — orchestrates LLM + image_gen + PIL, wired in vola.py)
     auth.py                         (three-mode session tokens: visitor / staff / owner)
     users.py                        (multi-user registry, per-user data folders, archive-not-delete)
-    onboarding.py                   (first-run wizard; restaurant variant lives here, not in modules/)
+    onboarding.py                   (first-run wizard; restaurant track/onboarding lives here. Restaurant chat handling is inline in vola.py — there is NO modules/restaurant.py file, unlike legal.py/retail.py.)
     orbi_window.py                  (pywebview WebView2 launcher — the "looks like a program" window)
     backup.py + watchdog.py + updater.py + scheduler.py + service_manager.py + error_reporter.py
                                     (runtime housekeeping)
@@ -621,9 +634,13 @@ Each bullet is a real Windows install bug a customer or test PC surfaced. All fi
       follow_up.py friend_checkin.py gcal.py imap_smtp.py mail_merge.py notifications.py
       ocr.py phone_order.py pptx_gen.py review_responder.py sms_sender.py style_learner.py
       translation.py twilio_provision.py voice_notes.py voicemail.py wellbeing.py
-      auto_categorize.py                                  (~30 helper modules at top level — feature-specific. `ls customer_install/*.py` is the live list.)
+      auto_categorize.py widget_installer.py test_capabilities.py
+                                                          (~32 helper modules at top level — feature-specific. `ls customer_install/*.py` is the live list.
+                                                           widget_installer.py: Playwright auto-installs Orby widget on WordPress/Squarespace/Shopify/Wix sites.
+                                                           test_capabilities.py: full capability sweep test harness.)
     site_scraper/                   (LLM-driven website scraper — crawler.py + llm_extract.py + merge.py + http_client.py + link_extractor.py + page_parser.py + storage.py)
     web_agent/                      (Playwright-based browser automation — controller.py + learner.py + page_observer.py + actions.py + session.py + recipes/)
+    tools/                          (research + test scripts — legal_research.py, web_search.py, url_fetch.py; seed/test: seed_demo_contractor.py, test_contractor_module.py, test_orby_sweep.py)
     connectors/                     (third-party integration adapters — small)
     llm_local/                      (local-model harness, optional)
     bin/                            (runtime binaries — ffmpeg / cloudflared / piper that ship with the install)
@@ -651,7 +668,7 @@ Each bullet is a real Windows install bug a customer or test PC surfaced. All fi
         invoice_pdf.py invoices.py line_items.py pricing.py
         projects.py proposal_pdf.py subcontractors.py wins.py
         clients.py catalog.py internal_messages.py                   (CONTRACTOR group — 15 files; enabled via "contractor" string in enabled_modules, which vola.py maps to this file group. Code was shelved 2026-05-31, reactivated in dev config 2026-06-30.)
-    static/                         (chat widget JS + CSS; dashboard.* are SYMLINKS → ~/orbi_web/owner_dashboard/)
+    static/                         (chat widget JS + CSS; embed widget; booking embed; demo/preview pages; brand icons. dashboard.* are SYMLINKS → ~/orbi_web/owner_dashboard/. Files: chat.{html,css,js}, embed.js, embed-demo.html, booking.html, booking-embed.js, demo_mode.html, idunn_preview.html, myorbi-favicon.png, myorbi-icon.png.)
     owner_dashboard                 (SYMLINK → ../owner_dashboard. ONE canonical source. No drift risk — previous "SECONDARY physical copy" note was wrong.)
     installer/
       install_runtime.py            (the bundled installer logic — runs inside the .exe, 83,747 bytes)
@@ -662,7 +679,7 @@ Each bullet is a real Windows install bug a customer or test PC surfaced. All fi
     install.sh                      (legacy Linux installer — predates the Windows .exe path. Not currently used.)
     requirements.txt
     orbi_capabilities.md            (high-level capability inventory for reference)
-  owner_dashboard/                  (LIVE SOURCE — top-level. customer_install/static/dashboard.* + customer_install/owner_dashboard symlink BOTH point here. Single canonical copy.)
+  owner_dashboard/                  (LIVE SOURCE — top-level. customer_install/static/dashboard.* + customer_install/owner_dashboard symlink BOTH point here. Single canonical copy. Files: dashboard.html, dashboard.js, dashboard.css, dashboard-mobile.css, login.html.)
   billing/                          (⚠️ STALE — contains an older stripe_webhook.py (~74 KB, pre-Render) + the original twilio_central.py. The LIVE brain code is at ~/orbi-brain/. ~/orbi-brain/twilio_central.py is a symlink BACK to ~/orbi_web/billing/twilio_central.py, so that file IS live — do not edit billing/stripe_webhook.py as production.)
   brain/                            (early prototype brain_server.py + admin_server.py — superseded by ~/orbi-brain/)
   pwa/                              (manifest + offline shell for PWA install path — top-level copy)
@@ -676,7 +693,7 @@ Each bullet is a real Windows install bug a customer or test PC surfaced. All fi
   README.md
 
 ~/orbi-brain/                       (THE LIVE BRAIN — Render-hosted at billing.twickell.com. Also running locally as orbi-stripe.service for dev.)
-  stripe_webhook.py                 (Flask app — 4,552 lines as of 2026-06-30. ACTIVE. Routes grouped by surface:
+  stripe_webhook.py                 (Flask app — 4,612 lines as of 2026-06-30. ACTIVE. Routes grouped by surface:
                                      Customer/install:   POST /webhook, GET /api/verify/<token>,
                                                          GET /download/<install_token>, GET /download/by-platform/<platform>
                                      LLM proxy + TTS:    POST /v1/chat/completions, POST /api/brain/tts,
@@ -713,6 +730,9 @@ Each bullet is a real Windows install bug a customer or test PC surfaced. All fi
     admin-login.html, admin.html           (Frank's internal demo workspace — noindex)
     scs-login.html, scs-demo.html          (TEMPORARY preview for Sierra Contractors Source — noindex.
                                             Footer "🏗️ SCS Preview" link in index.html. Remove on Frank's signal.)
+    login.html                             (cloud-v1 customer login page — twickell.com/login)
+    purblum-demo.html                      (PurBlum stunt-double deli demo page)
+    brindy-*, fst-*, myorbi-*, myvola-*   (brand asset images — favicons, icon-192, logos from past brand explorations 2026-06-27; kept as web assets)
   vercel.json                       (deploy config: outputDirectory: "website")
   app.py                            (LOCAL DEV ONLY — Flask on port 5001 for TTS + demo chat.
                                      NOT deployed to Vercel. Don't confuse with the brain.)
@@ -797,7 +817,7 @@ This means the live disk is AHEAD of what GitHub knows about. The 6-18 16:19 `.e
 - **No human support team.** Customer Support module ships in v1 — every Orbi has `product_knowledge.json` bundled so she can answer product questions instantly. Escalation to Frank only when she genuinely can't resolve. Marketed PROUDLY: "I'm the support team — 24/7, no queue, no hold music."
 
 **Branches / production state (updated 2026-06-23):**
-- `~/twickell_live` — current website is on `main`/`origin/main` at `8aa0427`; live `https://twickell.com/` matches local `website/index.html` byte-for-byte. Local `cloud-v1` is ahead of `origin/cloud-v1` by 6 commits, so `origin/cloud-v1` is stale.
+- `~/twickell_live` — local `cloud-v1` tracks `origin/cloud-v1` at `2b805f0`; `main`/`origin/main` point at `8729a87`. Live `https://twickell.com/` matches local `website/index.html` byte-for-byte as of 2026-07-01.
 - `~/orbi_web/cloud-v1` — synced with `origin/cloud-v1` at `e222928`. This is the current Orbi code line on disk.
 - `~/orbi-brain` — not part of the `orbi_web` git repo. Active local brain code has moved to auth/tenant/proxy flow and was modified through 2026-06-23.
 
@@ -826,7 +846,7 @@ This means the live disk is AHEAD of what GitHub knows about. The 6-18 16:19 `.e
 - Magic-link login flow: ✅ test token `inst_43fe1f67a9db13709fa79104844923ff` created via brain, Frank clicked, landed in dashboard as owner. End-to-end works.
 - Kokoro TTS: ✅ `GET /tts?voice=af` → 200 OK, 13.5 KB MP3.
 - Microsoft Ava fallback: ✅ `GET /tts?voice=en-US-AvaNeural` → 200 OK, 7.6 KB MP3 via edge_tts.
-- All services healthy: orbi.twickell.com, billing.twickell.com, twickell.com (prod), cloud-v1 preview tunnel all returning HTTP 200.
+- Verified 2026-07-01: `https://orbi.twickell.com/health`, `https://billing.twickell.com/health`, and `https://twickell.com/` all return HTTP 200. Cloud-v1 preview tunnel was not separately reverified in this audit.
 
 **Still pending before real customer signup works (NOT done yet — Frank's call when to do these):**
 
@@ -944,5 +964,5 @@ Whole loop is ~2-3 minutes plus walking time. Faster than asking Frank to find a
 4. **Per-seat means per-person/account access in cloud-v1, not per-device.** Do not resurrect the old "3 devices per host computer" sales model unless explicitly working on v2 local install.
 5. **Customer experience is signup-and-onboard, not install-and-debug.** No PowerShell, no terminal, no env files, no GitHub. Cloud-v1 customers should reach a dashboard and guided onboarding.
 6. **Code in git, data not.** Wiping/seeding data files requires explicit owner approval every time.
-7. **twickell.com deploys from `twickell_live/main`.** Frank verifies on the live site. As of 2026-06-23, `main`/`origin/main` are current and `origin/cloud-v1` is stale by 6 commits.
+7. **twickell.com deploys from `twickell_live/main`.** Frank verifies on the live site. As of the 2026-07-01 audit, local `cloud-v1` tracks `origin/cloud-v1` at `2b805f0`, while `main`/`origin/main` point at `8729a87`.
 8. **Honest framing over cheerleading.** Don't claim "moats" for features competitors can copy in a sprint. Name strengths AND limits. Disclosure beats surprise.
