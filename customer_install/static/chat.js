@@ -230,7 +230,9 @@
     // here; the user clicks "Talk to Orbi" to start every session.
     if (prefs.panelOpen && IS_EMBED) openPanel(false);
     setSpeakerOn(prefs.speakerOn, /*persist*/ false);
-    if (prefs.micOn && IS_EMBED) setMicOn(true, /*persist*/ false);
+    // Do NOT auto-restore mic in embed mode — Chrome requires a real user
+    // gesture inside the iframe for SpeechRecognition to capture audio.
+    // Without it, recognition shows "active" (green) but hears nothing.
   }
 
   // ------------------------------------------------------------------
@@ -862,7 +864,7 @@ _audioEl.src = '/tts?text=%20&silent=1';
       console.warn('mic error:', e.error);
       if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
         setMicOn(false);
-        alert('Microphone permission was denied. To use voice, please allow microphone access in your browser settings.');
+        setStateBar('Microphone blocked — tap the mic icon to retry.', 'error');
       }
     };
 
