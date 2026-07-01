@@ -1117,6 +1117,29 @@ _audioEl.src = '/tts?text=%20&silent=1';
     micToggle.classList.remove('muted-while-speaking');
   }
 
+  function _renderMarkdown(text) {
+    // Lightweight markdown → HTML for chat bubbles. Handles the subset
+    // the LLM commonly outputs: bold, bullets, line breaks. Uses
+    // innerHTML so formatting actually renders instead of showing raw **.
+    const esc = String(text || '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+    return esc
+      // Bold **text**
+      .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
+      // Italic *text* (single asterisks not already consumed by bold)
+      .replace(/\*([^*\n]+)\*/g, '<em>$1</em>')
+      // Bullet lines: "- item" or "• item" at start of line → <li>
+      .replace(/^[-•]\s+(.+)$/gm, '<li>$1</li>')
+      // Wrap consecutive <li> runs in a <ul>
+      .replace(/(<li>[\s\S]*?<\/li>)(\n<li>[\s\S]*?<\/li>)*/g, '<ul>$&</ul>')
+      // Double newline → paragraph gap
+      .replace(/\n\n/g, '<br><br>')
+      // Single newline → line break
+      .replace(/\n/g, '<br>');
+  }
+
   function stripForSpeech(t) {
     // Clean text BEFORE it goes to TTS so she speaks like a human, not a
     // markdown parser. Without these substitutions she reads markdown
@@ -1125,8 +1148,18 @@ _audioEl.src = '/tts?text=%20&silent=1';
     return String(t || '')
       // Markdown bold/italic markers
       .replace(/\*\*?/g, '')
+      // Emoji number bullets (1️⃣, 2️⃣, etc.) — strip the emoji, keep text
+      .replace(/\d️⃣\s*/g, '')
       // Line-start bullet markers
       .replace(/^[-•]\s+/gm, '')
+      // Strip trailing spaces/tabs before newlines (markdown line breaks)
+      .replace(/[ \t]+\n/g, '\n')
+      // Lines NOT ending with .?!: need a period so edge_tts pauses there.
+      // Without this, "Business phone: Answers calls\nWebsite chat: ..."
+      // is spoken as one continuous breath.
+      .replace(/([^.?!:\n])\n+/g, '$1. ')
+      // Lines already ending with punctuation just need a space
+      .replace(/([.?!:])\n+/g, '$1 ')
       // ALL hashes — markdown headings (## Pricing) and inline tags
       // (#seat). TTS reads each one as the word "hashtag" otherwise.
       .replace(/#+/g, '')
@@ -1135,6 +1168,8 @@ _audioEl.src = '/tts?text=%20&silent=1';
       // System tier hints we don't want spoken
       .replace(/—\s*backup mode\s*—/gi, '')
       .replace(/—\s*offline mode\s*—/gi, '')
+      // Em/en dashes used as connectors — replace with comma-pause
+      .replace(/\s*[–—]\s*/g, ', ')
       // Currency — Edge TTS reads "$129" as "dollar one twenty nine".
       // Rewrite as natural English: "$129" → "129 dollars",
       // "$29.99" → "29 dollars and 99 cents", "$0.99" → "99 cents".
@@ -1159,8 +1194,12 @@ _audioEl.src = '/tts?text=%20&silent=1';
       .replace(/\s*\/\s*hour\b/gi, ' per hour')
       .replace(/\s*\/\s*wk\b/gi, ' per week')
       .replace(/\s*\/\s*week\b/gi, ' per week')
-      // Collapse any double-spaces the substitutions introduced
-      .replace(/\s{2,}/g, ' ')
+      // Sentence-end pause: after . ? ! add a short pause that edge_tts
+      // respects — without this everything runs together as one breath.
+      .replace(/([.?!])\s+/g, '$1  ')
+      // Collapse leftover runs of 3+ spaces (but preserve the 2-space
+      // sentence pauses added above)
+      .replace(/\s{3,}/g, ' ')
       .trim();
   }
 
@@ -1172,10 +1211,11 @@ _audioEl.src = '/tts?text=%20&silent=1';
     div.className = 'message ' + role +
       (opts.tier && opts.tier !== 'brain' && opts.tier !== 'none' ? ' degraded' : '');
 
-    // Content
+    // Content — render basic markdown so bullet lists, bold, and line
+    // breaks display properly instead of showing raw asterisks/dashes.
     const body = document.createElement('div');
     body.className = 'message-body';
-    body.textContent = text;
+    body.innerHTML = _renderMarkdown(text);
     div.appendChild(body);
 
     // Tier hint — only show when we're ACTUALLY degraded. Healthy tiers:
@@ -1501,15 +1541,14 @@ _audioEl.src = '/tts?text=%20&silent=1';
       // for natural conversation. Long greetings = long anti-echo mute.
       greeting = `Hi ${name}! What can I help with?`;
     } else {
-      // First-time visitor — one short sentence. The avatar + business
-      // name in the header already shows who she is, so the greeting
-      // doesn't need to re-introduce. Special case: when the business
-      // IS Orbi (her own website / sales bot), saying "Orbi at Orbi"
-      // sounds dumb. Drop the "at X" suffix in that case.
+      // First-time visitor — ask for name + phone right in the greeting
+      // so the lead capture happens upfront. Special case: when the
+      // business IS Orbi (sales bot) skip the lead ask — that flow
+      // collects info its own way.
       const isOrbiSite = /^(vola|myorby|orbi|myorbi)$/i.test((businessName || '').trim());
       greeting = isOrbiSite
         ? `Hi! I'm Orby — how can I help?`
-        : `Hi! I'm Orby at ${businessName} — how can I help?`;
+        : `Hi! Welcome to ${businessName} — what's your name?`;
     }
     // Remove the welcome bubble (replaced by Orby's actual first message)
     document.getElementById('welcome')?.remove();
