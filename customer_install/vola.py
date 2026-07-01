@@ -1427,6 +1427,17 @@ def tts():
     # would lose interest before the TTS finished anyway.
     if len(text) > 12000:
         text = text[:12000]
+    # TTS preprocessing — fix things the engine mispronounces.
+    # Dollar amounts with comma-separators ("$2,294.49") get read as
+    # "$2" pause "294" "$0.49". Strip the commas so "$2294.49" flows
+    # naturally as "two thousand two hundred ninety-four dollars and
+    # forty-nine cents."
+    import re as _re_tts
+    text = _re_tts.sub(
+        r'\$(\d{1,3}(?:,\d{3})+(?:\.\d+)?)',
+        lambda m: '$' + m.group(1).replace(',', ''),
+        text,
+    )
 
     tts_cfg = CONFIG.get("tts") or {}
     engine = tts_cfg.get("engine", "edge").lower()
@@ -3867,19 +3878,29 @@ def public_business_summary():
     /chat) so the widget header on purblum.com says 'PurBlum' not the
     default 'myOrbi'."""
     business = _resolve_business_profile_for_request(request)
-    # Default quick actions based on what scope is enabled
-    scope = CONFIG.get("scope", {})
-    actions = ["Are you open right now?", "Where are you located?"]
-    if business.get("services") or business.get("menu"):
-        actions.append("What do you offer?")
-    if scope.get("public_can_take_orders"):
-        actions.append("I'd like to place an order")
-    if scope.get("public_can_book_appointments"):
-        actions.append("Can I book an appointment?")
-    if scope.get("public_can_request_quotes"):
-        actions.append("I'd like a quote")
+    biz_name = (business.get("name") or CONFIG.get("business", {}).get("name", ""))
+    biz_norm = biz_name.lower().replace(" ", "").replace("-", "")
+    _is_sales = biz_norm in ("myorbi", "myorby")
+    if _is_sales:
+        actions = [
+            "What is Orby?",
+            "How much does it cost?",
+            "How does the phone answering work?",
+            "Can I see a demo?",
+        ]
+    else:
+        scope = CONFIG.get("scope", {})
+        actions = ["Are you open right now?", "Where are you located?"]
+        if business.get("services") or business.get("menu"):
+            actions.append("What do you offer?")
+        if scope.get("public_can_take_orders"):
+            actions.append("I'd like to place an order")
+        if scope.get("public_can_book_appointments"):
+            actions.append("Can I book an appointment?")
+        if scope.get("public_can_request_quotes"):
+            actions.append("I'd like a quote")
     return jsonify({
-        "name": business.get("name") or CONFIG.get("business", {}).get("name", ""),
+        "name": biz_name,
         "tagline": business.get("tagline", ""),
         "welcome": True,
         "quick_actions": actions[:4],
