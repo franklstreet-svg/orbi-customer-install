@@ -967,6 +967,10 @@ _audioEl.src = '/tts?text=%20&silent=1';
   async function deliverSpokenWelcome() {
     if (_welcomeDelivered) return;
     _welcomeDelivered = true;
+    // Cancel any proactive greeting that setSpeakerOn may have started on
+    // the same click — without this both audios overlap on the first tap.
+    _pendingFirstSpeech = null;
+    stopSpeaking();
     const welcomeText = "Hi, welcome to myOrby. How can I help you today?";
     // Remove the static placeholder card now that real conversation starts
     welcomeEl?.remove();
