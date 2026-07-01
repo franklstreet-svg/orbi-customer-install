@@ -437,7 +437,13 @@ _audioEl.src = '/tts?text=%20&silent=1';
       // request) instead of sitting there with a canned silent welcome
       // bubble. Subsequent mic taps don't re-greet.
       if (turningOn && history.length === 0 && !_welcomeDelivered) {
-        deliverSpokenWelcome().finally(() => setTimeout(() => setMicOn(true), 400));
+        // Turn mic on FIRST inside the user-gesture window so Chrome's
+        // SpeechRecognition actually captures audio. speak() inside
+        // deliverSpokenWelcome will apply anti-echo (stop mic during TTS,
+        // re-arm after). Delaying setMicOn until after TTS put it outside
+        // Chrome's gesture window, causing green-but-deaf recognition.
+        setMicOn(true);
+        deliverSpokenWelcome();
       } else {
         setMicOn(turningOn);
       }
