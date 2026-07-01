@@ -56,8 +56,7 @@
   // buster, which inadvertently rotated on every page load and made Orby
   // re-greet from the top on every navigation. Removed 2026-06-03.
   //
-  // Visitor profile (name + phone) lives separately in localStorage so
-  // Orby still recognizes the visitor on their next visit.
+  // Visitor profile (name + phone) lives in sessionStorage — clears on close.
   const _qs = new URLSearchParams(window.location.search);
   const HIST_KEY = 'orbi_chat_history__' +
     (_qs.get('parent') || window.location.origin);
@@ -172,7 +171,7 @@
       welcome.innerHTML = `
         <div class="welcome-bubble">
           <h2 id="welcome-title">Hi! How can I help?</h2>
-          <p id="welcome-sub">Ask me anything — hours, services, prices, or anything else.</p>
+          <p id="welcome-sub">Your business phone, website chat, and scheduling — one brain.</p>
         </div>
         <div class="quick-actions" id="quick-actions"></div>`;
       chatArea.appendChild(welcome);
@@ -266,12 +265,21 @@
     // the proactive greeting.
     _unlockMobileAudio();
     if (!prefs.speakerOn) setSpeakerOn(true);
-    // Frank 2026-06-23: mic stays OFF on panel open. Customer taps the
-    // mic icon when they want to talk — that tap is the gesture that
-    // also turns on the speaker (already on by default here) and primes
-    // audio. Defaulting mic OFF avoids the confusing "is the mic on
-    // already? do I need to tap it?" UX and gives us the gesture iOS
-    // requires before recording.
+    // Drain proactive greeting — this click is a user gesture so audio is unlocked.
+    // Mic turns on after the greeting finishes (avoids echo during playback).
+    if (prefs.speakerOn && _pendingFirstSpeech) {
+      const _greetTxt = _pendingFirstSpeech;
+      _pendingFirstSpeech = null;
+      try {
+        Promise.resolve(speak(_greetTxt)).finally(() => {
+          _markGreetingDone();
+          if (!prefs.micOn) setMicOn(true);
+        });
+      } catch {
+        _markGreetingDone();
+        if (!prefs.micOn) setMicOn(true);
+      }
+    }
   }
 
   // Mobile audio unlock — two-pronged approach:
@@ -653,7 +661,7 @@ _audioEl.src = '/tts?text=%20&silent=1';
       // and can navigate its own window with no cross-origin friction).
       if (data.navigate_request && data.navigate_request.url) {
         const navUrl = data.navigate_request.url;
-        // Give the bot's last sentence ~2.5s to speak before nav.
+        // Give the bot's last sentence ~5s to speak before nav.
         setTimeout(() => {
           // Primary path: ask the parent embed.js to do the navigation.
           // The parent listens for orbi:navigate and runs
@@ -667,7 +675,7 @@ _audioEl.src = '/tts?text=%20&silent=1';
           if (window.top === window.self) {
             try { window.top.location.assign(navUrl); } catch {}
           }
-        }, 2500);
+        }, 5000);
       }
 
       // Live cart panel — server returns order_summary when the chat
@@ -747,8 +755,8 @@ _audioEl.src = '/tts?text=%20&silent=1';
         setStateBar(null);
         addBubble('assistant',
           startData.error === 'rate_limited'
-            ? "I've already looked at one site recently — give me a few minutes before I scan another. Or tell me what kind of business you run and I'll recommend a fit."
-            : "I couldn't reach that site. Want to tell me what kind of business you run instead?",
+            ? "I'm having trouble reaching that site right now. Can you tell me a bit about what you offer and I'll work with that?"
+            : "I couldn't reach that site. Can you tell me a bit about what you offer instead?",
           { tier: 'local' });
         return;
       }
@@ -1545,10 +1553,7 @@ _audioEl.src = '/tts?text=%20&silent=1';
       // so the lead capture happens upfront. Special case: when the
       // business IS Orbi (sales bot) skip the lead ask — that flow
       // collects info its own way.
-      const isOrbiSite = /^(vola|myorby|orbi|myorbi)$/i.test((businessName || '').trim());
-      greeting = isOrbiSite
-        ? `Hi! I'm Orby — how can I help?`
-        : `Hi! Welcome to ${businessName} — what's your name?`;
+      greeting = `Hi, welcome to ${businessName}. My name is Orby. How can I help you?`;
     }
     // Remove the welcome bubble (replaced by Orby's actual first message)
     document.getElementById('welcome')?.remove();
@@ -1562,27 +1567,25 @@ _audioEl.src = '/tts?text=%20&silent=1';
     // and the greeting never queues at all. The drains below (first tap,
     // speaker toggle) consult prefs.speakerOn at drain time instead.
     _pendingFirstSpeech = greeting;
-    if (prefs.speakerOn) {
-      _pendingFirstSpeech = null;
-      try { Promise.resolve(speak(greeting)).finally(_markGreetingDone); } catch { _markGreetingDone(); }
-    }
+    // Don't call speak() here — audio is not yet unlocked (no user gesture at page load).
+    // openPanel() drains _pendingFirstSpeech on the "Talk to Orby" click (standalone),
+    // or _drainOnFirstTap fires on the first interaction in embed mode.
     // If speakerOn is false right now, leave _pendingFirstSpeech queued —
-    // the setSpeakerOn drain (auto-on at boot or user toggle) picks it up
-    // and resolves the greeting gate at that point.
+    // the setSpeakerOn drain (auto-on at boot or user toggle) picks it up.
   }
 
-  // Visitor profile (name + phone + email) lives in localStorage keyed per
-  // customer site so it PERSISTS across browser sessions. Chat history is
-  // wiped at tab-close, but Orby still recognizes returning visitors by
-  // their name + phone — same model as the phone-side caller recognition.
+  // Visitor profile (name + phone + email) lives in sessionStorage — same
+  // tab only. Clears when the tab closes or the page refreshes so the next
+  // visitor starts completely fresh. (localStorage was used before but caused
+  // Orby to remember one customer when a different one arrived.)
   const VISITOR_KEY = 'orbi_visitor__' +
     (new URLSearchParams(window.location.search).get('parent') || window.location.origin);
   function loadVisitorInfo() {
-    try { return JSON.parse(localStorage.getItem(VISITOR_KEY) || '{}'); }
+    try { return JSON.parse(sessionStorage.getItem(VISITOR_KEY) || '{}'); }
     catch { return {}; }
   }
   function saveVisitorInfo() {
-    try { localStorage.setItem(VISITOR_KEY, JSON.stringify(visitor)); } catch {}
+    try { sessionStorage.setItem(VISITOR_KEY, JSON.stringify(visitor)); } catch {}
   }
   function maybeCaptureContactInfo(text) {
     // Phone: 555-1234, (555) 555-1234, +1 555 555 1234, etc.
