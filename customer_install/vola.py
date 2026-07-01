@@ -4469,11 +4469,15 @@ def public_chat():
             if _m:
                 _scrape_url = _m.group(1).strip()
                 _sales_scrape_request = {"url": _scrape_url}
-                # Strip the marker (and any whitespace around it) from the
-                # user-facing reply text so the visitor never sees the raw tag.
-                resp.text = _re.sub(
-                    r"\s*<<SCRAPE:\s*.+?\s*>>\s*", " ", resp.text
-                ).strip()
+                # Keep only the text BEFORE the marker — the LLM frequently
+                # ignores "FULL STOP" and appends Phase 4.1 content (using
+                # hallucinated training-data knowledge) in the same response.
+                # Anything after the <<SCRAPE:...>> tag is pre-emptive and
+                # wrong; discard it so the customer only sees "Cool, looking
+                # at your site now..." and nothing else until the real scrape
+                # result comes back on the (continue) turn.
+                _pre_marker = resp.text[: _m.start()].rstrip()
+                resp.text = _pre_marker if _pre_marker else resp.text
         except Exception as _e:
             log.warning(f"SCRAPE marker parse failed: {_e}")
 
