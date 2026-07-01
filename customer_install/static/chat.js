@@ -450,6 +450,12 @@ _audioEl.src = '/tts?text=%20&silent=1';
       } else {
         if (turningOn && !prefs.speakerOn) setSpeakerOn(true);
         setMicOn(turningOn);
+        // Guarantee recognition.start() fires inside this gesture window.
+        // startListening() bails when isSpeaking=true (proactive greeting
+        // still playing), so call safeStart() directly here. This is the
+        // first call Chrome needs in a gesture context — all restarts after
+        // this (armMic, onend timer) work from any context.
+        if (turningOn && !isListening) safeStart();
       }
     });
     speakerToggle.addEventListener('click', () => {
@@ -879,7 +885,7 @@ _audioEl.src = '/tts?text=%20&silent=1';
     };
 
     recognition.onresult = (event) => {
-      if (_suppressSTT) { clearInterim(); return; }
+      if (isSpeaking) { clearInterim(); return; }
       let interim = '';
       let finalText = '';
       for (let i = event.resultIndex; i < event.results.length; i++) {
