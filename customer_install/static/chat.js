@@ -437,7 +437,7 @@ _audioEl.src = '/tts?text=%20&silent=1';
       // request) instead of sitting there with a canned silent welcome
       // bubble. Subsequent mic taps don't re-greet.
       if (turningOn && history.length === 0 && !_welcomeDelivered) {
-        deliverSpokenWelcome().finally(() => setMicOn(true));
+        deliverSpokenWelcome().finally(() => setTimeout(() => setMicOn(true), 400));
       } else {
         setMicOn(turningOn);
       }
