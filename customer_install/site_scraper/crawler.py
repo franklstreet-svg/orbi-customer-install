@@ -42,7 +42,8 @@ def crawl_site(start_url: str,
                 max_depth: int = 5,
                 wall_time_seconds: int = 600,
                 fetch_delay_seconds: float = 0.5,
-                save: bool = True) -> dict:
+                save: bool = True,
+                render: bool = True) -> dict:
     """Crawl every same-domain page reachable from `start_url`, run LLM
     extraction on each, merge into a unified business profile.
 
@@ -85,7 +86,7 @@ def crawl_site(start_url: str,
         visited.add(url)
 
         # Fetch
-        fetched = http_client.fetch(url)
+        fetched = http_client.fetch(url, render=render)
         if not fetched.get("ok"):
             failed.append({"url": url, "error": fetched.get("error", "")})
             log.debug(f"crawl: skip {url} ({fetched.get('error', '')})")

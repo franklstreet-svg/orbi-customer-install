@@ -913,6 +913,7 @@ def _run_scrape_job(job_id: str, url: str, payload: dict) -> None:
             max_depth=int(payload.get("max_depth", 3)),
             wall_time_seconds=int(payload.get("wall_time_seconds", 120)),
             fetch_delay_seconds=float(payload.get("fetch_delay_seconds", 0.1)),
+            render=bool(payload.get("render", True)),
         )
         slug = result.get("slug") or result.get("domain", "").replace(".", "_")
         profile_path = DATA_DIR / "customer_profiles" / f"{slug}.json"
@@ -1176,6 +1177,9 @@ def api_public_sales_scrape():
         "max_pages": 8,
         "max_depth": 1,
         "_source": "public_sales",
+        # Skip Playwright for public scrapes — static HTML is fine and
+        # Playwright adds 10+ s of startup latency per page.
+        "render": False,
     }
     with _SCRAPE_JOBS_LOCK:
         _SCRAPE_JOBS[job_id] = {
