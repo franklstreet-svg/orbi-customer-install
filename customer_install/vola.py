@@ -4294,17 +4294,12 @@ def public_chat():
         except Exception as e:
             log.warning(f"public web search failed: {e}")
 
-    # URL FETCH — if the visitor pasted a specific URL, go fetch the page
-    try:
-        urls_in_msg = tool_url_fetch.extract_urls(user_msg)[:3]
-        if urls_in_msg:
-            fetched = [tool_url_fetch.fetch_or_search(u) for u in urls_in_msg]
-            url_ctx = tool_url_fetch.context_block(fetched)
-            if url_ctx:
-                extras.append(url_ctx)
-                log.info(f"public url_fetch: {len(urls_in_msg)} url(s)")
-    except Exception as e:
-        log.warning(f"public url_fetch failed: {e}")
+    # URL FETCH intentionally skipped for the public/sales chat.
+    # When a visitor pastes their business URL, the LLM emits <<SCRAPE:url>>
+    # which runs an async scrape (fast, render=False). Doing a synchronous
+    # inline fetch here adds large page content to the prompt before the LLM
+    # call, causing LLM timeouts on sites with heavy HTML. The SCRAPE flow
+    # handles business websites correctly — no inline fetch needed here.
     if extras:
         system += "\n\n" + "\n\n".join(extras)
 
