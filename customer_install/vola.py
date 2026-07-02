@@ -4466,7 +4466,7 @@ def public_chat():
                 # so any hallucinated Phase 4.1 content (training-data business
                 # info) gets discarded. The LLM dropped the marker AND ignored
                 # FULL STOP — we can't trust anything it wrote after "looking at".
-                resp.text = f"Cool, looking at {_u} now — give me about a minute. <<SCRAPE:{_u}>>"
+                resp.text = f"Cool, pulling up {_u} now — heads up, some sites block automated access so if I can't read it I'll ask you a couple quick questions instead. Give me about a minute. <<SCRAPE:{_u}>>"
                 log.info(f"chat: SCRAPE fallback fired (LLM dropped marker), url={_u}")
         except Exception as _e:
             log.warning(f"SCRAPE fallback failed: {_e}")
