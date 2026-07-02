@@ -7614,6 +7614,44 @@ def owner_chat():
     except Exception as e:
         log.warning(f"auto-memory thread launch failed: {e}")
 
+    # RESCRAPE — owner asked Orby to re-read the business website.
+    # Strip the marker from the reply and kick off a fresh crawl in background.
+    _rescrape_fired = False
+    if resp.text and "<<RESCRAPE>>" in resp.text:
+        resp.text = resp.text.replace("<<RESCRAPE>>", "").rstrip()
+        try:
+            _biz_url = (business.get("contact") or {}).get("website", "").strip()
+            if _biz_url:
+                import uuid as _uuid
+                _rjob_id = _uuid.uuid4().hex[:16]
+                _rpayload = {
+                    "url": _biz_url,
+                    "max_pages": 50,
+                    "max_depth": 3,
+                    "wall_time_seconds": 300,
+                    "fetch_delay_seconds": 0.3,
+                    "_source": "owner_rescrape",
+                    "render": False,
+                }
+                with _SCRAPE_JOBS_LOCK:
+                    _SCRAPE_JOBS[_rjob_id] = {
+                        "status": "running",
+                        "started_at": time.time(),
+                        "url": _biz_url,
+                        "source": "owner_rescrape",
+                    }
+                threading.Thread(
+                    target=_run_scrape_job,
+                    args=(_rjob_id, _biz_url, _rpayload),
+                    daemon=True,
+                ).start()
+                _rescrape_fired = True
+                log.info(f"owner_rescrape: started job {_rjob_id} for {_biz_url}")
+            else:
+                resp.text += " (I don't have a website URL on file — add it in Business tab first.)"
+        except Exception as _re:
+            log.warning(f"owner_rescrape failed to start: {_re}")
+
     fallback_msg = (
         "I'm having a hard time thinking right now — give me about "
         "30 seconds and ask again. If it keeps happening, hit the "
@@ -7624,6 +7662,7 @@ def owner_chat():
         "reply": resp.text or fallback_msg,
         "tier": resp.tier,
         "latency_ms": resp.latency_ms,
+        "rescrape_started": _rescrape_fired,
     })
 
 
